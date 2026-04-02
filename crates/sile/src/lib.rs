@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod hir;
 pub mod codegen;
 pub mod device;
 pub mod error;
