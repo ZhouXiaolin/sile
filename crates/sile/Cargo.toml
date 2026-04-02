@@ -4,5 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+libloading.workspace = true
 sile-macros = { path = "../sile-macros" }
+tempfile.workspace = true
 thiserror.workspace = true

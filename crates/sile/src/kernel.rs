@@ -43,7 +43,7 @@ impl<'a> KernelLauncher<'a> {
         };
         let spec = KernelSpec::from(self.spec);
         spec.validate_launch(&self.args, &launch)?;
-        let _ = stream;
-        Err(crate::Error::UnsupportedBackend("backend not wired yet"))
+        crate::backend::for_device(stream.device())?
+            .launch_spec(&spec, &self.args, &launch, stream)
     }
 }
