@@ -1,3 +1,4 @@
+pub mod codegen;
 pub mod device;
 pub mod error;
 pub mod kernel;
