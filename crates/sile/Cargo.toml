@@ -1,0 +1,8 @@
+[package]
+name = "sile"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sile-macros = { path = "../sile-macros" }
+thiserror.workspace = true
