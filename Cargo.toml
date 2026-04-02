@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/sile", "crates/sile-macros"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+darling = "0.20"
+libloading = "0.8"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+tempfile = "3"
+thiserror = "2"
