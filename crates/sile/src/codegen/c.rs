@@ -22,7 +22,7 @@ fn generate_vec_add(kernel: &BackendKernel) -> crate::Result<String> {
 
 fn generate_softmax(_kernel: &BackendKernel) -> crate::Result<String> {
     Ok(
-        "#include <math.h>\n\n\
+        "#include <math.h>\n#include <stdint.h>\n\n\
          void sile_kernel_softmax(const float* x, float* y, int64_t pid_m, int64_t bm, int64_t bn, int64_t n) {\n\
          \x20   int64_t row_base = pid_m * bm;\n\
          \x20   for (int64_t row = 0; row < bm; ++row) {\n\

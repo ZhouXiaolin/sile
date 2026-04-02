@@ -4,7 +4,9 @@ use libloading::Library;
 use tempfile::tempdir;
 
 use crate::{
-    backend_ir, kernel::{KernelArg, LaunchConfig}, ssa,
+    backend_ir::{self, ir::BackendOp},
+    kernel::{KernelArg, LaunchConfig},
+    ssa,
     Result, Stream,
 };
 
@@ -28,13 +30,17 @@ impl CpuBackend {
         Err(crate::Error::UnsupportedBackend("no C compiler found"))
     }
 
-    fn compile_kernel_from_hir(kernel: &crate::hir::Kernel) -> Result<String> {
+    fn compile_kernel_from_hir(
+        kernel: &crate::hir::Kernel,
+    ) -> Result<(String, BackendOp)> {
         let typed = crate::typeck::check_kernel(kernel)
             .map_err(|err| crate::Error::Shape(err.to_string()))?;
         let ssa = crate::passes::canonicalize::run(ssa::lower_typed_kernel_to_ssa(&typed));
         let ssa = crate::passes::dce::run(ssa);
         let backend = backend_ir::lower::lower_ssa_to_backend_ir(&ssa);
-        crate::codegen::c::generate(&backend)
+        let op = backend.op;
+        let code = crate::codegen::c::generate(&backend)?;
+        Ok((code, op))
     }
 }
 
@@ -55,7 +61,7 @@ impl crate::backend::Backend for CpuBackend {
         };
         let so_path = dir.path().join(format!("lib{}.{}", kernel.name, ext));
 
-        let c_code = Self::compile_kernel_from_hir(kernel)?;
+        let (c_code, backend_op) = Self::compile_kernel_from_hir(kernel)?;
         fs::write(&c_path, c_code)?;
 
         let compiler = Self::compiler()?;
@@ -79,31 +85,33 @@ impl crate::backend::Backend for CpuBackend {
 
             let tile_size = args[0].shape[0] / launch.grid[0] as i64;
 
-            // Check if this is a softmax-like kernel (2 args) or vec_add (3 args)
-            if args.len() == 2 && kernel.name.contains("softmax") {
-                let func: libloading::Symbol<KernelFnSoftmax> = library
-                    .get(symbol_name.as_bytes())
-                    .map_err(|e| crate::Error::Compile(e.to_string()))?;
+            match backend_op {
+                BackendOp::Softmax2D => {
+                    let func: libloading::Symbol<KernelFnSoftmax> = library
+                        .get(symbol_name.as_bytes())
+                        .map_err(|e| crate::Error::Compile(e.to_string()))?;
 
-                let x_ptr = args[0].mut_ptr;
-                let y_ptr = args[1].mut_ptr;
-                let n = args[0].shape[1];
-                let bm = tile_size;
+                    let x_ptr = args[0].mut_ptr;
+                    let y_ptr = args[1].mut_ptr;
+                    let n = args[0].shape[1];
+                    let bm = tile_size;
 
-                for gx in 0..launch.grid[0] {
-                    func(x_ptr, y_ptr, gx as i64, bm, n, n);
+                    for gx in 0..launch.grid[0] {
+                        func(x_ptr, y_ptr, gx as i64, bm, n, n);
+                    }
                 }
-            } else {
-                let func: libloading::Symbol<KernelFn1D> = library
-                    .get(symbol_name.as_bytes())
-                    .map_err(|e| crate::Error::Compile(e.to_string()))?;
+                BackendOp::VecAdd1D => {
+                    let func: libloading::Symbol<KernelFn1D> = library
+                        .get(symbol_name.as_bytes())
+                        .map_err(|e| crate::Error::Compile(e.to_string()))?;
 
-                let a_ptr = args[0].mut_ptr;
-                let b_ptr = args[1].mut_ptr;
-                let c_ptr = args[2].mut_ptr;
+                    let a_ptr = args[0].mut_ptr;
+                    let b_ptr = args[1].mut_ptr;
+                    let c_ptr = args[2].mut_ptr;
 
-                for gx in 0..launch.grid[0] {
-                    func(a_ptr, b_ptr, c_ptr, gx as i64, tile_size);
+                    for gx in 0..launch.grid[0] {
+                        func(a_ptr, b_ptr, c_ptr, gx as i64, tile_size);
+                    }
                 }
             }
         }
