@@ -1,11 +1,11 @@
 pub mod cpu_c;
 
-use crate::{kernel::LaunchConfig, KernelArg, KernelSpec, Result, Stream};
+use crate::{kernel::LaunchConfig, kernel::KernelArg, Result, Stream};
 
 pub trait Backend: Send + Sync {
-    fn launch_spec(
+    fn launch_kernel(
         &self,
-        spec: &KernelSpec,
+        kernel: &crate::hir::Kernel,
         args: &[KernelArg<'_>],
         launch: &LaunchConfig,
         stream: &Stream,

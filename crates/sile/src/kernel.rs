@@ -1,4 +1,4 @@
-use crate::{Device, KernelSpec, Result};
+use crate::{Device, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LaunchConfig {
@@ -14,15 +14,15 @@ pub struct KernelArg<'a> {
 }
 
 pub struct KernelLauncher<'a> {
-    spec: &'static crate::spec::KernelSpecRef,
+    kernel: &'static crate::hir::Kernel,
     args: Vec<KernelArg<'a>>,
     grid: Option<[u32; 3]>,
 }
 
 impl<'a> KernelLauncher<'a> {
-    pub fn new(spec: &'static crate::spec::KernelSpecRef, args: Vec<KernelArg<'a>>) -> Self {
+    pub fn new(kernel: &'static crate::hir::Kernel, args: Vec<KernelArg<'a>>) -> Self {
         Self {
-            spec,
+            kernel,
             args,
             grid: None,
         }
@@ -33,17 +33,15 @@ impl<'a> KernelLauncher<'a> {
         self
     }
 
-    pub fn spec_ref(&self) -> &'static crate::spec::KernelSpecRef {
-        self.spec
+    pub fn kernel(&self) -> &'static crate::hir::Kernel {
+        self.kernel
     }
 
     pub fn apply(self, stream: &crate::Stream) -> Result<()> {
         let launch = LaunchConfig {
             grid: self.grid.ok_or_else(|| crate::Error::Shape("grid not set".into()))?,
         };
-        let spec = KernelSpec::from(self.spec);
-        spec.validate_launch(&self.args, &launch)?;
         crate::backend::for_device(stream.device())?
-            .launch_spec(&spec, &self.args, &launch, stream)
+            .launch_kernel(self.kernel, &self.args, &launch, stream)
     }
 }

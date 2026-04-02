@@ -9,7 +9,7 @@ fn vec_add(a: &Tensor<f32>, b: &Tensor<f32>, c: &mut Tensor<f32>) {
 }
 
 #[test]
-fn macro_builds_a_launcher_with_the_expected_hir() {
+fn vec_add_macro_emits_hir_kernel() {
     let device = Device::cpu();
     let a = Tensor::ones([16], &device).unwrap();
     let b = Tensor::ones([16], &device).unwrap();
@@ -20,4 +20,5 @@ fn macro_builds_a_launcher_with_the_expected_hir() {
 
     assert_eq!(kernel.name, "vec_add");
     assert_eq!(kernel.params.len(), 3);
+    assert!(kernel.body.len() >= 3);
 }
