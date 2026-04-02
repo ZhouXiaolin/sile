@@ -12,6 +12,7 @@ pub struct KernelParam {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub enum KernelStmt {
     Let {
         name: syn::Ident,

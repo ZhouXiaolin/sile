@@ -7,6 +7,7 @@ pub mod hir;
 pub mod kernel;
 pub mod passes;
 pub mod schedule;
+#[deprecated = "use crate::hir::Kernel and compiler pipeline instead"]
 pub mod spec;
 pub mod ssa;
 pub mod stream;
@@ -16,11 +17,8 @@ pub mod typeck;
 
 pub use device::Device;
 pub use error::{Error, Result};
+pub use hir::{BuiltinOp, ElemType, Expr, Kernel, Param, ParamKind, ShapeExpr, Stmt, Type, ValueCategory};
 pub use kernel::{KernelArg, KernelLauncher, LaunchConfig};
 pub use sile_macros::kernel;
-pub use spec::{
-    BinaryOp, KernelSpec, KernelSpecRef, Node, NodeRef, Param, ParamKind, ParamRef, ScalarType,
-    Shape, Store, StoreRef, TileExpr,
-};
 pub use stream::Stream;
 pub use tensor::Tensor;
