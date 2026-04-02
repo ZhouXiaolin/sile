@@ -135,7 +135,7 @@ pub struct TileExpr {
 }
 
 impl TileExpr {
-    pub fn grid_x() -> Self {
+    pub const fn grid_x() -> Self {
         Self { axis: 0 }
     }
 }
