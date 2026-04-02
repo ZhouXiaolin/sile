@@ -4,11 +4,13 @@ use libloading::Library;
 use tempfile::tempdir;
 
 use crate::{
-    kernel::{KernelArg, LaunchConfig},
+    backend_ir, kernel::{KernelArg, LaunchConfig}, ssa,
     Result, Stream,
 };
 
-type KernelFn = unsafe extern "C" fn(*const f32, *const f32, *mut f32, i64, i64);
+type KernelFn1D = unsafe extern "C" fn(*const f32, *const f32, *mut f32, i64, i64);
+
+type KernelFnSoftmax = unsafe extern "C" fn(*const f32, *mut f32, i64, i64, i64, i64);
 
 pub struct CpuBackend;
 
@@ -24,6 +26,15 @@ impl CpuBackend {
             }
         }
         Err(crate::Error::UnsupportedBackend("no C compiler found"))
+    }
+
+    fn compile_kernel_from_hir(kernel: &crate::hir::Kernel) -> Result<String> {
+        let typed = crate::typeck::check_kernel(kernel)
+            .map_err(|err| crate::Error::Shape(err.to_string()))?;
+        let ssa = crate::passes::canonicalize::run(ssa::lower_typed_kernel_to_ssa(&typed));
+        let ssa = crate::passes::dce::run(ssa);
+        let backend = backend_ir::lower::lower_ssa_to_backend_ir(&ssa);
+        crate::codegen::c::generate(&backend)
     }
 }
 
@@ -44,22 +55,13 @@ impl crate::backend::Backend for CpuBackend {
         };
         let so_path = dir.path().join(format!("lib{}.{}", kernel.name, ext));
 
-        let tile_size = args[0].shape[0] / launch.grid[0] as i64;
-        let c_code = format!(
-            "#include <stdint.h>\n#include <stddef.h>\n\n\
-             void sile_kernel_{name}(float* a, float* b, float* c, int64_t pid, int64_t tile_size) {{\n\
-             \x20   int64_t base = pid * tile_size;\n\
-             \x20   for (int64_t i = 0; i < tile_size; ++i) {{\n\
-             \x20       c[base + i] = a[base + i] + b[base + i];\n\
-             \x20   }}\\
-             }}\n",
-            name = kernel.name,
-        );
+        let c_code = Self::compile_kernel_from_hir(kernel)?;
         fs::write(&c_path, c_code)?;
 
         let compiler = Self::compiler()?;
         let output = Command::new(compiler)
             .args(["-shared", "-fPIC", "-O2"])
+            .arg("-lm")
             .arg(&c_path)
             .arg("-o")
             .arg(&so_path)
@@ -74,16 +76,35 @@ impl crate::backend::Backend for CpuBackend {
             let library =
                 Library::new(&so_path).map_err(|e| crate::Error::Compile(e.to_string()))?;
             let symbol_name = format!("sile_kernel_{}", kernel.name);
-            let func: libloading::Symbol<KernelFn> = library
-                .get(symbol_name.as_bytes())
-                .map_err(|e| crate::Error::Compile(e.to_string()))?;
 
-            let a_ptr = args[0].mut_ptr;
-            let b_ptr = args[1].mut_ptr;
-            let c_ptr = args[2].mut_ptr;
+            let tile_size = args[0].shape[0] / launch.grid[0] as i64;
 
-            for gx in 0..launch.grid[0] {
-                func(a_ptr, b_ptr, c_ptr, gx as i64, tile_size);
+            // Check if this is a softmax-like kernel (2 args) or vec_add (3 args)
+            if args.len() == 2 && kernel.name.contains("softmax") {
+                let func: libloading::Symbol<KernelFnSoftmax> = library
+                    .get(symbol_name.as_bytes())
+                    .map_err(|e| crate::Error::Compile(e.to_string()))?;
+
+                let x_ptr = args[0].mut_ptr;
+                let y_ptr = args[1].mut_ptr;
+                let n = args[0].shape[1];
+                let bm = tile_size;
+
+                for gx in 0..launch.grid[0] {
+                    func(x_ptr, y_ptr, gx as i64, bm, n, n);
+                }
+            } else {
+                let func: libloading::Symbol<KernelFn1D> = library
+                    .get(symbol_name.as_bytes())
+                    .map_err(|e| crate::Error::Compile(e.to_string()))?;
+
+                let a_ptr = args[0].mut_ptr;
+                let b_ptr = args[1].mut_ptr;
+                let c_ptr = args[2].mut_ptr;
+
+                for gx in 0..launch.grid[0] {
+                    func(a_ptr, b_ptr, c_ptr, gx as i64, tile_size);
+                }
             }
         }
 
