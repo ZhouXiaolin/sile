@@ -1,8 +1,8 @@
 pub mod backend;
-pub mod hir;
 pub mod codegen;
 pub mod device;
 pub mod error;
+pub mod hir;
 pub mod kernel;
 pub mod spec;
 pub mod stream;

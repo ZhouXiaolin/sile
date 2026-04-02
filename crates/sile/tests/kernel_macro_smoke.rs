@@ -1,21 +1,23 @@
-use sile::{tile, Device, Tensor};
+use sile::{Device, Tensor};
 
 #[sile::kernel]
 fn vec_add(a: &Tensor<f32>, b: &Tensor<f32>, c: &mut Tensor<f32>) {
-    let tid = tile::id().0;
-    let x = a.load_tile([4], [tid]);
-    let y = b.load_tile([4], [tid]);
-    c.store(x + y);
+    let tid = sile::tile::id().0;
+    let tile_a = a.load_tile([4], [tid]);
+    let tile_b = b.load_tile([4], [tid]);
+    c.store(tile_a + tile_b);
 }
 
 #[test]
-fn macro_builds_a_launcher_with_the_expected_spec() {
+fn macro_builds_a_launcher_with_the_expected_hir() {
     let device = Device::cpu();
     let a = Tensor::ones([16], &device).unwrap();
     let b = Tensor::ones([16], &device).unwrap();
     let mut c = Tensor::zeros([16], &device).unwrap();
 
     let launcher = vec_add(&a, &b, &mut c).grid((4, 1, 1));
-    assert_eq!(launcher.spec_ref().name, "vec_add");
-    assert_eq!(launcher.spec_ref().nodes.len(), 3);
+    let kernel = launcher.kernel();
+
+    assert_eq!(kernel.name, "vec_add");
+    assert_eq!(kernel.params.len(), 3);
 }

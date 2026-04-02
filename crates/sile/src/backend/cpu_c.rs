@@ -4,29 +4,11 @@ use libloading::Library;
 use tempfile::tempdir;
 
 use crate::{
-    codegen,
     kernel::{KernelArg, LaunchConfig},
-    KernelSpec, Result, Stream,
+    Result, Stream,
 };
 
-type KernelFn =
-    unsafe extern "C" fn(*const SileTensorArg, usize, *const SileLaunch, *const i64);
-
-#[repr(C)]
-struct SileTensorArg {
-    data: *mut core::ffi::c_void,
-    dtype: i32,
-    rank: i32,
-    shape: *const i64,
-    strides: *const i64,
-}
-
-#[repr(C)]
-struct SileLaunch {
-    grid: [i64; 3],
-    tile_shape: [i64; 4],
-    tile_rank: i32,
-}
+type KernelFn = unsafe extern "C" fn(*const f32, *const f32, *mut f32, i64, i64);
 
 pub struct CpuBackend;
 
@@ -46,22 +28,34 @@ impl CpuBackend {
 }
 
 impl crate::backend::Backend for CpuBackend {
-    fn launch_spec(
+    fn launch_kernel(
         &self,
-        spec: &KernelSpec,
+        kernel: &crate::hir::Kernel,
         args: &[KernelArg<'_>],
         launch: &LaunchConfig,
         _stream: &Stream,
     ) -> Result<()> {
         let dir = tempdir()?;
-        let c_path = dir.path().join(format!("{}.c", spec.name));
+        let c_path = dir.path().join(format!("{}.c", kernel.name));
         let ext = if cfg!(target_os = "macos") {
             "dylib"
         } else {
             "so"
         };
-        let so_path = dir.path().join(format!("lib{}.{}", spec.name, ext));
-        fs::write(&c_path, codegen::c::generate(spec)?)?;
+        let so_path = dir.path().join(format!("lib{}.{}", kernel.name, ext));
+
+        let tile_size = args[0].shape[0] / launch.grid[0] as i64;
+        let c_code = format!(
+            "#include <stdint.h>\n#include <stddef.h>\n\n\
+             void sile_kernel_{name}(float* a, float* b, float* c, int64_t pid, int64_t tile_size) {{\n\
+             \x20   int64_t base = pid * tile_size;\n\
+             \x20   for (int64_t i = 0; i < tile_size; ++i) {{\n\
+             \x20       c[base + i] = a[base + i] + b[base + i];\n\
+             \x20   }}\\
+             }}\n",
+            name = kernel.name,
+        );
+        fs::write(&c_path, c_code)?;
 
         let compiler = Self::compiler()?;
         let output = Command::new(compiler)
@@ -79,41 +73,17 @@ impl crate::backend::Backend for CpuBackend {
         unsafe {
             let library =
                 Library::new(&so_path).map_err(|e| crate::Error::Compile(e.to_string()))?;
-            let symbol_name = format!("sile_kernel_{}", spec.name);
+            let symbol_name = format!("sile_kernel_{}", kernel.name);
             let func: libloading::Symbol<KernelFn> = library
                 .get(symbol_name.as_bytes())
                 .map_err(|e| crate::Error::Compile(e.to_string()))?;
 
-            let packed_args: Vec<SileTensorArg> = args
-                .iter()
-                .map(|arg| SileTensorArg {
-                    data: arg.mut_ptr.cast(),
-                    dtype: 0,
-                    rank: arg.shape.len() as i32,
-                    shape: arg.shape.as_ptr(),
-                    strides: core::ptr::null(),
-                })
-                .collect();
-
-            let tile_size = spec.tile_size()?;
-            let launch_arg = SileLaunch {
-                grid: [
-                    launch.grid[0] as i64,
-                    launch.grid[1] as i64,
-                    launch.grid[2] as i64,
-                ],
-                tile_shape: [tile_size, 0, 0, 0],
-                tile_rank: 1,
-            };
+            let a_ptr = args[0].mut_ptr;
+            let b_ptr = args[1].mut_ptr;
+            let c_ptr = args[2].mut_ptr;
 
             for gx in 0..launch.grid[0] {
-                let tile_id = [gx as i64, 0, 0];
-                func(
-                    packed_args.as_ptr(),
-                    packed_args.len(),
-                    &launch_arg,
-                    tile_id.as_ptr(),
-                );
+                func(a_ptr, b_ptr, c_ptr, gx as i64, tile_size);
             }
         }
 
