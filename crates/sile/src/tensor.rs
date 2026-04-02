@@ -63,4 +63,22 @@ impl Tensor<f32> {
     pub fn device(&self) -> &Device {
         &self.device
     }
+
+    pub fn as_kernel_arg(&self) -> crate::kernel::KernelArg<'_> {
+        crate::kernel::KernelArg {
+            ptr: self.as_ptr(),
+            mut_ptr: self.as_ptr() as *mut f32,
+            shape: &self.shape,
+            device: &self.device,
+        }
+    }
+
+    pub fn as_kernel_arg_mut(&mut self) -> crate::kernel::KernelArg<'_> {
+        crate::kernel::KernelArg {
+            ptr: self.as_ptr(),
+            mut_ptr: self.as_mut_ptr(),
+            shape: &self.shape,
+            device: &self.device,
+        }
+    }
 }
