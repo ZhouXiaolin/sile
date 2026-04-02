@@ -1,4 +1,4 @@
-use super::{ElemType, ShapeExpr, Type};
+use super::{ShapeExpr, Type};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParamKind {
