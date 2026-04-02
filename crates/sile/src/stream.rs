@@ -1,4 +1,4 @@
-use crate::Device;
+use crate::{Device, Result};
 
 #[derive(Clone, Debug)]
 pub struct Stream {
@@ -12,5 +12,9 @@ impl Stream {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    pub fn synchronize(&self) -> Result<()> {
+        Ok(())
     }
 }
