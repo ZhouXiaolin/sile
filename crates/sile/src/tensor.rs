@@ -34,7 +34,7 @@ impl Tensor<f32> {
     }
 
     pub fn random(shape: impl Into<Vec<i64>>, device: &Device) -> Result<Self> {
-        use rand::Rng;
+        use rand::RngExt;
         let shape = shape.into();
         let len = shape.iter().product::<i64>() as usize;
         let mut rng = rand::rng();
