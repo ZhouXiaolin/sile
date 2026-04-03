@@ -1,19 +1,6 @@
+use sile_hir::ParamKind;
+use sile_lir::{KernelAbi, ValueInfo, ValueInfoTable};
 use sile_lir::ir::*;
-
-pub struct KernelGenInfo {
-    pub name: String,
-    pub num_buffers: usize,
-    pub buffer_kinds: Vec<BufferKind>,
-    pub num_shapes: usize,
-    pub param_ranks: Vec<usize>,
-    pub shape_offsets: Vec<usize>,
-}
-
-#[derive(Clone, Copy)]
-pub enum BufferKind {
-    Input,
-    Output,
-}
 
 #[derive(Clone, Copy)]
 struct TilePlan {
@@ -22,12 +9,16 @@ struct TilePlan {
     cols: i64,
 }
 
-pub fn generate(func: &Function, info: &KernelGenInfo) -> sile_core::Result<String> {
+pub fn generate(
+    func: &Function,
+    abi: &KernelAbi,
+    value_info: &ValueInfoTable,
+) -> sile_core::Result<String> {
     let mut ctx = MetalCodegen {
         func,
-        info,
+        abi,
         tile_plan: infer_tile_plan(func),
-        inst_shapes: analyze_instruction_shapes(func),
+        inst_shapes: instruction_shapes(value_info),
         param_names: Vec::new(),
         inst_names: Vec::new(),
         indent: 0,
@@ -43,7 +34,7 @@ pub fn generate(func: &Function, info: &KernelGenInfo) -> sile_core::Result<Stri
 
 struct MetalCodegen<'a> {
     func: &'a Function,
-    info: &'a KernelGenInfo,
+    abi: &'a KernelAbi,
     tile_plan: Option<TilePlan>,
     inst_shapes: Vec<Option<Vec<i64>>>,
     param_names: Vec<String>,
@@ -60,14 +51,13 @@ impl<'a> MetalCodegen<'a> {
     }
 
     fn emit_kernel_signature(&mut self) {
-        let fn_name = format!("kernel void sile_kernel_{}", self.info.name);
+        let fn_name = format!("kernel void sile_kernel_{}", self.func.name);
         self.out.push_str(&format!("{}(\n", fn_name));
 
-        for i in 0..self.info.num_buffers {
-            let qualifier = match self.info.buffer_kinds.get(i) {
-                Some(BufferKind::Input) => "const ",
-                Some(BufferKind::Output) => "",
-                None => "",
+        for (i, param) in self.abi.params.iter().enumerate() {
+            let qualifier = match param.kind {
+                ParamKind::Input => "const ",
+                ParamKind::Output => "",
             };
             self.out.push_str(&format!(
                 "    {}device float* buf_{} [[buffer({})]]",
@@ -76,7 +66,7 @@ impl<'a> MetalCodegen<'a> {
             self.out.push_str(",\n");
         }
 
-        let buffer_count = self.info.num_buffers;
+        let buffer_count = self.abi.params.len();
         self.out.push_str(&format!(
             "    device int64_t* shapes [[buffer({})]],\n",
             buffer_count
@@ -94,7 +84,7 @@ impl<'a> MetalCodegen<'a> {
     }
 
     fn emit_kernel_body(&mut self) {
-        for i in 0..self.info.num_buffers {
+        for i in 0..self.abi.params.len() {
             self.param_names.push(format!("buf_{}", i));
         }
 
@@ -110,9 +100,9 @@ impl<'a> MetalCodegen<'a> {
 
         self.writeln("uint sile_pid = gid.x;");
 
-        for (param_idx, rank) in self.info.param_ranks.iter().enumerate() {
-            for dim in 0..*rank {
-                let shape_idx = self.info.shape_offsets[param_idx] + dim;
+        for (param_idx, param) in self.abi.params.iter().enumerate() {
+            for dim in 0..param.rank {
+                let shape_idx = self.abi.shape_layout.offsets[param_idx] + dim;
                 self.writeln(&format!(
                     "int64_t {}_dim_{} = shapes[{}];",
                     self.param_names[param_idx], dim, shape_idx
@@ -124,7 +114,7 @@ impl<'a> MetalCodegen<'a> {
 
         if let Some(plan) = self.tile_plan {
             let output_name = self.param_names[plan.output_param].clone();
-            let output_rank = self.info.param_ranks[plan.output_param];
+            let output_rank = self.abi.params[plan.output_param].rank;
             if output_rank == 1 {
                 self.writeln(&format!(
                     "int64_t sile_total_tiles = {}_dim_0 / {};",
@@ -142,7 +132,7 @@ impl<'a> MetalCodegen<'a> {
             }
             self.writeln("if (sile_pid < sile_total_tiles) {");
         } else {
-            let scalar_extent = if self.info.param_ranks.is_empty() {
+            let scalar_extent = if self.abi.params.is_empty() {
                 "0".to_string()
             } else {
                 format!("{}_dim_0", self.param_names[0])
@@ -172,7 +162,7 @@ impl<'a> MetalCodegen<'a> {
                 inst,
                 &self.param_names,
                 &self.inst_names,
-                self.info,
+                self.abi,
                 self.tile_plan,
                 &self.inst_shapes,
                 global_idx,
@@ -214,61 +204,22 @@ fn infer_tile_plan(func: &Function) -> Option<TilePlan> {
     None
 }
 
-fn analyze_instruction_shapes(func: &Function) -> Vec<Option<Vec<i64>>> {
-    let total = func
-        .blocks
+fn instruction_shapes(value_info: &ValueInfoTable) -> Vec<Option<Vec<i64>>> {
+    value_info
+        .instructions
         .iter()
-        .map(|block| block.instructions.len())
-        .sum();
-    let mut shapes = vec![None; total];
-    let mut next_idx = 0usize;
-
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            shapes[next_idx] = match inst {
-                Instruction::TileAlloc { rows, cols, .. }
-                | Instruction::TileLoad2D { rows, cols, .. }
-                | Instruction::TileMma {
-                    tile_m: rows,
-                    tile_n: cols,
-                    ..
-                }
-                | Instruction::TileBroadcast { rows, cols, .. } => Some(vec![*rows, *cols]),
-                Instruction::TileReduceMax {
-                    axis, rows, cols, ..
-                }
-                | Instruction::TileReduceSum {
-                    axis, rows, cols, ..
-                } => {
-                    if *axis == 1 {
-                        Some(vec![*rows, 1])
-                    } else {
-                        Some(vec![1, *cols])
-                    }
-                }
-                Instruction::Add(lhs, rhs)
-                | Instruction::Sub(lhs, rhs)
-                | Instruction::Mul(lhs, rhs)
-                | Instruction::Div(lhs, rhs) => {
-                    value_tile_shape(lhs, &shapes).or_else(|| value_tile_shape(rhs, &shapes))
-                }
-                Instruction::Exp(value) | Instruction::FNeg(value) => {
-                    value_tile_shape(value, &shapes)
-                }
-                _ => None,
-            };
-            next_idx += 1;
-        }
-    }
-
-    shapes
+        .map(|info| match info {
+            ValueInfo::Tile { rows, cols, .. } => Some(vec![*rows, *cols]),
+            _ => None,
+        })
+        .collect()
 }
 
 fn emit_instruction(
     inst: &Instruction,
     param_names: &[String],
     inst_names: &[String],
-    info: &KernelGenInfo,
+    abi: &KernelAbi,
     tile_plan: Option<TilePlan>,
     inst_shapes: &[Option<Vec<i64>>],
     inst_idx: usize,
@@ -379,7 +330,7 @@ fn emit_instruction(
         Instruction::GetTileCoord { dim } => {
             let plan = tile_plan.expect("tile coord requires tile plan");
             let output_name = &param_names[plan.output_param];
-            let output_rank = info.param_ranks[plan.output_param];
+            let output_rank = abi.params[plan.output_param].rank;
             if output_rank == 1 {
                 format!("int {} = sile_pid;", result_name)
             } else {
@@ -413,14 +364,14 @@ fn emit_instruction(
             let buf_name = resolve_value_name(buf, param_names, inst_names);
             let row_name = resolve_value_name(row_tile, param_names, inst_names);
             let col_name = resolve_value_name(col_tile, param_names, inst_names);
-            let param_rank = buffer_rank(buf, info);
+            let param_rank = buffer_rank(buf, abi);
             if param_rank == Some(1) {
                 format!(
                     "threadgroup float {0}_tlocal[{1}][{2}];\nfor (int {0}r = 0; {0}r < {1}; ++{0}r)\n  for (int {0}c = 0; {0}c < {2}; ++{0}c) {{\n    int sile_index = {3} * {2} + {0}c;\n    {0}_tlocal[{0}r][{0}c] = {4}[sile_index];\n  }}",
                     result_name, rows, cols, col_name, buf_name
                 )
             } else {
-                let stride = buffer_dim_expr(buf, *stride_shape_idx, param_names, info);
+                let stride = buffer_dim_expr(buf, *stride_shape_idx, param_names, abi);
                 format!(
                     "threadgroup float {0}_tlocal[{1}][{2}];\nfor (int {0}r = 0; {0}r < {1}; ++{0}r)\n  for (int {0}c = 0; {0}c < {2}; ++{0}c) {{\n    int sile_row = {3} * {1} + {0}r;\n    int sile_col = {5} * {2} + {0}c;\n    {0}_tlocal[{0}r][{0}c] = {4}[sile_row * {6} + sile_col];\n  }}",
                     result_name, rows, cols, row_name, buf_name, col_name, stride
@@ -492,7 +443,7 @@ fn emit_instruction(
             let buf_name = resolve_value_name(buf, param_names, inst_names);
             let row_name = resolve_value_name(row_tile, param_names, inst_names);
             let col_name = resolve_value_name(col_tile, param_names, inst_names);
-            let param_rank = buffer_rank(buf, info);
+            let param_rank = buffer_rank(buf, abi);
             let src_arr = resolve_tile_array_name(value, param_names, inst_names);
             if param_rank == Some(1) {
                 format!(
@@ -500,7 +451,7 @@ fn emit_instruction(
                     rows, cols, col_name, cols, buf_name, src_arr
                 )
             } else {
-                let stride = buffer_dim_expr(buf, *stride_shape_idx, param_names, info);
+                let stride = buffer_dim_expr(buf, *stride_shape_idx, param_names, abi);
                 format!(
                     "for (int stor_r = 0; stor_r < {}; ++stor_r)\n  for (int stor_c = 0; stor_c < {}; ++stor_c) {{\n    int sile_row = {} * {} + stor_r;\n    int sile_col = {} * {} + stor_c;\n    {}[sile_row * {} + sile_col] = {}[stor_r][stor_c];\n  }}",
                     rows, cols, row_name, rows, col_name, cols, buf_name, stride, src_arr
@@ -515,11 +466,11 @@ fn buffer_dim_expr(
     value: &Value,
     dim: usize,
     param_names: &[String],
-    info: &KernelGenInfo,
+    abi: &KernelAbi,
 ) -> String {
     match value {
         Value::Param(param_idx)
-            if *param_idx < info.param_ranks.len() && dim < info.param_ranks[*param_idx] =>
+            if *param_idx < abi.params.len() && dim < abi.params[*param_idx].rank =>
         {
             format!("{}_dim_{}", param_names[*param_idx], dim)
         }
@@ -579,13 +530,6 @@ fn shape2(shape: &Option<Vec<i64>>) -> Option<[i64; 2]> {
     }
 }
 
-fn value_tile_shape(value: &Value, inst_shapes: &[Option<Vec<i64>>]) -> Option<Vec<i64>> {
-    match value {
-        Value::Inst(idx) => inst_shapes.get(*idx).and_then(|shape| shape.clone()),
-        _ => None,
-    }
-}
-
 fn emit_tile_binary(
     result_name: &str,
     rows: i64,
@@ -632,9 +576,9 @@ fn emit_tile_unary(
     )
 }
 
-fn buffer_rank(value: &Value, info: &KernelGenInfo) -> Option<usize> {
+fn buffer_rank(value: &Value, abi: &KernelAbi) -> Option<usize> {
     match value {
-        Value::Param(param_idx) => info.param_ranks.get(*param_idx).copied(),
+        Value::Param(param_idx) => abi.params.get(*param_idx).map(|param| param.rank),
         _ => None,
     }
 }

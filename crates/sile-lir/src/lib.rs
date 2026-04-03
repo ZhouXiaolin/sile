@@ -2,11 +2,12 @@ pub mod backend;
 pub mod builder;
 pub mod executable;
 pub mod ir;
+pub mod print;
 
 pub use backend::Backend;
 pub use executable::{
-    ExecutableKernel, KernelAbi, KernelParamAbi, LaunchSemantics, ParamPassing, ShapeLayout, ValueInfo,
-    ValueInfoTable,
+    ExecutableKernel, KernelAbi, KernelParamAbi, LaunchSemantics, ParamPassing, ShapeLayout,
+    ValueInfo, ValueInfoTable,
 };
 pub use ir::{
     BasicBlock, CmpOp, Constant, FloatType, Function, GlobalVariable, Instruction, IntegerType,

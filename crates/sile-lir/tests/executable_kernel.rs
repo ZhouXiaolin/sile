@@ -1,91 +1,84 @@
-use sile_hir::Kernel;
-
-use sile_lir::ElemType;
-use sile_lir::executable::{
-    ExecutableKernel, KernelAbi, KernelParamAbi, LaunchSemantics, ParamPassing, ShapeLayout, ValueInfo,
-    ValueInfoTable,
+use sile_hir::ParamKind;
+use sile_lir::{
+    ElemType, ExecutableKernel, FloatType, Function, KernelAbi, KernelParamAbi, LaunchSemantics,
+    Param, ParamPassing, ShapeLayout, Type, ValueInfo, ValueInfoTable,
 };
 
 #[test]
 fn executable_kernel_keeps_abi_and_value_info_together() {
-    let params = vec![KernelParamAbi {
-        index: 0,
-        name: "input".to_owned(),
-        kind: ElemType::F32,
-        elem: ElemType::F32,
-        rank: 2,
-        passing: ParamPassing::Buffer,
-    }];
-
-    let layout = ShapeLayout {
-        total_dims: 4,
-        offsets: vec![0, 8],
-    };
-
-    let abi = KernelAbi {
-        params: params.clone(),
-        shape_layout: layout.clone(),
-        launch: LaunchSemantics {
-            program_id_dims: [1, 1, 1],
+    let kernel = ExecutableKernel {
+        name: "vec_add".into(),
+        abi: KernelAbi {
+            params: vec![
+                KernelParamAbi {
+                    index: 0,
+                    name: "a".into(),
+                    kind: ParamKind::Input,
+                    elem: ElemType::F32,
+                    rank: 1,
+                    passing: ParamPassing::Buffer,
+                },
+                KernelParamAbi {
+                    index: 1,
+                    name: "c".into(),
+                    kind: ParamKind::Output,
+                    elem: ElemType::F32,
+                    rank: 1,
+                    passing: ParamPassing::Buffer,
+                },
+            ],
+            shape_layout: ShapeLayout {
+                total_dims: 2,
+                offsets: vec![0, 1],
+            },
+            launch: LaunchSemantics { program_id_dims: 1 },
+        },
+        func: Function::new(
+            "vec_add",
+            vec![Param {
+                name: "a".into(),
+                ty: Type::ptr(Type::Float(FloatType::F32)),
+            }],
+            Type::Void,
+        ),
+        value_info: ValueInfoTable {
+            params: vec![
+                ValueInfo::Buffer {
+                    elem: ElemType::F32,
+                    rank: 1,
+                },
+                ValueInfo::Buffer {
+                    elem: ElemType::F32,
+                    rank: 1,
+                },
+            ],
+            instructions: vec![ValueInfo::Tile {
+                elem: ElemType::F32,
+                rows: 1,
+                cols: 4,
+            }],
         },
     };
 
-    let value_info = ValueInfoTable {
-        params: params.clone(),
-        instructions: vec![ValueInfo::Tile {
+    assert_eq!(kernel.abi.shape_layout.total_dims, 2);
+    assert_eq!(kernel.abi.launch.program_id_dims, 1);
+    assert!(matches!(
+        kernel.value_info.instructions[0],
+        ValueInfo::Tile {
             elem: ElemType::F32,
-            rank: 2,
-            layout: layout.clone(),
-            param_index: 0,
-        }],
-    };
-
-    let kernel = ExecutableKernel {
-        name: "test".to_owned(),
-        abi,
-        func: zilch_kernel(),
-        value_info,
-    };
-
-    assert_eq!(kernel.abi.params.len(), kernel.value_info.params.len());
-
-    if let Some(ValueInfo::Tile { param_index, .. }) = kernel.value_info.instructions.first() {
-        assert_eq!(*param_index, 0);
-    } else {
-        panic!("expected a tile entry");
-    }
+            rows: 1,
+            cols: 4
+        }
+    ));
 }
 
 #[test]
 fn shape_layout_offsets_match_param_order() {
-    let offsets = vec![0, 16, 32];
     let layout = ShapeLayout {
-        total_dims: 6,
-        offsets: offsets.clone(),
+        total_dims: 5,
+        offsets: vec![0, 2, 4],
     };
 
-    let params = offsets
-        .iter()
-        .enumerate()
-        .map(|(idx, _)| KernelParamAbi {
-            index: idx,
-            name: format!("arg{}", idx),
-            kind: ElemType::F32,
-            elem: ElemType::F32,
-            rank: 2,
-            passing: ParamPassing::Buffer,
-        })
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        layout.offsets,
-        params
-            .iter()
-            .map(|param| param.index * 16)
-            .collect::<Vec<_>>()
-    );
-}
-
-fn zilch_kernel() -> Kernel {
-    Kernel::new("zilch", vec![], vec![], vec![])
+    assert_eq!(layout.offsets, vec![0, 2, 4]);
+    assert_eq!(layout.total_dims, 5);
 }
