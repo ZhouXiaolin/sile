@@ -1,11 +1,12 @@
-use sile_hir::Kernel;
-use sile_hir::types::ElemType;
+use sile_hir::{types::ElemType, ParamKind};
+
+use crate::ir::Function;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutableKernel {
     pub name: String,
     pub abi: KernelAbi,
-    pub func: Kernel,
+    pub func: Function,
     pub value_info: ValueInfoTable,
 }
 
@@ -20,7 +21,7 @@ pub struct KernelAbi {
 pub struct KernelParamAbi {
     pub index: usize,
     pub name: String,
-    pub kind: ElemType,
+    pub kind: ParamKind,
     pub elem: ElemType,
     pub rank: usize,
     pub passing: ParamPassing,
@@ -39,12 +40,12 @@ pub struct ShapeLayout {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LaunchSemantics {
-    pub program_id_dims: [u32; 3],
+    pub program_id_dims: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValueInfoTable {
-    pub params: Vec<KernelParamAbi>,
+    pub params: Vec<ValueInfo>,
     pub instructions: Vec<ValueInfo>,
 }
 
@@ -52,23 +53,17 @@ pub struct ValueInfoTable {
 pub enum ValueInfo {
     Buffer {
         elem: ElemType,
-        size: usize,
-        param_index: usize,
+        rank: usize,
     },
     Scalar {
         elem: ElemType,
     },
-    Index {
-        expr: usize,
-    },
-    Shape {
-        total_dims: usize,
-    },
+    Index,
+    Shape,
     Tile {
         elem: ElemType,
-        rank: usize,
-        layout: ShapeLayout,
-        param_index: usize,
+        rows: i64,
+        cols: i64,
     },
     Void,
 }

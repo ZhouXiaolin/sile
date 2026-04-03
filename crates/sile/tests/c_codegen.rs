@@ -1,7 +1,6 @@
 use sile::{
-    codegen::c::{BufferKind, KernelGenInfo},
     hir::{BuiltinOp, ElemType, Expr, Kernel, Param, ParamKind, ShapeExpr, Stmt, Type},
-    lir, passes, scheduling, ssa, typeck,
+    compiler, passes, ssa, typeck,
 };
 
 #[test]
@@ -10,26 +9,13 @@ fn c_codegen_emits_vec_add_with_openmp() {
     let typed = typeck::check_kernel(&kernel).unwrap();
     let ssa = passes::canonicalize::run(ssa::lower_typed_kernel_to_ssa(&typed));
     let ssa = passes::dce::run(ssa);
-    let lir_func = lir::lower_ssa_to_lir(&ssa, &typed);
-    let annotations = scheduling::annotate(&lir_func);
-
-    let info = KernelGenInfo {
-        name: kernel.name.clone(),
-        num_buffers: kernel.params.len(),
-        buffer_kinds: kernel
-            .params
-            .iter()
-            .map(|p| match p.kind {
-                ParamKind::Input => BufferKind::Input,
-                ParamKind::Output => BufferKind::Output,
-            })
-            .collect(),
-        num_shapes: 1,
-        param_ranks: vec![1, 1, 1],
-        shape_offsets: vec![0, 1, 2],
-    };
-
-    let c = sile::codegen::c::generate(&lir_func, &info).unwrap();
+    let executable = compiler::compile(&typed);
+    let c = sile::codegen::c::generate(
+        &executable.func,
+        &executable.abi,
+        &executable.value_info,
+    )
+    .unwrap();
 
     assert!(c.contains("void sile_kernel_vec_add"));
     assert!(c.contains("#include <omp.h>"));

@@ -7,10 +7,9 @@ use libloading::Library;
 use tempfile::tempdir;
 
 use sile_core::{KernelArg, LaunchConfig, Result, Stream};
-use sile_hir::{Kernel, Type};
-use sile_lir::ir::Function;
+use sile_lir::ExecutableKernel;
 
-use crate::codegen_c::{generate, BufferKind, KernelGenInfo};
+use crate::codegen_c::generate;
 
 type KernelFn = unsafe extern "C" fn(*const *const c_void, i64, i64, *const i64, i64);
 
@@ -44,52 +43,8 @@ impl CpuBackend {
         ))
     }
 
-    fn build_kernel_gen_info(kernel: &Kernel) -> KernelGenInfo {
-        KernelGenInfo {
-            name: kernel.name.clone(),
-            num_buffers: kernel.params.len(),
-            buffer_kinds: kernel
-                .params
-                .iter()
-                .map(|p| match p.kind {
-                    sile_hir::ParamKind::Input => BufferKind::Input,
-                    sile_hir::ParamKind::Output => BufferKind::Output,
-                })
-                .collect(),
-            num_shapes: kernel
-                .params
-                .iter()
-                .map(|param| match &param.ty {
-                    Type::Tensor { shape, .. } | Type::Tile { shape, .. } => shape.rank(),
-                    Type::Shape | Type::Scalar(_) => 0,
-                })
-                .sum(),
-            param_ranks: kernel
-                .params
-                .iter()
-                .map(|param| match &param.ty {
-                    Type::Tensor { shape, .. } | Type::Tile { shape, .. } => shape.rank(),
-                    Type::Shape | Type::Scalar(_) => 0,
-                })
-                .collect(),
-            shape_offsets: {
-                let mut offsets = Vec::with_capacity(kernel.params.len());
-                let mut next = 0usize;
-                for param in &kernel.params {
-                    offsets.push(next);
-                    next += match &param.ty {
-                        Type::Tensor { shape, .. } | Type::Tile { shape, .. } => shape.rank(),
-                        Type::Shape | Type::Scalar(_) => 0,
-                    };
-                }
-                offsets
-            },
-        }
-    }
-
-    fn compile_kernel(func: &Function, kernel: &Kernel) -> Result<String> {
-        let info = Self::build_kernel_gen_info(kernel);
-        let code = generate(func, &info)?;
+    fn compile_kernel(kernel: &ExecutableKernel) -> Result<String> {
+        let code = generate(&kernel.func, &kernel.abi, &kernel.value_info)?;
         Ok(code)
     }
 }
@@ -97,8 +52,7 @@ impl CpuBackend {
 impl sile_lir::Backend for CpuBackend {
     fn execute(
         &self,
-        func: &Function,
-        kernel: &Kernel,
+        kernel: &ExecutableKernel,
         args: &[KernelArg<'_>],
         launch: &LaunchConfig,
         _stream: &Stream,
@@ -112,7 +66,7 @@ impl sile_lir::Backend for CpuBackend {
         };
         let so_path = dir.path().join(format!("lib{}.{}", kernel.name, ext));
 
-        let c_code = Self::compile_kernel(func, kernel)?;
+        let c_code = Self::compile_kernel(kernel)?;
         fs::write(&c_path, &c_code)?;
 
         let compiler = Self::compiler()?;
