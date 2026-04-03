@@ -246,7 +246,7 @@ impl<'a> CCodegen<'a> {
             }
             Value::Const(c) => match c {
                 Constant::Int(v) => format!("{}", v),
-                Constant::Float(v) => format!("{:.1f}", v),
+                Constant::Float(v) => format!("{:.1}", v),
                 Constant::Bool(v) => format!("{}", if *v { 1 } else { 0 }),
             },
             Value::Inst(i) => {
@@ -392,7 +392,7 @@ fn resolve_value_name(value: &Value, value_names: &[String]) -> String {
         }
         Value::Const(c) => match c {
             Constant::Int(v) => format!("{}", v),
-            Constant::Float(v) => format!("{:.1f}", v),
+            Constant::Float(v) => format!("{:.1}", v),
             Constant::Bool(v) => format!("{}", if *v { 1 } else { 0 }),
         },
         Value::Inst(i) => {

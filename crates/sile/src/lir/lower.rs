@@ -66,7 +66,7 @@ fn generate_loop_nesting(
     _loop_info: &LoopInfo,
 ) {
     let loop_var = builder.alloca(Type::i64());
-    builder.store(loop_var, builder.const_int(0));
+    builder.store(loop_var.clone(), builder.const_int(0));
 
     let header = builder.append_block("loop_header");
     let body = builder.append_block("loop_body");
@@ -75,15 +75,15 @@ fn generate_loop_nesting(
     builder.br(&header);
 
     builder.switch_to_block(&header);
-    let idx = builder.load(loop_var, Type::i64());
+    let idx = builder.load(loop_var.clone(), Type::i64());
     let bound = builder.const_int(256);
-    let cond = builder.icmp(CmpOp::Slt, idx, bound);
+    let cond = builder.icmp(CmpOp::Slt, idx.clone(), bound);
     builder.cond_br(cond, &body, &exit);
 
     builder.switch_to_block(&body);
     for inst in &ssa.instructions {
         if inst.opcode == SsaOpcode::ProgramId {
-            let idx_val = builder.load(loop_var, Type::i64());
+            let idx_val = builder.load(loop_var.clone(), Type::i64());
             let def_idx = get_def_index(&inst.def);
             value_map.insert(def_idx, idx_val);
         } else {
@@ -91,8 +91,9 @@ fn generate_loop_nesting(
         }
     }
 
+    let idx = builder.load(loop_var.clone(), Type::i64());
     let next = builder.add(idx, builder.const_int(1));
-    builder.store(loop_var, next);
+    builder.store(loop_var.clone(), next);
     builder.br(&header);
 
     builder.switch_to_block(&exit);
