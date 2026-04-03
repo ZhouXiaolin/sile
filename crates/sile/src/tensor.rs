@@ -1,107 +1,48 @@
 use crate::{Device, Error, Result};
 
-pub enum DList<const V: i32, R> {
-    Cons(R),
-}
-
-#[derive(Clone, Debug)]
-pub struct DListNil;
-
-pub trait Rank {}
-
-impl Rank for DListNil {}
-
-impl<const V: i32, R: Rank> Rank for DList<V, R> {}
-
-#[derive(Clone, Debug)]
-pub struct Partition<T> {
-    pub parts: Vec<T>,
-    pub tile_shape: Vec<i64>,
-    pub grid_shape: Vec<i64>,
-}
-
-impl<T: Clone> Partition<T> {
-    pub fn new(parts: Vec<T>, tile_shape: Vec<i64>, grid_shape: Vec<i64>) -> Self {
-        Self {
-            parts,
-            tile_shape,
-            grid_shape,
-        }
-    }
-}
-
 #[derive(Debug)]
-pub struct Tensor<T, R: Rank = DListNil> {
+pub struct Tensor<T> {
     data: Vec<T>,
     shape: Vec<i64>,
     device: Device,
-    _rank: std::marker::PhantomData<R>,
 }
 
-impl<T: Clone, R: Rank> Clone for Tensor<T, R> {
+impl<T: Clone> Clone for Tensor<T> {
     fn clone(&self) -> Self {
         Self {
             data: self.data.clone(),
             shape: self.shape.clone(),
             device: self.device.clone(),
-            _rank: std::marker::PhantomData,
         }
     }
 }
 
-impl<T: Clone, R: Rank> Tensor<T, R> {
-    pub fn partition(&self, tile_shape: impl Into<Vec<i64>>) -> Partition<Self> {
-        let tile_shape = tile_shape.into();
-        let grid_shape: Vec<i64> = self
-            .shape
-            .iter()
-            .zip(tile_shape.iter())
-            .map(|(&s, &t)| if t > 0 { s / t } else { 1 })
-            .collect();
-        let count: usize = grid_shape.iter().map(|&x| x as usize).product();
-        Partition {
-            parts: (0..count).map(|_| self.clone()).collect(),
-            tile_shape,
-            grid_shape,
-        }
-    }
-
+impl<T: Clone> Tensor<T> {
     pub fn shape(&self) -> &[i64] {
         &self.shape
     }
 }
 
-impl Partition<Tensor<f32, DListNil>> {
-    pub fn unpartition(self) -> Tensor<f32, DListNil> {
-        let mut parts = self.parts.into_iter();
-        let mut result = parts.next().expect("partition must have at least one part");
-        for part in parts {
-            result.data.extend_from_slice(&part.data);
-            result.shape[0] += part.shape[0];
-        }
-        result
-    }
-
-    pub fn as_kernel_arg(&self) -> crate::kernel::KernelArg<'_> {
-        self.parts[0].as_kernel_arg()
-    }
-
-    pub fn as_kernel_arg_mut(&mut self) -> crate::kernel::KernelArg<'_> {
-        self.parts[0].as_kernel_arg_mut()
-    }
-}
-
-pub fn unpartition(partition: Partition<Tensor<f32, DListNil>>) -> Tensor<f32, DListNil> {
-    partition.unpartition()
-}
-
-impl Tensor<f32, DListNil> {
+impl Tensor<f32> {
     pub fn zeros(shape: impl Into<Vec<i64>>, device: &Device) -> Result<Self> {
         Self::filled(shape.into(), 0.0, device)
     }
 
     pub fn ones(shape: impl Into<Vec<i64>>, device: &Device) -> Result<Self> {
         Self::filled(shape.into(), 1.0, device)
+    }
+
+    pub fn random(shape: impl Into<Vec<i64>>, device: &Device) -> Result<Self> {
+        use rand::Rng;
+        let shape = shape.into();
+        let len = shape.iter().product::<i64>() as usize;
+        let mut rng = rand::rng();
+        let data: Vec<f32> = (0..len).map(|_| rng.random_range(0.0..1.0)).collect();
+        Ok(Self {
+            data,
+            shape,
+            device: device.clone(),
+        })
     }
 
     pub fn from_vec(data: Vec<f32>, shape: impl Into<Vec<i64>>, device: &Device) -> Result<Self> {
@@ -117,7 +58,6 @@ impl Tensor<f32, DListNil> {
             data,
             shape,
             device: device.clone(),
-            _rank: std::marker::PhantomData,
         })
     }
 
@@ -127,7 +67,6 @@ impl Tensor<f32, DListNil> {
             data: vec![value; len],
             shape,
             device: device.clone(),
-            _rank: std::marker::PhantomData,
         })
     }
 
@@ -166,19 +105,23 @@ impl Tensor<f32, DListNil> {
     }
 
     // Kernel-context stub methods (used inside #[kernel] bodies)
-    pub fn load_tile<const N: usize, const M: usize, R: Rank>(
+    pub fn load_tile<const N: usize, const M: usize>(
         &self,
         _tile_shape: [i64; N],
         _indices: [i64; M],
-    ) -> crate::Tile<f32, R> {
-        crate::Tile::new(_tile_shape.to_vec())
+    ) -> crate::Tile<f32> {
+        crate::Tile::new(_tile_shape.iter().copied().collect())
     }
 
-    pub fn load_tile_like_2d<R: Rank>(&self, _target: &Tensor<f32, R>) -> crate::Tile<f32, R> {
+    pub fn dim(&self, idx: usize) -> i64 {
+        self.shape[idx]
+    }
+
+    pub fn load_tile_like_2d(&self, _target: &Tensor<f32>) -> crate::Tile<f32> {
         crate::Tile::new(_target.shape().to_vec())
     }
 
-    pub fn store(&mut self, _value: crate::Tile<f32, DListNil>) {
+    pub fn store(&mut self, _value: crate::Tile<f32>) {
         // no-op in host context; handled by codegen
     }
 }

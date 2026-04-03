@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 libloading.workspace = true
+rand.workspace = true
 sile-macros = { path = "../sile-macros" }
 tempfile.workspace = true
 thiserror.workspace = true

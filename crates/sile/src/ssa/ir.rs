@@ -34,6 +34,10 @@ pub enum SsaOpcode {
     Broadcast,
     Store,
     ShapeOf,
+    Mma,
+    Constant,
+    ScalarDiv,
+    ShapeDim,
 }
 
 impl SsaInstruction {
@@ -53,6 +57,10 @@ impl SsaInstruction {
             SsaOpcode::Broadcast => "broadcast",
             SsaOpcode::Store => "store",
             SsaOpcode::ShapeOf => "shape_of",
+            SsaOpcode::Mma => "mma",
+            SsaOpcode::Constant => "constant",
+            SsaOpcode::ScalarDiv => "scalar_div",
+            SsaOpcode::ShapeDim => "shape_dim",
         }
     }
 }

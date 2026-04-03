@@ -2,6 +2,7 @@
 pub enum BackendOp {
     VecAdd1D,
     Softmax2D,
+    MatMul2D,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

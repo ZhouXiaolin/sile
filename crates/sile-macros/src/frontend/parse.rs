@@ -42,6 +42,10 @@ pub fn parse_kernel(input: &syn::ItemFn) -> syn::Result<KernelDecl> {
                 body.push(KernelStmt::Let { name, expr });
             }
             syn::Stmt::Expr(expr, _) => {
+                if let syn::Expr::ForLoop(for_loop) = expr {
+                    parse_for_loop(for_loop, &mut body)?;
+                    continue;
+                }
                 if let syn::Expr::MethodCall(call) = expr {
                     if call.method == "store" {
                         let target = match call.receiver.as_ref() {
@@ -83,6 +87,110 @@ pub fn parse_kernel(input: &syn::ItemFn) -> syn::Result<KernelDecl> {
     })
 }
 
+fn parse_for_loop(for_loop: &syn::ExprForLoop, body: &mut Vec<KernelStmt>) -> syn::Result<()> {
+    let var = match for_loop.pat.as_ref() {
+        syn::Pat::Ident(pat) => pat.ident.clone(),
+        _ => {
+            return Err(syn::Error::new_spanned(
+                &for_loop.pat,
+                "for loop variable must be an ident",
+            ))
+        }
+    };
+    let (start, end) = match for_loop.expr.as_ref() {
+        syn::Expr::Range(range) => {
+            let start_expr = range.start.as_ref().ok_or_else(|| {
+                syn::Error::new_spanned(range, "for loop range must have a start")
+            })?;
+            let end_expr = range
+                .end
+                .as_ref()
+                .ok_or_else(|| syn::Error::new_spanned(range, "for loop range must have an end"))?;
+            (parse_expr(start_expr)?, parse_expr(end_expr)?)
+        }
+        _ => {
+            return Err(syn::Error::new_spanned(
+                &for_loop.expr,
+                "for loop expression must be a range",
+            ))
+        }
+    };
+    let mut loop_body = Vec::new();
+    for inner_stmt in &for_loop.body.stmts {
+        match inner_stmt {
+            syn::Stmt::Local(local) => {
+                let name = match &local.pat {
+                    syn::Pat::Ident(pat) => pat.ident.clone(),
+                    syn::Pat::Type(pat_type) => {
+                        if let syn::Pat::Ident(inner) = pat_type.pat.as_ref() {
+                            inner.ident.clone()
+                        } else {
+                            return Err(syn::Error::new_spanned(
+                                &local.pat,
+                                "expected ident pattern",
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(syn::Error::new_spanned(
+                            &local.pat,
+                            "expected ident pattern",
+                        ))
+                    }
+                };
+                let expr = local
+                    .init
+                    .as_ref()
+                    .map(|init| parse_expr(init.expr.as_ref()))
+                    .transpose()?
+                    .ok_or_else(|| {
+                        syn::Error::new_spanned(local, "let binding requires initializer")
+                    })?;
+                loop_body.push(KernelStmt::Let { name, expr });
+            }
+            syn::Stmt::Expr(inner_expr, _) => {
+                if let syn::Expr::MethodCall(call) = inner_expr {
+                    if call.method == "store" {
+                        let target = match call.receiver.as_ref() {
+                            syn::Expr::Path(path) => {
+                                path.path.segments.last().unwrap().ident.clone()
+                            }
+                            _ => {
+                                return Err(syn::Error::new_spanned(
+                                    &call.receiver,
+                                    "store target must be an ident",
+                                ))
+                            }
+                        };
+                        let value = parse_expr(call.args.first().ok_or_else(|| {
+                            syn::Error::new_spanned(call, "store requires one argument")
+                        })?)?;
+                        loop_body.push(KernelStmt::Store { target, value });
+                        continue;
+                    }
+                }
+                return Err(syn::Error::new_spanned(
+                    inner_expr,
+                    "unsupported kernel statement in for loop",
+                ));
+            }
+            other => {
+                return Err(syn::Error::new_spanned(
+                    other,
+                    "unsupported statement in for loop",
+                ))
+            }
+        }
+    }
+    body.push(KernelStmt::ForLoop {
+        var,
+        start,
+        end,
+        body: loop_body,
+    });
+    Ok(())
+}
+
 fn parse_param(arg: &syn::FnArg) -> syn::Result<KernelParam> {
     let syn::FnArg::Typed(arg) = arg else {
         return Err(syn::Error::new_spanned(
@@ -102,10 +210,65 @@ fn parse_param(arg: &syn::FnArg) -> syn::Result<KernelParam> {
             "kernel parameter must be a reference",
         ));
     };
+
+    let shape = extract_shape_from_type(&reference.elem);
+
     Ok(KernelParam {
         name: pat.ident.clone(),
         is_mut: reference.mutability.is_some(),
+        shape,
     })
+}
+
+fn extract_shape_from_type(ty: &syn::Type) -> Option<Vec<i64>> {
+    let syn::Type::Path(type_path) = ty else {
+        return None;
+    };
+    let last_seg = type_path.path.segments.last()?;
+    if last_seg.ident != "Tensor" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &last_seg.arguments else {
+        return None;
+    };
+    if args.args.len() < 2 {
+        return None;
+    }
+    let syn::GenericArgument::Const(const_expr) = &args.args[1] else {
+        return None;
+    };
+    if let syn::Expr::Array(arr) = const_expr {
+        let mut shape = Vec::new();
+        for elem in &arr.elems {
+            if let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Int(lit_int),
+                ..
+            }) = elem
+            {
+                shape.push(lit_int.base10_parse::<i64>().unwrap_or(-1));
+            } else if let syn::Expr::Unary(syn::ExprUnary {
+                op: syn::UnOp::Neg(_),
+                expr,
+                ..
+            }) = elem
+            {
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Int(lit_int),
+                    ..
+                }) = expr.as_ref()
+                {
+                    let val: i64 = lit_int.base10_parse().unwrap_or(1);
+                    shape.push(-val);
+                }
+            } else {
+                shape.push(-1);
+            }
+        }
+        if !shape.is_empty() {
+            return Some(shape);
+        }
+    }
+    None
 }
 
 fn parse_expr(expr: &syn::Expr) -> syn::Result<KernelExpr> {
@@ -153,10 +316,12 @@ fn parse_expr(expr: &syn::Expr) -> syn::Result<KernelExpr> {
         syn::Expr::Lit(lit) => {
             if let syn::Lit::Int(lit_int) = &lit.lit {
                 Ok(KernelExpr::Lit(lit_int.clone()))
+            } else if let syn::Lit::Float(lit_float) = &lit.lit {
+                Ok(KernelExpr::FloatLit(lit_float.clone()))
             } else {
                 Err(syn::Error::new_spanned(
                     &lit.lit,
-                    "only integer literals supported in kernel expressions",
+                    "only integer and float literals supported in kernel expressions",
                 ))
             }
         }
@@ -174,16 +339,12 @@ fn parse_expr(expr: &syn::Expr) -> syn::Result<KernelExpr> {
         }
         syn::Expr::Call(call) => {
             let func = match call.func.as_ref() {
-                syn::Expr::Path(path) => {
-                    // Handle both simple idents and qualified paths like `sile::tile::id`
-                    path.path
-                        .segments
-                        .last()
-                        .map(|seg| seg.ident.clone())
-                        .ok_or_else(|| {
-                            syn::Error::new_spanned(&call.func, "expected function name")
-                        })?
-                }
+                syn::Expr::Path(path) => path
+                    .path
+                    .segments
+                    .last()
+                    .map(|seg| seg.ident.clone())
+                    .ok_or_else(|| syn::Error::new_spanned(&call.func, "expected function name"))?,
                 _ => {
                     return Err(syn::Error::new_spanned(
                         &call.func,
@@ -199,6 +360,14 @@ fn parse_expr(expr: &syn::Expr) -> syn::Result<KernelExpr> {
             Ok(KernelExpr::Call { func, args })
         }
         syn::Expr::Reference(reference) => parse_expr(&reference.expr),
+        syn::Expr::Index(index) => {
+            let target = parse_expr(&index.expr)?;
+            let idx = parse_expr(&index.index)?;
+            Ok(KernelExpr::Index {
+                target: Box::new(target),
+                index: Box::new(idx),
+            })
+        }
         other => Err(syn::Error::new_spanned(
             other,
             "unsupported expression kind in kernel",
