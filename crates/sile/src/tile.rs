@@ -36,8 +36,8 @@ impl<T, R: Rank> Tile<T, R> {
         Tile::new(vec![self.shape[0]])
     }
 
-    pub fn reshape(&self, new_shape: Vec<i64>) -> Tile<T, DListNil> {
-        Tile::new(new_shape)
+    pub fn reshape<const N: usize>(&self, new_shape: [i32; N]) -> Tile<T, DListNil> {
+        Tile::new(new_shape.iter().map(|&v| v as i64).collect())
     }
 
     pub fn broadcast(&self, _target_shape: &[i64]) -> Tile<T, DListNil> {

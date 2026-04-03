@@ -1,14 +1,14 @@
-use sile::{Device, Tensor};
+use sile::{Device, Tensor, Tile};
 
 #[sile::kernel]
-fn softmax(x: &Tensor<f32>, y: &mut Tensor<f32>) {
-    let tile_x = x.load_tile_like_2d(y);
-    let tile_x_max = reduce_max(tile_x, 1);
-    let tile_x_max = tile_x_max.reshape([2, 1]).broadcast(y);
-    let num = exp(tile_x - tile_x_max);
-    let denom = reduce_sum(num, 1);
-    let denom = denom.reshape([2, 1]).broadcast(y);
-    y.store(num / denom);
+fn softmax<const BM: i32, const BN: i32>(x: &Tensor<f32>, y: &mut Tensor<f32>) {
+    let tile_x: Tile<f32> = sile::load_tile_like_2d(x, y);
+    let tile_x_max: Tile<f32> = sile::reduce_max(tile_x.clone(), 1i32);
+    let tile_x_max_bcast: Tile<f32> = tile_x_max.reshape([BM, 1]).broadcast(y.shape());
+    let num: Tile<f32> = sile::exp(tile_x - tile_x_max_bcast);
+    let denom: Tile<f32> = sile::reduce_sum(num.clone(), 1);
+    let denom_bcast = denom.reshape([BM, 1]).broadcast(y.shape());
+    y.store(num / denom_bcast);
 }
 
 fn main() -> Result<(), sile::Error> {
@@ -19,10 +19,7 @@ fn main() -> Result<(), sile::Error> {
     let data: Vec<f32> = (0..(m * n) as i32).map(|v| v as f32).collect();
     let x = Tensor::from_vec(data, [m, n], &device)?;
     let mut y = Tensor::zeros([m, n], &device)?;
-
-    softmax(&x, &mut y)
-        .grid((2, 1, 1))
-        .apply(&stream)?;
+    softmax::<2, 8>(&x, &mut y).grid((2, 1, 1)).apply(&stream);
 
     let y_host = y.to_vec(&stream)?;
     for i in 0..m as usize {

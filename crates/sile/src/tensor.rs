@@ -4,6 +4,7 @@ pub enum DList<const V: i32, R> {
     Cons(R),
 }
 
+#[derive(Clone, Debug)]
 pub struct DListNil;
 
 pub trait Rank {}
@@ -63,6 +64,10 @@ impl<T: Clone, R: Rank> Tensor<T, R> {
             tile_shape,
             grid_shape,
         }
+    }
+
+    pub fn shape(&self) -> &[i64] {
+        &self.shape
     }
 }
 
@@ -126,9 +131,6 @@ impl Tensor<f32, DListNil> {
         })
     }
 
-    pub fn shape(&self) -> &[i64] {
-        &self.shape
-    }
     pub fn len(&self) -> usize {
         self.data.len()
     }
@@ -161,5 +163,22 @@ impl Tensor<f32, DListNil> {
             shape: &self.shape,
             device: &self.device,
         }
+    }
+
+    // Kernel-context stub methods (used inside #[kernel] bodies)
+    pub fn load_tile<const N: usize, const M: usize, R: Rank>(
+        &self,
+        _tile_shape: [i64; N],
+        _indices: [i64; M],
+    ) -> crate::Tile<f32, R> {
+        crate::Tile::new(_tile_shape.to_vec())
+    }
+
+    pub fn load_tile_like_2d<R: Rank>(&self, _target: &Tensor<f32, R>) -> crate::Tile<f32, R> {
+        crate::Tile::new(_target.shape().to_vec())
+    }
+
+    pub fn store(&mut self, _value: crate::Tile<f32, DListNil>) {
+        // no-op in host context; handled by codegen
     }
 }
