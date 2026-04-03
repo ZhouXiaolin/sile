@@ -1,5 +1,5 @@
-pub mod ir;
 pub mod builder;
+pub mod ir;
 pub mod lower;
 
 pub use ir::{
