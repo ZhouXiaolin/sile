@@ -44,7 +44,7 @@ pub enum KernelExpr {
     Array(syn::ExprArray),
     FieldAccess {
         target: Box<KernelExpr>,
-        field: syn::Ident,
+        field: String,
     },
 }
 
