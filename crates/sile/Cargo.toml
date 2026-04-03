@@ -9,6 +9,7 @@ sile-hir = { path = "../sile-hir" }
 sile-lir = { path = "../sile-lir" }
 sile-compiler = { path = "../sile-compiler" }
 sile-backend-cpu = { path = "../sile-backend-cpu" }
+sile-backend-metal = { path = "../sile-backend-metal" }
 sile-macros = { path = "../sile-macros" }
 libloading.workspace = true
 rand.workspace = true

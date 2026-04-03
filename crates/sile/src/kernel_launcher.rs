@@ -1,4 +1,4 @@
-use sile_core::{KernelArg, LaunchConfig, Result, Stream};
+use sile_core::{Device, KernelArg, LaunchConfig, Result, Stream};
 use sile_hir::Kernel;
 use sile_lir::Backend;
 
@@ -38,7 +38,18 @@ impl<'a> KernelLauncher<'a> {
 
         let lir_func = sile_compiler::compile(&typed);
 
-        let backend = sile_backend_cpu::CpuBackend::new();
-        backend.execute(&lir_func, self.kernel, &self.args, &launch, stream)
+        match stream.device() {
+            Device::Cpu(_) => {
+                let backend = sile_backend_cpu::CpuBackend::new();
+                backend.execute(&lir_func, self.kernel, &self.args, &launch, stream)
+            }
+            Device::Metal(_) => {
+                let backend = sile_backend_metal::MetalBackend::new()?;
+                backend.execute(&lir_func, self.kernel, &self.args, &launch, stream)
+            }
+            _ => Err(sile_core::Error::UnsupportedBackend(
+                "backend not implemented",
+            )),
+        }
     }
 }
