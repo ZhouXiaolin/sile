@@ -5,7 +5,17 @@ pub struct SsaProgram {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SsaInstruction {
+    pub def: SsaValue,
     pub opcode: SsaOpcode,
+    pub uses: Vec<SsaValue>,
+    pub immediates: Vec<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SsaValue {
+    Param(usize),
+    Local(usize),
+    Const(i64),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15,6 +25,7 @@ pub enum SsaOpcode {
     LoadTileLike2D,
     Add,
     Sub,
+    Mul,
     Div,
     Exp,
     ReduceMax,
@@ -22,6 +33,7 @@ pub enum SsaOpcode {
     Reshape,
     Broadcast,
     Store,
+    ShapeOf,
 }
 
 impl SsaInstruction {
@@ -32,6 +44,7 @@ impl SsaInstruction {
             SsaOpcode::LoadTileLike2D => "load_tile_like_2d",
             SsaOpcode::Add => "add",
             SsaOpcode::Sub => "sub",
+            SsaOpcode::Mul => "mul",
             SsaOpcode::Div => "div",
             SsaOpcode::Exp => "exp",
             SsaOpcode::ReduceMax => "reduce_max",
@@ -39,6 +52,7 @@ impl SsaInstruction {
             SsaOpcode::Reshape => "reshape",
             SsaOpcode::Broadcast => "broadcast",
             SsaOpcode::Store => "store",
+            SsaOpcode::ShapeOf => "shape_of",
         }
     }
 }
