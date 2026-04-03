@@ -54,6 +54,10 @@ pub enum KernelExpr {
         method: syn::Ident,
         args: Vec<KernelExpr>,
     },
+    Call {
+        func: syn::Ident,
+        args: Vec<KernelExpr>,
+    },
     BinaryOp {
         left: Box<KernelExpr>,
         op: BinOpKind,
@@ -272,6 +276,25 @@ fn parse_expr(expr: &syn::Expr) -> syn::Result<KernelExpr> {
                 })?,
             })
         }
+        syn::Expr::Call(call) => {
+            let func = match call.func.as_ref() {
+                syn::Expr::Path(path) => path.path.get_ident().cloned().ok_or_else(|| {
+                    syn::Error::new_spanned(&call.func, "expected function name")
+                })?,
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        &call.func,
+                        "expected simple function call",
+                    ))
+                }
+            };
+            let args = call
+                .args
+                .iter()
+                .map(parse_expr)
+                .collect::<syn::Result<Vec<_>>>()?;
+            Ok(KernelExpr::Call { func, args })
+        }
         other => Err(syn::Error::new_spanned(
             other,
             "unsupported expression kind in kernel",
@@ -376,32 +399,62 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
             let val: i32 = lit.base10_parse().unwrap_or(0);
             quote! { ::sile::hir::Expr::ScalarI32(#val) }
         }
-        KernelExpr::MethodCall { receiver, method, args } => {
-            let method_name = method.to_string();
-            let receiver_expr = lower_expr(receiver);
+        KernelExpr::Call { func, args } => {
+            let func_name = func.to_string();
             let args_exprs: Vec<_> = args.iter().map(lower_expr).collect();
-            match method_name.as_str() {
-                "load_tile" | "load_tile_like_2d" => {
-                    let op = if method_name == "load_tile_like_2d" {
-                        quote! { ::sile::hir::BuiltinOp::LoadTileLike2D }
-                    } else {
-                        quote! { ::sile::hir::BuiltinOp::LoadTile }
-                    };
-                    let all_args = [receiver_expr].into_iter().chain(args_exprs);
+            match func_name.as_str() {
+                "load_tile_like_2d" => {
+                    let all_args = args_exprs;
                     quote! {
                         ::sile::hir::Expr::Builtin {
-                            op: #op,
+                            op: ::sile::hir::BuiltinOp::LoadTileLike2D,
                             args: vec![#(#all_args),*],
                         }
                     }
                 }
                 "reduce_max" | "reduce_sum" | "reshape" | "broadcast"
-                | "exp" | "shape" => {
-                    let op = match method_name.as_str() {
+                | "exp" | "shape_of" => {
+                    let op = match func_name.as_str() {
                         "reduce_max" => quote! { ::sile::hir::BuiltinOp::ReduceMax },
                         "reduce_sum" => quote! { ::sile::hir::BuiltinOp::ReduceSum },
                         "reshape" => quote! { ::sile::hir::BuiltinOp::Reshape },
                         "broadcast" => quote! { ::sile::hir::BuiltinOp::Broadcast },
+                        "exp" => quote! { ::sile::hir::BuiltinOp::Exp },
+                        "shape_of" => quote! { ::sile::hir::BuiltinOp::ShapeOf },
+                        _ => unreachable!(),
+                    };
+                    quote! {
+                        ::sile::hir::Expr::Builtin {
+                            op: #op,
+                            args: vec![#(#args_exprs),*],
+                        }
+                    }
+                }
+                _ => {
+                    quote! { ::sile::hir::Expr::Var(#func_name.to_string()) }
+                }
+            }
+        }
+        KernelExpr::MethodCall { receiver, method, args } => {
+            let method_name = method.to_string();
+            let receiver_expr = lower_expr(receiver);
+            let args_exprs: Vec<_> = args.iter().map(lower_expr).collect();
+            match method_name.as_str() {
+                "load_tile" => {
+                    let all_args = [receiver_expr].into_iter().chain(args_exprs);
+                    quote! {
+                        ::sile::hir::Expr::Builtin {
+                            op: ::sile::hir::BuiltinOp::LoadTile,
+                            args: vec![#(#all_args),*],
+                        }
+                    }
+                }
+                "reshape" | "broadcast" | "reduce_max" | "reduce_sum" | "exp" | "shape" => {
+                    let op = match method_name.as_str() {
+                        "reshape" => quote! { ::sile::hir::BuiltinOp::Reshape },
+                        "broadcast" => quote! { ::sile::hir::BuiltinOp::Broadcast },
+                        "reduce_max" => quote! { ::sile::hir::BuiltinOp::ReduceMax },
+                        "reduce_sum" => quote! { ::sile::hir::BuiltinOp::ReduceSum },
                         "exp" => quote! { ::sile::hir::BuiltinOp::Exp },
                         "shape" => quote! { ::sile::hir::BuiltinOp::ShapeOf },
                         _ => unreachable!(),
@@ -415,7 +468,6 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
                     }
                 }
                 "store" => {
-                    // store 不应该出现在 expr 位置，但为了健壮性处理
                     quote! {
                         ::sile::hir::Expr::Builtin {
                             op: ::sile::hir::BuiltinOp::Store,
@@ -424,7 +476,6 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
                     }
                 }
                 _ => {
-                    // 未知方法，当作 Var 处理
                     quote! { ::sile::hir::Expr::Var(#method_name.to_string()) }
                 }
             }
@@ -492,10 +543,11 @@ Expected: 编译通过。
 - [ ] **Step 3: 运行宏测试**
 
 ```bash
-cargo test -p sile kernel_macro_smoke -- --nocapture
+cargo test -p sile kernel_frontend_vec_add -- --nocapture
+cargo test -p sile kernel_frontend_softmax -- --nocapture
 ```
 
-Expected: PASS — HIR 现在包含真实的表达式。
+Expected: PASS — HIR 现在包含真实的表达式，包括自由函数调用。
 
 - [ ] **Step 4: Commit**
 
@@ -1316,12 +1368,12 @@ git commit -m "feat(codegen): generic C code generation from backend IR instruct
 
 ---
 
-### Task 10: 修复 examples 和宏 — 确保 end-to-end 编译
+### Task 10: 恢复 examples 的 `{[m,n,k]}` 语法 — 确保 end-to-end 编译
 
 **Files:**
 - Modify: `crates/sile-macros/src/lib.rs` — 更新 arg_exprs 支持 Partition
-- Modify: `crates/sile/examples/vec_add.rs` — 修正用法
-- Modify: `crates/sile/examples/softmax.rs` — 修正用法
+- Modify: `crates/sile/examples/vec_add.rs` — 恢复 `{[m,n,k]}` 语法
+- Modify: `crates/sile/examples/softmax.rs` — 恢复 `{[m,n,k]}` 语法
 
 - [ ] **Step 1: 修改 sile-macros/src/lib.rs — 支持 Partition 参数**
 
@@ -1360,16 +1412,20 @@ git commit -m "feat(codegen): generic C code generation from backend IR instruct
         .collect();
 ```
 
-- [ ] **Step 2: 修改 examples/vec_add.rs**
+- [ ] **Step 2: 修改 examples/vec_add.rs — 使用 `{[m,n,k]}` 语法**
 
 ```rust
 use sile::{Device, Tensor};
 
 #[sile::kernel]
-fn vec_add(a: &Tensor<f32>, b: &Tensor<f32>, c: &mut Tensor<f32>) {
-    let tid = sile::tile::id().0;
-    let tile_a = a.load_tile([4], [tid]);
-    let tile_b = b.load_tile([4], [tid]);
+fn vec_add<const S: [i32; 1]>(
+    a: &Tensor<f32, {[-1]}>,
+    b: &Tensor<f32, {[-1]}>,
+    c: &mut Tensor<f32, S>,
+) {
+    let pid = tile::id().0;
+    let tile_a = a.load_tile([4], [pid]);
+    let tile_b = b.load_tile([4], [pid]);
     c.store(tile_a + tile_b);
 }
 
@@ -1398,19 +1454,23 @@ fn main() -> sile::Result<()> {
 }
 ```
 
-- [ ] **Step 3: 修改 examples/softmax.rs**
+- [ ] **Step 3: 修改 examples/softmax.rs — 使用 `{[m,n,k]}` 语法**
 
 ```rust
 use sile::{Device, Tensor, Tile};
 
 #[sile::kernel]
-fn softmax(x: &Tensor<f32>, y: &mut Tensor<f32>) {
-    let tile_x = x.load_tile_like_2d(y);
-    let tile_x_max = tile_x.reduce_max(1);
-    let tile_x_max = tile_x_max.reshape([2, 1]).broadcast(y.shape());
-    let num = tile_x.exp();
-    let denom = num.reduce_sum(1);
-    let denom = denom.reshape([2, 1]).broadcast(y.shape());
+fn softmax<const BM: i32, const BN: i32>(
+    x: &Tensor<f32, { [-1, -1] }>,
+    y: &mut Tensor<f32, { [BM, BN] }>,
+) {
+    let tile_x: Tile<f32, { [BM, BN] }> = load_tile_like_2d(x, y);
+    let tile_x_max: Tile<f32, { [BM] }> = reduce_max(tile_x, 1i32);
+    let tile_x_max: Tile<f32, { [BM, BN] }> =
+        tile_x_max.reshape([BM, 1]).broadcast(y.shape());
+    let num: Tile<f32, { [BM, BN] }> = exp(tile_x - tile_x_max);
+    let denom: Tile<f32, { [BM] }> = reduce_sum(num, 1);
+    let denom = denom.reshape([BM, 1]).broadcast(y.shape());
     y.store(num / denom);
 }
 
@@ -1423,7 +1483,7 @@ fn main() -> Result<(), sile::Error> {
     let data: Vec<f32> = (0..(m * n) as i32).map(|v| v as f32).collect();
     let x = Tensor::from_vec(data, [m, n], &device)?;
     let mut y = Tensor::zeros([m, n], &device)?;
-    let y = y.partition([bm as i64, bn as i64]);
+    let y = y.partition([bm,bn]);
     softmax(&x, &mut y).grid((2, 1, 1)).apply(&stream);
 
     let y = y.unpartition();
@@ -1453,7 +1513,7 @@ Expected: 两个 example 都编译通过。
 
 ```bash
 git add crates/sile-macros/src/lib.rs crates/sile/examples/vec_add.rs crates/sile/examples/softmax.rs
-git commit -m "fix(examples): update to match new partition/tile API"
+git commit -m "feat(examples): restore {[m,n,k]} rank syntax, support free function calls"
 ```
 
 ---
