@@ -32,11 +32,11 @@ pub fn load_tile_like_2d(x: &Tensor<f32>, y: &Tensor<f32>) -> Tile<f32> {
     Tile::new(y.shape().to_vec())
 }
 
-pub fn reduce_max(tile: Tile<f32>, _axis: i32) -> Tile<f32> {
+pub fn reduce_max(tile: Tile<f32>, _axis: i64) -> Tile<f32> {
     Tile::new(vec![tile.shape[0]])
 }
 
-pub fn reduce_sum(tile: Tile<f32>, _axis: i32) -> Tile<f32> {
+pub fn reduce_sum(tile: Tile<f32>, _axis: i64) -> Tile<f32> {
     Tile::new(vec![tile.shape[0]])
 }
 

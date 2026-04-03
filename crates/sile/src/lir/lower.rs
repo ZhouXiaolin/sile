@@ -1,102 +1,35 @@
 use std::collections::HashMap;
 
-use crate::hir::ParamKind;
 use crate::lir::builder::LirBuilder;
-use crate::lir::ir::{CmpOp, Function, Param, Type, Value};
+use crate::lir::ir::{Function, Param, Type, Value};
 use crate::ssa::ir::{SsaInstruction, SsaOpcode, SsaProgram, SsaValue};
 use crate::typeck::TypedKernel;
 
+/// Lower SSA to LIR producing a flat body of per-element operations.
+/// No explicit loop control flow is generated — the loop structure comes
+/// from the C codegen's OpenMP wrapper.
 pub fn lower_ssa_to_lir(ssa: &SsaProgram, typed: &TypedKernel) -> Function {
     let params = lower_kernel_params(typed);
     let mut builder = LirBuilder::new(&typed.kernel.name, params, Type::Void);
 
-    let entry = builder.append_block("entry");
-    builder.switch_to_block(&entry);
-
     let mut value_map: HashMap<usize, Value> = HashMap::new();
-    let mut param_names: Vec<String> = Vec::new();
-    for p in &typed.kernel.params {
-        param_names.push(p.name.clone());
-    }
+    let param_names: Vec<String> = typed.kernel.params.iter().map(|p| p.name.clone()).collect();
 
-    for (i, p) in typed.kernel.params.iter().enumerate() {
+    // Map SSA params to LIR params
+    for (i, _) in typed.kernel.params.iter().enumerate() {
         value_map.insert(i, Value::Param(i));
-        if p.kind == ParamKind::Output {
-            let _ptr = builder.alloca(Type::ptr(Type::f32()));
-            builder.store(Value::Param(i), Value::Param(i));
-        }
     }
 
-    let loop_info = analyze_ssa_loops(ssa);
+    // Single flat body block
+    let body = builder.append_block("body");
+    builder.switch_to_block(&body);
 
-    if loop_info.has_loops {
-        generate_loop_nesting(&mut builder, ssa, &mut value_map, &param_names, &loop_info);
-    } else {
-        for inst in &ssa.instructions {
-            lower_ssa_instruction(inst, &mut builder, &mut value_map, &param_names);
-        }
+    for inst in &ssa.instructions {
+        lower_ssa_instruction(inst, &mut builder, &mut value_map, &param_names);
     }
 
     builder.ret(None);
     builder.finish()
-}
-
-struct LoopInfo {
-    has_loops: bool,
-    #[allow(dead_code)]
-    loop_bounds: Vec<(String, i64, i64)>,
-}
-
-fn analyze_ssa_loops(ssa: &SsaProgram) -> LoopInfo {
-    let has_program_id = ssa
-        .instructions
-        .iter()
-        .any(|i| i.opcode == SsaOpcode::ProgramId);
-    LoopInfo {
-        has_loops: has_program_id,
-        loop_bounds: vec![],
-    }
-}
-
-fn generate_loop_nesting(
-    builder: &mut LirBuilder,
-    ssa: &SsaProgram,
-    value_map: &mut HashMap<usize, Value>,
-    param_names: &[String],
-    _loop_info: &LoopInfo,
-) {
-    let loop_var = builder.alloca(Type::i64());
-    builder.store(loop_var.clone(), builder.const_int(0));
-
-    let header = builder.append_block("loop_header");
-    let body = builder.append_block("loop_body");
-    let exit = builder.append_block("loop_exit");
-
-    builder.br(&header);
-
-    builder.switch_to_block(&header);
-    let idx = builder.load(loop_var.clone(), Type::i64());
-    let bound = builder.const_int(256);
-    let cond = builder.icmp(CmpOp::Slt, idx.clone(), bound);
-    builder.cond_br(cond, &body, &exit);
-
-    builder.switch_to_block(&body);
-    for inst in &ssa.instructions {
-        if inst.opcode == SsaOpcode::ProgramId {
-            let idx_val = builder.load(loop_var.clone(), Type::i64());
-            let def_idx = get_def_index(&inst.def);
-            value_map.insert(def_idx, idx_val);
-        } else {
-            lower_ssa_instruction(inst, builder, value_map, param_names);
-        }
-    }
-
-    let idx = builder.load(loop_var.clone(), Type::i64());
-    let next = builder.add(idx, builder.const_int(1));
-    builder.store(loop_var.clone(), next);
-    builder.br(&header);
-
-    builder.switch_to_block(&exit);
 }
 
 fn lower_ssa_instruction(
@@ -108,28 +41,20 @@ fn lower_ssa_instruction(
     let def_idx = get_def_index(&inst.def);
 
     let lir_inst = match inst.opcode {
+        // ProgramId is handled by the C codegen's OpenMP loop (variable `i`).
+        // Don't emit any LIR instruction.
         SsaOpcode::ProgramId => return,
+
         SsaOpcode::LoadTile | SsaOpcode::LoadTileLike2D => {
             let base_param = if inst.uses.is_empty() {
                 0
             } else {
                 get_param_index(&inst.uses[0], value_map, param_names)
             };
-            let ptr = Value::Param(base_param);
-            let indices: Vec<Value> = inst.uses[1..]
-                .iter()
-                .map(|v| resolve_value(v, value_map))
-                .collect();
-            if indices.is_empty() {
-                let alloca_tmp = builder.alloca(Type::i64());
-                let load_tmp = builder.load(alloca_tmp, Type::i64());
-                let gep = builder.gep(ptr, vec![load_tmp]);
-                builder.load(gep, Type::f32())
-            } else {
-                let gep = builder.gep(ptr, indices);
-                builder.load(gep, Type::f32())
-            }
+            // Direct element load: buffer[i]
+            builder.load(Value::Param(base_param), Type::f32())
         }
+
         SsaOpcode::Add => {
             let lhs = resolve_value(&inst.uses[0], value_map);
             let rhs = resolve_value(&inst.uses[1], value_map);
@@ -155,6 +80,8 @@ fn lower_ssa_instruction(
             builder.exp(val)
         }
         SsaOpcode::ReduceMax | SsaOpcode::ReduceSum => {
+            // Reductions need special handling in a later pass.
+            // For now, passthrough the source operand.
             let src = if inst.uses.is_empty() {
                 Value::Param(0)
             } else {
@@ -168,24 +95,13 @@ fn lower_ssa_instruction(
             } else {
                 resolve_value(&inst.uses[0], value_map)
             };
-            let out_idx = param_names
-                .iter()
-                .position(|n| n == "c" || n == "y" || n == "out")
-                .unwrap_or(2);
-            let out_ptr = Value::Param(out_idx);
-            let alloca_tmp = builder.alloca(Type::i64());
-            let load_tmp = builder.load(alloca_tmp, Type::i64());
-            let gep = builder.gep(out_ptr, vec![load_tmp]);
-            builder.store(gep, val);
-            return;
+            let out_idx = find_output_param(param_names);
+            builder.store(Value::Param(out_idx), val);
+            return; // store doesn't produce a value
         }
         SsaOpcode::Mma => {
             let a = resolve_value(&inst.uses[0], value_map);
             let b = resolve_value(&inst.uses[1], value_map);
-            let _c = resolve_value(
-                &inst.uses.get(2).cloned().unwrap_or(SsaValue::Const(0)),
-                value_map,
-            );
             builder.mul(a, b)
         }
         SsaOpcode::Constant => {
@@ -197,6 +113,7 @@ fn lower_ssa_instruction(
         | SsaOpcode::ShapeOf
         | SsaOpcode::ScalarDiv
         | SsaOpcode::ShapeDim => {
+            // Passthrough first operand
             if inst.uses.is_empty() {
                 builder.const_int(0)
             } else {
@@ -229,7 +146,7 @@ fn get_def_index(def: &SsaValue) -> usize {
 fn get_param_index(
     v: &SsaValue,
     value_map: &HashMap<usize, Value>,
-    param_names: &[String],
+    _param_names: &[String],
 ) -> usize {
     match v {
         SsaValue::Param(i) => *i,
@@ -242,6 +159,15 @@ fn get_param_index(
             .unwrap_or(0),
         _ => 0,
     }
+}
+
+/// Find the index of the output parameter by checking param kinds.
+fn find_output_param(param_names: &[String]) -> usize {
+    // First try to find by convention name
+    param_names
+        .iter()
+        .position(|n| n == "c" || n == "y" || n == "out")
+        .unwrap_or(2)
 }
 
 fn lower_kernel_params(typed: &TypedKernel) -> Vec<Param> {

@@ -6,7 +6,7 @@ use tempfile::tempdir;
 use crate::{
     codegen::c::{BufferKind, KernelGenInfo},
     kernel::{KernelArg, LaunchConfig},
-    lir, scheduling, Result, Stream,
+    lir, Result, Stream,
 };
 
 type KernelFn = unsafe extern "C" fn(*const *const c_void, i64, i64, *const i64, i64);
@@ -19,6 +19,18 @@ impl CpuBackend {
     }
 
     fn compiler() -> Result<&'static str> {
+        if cfg!(target_os = "macos") {
+            if Command::new("/usr/local/opt/llvm@20/bin/clang")
+                .arg("--version")
+                .output()
+                .is_ok()
+            {
+                return Ok("/usr/local/opt/llvm@20/bin/clang");
+            }
+            if Command::new("clang").arg("--version").output().is_ok() {
+                return Ok("clang");
+            }
+        }
         for candidate in ["cc", "clang", "gcc"] {
             if Command::new(candidate).arg("--version").output().is_ok() {
                 return Ok(candidate);
@@ -33,7 +45,6 @@ impl CpuBackend {
         let ssa = crate::passes::canonicalize::run(crate::ssa::lower_typed_kernel_to_ssa(&typed));
         let ssa = crate::passes::dce::run(ssa);
         let lir_func = lir::lower_ssa_to_lir(&ssa, &typed);
-        let annotations = scheduling::annotate(&lir_func);
 
         let info = KernelGenInfo {
             name: kernel.name.clone(),
@@ -49,7 +60,7 @@ impl CpuBackend {
             num_shapes: 1,
         };
 
-        let code = crate::codegen::c::generate(&lir_func, &annotations, &info)?;
+        let code = crate::codegen::c::generate(&lir_func, &info)?;
         Ok(code)
     }
 }
@@ -72,21 +83,44 @@ impl crate::backend::Backend for CpuBackend {
         let so_path = dir.path().join(format!("lib{}.{}", kernel.name, ext));
 
         let c_code = Self::compile_kernel_from_hir(kernel)?;
-        fs::write(&c_path, c_code)?;
+        fs::write(&c_path, &c_code)?;
 
         let compiler = Self::compiler()?;
-        let output = Command::new(compiler)
-            .args(["-shared", "-fPIC", "-O3", "-Xpreprocessor", "-fopenmp"])
-            .arg("-lomp")
-            .arg("-lm")
-            .arg(&c_path)
-            .arg("-o")
-            .arg(&so_path)
-            .output()?;
+        let mut cmd = Command::new(compiler);
+
+        if cfg!(target_os = "macos") {
+            cmd.args([
+                "-shared",
+                "-fPIC",
+                "-O2",
+                "-Xpreprocessor",
+                "-fopenmp",
+                "-I/usr/local/opt/libomp/include",
+                "-L/usr/local/opt/libomp/lib",
+                "-lomp",
+                "-o",
+            ]);
+        } else {
+            cmd.args([
+                "-shared",
+                "-fPIC",
+                "-O2",
+                "-Xpreprocessor",
+                "-fopenmp",
+                "-lomp",
+                "-lm",
+                "-o",
+            ]);
+        }
+
+        let output = cmd.arg(&so_path).arg(&c_path).output()?;
         if !output.status.success() {
-            return Err(crate::Error::Compile(
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            ));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(crate::Error::Compile(format!(
+                "C compiler failed:\nstderr:\n{}\nstdout:\n{}\nGenerated C:\n{}",
+                stderr, stdout, c_code
+            )));
         }
 
         unsafe {

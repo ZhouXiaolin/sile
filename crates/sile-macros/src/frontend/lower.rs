@@ -102,8 +102,8 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
             quote! { ::sile::hir::Expr::Var(#name.to_string()) }
         }
         KernelExpr::Lit(lit) => {
-            let val: i32 = lit.base10_parse().unwrap_or(0);
-            quote! { ::sile::hir::Expr::ScalarI32(#val) }
+            let val: i64 = lit.base10_parse().unwrap_or(0);
+            quote! { ::sile::hir::Expr::ScalarI64(#val) }
         }
         KernelExpr::FloatLit(lit) => {
             let val: f32 = lit.base10_parse().unwrap_or(0.0);
@@ -264,12 +264,12 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
             } = target.as_ref()
             {
                 if method.to_string() == "shape" {
-                    let dim_idx: i32 = field.parse().unwrap_or(0);
+                    let dim_idx: i64 = field.parse().unwrap_or(0);
                     let receiver_lowered = lower_expr(receiver);
                     return quote! {
                         ::sile::hir::Expr::Builtin {
                             op: ::sile::hir::BuiltinOp::ShapeDim,
-                            args: vec![#receiver_lowered, ::sile::hir::Expr::ScalarI32(#dim_idx)],
+                            args: vec![#receiver_lowered, ::sile::hir::Expr::ScalarI64(#dim_idx)],
                         }
                     };
                 }
@@ -277,7 +277,7 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
             // Handle tile::id().N -> ShapeDim(ProgramId, N)
             if let KernelExpr::Call { func, .. } = target.as_ref() {
                 if func.to_string() == "id" {
-                    let dim_idx: i32 = field.parse().unwrap_or(0);
+                    let dim_idx: i64 = field.parse().unwrap_or(0);
                     return quote! {
                         ::sile::hir::Expr::Builtin {
                             op: ::sile::hir::BuiltinOp::ShapeDim,
@@ -286,7 +286,7 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
                                     op: ::sile::hir::BuiltinOp::ProgramId,
                                     args: vec![],
                                 },
-                                ::sile::hir::Expr::ScalarI32(#dim_idx),
+                                ::sile::hir::Expr::ScalarI64(#dim_idx),
                             ],
                         }
                     };
@@ -308,7 +308,7 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
             {
                 if method.to_string() == "shape" {
                     let dim_idx = match index.as_ref() {
-                        KernelExpr::Lit(lit) => lit.base10_parse::<i32>().unwrap_or(0),
+                        KernelExpr::Lit(lit) => lit.base10_parse::<i64>().unwrap_or(0),
                         KernelExpr::Var(ident) => {
                             let name = ident.to_string();
                             return quote! {
@@ -330,7 +330,7 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
                     return quote! {
                         ::sile::hir::Expr::Builtin {
                             op: ::sile::hir::BuiltinOp::ShapeDim,
-                            args: vec![#receiver_lowered, ::sile::hir::Expr::ScalarI32(#dim_idx)],
+                            args: vec![#receiver_lowered, ::sile::hir::Expr::ScalarI64(#dim_idx)],
                         }
                     };
                 }
