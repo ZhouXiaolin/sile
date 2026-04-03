@@ -1,7 +1,7 @@
 use sile::{tile, Device, Tensor};
 
 #[sile::kernel]
-fn vec_add(a: &Tensor<f32>, b: &Tensor<f32>, c: &mut Tensor<f32>) {
+fn vec_add(a: &Tensor<f32, { [-1] }>, b: &Tensor<f32, { [-1] }>, c: &mut Tensor<f32, { [-1] }>) {
     let pid = tile::id().0;
     let tile_a = a.load_tile([4], [pid]);
     let tile_b = b.load_tile([4], [pid]);
