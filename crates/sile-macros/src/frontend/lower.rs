@@ -82,7 +82,8 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
                         }
                     }
                 }
-                "reduce_max" | "reduce_sum" | "reshape" | "broadcast" | "exp" | "shape_of" => {
+                "reduce_max" | "reduce_sum" | "reshape" | "broadcast" | "exp" | "shape_of"
+                | "id" => {
                     let op = match func_name.as_str() {
                         "reduce_max" => quote! { ::sile::hir::BuiltinOp::ReduceMax },
                         "reduce_sum" => quote! { ::sile::hir::BuiltinOp::ReduceSum },
@@ -90,6 +91,7 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
                         "broadcast" => quote! { ::sile::hir::BuiltinOp::Broadcast },
                         "exp" => quote! { ::sile::hir::BuiltinOp::Exp },
                         "shape_of" => quote! { ::sile::hir::BuiltinOp::ShapeOf },
+                        "id" => quote! { ::sile::hir::BuiltinOp::ProgramId },
                         _ => unreachable!(),
                     };
                     quote! {
@@ -122,7 +124,8 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
                         }
                     }
                 }
-                "reshape" | "broadcast" | "reduce_max" | "reduce_sum" | "exp" | "shape" => {
+                "reshape" | "broadcast" | "reduce_max" | "reduce_sum" | "exp" | "shape"
+                | "load_tile_like_2d" => {
                     let op = match method_name.as_str() {
                         "reshape" => quote! { ::sile::hir::BuiltinOp::Reshape },
                         "broadcast" => quote! { ::sile::hir::BuiltinOp::Broadcast },
@@ -130,6 +133,7 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
                         "reduce_sum" => quote! { ::sile::hir::BuiltinOp::ReduceSum },
                         "exp" => quote! { ::sile::hir::BuiltinOp::Exp },
                         "shape" => quote! { ::sile::hir::BuiltinOp::ShapeOf },
+                        "load_tile_like_2d" => quote! { ::sile::hir::BuiltinOp::LoadTileLike2D },
                         _ => unreachable!(),
                     };
                     let all_args = [receiver_expr].into_iter().chain(args_exprs);

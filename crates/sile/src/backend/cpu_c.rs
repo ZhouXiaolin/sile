@@ -6,8 +6,7 @@ use tempfile::tempdir;
 use crate::{
     backend_ir::{self, ir::BackendOp},
     kernel::{KernelArg, LaunchConfig},
-    ssa,
-    Result, Stream,
+    ssa, Result, Stream,
 };
 
 type KernelFn1D = unsafe extern "C" fn(*const f32, *const f32, *mut f32, i64, i64);
@@ -30,9 +29,7 @@ impl CpuBackend {
         Err(crate::Error::UnsupportedBackend("no C compiler found"))
     }
 
-    fn compile_kernel_from_hir(
-        kernel: &crate::hir::Kernel,
-    ) -> Result<(String, BackendOp)> {
+    fn compile_kernel_from_hir(kernel: &crate::hir::Kernel) -> Result<(String, BackendOp)> {
         let typed = crate::typeck::check_kernel(kernel)
             .map_err(|err| crate::Error::Shape(err.to_string()))?;
         let ssa = crate::passes::canonicalize::run(ssa::lower_typed_kernel_to_ssa(&typed));

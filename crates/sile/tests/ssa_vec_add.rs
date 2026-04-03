@@ -21,7 +21,7 @@ fn vec_add_lowers_to_three_ssa_values_before_store() {
     let typed = check_kernel(&kernel).unwrap();
     let ssa = lower_typed_kernel_to_ssa(&typed);
 
-    assert_eq!(ssa.instructions.len(), 4);
+    assert_eq!(ssa.instructions.len(), 5);
     assert_eq!(ssa.instructions[0].opcode_name(), "program_id");
-    assert_eq!(ssa.instructions[3].opcode_name(), "store");
+    assert_eq!(ssa.instructions[4].opcode_name(), "store");
 }

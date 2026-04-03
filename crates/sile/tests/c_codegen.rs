@@ -1,4 +1,7 @@
-use sile::{backend_ir::ir::{BackendKernel, BackendOp}, codegen};
+use sile::{
+    backend_ir::ir::{BackendInstruction, BackendKernel, BackendOp},
+    codegen,
+};
 
 #[test]
 fn c_codegen_emits_vec_add_loop() {
@@ -6,6 +9,11 @@ fn c_codegen_emits_vec_add_loop() {
         op: BackendOp::VecAdd1D,
         tile_rank: 1,
         tile_shape_symbols: vec!["S".to_string()],
+        instructions: vec![BackendInstruction::Compute {
+            dest: "c".to_string(),
+            op: "add".to_string(),
+            args: vec!["a".to_string(), "b".to_string()],
+        }],
     };
 
     let c = codegen::c::generate(&kernel).unwrap();

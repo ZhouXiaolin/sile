@@ -39,9 +39,15 @@ impl<'a> KernelLauncher<'a> {
 
     pub fn apply(self, stream: &crate::Stream) -> Result<()> {
         let launch = LaunchConfig {
-            grid: self.grid.ok_or_else(|| crate::Error::Shape("grid not set".into()))?,
+            grid: self
+                .grid
+                .ok_or_else(|| crate::Error::Shape("grid not set".into()))?,
         };
-        crate::backend::for_device(stream.device())?
-            .launch_kernel(self.kernel, &self.args, &launch, stream)
+        crate::backend::for_device(stream.device())?.launch_kernel(
+            self.kernel,
+            &self.args,
+            &launch,
+            stream,
+        )
     }
 }

@@ -198,6 +198,7 @@ fn parse_expr(expr: &syn::Expr) -> syn::Result<KernelExpr> {
                 .collect::<syn::Result<Vec<_>>>()?;
             Ok(KernelExpr::Call { func, args })
         }
+        syn::Expr::Reference(reference) => parse_expr(&reference.expr),
         other => Err(syn::Error::new_spanned(
             other,
             "unsupported expression kind in kernel",
