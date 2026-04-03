@@ -1,8 +1,11 @@
 [package]
-name = "sile-lir"
+name = "sile-backend-cpu"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 sile-core = { path = "../sile-core" }
 sile-hir = { path = "../sile-hir" }
+sile-lir = { path = "../sile-lir" }
+libloading.workspace = true
+tempfile.workspace = true

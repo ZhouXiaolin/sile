@@ -1,8 +1,8 @@
-use crate::lir::ir::{Constant, Function, Value};
-use crate::scheduling::dependency::{
+use super::dependency::{
     analyze_memory_accesses, find_natural_loops, has_loop_carried_dependency, is_reduction_pattern,
-    LoopInfo, ReductionType,
+    ReductionType,
 };
+use sile_lir::ir::{Constant, Function, Value};
 
 #[derive(Debug, Clone)]
 pub struct ScheduleAnnotation {

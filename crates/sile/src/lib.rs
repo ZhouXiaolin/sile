@@ -1,34 +1,59 @@
-pub mod backend;
-pub mod codegen;
-pub mod device;
-pub mod error;
-pub mod hir;
-pub mod kernel;
-pub mod lir;
-pub mod passes;
-pub mod schedule;
-pub mod scheduling;
-#[deprecated = "use crate::hir::Kernel and compiler pipeline instead"]
-pub mod spec;
-pub mod ssa;
-pub mod stream;
-pub mod tensor;
-pub mod tile;
-pub mod typeck;
+pub use sile_core as core;
+pub use sile_hir as hir;
+pub use sile_macros::kernel;
 
-pub use device::Device;
-pub use error::{Error, Result};
-pub use hir::{
+pub use sile_core::{Device, Error, KernelArg, LaunchConfig, Result, Stream};
+pub use sile_hir::{
     BuiltinOp, ElemType, Expr, Kernel, Param, ParamKind, ShapeExpr, Stmt, Type, ValueCategory,
 };
-pub use kernel::{KernelArg, KernelLauncher, LaunchConfig};
-pub use sile_macros::kernel;
-pub use stream::Stream;
+
+pub mod tensor;
+pub mod tile;
+
 pub use tensor::Tensor;
 pub use tile::Tile;
 
-// Free functions for kernel context
-pub fn load_tile_like_2d(x: &Tensor<f32>, y: &Tensor<f32>) -> Tile<f32> {
+pub mod typeck {
+    pub use sile_hir::typeck::*;
+}
+pub mod ssa {
+    pub use sile_compiler::lower_hir::lower_typed_kernel_to_ssa;
+    pub use sile_compiler::mir::ir;
+}
+pub mod lir {
+    pub use sile_compiler::lower_lir::lower_ssa_to_lir;
+    pub use sile_lir::ir::*;
+}
+pub mod compiler {
+    pub use sile_compiler::compile;
+}
+pub mod passes {
+    pub use sile_compiler::passes::*;
+}
+pub mod codegen {
+    pub mod c {
+        pub use sile_backend_cpu::codegen_c::*;
+    }
+}
+pub mod scheduling {
+    pub use sile_backend_cpu::scheduling::*;
+}
+pub mod schedule {
+    pub fn require_divisible(total: i64, tile: i64) -> sile_core::Result<()> {
+        if total % tile == 0 {
+            Ok(())
+        } else {
+            Err(sile_core::Error::Shape(format!(
+                "shape {total} is not divisible by tile {tile}"
+            )))
+        }
+    }
+}
+
+pub mod kernel_launcher;
+pub use kernel_launcher::KernelLauncher;
+
+pub fn load_tile_like_2d(_x: &Tensor<f32>, y: &Tensor<f32>) -> Tile<f32> {
     Tile::new(y.shape().to_vec())
 }
 

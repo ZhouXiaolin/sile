@@ -1,4 +1,5 @@
-use crate::{Device, Error, Result};
+use crate::tile::Tile;
+use sile_core::{Device, Error, KernelArg, Result};
 
 #[derive(Debug)]
 pub struct Tensor<T> {
@@ -79,15 +80,15 @@ impl Tensor<f32> {
     pub fn as_mut_ptr(&mut self) -> *mut f32 {
         self.data.as_mut_ptr()
     }
-    pub fn to_vec(&self, _stream: &crate::Stream) -> Result<Vec<f32>> {
+    pub fn to_vec(&self, _stream: &sile_core::Stream) -> Result<Vec<f32>> {
         Ok(self.data.clone())
     }
     pub fn device(&self) -> &Device {
         &self.device
     }
 
-    pub fn as_kernel_arg(&self) -> crate::kernel::KernelArg<'_> {
-        crate::kernel::KernelArg {
+    pub fn as_kernel_arg(&self) -> KernelArg<'_> {
+        KernelArg {
             ptr: self.as_ptr(),
             mut_ptr: self.as_ptr() as *mut f32,
             shape: &self.shape,
@@ -95,8 +96,8 @@ impl Tensor<f32> {
         }
     }
 
-    pub fn as_kernel_arg_mut(&mut self) -> crate::kernel::KernelArg<'_> {
-        crate::kernel::KernelArg {
+    pub fn as_kernel_arg_mut(&mut self) -> KernelArg<'_> {
+        KernelArg {
             ptr: self.as_ptr(),
             mut_ptr: self.as_mut_ptr(),
             shape: &self.shape,
@@ -109,19 +110,19 @@ impl Tensor<f32> {
         &self,
         _tile_shape: [i64; N],
         _indices: [i64; M],
-    ) -> crate::Tile<f32> {
-        crate::Tile::new(_tile_shape.iter().copied().collect())
+    ) -> Tile<f32> {
+        Tile::new(_tile_shape.iter().copied().collect())
     }
 
     pub fn dim(&self, idx: usize) -> i64 {
         self.shape[idx]
     }
 
-    pub fn load_tile_like_2d(&self, _target: &Tensor<f32>) -> crate::Tile<f32> {
-        crate::Tile::new(_target.shape().to_vec())
+    pub fn load_tile_like_2d(&self, _target: &Tensor<f32>) -> Tile<f32> {
+        Tile::new(_target.shape().to_vec())
     }
 
-    pub fn store(&mut self, _value: crate::Tile<f32>) {
+    pub fn store(&mut self, _value: Tile<f32>) {
         // no-op in host context; handled by codegen
     }
 }

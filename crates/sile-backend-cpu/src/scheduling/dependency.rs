@@ -1,4 +1,4 @@
-use crate::lir::ir::{Function, Instruction, Terminator, Value};
+use sile_lir::ir::{Function, Instruction, Terminator, Value};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
