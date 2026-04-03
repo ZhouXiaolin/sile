@@ -164,13 +164,8 @@ fn parse_expr(expr: &syn::Expr) -> syn::Result<KernelExpr> {
         syn::Expr::Field(field) => {
             let target = parse_expr(&field.base)?;
             let field = match &field.member {
-                syn::Member::Named(ident) => ident.clone(),
-                syn::Member::Unnamed(_) => {
-                    return Err(syn::Error::new_spanned(
-                        &field.member,
-                        "expected named field",
-                    ))
-                }
+                syn::Member::Named(ident) => ident.to_string(),
+                syn::Member::Unnamed(index) => index.index.to_string(),
             };
             Ok(KernelExpr::FieldAccess {
                 target: Box::new(target),
@@ -178,18 +173,24 @@ fn parse_expr(expr: &syn::Expr) -> syn::Result<KernelExpr> {
             })
         }
         syn::Expr::Call(call) => {
-            let func =
-                match call.func.as_ref() {
-                    syn::Expr::Path(path) => path.path.get_ident().cloned().ok_or_else(|| {
-                        syn::Error::new_spanned(&call.func, "expected function name")
-                    })?,
-                    _ => {
-                        return Err(syn::Error::new_spanned(
-                            &call.func,
-                            "expected simple function call",
-                        ))
-                    }
-                };
+            let func = match call.func.as_ref() {
+                syn::Expr::Path(path) => {
+                    // Handle both simple idents and qualified paths like `sile::tile::id`
+                    path.path
+                        .segments
+                        .last()
+                        .map(|seg| seg.ident.clone())
+                        .ok_or_else(|| {
+                            syn::Error::new_spanned(&call.func, "expected function name")
+                        })?
+                }
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        &call.func,
+                        "expected simple function call",
+                    ))
+                }
+            };
             let args = call
                 .args
                 .iter()
