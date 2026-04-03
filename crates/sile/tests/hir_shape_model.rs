@@ -30,10 +30,18 @@ fn kernel_model_distinguishes_tensor_and_tile_values() {
         ),
     );
 
-    let kernel = Kernel::new("demo", vec!["BM".into(), "BN".into()], vec![input, output], vec![]);
+    let kernel = Kernel::new(
+        "demo",
+        vec![("BM".into(), 0), ("BN".into(), 0)],
+        vec![input, output],
+        vec![],
+    );
 
     assert_eq!(kernel.name, "demo");
-    assert_eq!(kernel.const_params, vec!["BM", "BN"]);
+    assert_eq!(
+        kernel.const_params,
+        vec![("BM".to_string(), 0), ("BN".to_string(), 0)]
+    );
     assert_eq!(kernel.params[0].ty.category(), ValueCategory::Tensor);
     assert_eq!(
         Type::tile(ElemType::F32, ShapeExpr::tuple([ShapeExpr::symbol("BM")])).category(),

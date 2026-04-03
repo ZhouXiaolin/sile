@@ -1,31 +1,33 @@
 use std::collections::HashMap;
 
 use crate::lir::builder::LirBuilder;
-use crate::lir::ir::{Function, Param, Type, Value};
+use crate::lir::ir::{Constant, Function, Instruction, Param, Type, Value};
 use crate::ssa::ir::{SsaInstruction, SsaOpcode, SsaProgram, SsaValue};
 use crate::typeck::TypedKernel;
 
-/// Lower SSA to LIR producing a flat body of per-element operations.
-/// No explicit loop control flow is generated — the loop structure comes
-/// from the C codegen's OpenMP wrapper.
 pub fn lower_ssa_to_lir(ssa: &SsaProgram, typed: &TypedKernel) -> Function {
     let params = lower_kernel_params(typed);
     let mut builder = LirBuilder::new(&typed.kernel.name, params, Type::Void);
 
     let mut value_map: HashMap<usize, Value> = HashMap::new();
-    let param_names: Vec<String> = typed.kernel.params.iter().map(|p| p.name.clone()).collect();
+    let mut opcode_map: HashMap<usize, SsaOpcode> = HashMap::new();
+    let mut tile_shapes: HashMap<usize, Vec<i64>> = HashMap::new();
 
-    // Map SSA params to LIR params
     for (i, _) in typed.kernel.params.iter().enumerate() {
         value_map.insert(i, Value::Param(i));
     }
 
-    // Single flat body block
     let body = builder.append_block("body");
     builder.switch_to_block(&body);
 
     for inst in &ssa.instructions {
-        lower_ssa_instruction(inst, &mut builder, &mut value_map, &param_names);
+        lower_ssa_instruction(
+            inst,
+            &mut builder,
+            &mut value_map,
+            &mut opcode_map,
+            &mut tile_shapes,
+        );
     }
 
     builder.ret(None);
@@ -36,93 +38,207 @@ fn lower_ssa_instruction(
     inst: &SsaInstruction,
     builder: &mut LirBuilder,
     value_map: &mut HashMap<usize, Value>,
-    param_names: &[String],
+    opcode_map: &mut HashMap<usize, SsaOpcode>,
+    tile_shapes: &mut HashMap<usize, Vec<i64>>,
 ) {
     let def_idx = get_def_index(&inst.def);
-
-    let lir_inst = match inst.opcode {
-        // ProgramId is handled by the C codegen's OpenMP loop (variable `i`).
-        // Don't emit any LIR instruction.
-        SsaOpcode::ProgramId => return,
-
-        SsaOpcode::LoadTile | SsaOpcode::LoadTileLike2D => {
-            let base_param = if inst.uses.is_empty() {
-                0
+    let lowered = match inst.opcode {
+        SsaOpcode::ProgramId => Some(builder.const_int(0)),
+        SsaOpcode::ShapeDim => {
+            let dim = inst.immediates.first().copied().unwrap_or(0);
+            if inst
+                .uses
+                .first()
+                .and_then(|value| match value {
+                    SsaValue::Local(idx) => opcode_map.get(idx),
+                    _ => None,
+                })
+                == Some(&SsaOpcode::ProgramId)
+            {
+                Some(builder.get_tile_coord(dim))
             } else {
-                get_param_index(&inst.uses[0], value_map, param_names)
-            };
-            // Direct element load: buffer[i]
-            builder.load(Value::Param(base_param), Type::f32())
-        }
-
-        SsaOpcode::Add => {
-            let lhs = resolve_value(&inst.uses[0], value_map);
-            let rhs = resolve_value(&inst.uses[1], value_map);
-            builder.add(lhs, rhs)
-        }
-        SsaOpcode::Sub => {
-            let lhs = resolve_value(&inst.uses[0], value_map);
-            let rhs = resolve_value(&inst.uses[1], value_map);
-            builder.sub(lhs, rhs)
-        }
-        SsaOpcode::Mul => {
-            let lhs = resolve_value(&inst.uses[0], value_map);
-            let rhs = resolve_value(&inst.uses[1], value_map);
-            builder.mul(lhs, rhs)
-        }
-        SsaOpcode::Div => {
-            let lhs = resolve_value(&inst.uses[0], value_map);
-            let rhs = resolve_value(&inst.uses[1], value_map);
-            builder.push_instruction(crate::lir::ir::Instruction::Div(lhs, rhs))
-        }
-        SsaOpcode::Exp => {
-            let val = resolve_value(&inst.uses[0], value_map);
-            builder.exp(val)
-        }
-        SsaOpcode::ReduceMax | SsaOpcode::ReduceSum => {
-            // Reductions need special handling in a later pass.
-            // For now, passthrough the source operand.
-            let src = if inst.uses.is_empty() {
-                Value::Param(0)
-            } else {
-                resolve_value(&inst.uses[0], value_map)
-            };
-            src
-        }
-        SsaOpcode::Store => {
-            let val = if inst.uses.is_empty() {
-                Value::Param(0)
-            } else {
-                resolve_value(&inst.uses[0], value_map)
-            };
-            let out_idx = find_output_param(param_names);
-            builder.store(Value::Param(out_idx), val);
-            return; // store doesn't produce a value
-        }
-        SsaOpcode::Mma => {
-            let a = resolve_value(&inst.uses[0], value_map);
-            let b = resolve_value(&inst.uses[1], value_map);
-            builder.mul(a, b)
-        }
-        SsaOpcode::Constant => {
-            let val = inst.immediates.first().copied().unwrap_or(0);
-            builder.const_float(val as f64)
-        }
-        SsaOpcode::Reshape
-        | SsaOpcode::Broadcast
-        | SsaOpcode::ShapeOf
-        | SsaOpcode::ScalarDiv
-        | SsaOpcode::ShapeDim => {
-            // Passthrough first operand
-            if inst.uses.is_empty() {
-                builder.const_int(0)
-            } else {
-                resolve_value(&inst.uses[0], value_map)
+                Some(Value::ShapeDim(dim as usize))
             }
         }
+        SsaOpcode::LoadTile | SsaOpcode::LoadTileLike2D => {
+            let rank = inst.immediates.first().copied().unwrap_or(1);
+            if rank == 2 && inst.uses.len() >= 3 {
+                let rows = inst.immediates.get(1).copied().unwrap_or(1);
+                let cols = inst.immediates.get(2).copied().unwrap_or(1);
+                let stride_shape_idx = inst.immediates.get(3).copied().unwrap_or(1) as usize;
+                let buf = resolve_value(&inst.uses[0], value_map);
+                let row_tile = resolve_value(&inst.uses[1], value_map);
+                let col_tile = resolve_value(&inst.uses[2], value_map);
+                Some(builder.tile_load_2d(
+                    buf,
+                    rows,
+                    cols,
+                    row_tile,
+                    col_tile,
+                    stride_shape_idx,
+                ))
+            } else {
+                let ptr = resolve_value(&inst.uses[0], value_map);
+                Some(builder.load(ptr, Type::f32()))
+            }
+        }
+        SsaOpcode::Add => Some(builder.add(
+            resolve_value(&inst.uses[0], value_map),
+            resolve_value(&inst.uses[1], value_map),
+        )),
+        SsaOpcode::Sub => Some(builder.sub(
+            resolve_value(&inst.uses[0], value_map),
+            resolve_value(&inst.uses[1], value_map),
+        )),
+        SsaOpcode::Mul => Some(builder.mul(
+            resolve_value(&inst.uses[0], value_map),
+            resolve_value(&inst.uses[1], value_map),
+        )),
+        SsaOpcode::Div => Some(builder.push_instruction(Instruction::Div(
+            resolve_value(&inst.uses[0], value_map),
+            resolve_value(&inst.uses[1], value_map),
+        ))),
+        SsaOpcode::Exp => Some(builder.exp(resolve_value(&inst.uses[0], value_map))),
+        SsaOpcode::ReduceMax | SsaOpcode::ReduceSum => {
+            let source = inst
+                .uses
+                .first()
+                .map(|value| resolve_value(value, value_map))
+                .unwrap_or_else(|| builder.const_int(0));
+            let source_shape = inst
+                .uses
+                .first()
+                .and_then(|value| get_value_shape(value, tile_shapes));
+            if let Some(shape) = source_shape {
+                let rows = shape.first().copied().unwrap_or(1);
+                let cols = shape.get(1).copied().unwrap_or(1);
+                let axis = inst.immediates.first().copied().unwrap_or(0);
+                let value = match inst.opcode {
+                    SsaOpcode::ReduceMax => builder.tile_reduce_max(source, axis, rows, cols),
+                    SsaOpcode::ReduceSum => builder.tile_reduce_sum(source, axis, rows, cols),
+                    _ => unreachable!(),
+                };
+                tile_shapes.insert(def_idx, vec![rows, 1]);
+                Some(value)
+            } else {
+                Some(source)
+            }
+        }
+        SsaOpcode::Store => {
+            let output = resolve_value(&inst.uses[0], value_map);
+            let value = resolve_value(&inst.uses[1], value_map);
+            let rank = inst.immediates.first().copied().unwrap_or(1);
+            if rank == 2 && inst.uses.len() >= 4 {
+                let rows = inst.immediates.get(1).copied().unwrap_or(1);
+                let cols = inst.immediates.get(2).copied().unwrap_or(1);
+                let stride_shape_idx = inst.immediates.get(3).copied().unwrap_or(1) as usize;
+                let row_tile = resolve_value(&inst.uses[2], value_map);
+                let col_tile = resolve_value(&inst.uses[3], value_map);
+                builder.tile_store_2d(
+                    output,
+                    value,
+                    rows,
+                    cols,
+                    row_tile,
+                    col_tile,
+                    stride_shape_idx,
+                );
+            } else {
+                builder.store(output, value);
+            }
+            None
+        }
+        SsaOpcode::Mma => {
+            if inst.immediates.len() >= 3 {
+                Some(builder.tile_mma(
+                    resolve_value(&inst.uses[0], value_map),
+                    resolve_value(&inst.uses[1], value_map),
+                    resolve_value(&inst.uses[2], value_map),
+                    inst.immediates[0],
+                    inst.immediates[1],
+                    inst.immediates[2],
+                ))
+            } else {
+                Some(builder.mul(
+                    resolve_value(&inst.uses[0], value_map),
+                    resolve_value(&inst.uses[1], value_map),
+                ))
+            }
+        }
+        SsaOpcode::Constant => {
+            if inst.immediates.len() >= 3 {
+                let init = f32::from_bits(inst.immediates[0] as u32) as f64;
+                Some(builder.tile_alloc(
+                    inst.immediates[1],
+                    inst.immediates[2],
+                    init,
+                ))
+            } else {
+                let value = inst.immediates.first().copied().unwrap_or(0);
+                Some(builder.const_float(f32::from_bits(value as u32) as f64))
+            }
+        }
+        SsaOpcode::Reshape => {
+            let value = inst
+                .uses
+                .first()
+                .map(|value| resolve_value(value, value_map))
+                .unwrap_or_else(|| builder.const_int(0));
+            if !inst.immediates.is_empty() {
+                tile_shapes.insert(def_idx, normalize_shape(&inst.immediates));
+            }
+            Some(value)
+        }
+        SsaOpcode::Broadcast => {
+            let value = inst
+                .uses
+                .first()
+                .map(|value| resolve_value(value, value_map))
+                .unwrap_or_else(|| builder.const_int(0));
+            if inst.immediates.len() >= 2 {
+                let rows = inst.immediates[0];
+                let cols = inst.immediates[1];
+                tile_shapes.insert(def_idx, vec![rows, cols]);
+                Some(builder.tile_broadcast(value, rows, cols))
+            } else {
+                Some(value)
+            }
+        }
+        SsaOpcode::ShapeOf | SsaOpcode::ScalarDiv => inst
+            .uses
+            .first()
+            .map(|value| resolve_value(value, value_map))
+            .or_else(|| Some(builder.const_int(0))),
     };
 
-    value_map.insert(def_idx, lir_inst);
+    if let Some(value) = lowered {
+        value_map.insert(def_idx, value);
+    }
+    match inst.opcode {
+        SsaOpcode::LoadTile | SsaOpcode::LoadTileLike2D | SsaOpcode::Constant => {
+            if inst.immediates.len() >= 3 && inst.immediates[0] == 2 {
+                tile_shapes.insert(def_idx, vec![inst.immediates[1], inst.immediates[2]]);
+            } else if inst.immediates.len() >= 2 && matches!(inst.opcode, SsaOpcode::Constant) {
+                tile_shapes.insert(def_idx, vec![inst.immediates[1]]);
+            }
+        }
+        SsaOpcode::Mma => {
+            if inst.immediates.len() >= 2 {
+                tile_shapes.insert(def_idx, vec![inst.immediates[0], inst.immediates[1]]);
+            }
+        }
+        SsaOpcode::Add | SsaOpcode::Sub | SsaOpcode::Mul | SsaOpcode::Div | SsaOpcode::Exp => {
+            if let Some(shape) = inst
+                .uses
+                .iter()
+                .find_map(|value| get_value_shape(value, tile_shapes))
+            {
+                tile_shapes.insert(def_idx, shape);
+            }
+        }
+        _ => {}
+    }
+    opcode_map.insert(def_idx, inst.opcode.clone());
 }
 
 fn resolve_value(v: &SsaValue, value_map: &HashMap<usize, Value>) -> Value {
@@ -131,43 +247,17 @@ fn resolve_value(v: &SsaValue, value_map: &HashMap<usize, Value>) -> Value {
         SsaValue::Local(i) => value_map
             .get(i)
             .cloned()
-            .unwrap_or(Value::Const(crate::lir::ir::Constant::Int(0))),
-        SsaValue::Const(c) => Value::Const(crate::lir::ir::Constant::Int(*c)),
+            .unwrap_or(Value::Const(Constant::Int(0))),
+        SsaValue::Const(c) => Value::Const(Constant::Int(*c)),
     }
 }
 
 fn get_def_index(def: &SsaValue) -> usize {
     match def {
         SsaValue::Local(i) => *i,
-        _ => 0,
-    }
-}
-
-fn get_param_index(
-    v: &SsaValue,
-    value_map: &HashMap<usize, Value>,
-    _param_names: &[String],
-) -> usize {
-    match v {
         SsaValue::Param(i) => *i,
-        SsaValue::Local(i) => value_map
-            .get(i)
-            .and_then(|val| match val {
-                Value::Param(p) => Some(*p),
-                _ => None,
-            })
-            .unwrap_or(0),
-        _ => 0,
+        SsaValue::Const(_) => 0,
     }
-}
-
-/// Find the index of the output parameter by checking param kinds.
-fn find_output_param(param_names: &[String]) -> usize {
-    // First try to find by convention name
-    param_names
-        .iter()
-        .position(|n| n == "c" || n == "y" || n == "out")
-        .unwrap_or(2)
 }
 
 fn lower_kernel_params(typed: &TypedKernel) -> Vec<Param> {
@@ -175,9 +265,23 @@ fn lower_kernel_params(typed: &TypedKernel) -> Vec<Param> {
         .kernel
         .params
         .iter()
-        .map(|p| Param {
-            name: p.name.clone(),
+        .map(|param| Param {
+            name: param.name.clone(),
             ty: Type::ptr(Type::f32()),
         })
         .collect()
+}
+
+fn get_value_shape(value: &SsaValue, tile_shapes: &HashMap<usize, Vec<i64>>) -> Option<Vec<i64>> {
+    match value {
+        SsaValue::Local(idx) => tile_shapes.get(idx).cloned(),
+        _ => None,
+    }
+}
+
+fn normalize_shape(dims: &[i64]) -> Vec<i64> {
+    match dims {
+        [dim] => vec![*dim, 1],
+        values => values.to_vec(),
+    }
 }

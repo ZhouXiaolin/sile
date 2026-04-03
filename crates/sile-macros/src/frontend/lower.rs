@@ -1,9 +1,10 @@
 use quote::quote;
 
-use super::ast::{BinOpKind, KernelDecl, KernelExpr, KernelStmt};
+use super::ast::{BinOpKind, KernelDecl, KernelExpr, KernelShapeDim, KernelStmt};
 
 pub fn lower_kernel_to_hir(decl: &KernelDecl) -> proc_macro2::TokenStream {
     let name = decl.name.to_string();
+    let const_params: Vec<String> = decl.const_params.iter().map(|p| p.to_string()).collect();
     let params = decl.params.iter().map(|param| {
         let name = param.name.to_string();
         let kind = if param.is_mut {
@@ -14,11 +15,14 @@ pub fn lower_kernel_to_hir(decl: &KernelDecl) -> proc_macro2::TokenStream {
         let shape = if let Some(dims) = &param.shape {
             let dim_exprs: Vec<_> = dims
                 .iter()
-                .map(|d| {
-                    if *d == -1 {
-                        quote! { ::sile::hir::ShapeExpr::dynamic() }
-                    } else {
-                        quote! { ::sile::hir::ShapeExpr::constant(#d as i64) }
+                .map(|d| match d {
+                    KernelShapeDim::Dynamic => quote! { ::sile::hir::ShapeExpr::dynamic() },
+                    KernelShapeDim::Constant(value) => {
+                        quote! { ::sile::hir::ShapeExpr::constant(#value as i64) }
+                    }
+                    KernelShapeDim::Symbol(ident) => {
+                        let name = ident.to_string();
+                        quote! { ::sile::hir::ShapeExpr::symbol(#name) }
                     }
                 })
                 .collect();
@@ -39,22 +43,34 @@ pub fn lower_kernel_to_hir(decl: &KernelDecl) -> proc_macro2::TokenStream {
             )
         }
     });
-    let body = decl.body.iter().map(|stmt| lower_stmt(stmt));
+    let body = decl
+        .body
+        .iter()
+        .map(|stmt| lower_stmt(stmt, &decl.const_params));
+    let const_params_exprs: Vec<_> = decl
+        .const_params
+        .iter()
+        .map(|p| {
+            let name = p.to_string();
+            let ident = p;
+            quote! { (#name.to_string(), #ident as i64) }
+        })
+        .collect();
     quote! {
         ::sile::hir::Kernel::new(
             #name,
-            vec![],
+            vec![#(#const_params_exprs),*],
             vec![#(#params),*],
             vec![#(#body),*],
         )
     }
 }
 
-fn lower_stmt(stmt: &KernelStmt) -> proc_macro2::TokenStream {
+fn lower_stmt(stmt: &KernelStmt, const_params: &[syn::Ident]) -> proc_macro2::TokenStream {
     match stmt {
         KernelStmt::Let { name, expr } => {
             let name = name.to_string();
-            let expr = lower_expr(expr);
+            let expr = lower_expr(expr, const_params);
             quote! {
                 ::sile::hir::Stmt::Let {
                     name: #name.to_string(),
@@ -63,9 +79,19 @@ fn lower_stmt(stmt: &KernelStmt) -> proc_macro2::TokenStream {
                 }
             }
         }
+        KernelStmt::Assign { name, expr } => {
+            let name = name.to_string();
+            let expr = lower_expr(expr, const_params);
+            quote! {
+                ::sile::hir::Stmt::Assign {
+                    name: #name.to_string(),
+                    expr: #expr,
+                }
+            }
+        }
         KernelStmt::Store { target, value } => {
             let target = target.to_string();
-            let value = lower_expr(value);
+            let value = lower_expr(value, const_params);
             quote! {
                 ::sile::hir::Stmt::Store {
                     target: #target.to_string(),
@@ -80,9 +106,9 @@ fn lower_stmt(stmt: &KernelStmt) -> proc_macro2::TokenStream {
             body,
         } => {
             let var_name = var.to_string();
-            let start_val = lower_expr(start);
-            let end_val = lower_expr(end);
-            let body_stmts: Vec<_> = body.iter().map(|s| lower_stmt(s)).collect();
+            let start_val = lower_expr(start, const_params);
+            let end_val = lower_expr(end, const_params);
+            let body_stmts: Vec<_> = body.iter().map(|s| lower_stmt(s, const_params)).collect();
             quote! {
                 ::sile::hir::Stmt::ForLoop {
                     var: #var_name.to_string(),
@@ -95,10 +121,11 @@ fn lower_stmt(stmt: &KernelStmt) -> proc_macro2::TokenStream {
     }
 }
 
-fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
+fn lower_expr(expr: &KernelExpr, const_params: &[syn::Ident]) -> proc_macro2::TokenStream {
     match expr {
         KernelExpr::Var(ident) => {
             let name = ident.to_string();
+            // Leave as Var - will be resolved in SSA lowering using const_values map
             quote! { ::sile::hir::Expr::Var(#name.to_string()) }
         }
         KernelExpr::Lit(lit) => {
@@ -111,7 +138,7 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
         }
         KernelExpr::Call { func, args } => {
             let func_name = func.to_string();
-            let args_exprs: Vec<_> = args.iter().map(lower_expr).collect();
+            let args_exprs: Vec<_> = args.iter().map(|a| lower_expr(a, const_params)).collect();
             match func_name.as_str() {
                 "load_tile_like_2d" => {
                     let all_args = args_exprs;
@@ -140,22 +167,18 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
                         }
                     }
                 }
-                "reduce_max" | "reduce_sum" | "reshape" | "broadcast" | "exp" | "shape_of"
-                | "id" => {
+                "reduce_max" | "reduce_sum" | "exp" => {
                     let op = match func_name.as_str() {
                         "reduce_max" => quote! { ::sile::hir::BuiltinOp::ReduceMax },
                         "reduce_sum" => quote! { ::sile::hir::BuiltinOp::ReduceSum },
-                        "reshape" => quote! { ::sile::hir::BuiltinOp::Reshape },
-                        "broadcast" => quote! { ::sile::hir::BuiltinOp::Broadcast },
                         "exp" => quote! { ::sile::hir::BuiltinOp::Exp },
-                        "shape_of" => quote! { ::sile::hir::BuiltinOp::ShapeOf },
-                        "id" => quote! { ::sile::hir::BuiltinOp::ProgramId },
                         _ => unreachable!(),
                     };
+                    let all_args = args_exprs;
                     quote! {
                         ::sile::hir::Expr::Builtin {
                             op: #op,
-                            args: vec![#(#args_exprs),*],
+                            args: vec![#(#all_args),*],
                         }
                     }
                 }
@@ -170,8 +193,8 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
             args,
         } => {
             let method_name = method.to_string();
-            let receiver_expr = lower_expr(receiver);
-            let args_exprs: Vec<_> = args.iter().map(lower_expr).collect();
+            let receiver_expr = lower_expr(receiver, const_params);
+            let args_exprs: Vec<_> = args.iter().map(|a| lower_expr(a, const_params)).collect();
             match method_name.as_str() {
                 "load_tile" => {
                     let all_args = [receiver_expr].into_iter().chain(args_exprs);
@@ -210,14 +233,18 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
                         }
                     }
                 }
+                "clone" => {
+                    // .clone() on a Tile is just a passthrough - return the receiver
+                    receiver_expr
+                }
                 _ => {
                     quote! { ::sile::hir::Expr::Var(#method_name.to_string()) }
                 }
             }
         }
         KernelExpr::BinaryOp { left, op, right } => {
-            let left_expr = lower_expr(left);
-            let right_expr = lower_expr(right);
+            let left_expr = lower_expr(left, const_params);
+            let right_expr = lower_expr(right, const_params);
             let hir_op = match op {
                 BinOpKind::Add => quote! { ::sile::hir::BuiltinOp::Add },
                 BinOpKind::Sub => quote! { ::sile::hir::BuiltinOp::Sub },
@@ -265,7 +292,7 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
             {
                 if method.to_string() == "shape" {
                     let dim_idx: i64 = field.parse().unwrap_or(0);
-                    let receiver_lowered = lower_expr(receiver);
+                    let receiver_lowered = lower_expr(receiver, const_params);
                     return quote! {
                         ::sile::hir::Expr::Builtin {
                             op: ::sile::hir::BuiltinOp::ShapeDim,
@@ -294,7 +321,7 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
             }
             // Fallback: just pass through for .0, otherwise Var
             if field == "0" {
-                lower_expr(target)
+                lower_expr(target, const_params)
             } else {
                 let field_name = field.to_string();
                 quote! { ::sile::hir::Expr::Var(#field_name.to_string()) }
@@ -317,7 +344,7 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
                                     args: vec![
                                         ::sile::hir::Expr::Builtin {
                                             op: ::sile::hir::BuiltinOp::ShapeOf,
-                                            args: vec![#(lower_expr(receiver))],
+                                            args: vec![#(lower_expr(receiver, const_params))],
                                         },
                                         ::sile::hir::Expr::Var(#name.to_string()),
                                     ],
@@ -326,7 +353,7 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
                         }
                         _ => 0,
                     };
-                    let receiver_lowered = lower_expr(receiver);
+                    let receiver_lowered = lower_expr(receiver, const_params);
                     return quote! {
                         ::sile::hir::Expr::Builtin {
                             op: ::sile::hir::BuiltinOp::ShapeDim,
@@ -336,8 +363,8 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
                 }
             }
             // Fallback: just lower both sides
-            let target_lowered = lower_expr(target);
-            let index_lowered = lower_expr(index);
+            let target_lowered = lower_expr(target, const_params);
+            let index_lowered = lower_expr(index, const_params);
             quote! { ::sile::hir::Expr::Var("idx".to_string()) }
         }
     }

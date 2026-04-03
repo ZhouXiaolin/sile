@@ -100,6 +100,12 @@ fn rewrite_expr(expr: &syn::Expr) -> syn::Expr {
             args: call.args.iter().map(rewrite_expr).collect(),
             ..call.clone()
         }),
+        syn::Expr::Assign(assign) => syn::Expr::Assign(syn::ExprAssign {
+            left: Box::new(rewrite_expr(&assign.left)),
+            eq_token: assign.eq_token,
+            right: Box::new(rewrite_expr(&assign.right)),
+            attrs: assign.attrs.clone(),
+        }),
         syn::Expr::Reference(reference) => syn::Expr::Reference(syn::ExprReference {
             expr: Box::new(rewrite_expr(&reference.expr)),
             ..reference.clone()
@@ -248,6 +254,7 @@ pub fn kernel(_attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
+    // Build const params for function signature
     let const_generics: Vec<_> = input
         .sig
         .generics

@@ -5,6 +5,7 @@ use tempfile::tempdir;
 
 use crate::{
     codegen::c::{BufferKind, KernelGenInfo},
+    hir::Type,
     kernel::{KernelArg, LaunchConfig},
     lir, Result, Stream,
 };
@@ -57,7 +58,34 @@ impl CpuBackend {
                     crate::hir::ParamKind::Output => BufferKind::Output,
                 })
                 .collect(),
-            num_shapes: 1,
+            num_shapes: kernel
+                .params
+                .iter()
+                .map(|param| match &param.ty {
+                    Type::Tensor { shape, .. } | Type::Tile { shape, .. } => shape.rank(),
+                    Type::Shape | Type::Scalar(_) => 0,
+                })
+                .sum(),
+            param_ranks: kernel
+                .params
+                .iter()
+                .map(|param| match &param.ty {
+                    Type::Tensor { shape, .. } | Type::Tile { shape, .. } => shape.rank(),
+                    Type::Shape | Type::Scalar(_) => 0,
+                })
+                .collect(),
+            shape_offsets: {
+                let mut offsets = Vec::with_capacity(kernel.params.len());
+                let mut next = 0usize;
+                for param in &kernel.params {
+                    offsets.push(next);
+                    next += match &param.ty {
+                        Type::Tensor { shape, .. } | Type::Tile { shape, .. } => shape.rank(),
+                        Type::Shape | Type::Scalar(_) => 0,
+                    };
+                }
+                offsets
+            },
         };
 
         let code = crate::codegen::c::generate(&lir_func, &info)?;

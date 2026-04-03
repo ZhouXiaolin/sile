@@ -38,7 +38,7 @@ pub struct Param {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Kernel {
     pub name: String,
-    pub const_params: Vec<String>,
+    pub const_params: Vec<(String, i64)>,
     pub params: Vec<Param>,
     pub body: Vec<Stmt>,
 }
@@ -48,6 +48,10 @@ pub enum Stmt {
     Let {
         name: String,
         ty: Option<Type>,
+        expr: Expr,
+    },
+    Assign {
+        name: String,
         expr: Expr,
     },
     Store {
@@ -84,7 +88,7 @@ impl Param {
 impl Kernel {
     pub fn new(
         name: impl Into<String>,
-        const_params: Vec<String>,
+        const_params: Vec<(String, i64)>,
         params: Vec<Param>,
         body: Vec<Stmt>,
     ) -> Self {

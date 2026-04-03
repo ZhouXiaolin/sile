@@ -25,9 +25,11 @@ fn c_codegen_emits_vec_add_with_openmp() {
             })
             .collect(),
         num_shapes: 1,
+        param_ranks: vec![1, 1, 1],
+        shape_offsets: vec![0, 1, 2],
     };
 
-    let c = sile::codegen::c::generate(&lir_func, &annotations, &info).unwrap();
+    let c = sile::codegen::c::generate(&lir_func, &info).unwrap();
 
     assert!(c.contains("void sile_kernel_vec_add"));
     assert!(c.contains("#include <omp.h>"));

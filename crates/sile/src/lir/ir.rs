@@ -1,10 +1,9 @@
-use std::collections::HashMap;
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Param(usize),
     Const(Constant),
     Inst(usize),
+    ShapeDim(usize),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -107,6 +106,56 @@ pub enum Instruction {
         func: String,
         args: Vec<Value>,
         ret_ty: Type,
+    },
+    GetTileCoord {
+        dim: i64,
+    },
+    TileAlloc {
+        rows: i64,
+        cols: i64,
+        init: f64,
+    },
+    TileLoad2D {
+        buf: Value,
+        rows: i64,
+        cols: i64,
+        row_tile: Value,
+        col_tile: Value,
+        stride_shape_idx: usize,
+    },
+    TileMma {
+        a: Value,
+        b: Value,
+        acc: Value,
+        tile_m: i64,
+        tile_n: i64,
+        tile_k: i64,
+    },
+    TileReduceMax {
+        value: Value,
+        axis: i64,
+        rows: i64,
+        cols: i64,
+    },
+    TileReduceSum {
+        value: Value,
+        axis: i64,
+        rows: i64,
+        cols: i64,
+    },
+    TileBroadcast {
+        value: Value,
+        rows: i64,
+        cols: i64,
+    },
+    TileStore2D {
+        buf: Value,
+        value: Value,
+        rows: i64,
+        cols: i64,
+        row_tile: Value,
+        col_tile: Value,
+        stride_shape_idx: usize,
     },
 }
 
