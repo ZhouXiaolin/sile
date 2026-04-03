@@ -1,0 +1,7 @@
+[package]
+name = "sile-hir"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sile-core = { path = "../sile-core" }
