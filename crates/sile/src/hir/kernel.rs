@@ -88,10 +88,7 @@ impl Kernel {
 
 impl Expr {
     pub fn builtin(op: BuiltinOp) -> Self {
-        Self::Builtin {
-            op,
-            args: vec![],
-        }
+        Self::Builtin { op, args: vec![] }
     }
 
     pub fn kind_name(&self) -> &'static str {
