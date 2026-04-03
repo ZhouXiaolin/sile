@@ -29,7 +29,7 @@ fn infer_expr(expr: &Expr, _locals: &BTreeMap<String, Type>) -> Result<Type, err
         Expr::Builtin { op, args } => infer_builtin(*op, args),
         Expr::Var(_) => Ok(Type::Shape),
         Expr::Shape(_) => Ok(Type::Shape),
-        Expr::ScalarI32(_) => Ok(Type::Scalar(crate::hir::ElemType::F32)),
+        Expr::ScalarI64(_) => Ok(Type::Scalar(crate::hir::ElemType::F32)),
         Expr::ScalarF32(_) => Ok(Type::Scalar(crate::hir::ElemType::F32)),
     }
 }

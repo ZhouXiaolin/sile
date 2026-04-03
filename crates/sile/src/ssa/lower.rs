@@ -9,6 +9,10 @@ pub fn lower_typed_kernel_to_ssa(typed: &TypedKernel) -> SsaProgram {
     let mut instructions = Vec::new();
     let mut next_local = 0usize;
 
+    for (i, param) in typed.kernel.params.iter().enumerate() {
+        locals.insert(param.name.clone(), SsaValue::Param(i));
+    }
+
     for stmt in &typed.kernel.body {
         match stmt {
             Stmt::Let { name, expr, .. } => {
@@ -90,7 +94,7 @@ fn lower_expr(
 ) -> SsaValue {
     match expr {
         Expr::Var(name) => locals.get(name).cloned().unwrap_or(SsaValue::Const(0)),
-        Expr::ScalarI32(v) => SsaValue::Const(*v as i64),
+        Expr::ScalarI64(v) => SsaValue::Const(*v),
         Expr::ScalarF32(v) => SsaValue::Const((*v).to_bits() as i64),
         Expr::Shape(_) => SsaValue::Const(0),
         Expr::Builtin { op, args } => {

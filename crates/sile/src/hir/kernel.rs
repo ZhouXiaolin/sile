@@ -66,7 +66,7 @@ pub enum Stmt {
 pub enum Expr {
     Var(String),
     Shape(ShapeExpr),
-    ScalarI32(i32),
+    ScalarI64(i64),
     ScalarF32(f32),
     Builtin { op: BuiltinOp, args: Vec<Expr> },
 }
@@ -107,7 +107,7 @@ impl Expr {
             Self::Builtin { .. } => "builtin",
             Self::Var(_) => "var",
             Self::Shape(_) => "shape",
-            Self::ScalarI32(_) => "scalar",
+            Self::ScalarI64(_) => "scalar",
             Self::ScalarF32(_) => "scalar_f32",
         }
     }

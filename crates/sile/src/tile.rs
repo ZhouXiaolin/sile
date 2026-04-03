@@ -25,11 +25,11 @@ impl<T> Tile<T> {
         &self.shape
     }
 
-    pub fn reduce_max(&self, _axis: i32) -> Tile<T> {
+    pub fn reduce_max(&self, _axis: i64) -> Tile<T> {
         Tile::new(vec![self.shape[0]])
     }
 
-    pub fn reduce_sum(&self, _axis: i32) -> Tile<T> {
+    pub fn reduce_sum(&self, _axis: i64) -> Tile<T> {
         Tile::new(vec![self.shape[0]])
     }
 
