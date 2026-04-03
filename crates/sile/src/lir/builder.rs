@@ -38,7 +38,7 @@ impl LirBuilder {
         self.current_block.as_deref().unwrap_or("")
     }
 
-    fn push_instruction(&mut self, inst: Instruction) -> Value {
+    pub fn push_instruction(&mut self, inst: Instruction) -> Value {
         let val = Value::Inst(self.next_inst);
         self.next_inst += 1;
         if let Some(label) = &self.current_block {

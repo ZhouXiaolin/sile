@@ -1,30 +1,15 @@
-use std::{fs, process::Command};
+use std::{ffi::c_void, fs, process::Command};
 
 use libloading::Library;
 use tempfile::tempdir;
 
 use crate::{
-    backend_ir::{self, ir::BackendOp},
+    codegen::c::{BufferKind, KernelGenInfo},
     kernel::{KernelArg, LaunchConfig},
-    ssa, Result, Stream,
+    lir, scheduling, Result, Stream,
 };
 
-type KernelFn1D = unsafe extern "C" fn(*const f32, *const f32, *mut f32, i64, i64);
-type KernelFnSoftmax = unsafe extern "C" fn(*const f32, *mut f32, i64, i64, i64, i64, i64);
-type KernelFnMatMul = unsafe extern "C" fn(
-    *const f32,
-    *const f32,
-    *mut f32,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-);
+type KernelFn = unsafe extern "C" fn(*const *const c_void, i64, i64, *const i64, i64);
 
 pub struct CpuBackend;
 
@@ -42,15 +27,30 @@ impl CpuBackend {
         Err(crate::Error::UnsupportedBackend("no C compiler found"))
     }
 
-    fn compile_kernel_from_hir(kernel: &crate::hir::Kernel) -> Result<(String, BackendOp)> {
+    fn compile_kernel_from_hir(kernel: &crate::hir::Kernel) -> Result<String> {
         let typed = crate::typeck::check_kernel(kernel)
             .map_err(|err| crate::Error::Shape(err.to_string()))?;
-        let ssa = crate::passes::canonicalize::run(ssa::lower_typed_kernel_to_ssa(&typed));
+        let ssa = crate::passes::canonicalize::run(crate::ssa::lower_typed_kernel_to_ssa(&typed));
         let ssa = crate::passes::dce::run(ssa);
-        let backend = backend_ir::lower::lower_ssa_to_backend_ir(&ssa);
-        let op = backend.op;
-        let code = crate::codegen::c::generate(&backend)?;
-        Ok((code, op))
+        let lir_func = lir::lower_ssa_to_lir(&ssa, &typed);
+        let annotations = scheduling::annotate(&lir_func);
+
+        let info = KernelGenInfo {
+            name: kernel.name.clone(),
+            num_buffers: kernel.params.len(),
+            buffer_kinds: kernel
+                .params
+                .iter()
+                .map(|p| match p.kind {
+                    crate::hir::ParamKind::Input => BufferKind::Input,
+                    crate::hir::ParamKind::Output => BufferKind::Output,
+                })
+                .collect(),
+            num_shapes: 1,
+        };
+
+        let code = crate::codegen::c::generate(&lir_func, &annotations, &info)?;
+        Ok(code)
     }
 }
 
@@ -71,12 +71,13 @@ impl crate::backend::Backend for CpuBackend {
         };
         let so_path = dir.path().join(format!("lib{}.{}", kernel.name, ext));
 
-        let (c_code, backend_op) = Self::compile_kernel_from_hir(kernel)?;
+        let c_code = Self::compile_kernel_from_hir(kernel)?;
         fs::write(&c_path, c_code)?;
 
         let compiler = Self::compiler()?;
         let output = Command::new(compiler)
-            .args(["-shared", "-fPIC", "-O2"])
+            .args(["-shared", "-fPIC", "-O3", "-Xpreprocessor", "-fopenmp"])
+            .arg("-lomp")
             .arg("-lm")
             .arg(&c_path)
             .arg("-o")
@@ -92,61 +93,29 @@ impl crate::backend::Backend for CpuBackend {
             let library =
                 Library::new(&so_path).map_err(|e| crate::Error::Compile(e.to_string()))?;
             let symbol_name = format!("sile_kernel_{}", kernel.name);
+            let func: libloading::Symbol<KernelFn> = library
+                .get(symbol_name.as_bytes())
+                .map_err(|e| crate::Error::Compile(e.to_string()))?;
 
-            let tile_size = args[0].shape[0] / launch.grid[0] as i64;
+            let buffers: Vec<*const c_void> =
+                args.iter().map(|a| a.mut_ptr as *const c_void).collect();
 
-            match backend_op {
-                BackendOp::Softmax2D => {
-                    let func: libloading::Symbol<KernelFnSoftmax> = library
-                        .get(symbol_name.as_bytes())
-                        .map_err(|e| crate::Error::Compile(e.to_string()))?;
+            let shapes: Vec<i64> = args.iter().flat_map(|a| a.shape.iter().copied()).collect();
 
-                    let x_ptr = args[0].mut_ptr;
-                    let y_ptr = args[1].mut_ptr;
-                    let n = args[0].shape[1];
-                    let bm = tile_size;
+            let num_threadgroups = launch.grid[0] as i64;
+            let threads_per_group = if args.is_empty() || args[0].shape.is_empty() {
+                256
+            } else {
+                args[0].shape[0] / num_threadgroups
+            };
 
-                    for gx in 0..launch.grid[0] {
-                        func(x_ptr, y_ptr, gx as i64, bm, n, n);
-                    }
-                }
-                BackendOp::VecAdd1D => {
-                    let func: libloading::Symbol<KernelFn1D> = library
-                        .get(symbol_name.as_bytes())
-                        .map_err(|e| crate::Error::Compile(e.to_string()))?;
-
-                    let a_ptr = args[0].mut_ptr;
-                    let b_ptr = args[1].mut_ptr;
-                    let c_ptr = args[2].mut_ptr;
-
-                    for gx in 0..launch.grid[0] {
-                        func(a_ptr, b_ptr, c_ptr, gx as i64, tile_size);
-                    }
-                }
-                BackendOp::MatMul2D => {
-                    let func: libloading::Symbol<KernelFnMatMul> = library
-                        .get(symbol_name.as_bytes())
-                        .map_err(|e| crate::Error::Compile(e.to_string()))?;
-
-                    let a_ptr = args[0].mut_ptr;
-                    let b_ptr = args[1].mut_ptr;
-                    let c_ptr = args[2].mut_ptr;
-                    let m = args[0].shape[0];
-                    let n = args[1].shape[1];
-                    let k = args[0].shape[1];
-                    let bm = tile_size;
-                    let bn = args[2].shape[1] / launch.grid[1] as i64;
-                    let bk = k;
-
-                    for gx in 0..launch.grid[0] {
-                        for gy in 0..launch.grid[1] {
-                            func(
-                                a_ptr, b_ptr, c_ptr, gx as i64, gy as i64, m, n, k, bm, bn, bk,
-                            );
-                        }
-                    }
-                }
-            }
+            func(
+                buffers.as_ptr(),
+                num_threadgroups,
+                threads_per_group,
+                shapes.as_ptr(),
+                shapes.len() as i64,
+            );
         }
 
         Ok(())

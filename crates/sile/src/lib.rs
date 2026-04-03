@@ -1,12 +1,13 @@
 pub mod backend;
-pub mod backend_ir;
 pub mod codegen;
 pub mod device;
 pub mod error;
 pub mod hir;
 pub mod kernel;
+pub mod lir;
 pub mod passes;
 pub mod schedule;
+pub mod scheduling;
 #[deprecated = "use crate::hir::Kernel and compiler pipeline instead"]
 pub mod spec;
 pub mod ssa;
