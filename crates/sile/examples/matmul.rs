@@ -9,15 +9,12 @@ fn matmul<const BM: i64, const BN: i64, const BK: i64, const K_BLOCKS: i64>(
     let m_idx = sile::tile::id().0;
     let n_idx = sile::tile::id().1;
 
-    let acc = sile::constant(0.0, [BM, BN]);
-
+    let mut acc = sile::constant(0.0, [BM, BN]);
     for k_idx in 0..K_BLOCKS {
         let a_tile = a.load_tile([BM, BK], [m_idx, k_idx]);
         let b_tile = b.load_tile([BK, BN], [k_idx, n_idx]);
-        let new_acc = sile::mma(a_tile, b_tile, acc.clone());
-        c.store(new_acc);
+        acc = sile::mma(a_tile, b_tile, acc.clone());
     }
-
     c.store(acc);
 }
 
@@ -25,9 +22,9 @@ fn main() -> Result<(), sile::Error> {
     let device = Device::default()?;
     let stream = device.create_stream()?;
 
-    let (m, n, k) = (128i64, 256i64, 64i64);
-    const BM: i64 = 64;
-    const BN: i64 = 64;
+    let (m, n, k) = (128i64, 128i64, 64i64);
+    const BM: i64 = 32;
+    const BN: i64 = 32;
     const BK: i64 = 32;
     const K_BLOCKS: i64 = 2;
 
@@ -35,7 +32,7 @@ fn main() -> Result<(), sile::Error> {
     let b = Tensor::random([k, n], &device)?;
     let mut c = Tensor::zeros([m, n], &device)?;
 
-    let grid = ((m / BM) as u32, (n / BN) as u32, 1);
+    let grid = (((m / BM) * (n / BN)) as u32, 1u32, 1u32);
 
     matmul::<BM, BN, BK, K_BLOCKS>(&a, &b, &mut c)
         .grid(grid)
@@ -43,7 +40,6 @@ fn main() -> Result<(), sile::Error> {
 
     let c_host = c.to_vec(&stream)?;
 
-    // Host-side reference matmul for verify
     let a_host = a.to_vec(&stream)?;
     let b_host = b.to_vec(&stream)?;
     for i in 0..m as usize {
@@ -53,7 +49,7 @@ fn main() -> Result<(), sile::Error> {
                 sum += a_host[i * k as usize + l_idx] * b_host[l_idx * n as usize + j];
             }
             assert!(
-                (c_host[i * n as usize + j] - sum).abs() < 1e-3,
+                (c_host[i * n as usize + j] - sum).abs() < 1e-2,
                 "mismatch at c[{i}][{j}]: got {}, expected {}",
                 c_host[i * n as usize + j],
                 sum

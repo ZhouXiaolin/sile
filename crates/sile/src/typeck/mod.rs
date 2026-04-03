@@ -13,9 +13,16 @@ pub struct TypedKernel {
 pub fn check_kernel(kernel: &Kernel) -> Result<TypedKernel, error::TypeError> {
     let mut locals = BTreeMap::new();
     for stmt in &kernel.body {
-        if let crate::hir::Stmt::Let { name, expr, .. } = stmt {
-            let ty = infer_expr(expr, &locals)?;
-            locals.insert(name.clone(), ty);
+        match stmt {
+            crate::hir::Stmt::Let { name, expr, .. } => {
+                let ty = infer_expr(expr, &locals)?;
+                locals.insert(name.clone(), ty);
+            }
+            crate::hir::Stmt::Assign { name, expr } => {
+                let ty = infer_expr(expr, &locals)?;
+                locals.insert(name.clone(), ty);
+            }
+            crate::hir::Stmt::Store { .. } | crate::hir::Stmt::ForLoop { .. } => {}
         }
     }
     Ok(TypedKernel {

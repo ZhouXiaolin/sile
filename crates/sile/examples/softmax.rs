@@ -1,17 +1,17 @@
 use sile::{Device, Tensor};
-
+use sile::load_tile_like_2d;
 #[sile::kernel]
 fn softmax<const BM: i64, const BN: i64>(
     x: &Tensor<f32, { [-1, -1] }>,
     y: &mut Tensor<f32, { [BM, BN] }>,
 ) {
-    let tile_x: Tile<f32, { [BM, BN] }> = sile::load_tile_like_2d(x, y);
+    let tile_x: Tile<f32, { [BM, BN] }> = load_tile_like_2d(x,y);
     let tile_x_max: Tile<f32, { [BM] }> = sile::reduce_max(tile_x.clone(), 1i64);
     let tile_x_max_bcast: Tile<f32, { [BM, BN] }> =
-        tile_x_max.reshape([BM, 1]).broadcast(y.shape());
+        tile_x_max.reshape([BM, 1]).broadcast(&[BM, BN]);
     let num: Tile<f32, { [BM, BN] }> = sile::exp(tile_x - tile_x_max_bcast);
     let denom: Tile<f32, { [BM] }> = sile::reduce_sum(num.clone(), 1i64);
-    let denom_bcast: Tile<f32, { [BM, BN] }> = denom.reshape([BM, 1]).broadcast(y.shape());
+    let denom_bcast: Tile<f32, { [BM, BN] }> = denom.reshape([BM, 1]).broadcast(&[BM, BN]);
     y.store(num / denom_bcast);
 }
 

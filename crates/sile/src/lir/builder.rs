@@ -147,6 +147,99 @@ impl LirBuilder {
         Value::Const(Constant::Float(v))
     }
 
+    pub fn get_tile_coord(&mut self, dim: i64) -> Value {
+        self.push_instruction(Instruction::GetTileCoord { dim })
+    }
+
+    pub fn tile_alloc(&mut self, rows: i64, cols: i64, init: f64) -> Value {
+        self.push_instruction(Instruction::TileAlloc { rows, cols, init })
+    }
+
+    pub fn tile_load_2d(
+        &mut self,
+        buf: Value,
+        rows: i64,
+        cols: i64,
+        row_tile: Value,
+        col_tile: Value,
+        stride_shape_idx: usize,
+    ) -> Value {
+        self.push_instruction(Instruction::TileLoad2D {
+            buf,
+            rows,
+            cols,
+            row_tile,
+            col_tile,
+            stride_shape_idx,
+        })
+    }
+
+    pub fn tile_mma(
+        &mut self,
+        a: Value,
+        b: Value,
+        acc: Value,
+        tile_m: i64,
+        tile_n: i64,
+        tile_k: i64,
+    ) -> Value {
+        self.push_instruction(Instruction::TileMma {
+            a,
+            b,
+            acc,
+            tile_m,
+            tile_n,
+            tile_k,
+        })
+    }
+
+    pub fn tile_reduce_max(&mut self, value: Value, axis: i64, rows: i64, cols: i64) -> Value {
+        self.push_instruction(Instruction::TileReduceMax {
+            value,
+            axis,
+            rows,
+            cols,
+        })
+    }
+
+    pub fn tile_reduce_sum(&mut self, value: Value, axis: i64, rows: i64, cols: i64) -> Value {
+        self.push_instruction(Instruction::TileReduceSum {
+            value,
+            axis,
+            rows,
+            cols,
+        })
+    }
+
+    pub fn tile_broadcast(&mut self, value: Value, rows: i64, cols: i64) -> Value {
+        self.push_instruction(Instruction::TileBroadcast { value, rows, cols })
+    }
+
+    pub fn tile_store_2d(
+        &mut self,
+        buf: Value,
+        value: Value,
+        rows: i64,
+        cols: i64,
+        row_tile: Value,
+        col_tile: Value,
+        stride_shape_idx: usize,
+    ) {
+        if let Some(label) = &self.current_block {
+            if let Some(block) = self.func.get_block_mut(label) {
+                block.instructions.push(Instruction::TileStore2D {
+                    buf,
+                    value,
+                    rows,
+                    cols,
+                    row_tile,
+                    col_tile,
+                    stride_shape_idx,
+                });
+            }
+        }
+    }
+
     pub fn phi(&mut self, dest: &str, ty: Type, incoming: Vec<(Value, String)>) {
         if let Some(label) = &self.current_block {
             if let Some(block) = self.func.get_block_mut(label) {

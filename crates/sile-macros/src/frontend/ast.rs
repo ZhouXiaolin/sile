@@ -1,6 +1,7 @@
 #[derive(Clone, Debug)]
 pub struct KernelDecl {
     pub name: syn::Ident,
+    pub const_params: Vec<syn::Ident>,
     pub params: Vec<KernelParam>,
     pub body: Vec<KernelStmt>,
 }
@@ -9,12 +10,23 @@ pub struct KernelDecl {
 pub struct KernelParam {
     pub name: syn::Ident,
     pub is_mut: bool,
-    pub shape: Option<Vec<i64>>,
+    pub shape: Option<Vec<KernelShapeDim>>,
+}
+
+#[derive(Clone, Debug)]
+pub enum KernelShapeDim {
+    Dynamic,
+    Constant(i64),
+    Symbol(syn::Ident),
 }
 
 #[derive(Clone, Debug)]
 pub enum KernelStmt {
     Let {
+        name: syn::Ident,
+        expr: KernelExpr,
+    },
+    Assign {
         name: syn::Ident,
         expr: KernelExpr,
     },

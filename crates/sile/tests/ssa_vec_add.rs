@@ -11,7 +11,7 @@ fn vec_add(a: &Tensor<f32>, b: &Tensor<f32>, c: &mut Tensor<f32>) {
 }
 
 #[test]
-fn vec_add_lowers_to_three_ssa_values_before_store() {
+fn vec_add_lowers_to_tile_aware_ssa_before_store() {
     let device = Device::cpu();
     let a = Tensor::ones([16], &device).unwrap();
     let b = Tensor::ones([16], &device).unwrap();
@@ -21,7 +21,11 @@ fn vec_add_lowers_to_three_ssa_values_before_store() {
     let typed = check_kernel(&kernel).unwrap();
     let ssa = lower_typed_kernel_to_ssa(&typed);
 
-    assert_eq!(ssa.instructions.len(), 5);
+    assert_eq!(ssa.instructions.len(), 6);
     assert_eq!(ssa.instructions[0].opcode_name(), "program_id");
-    assert_eq!(ssa.instructions[4].opcode_name(), "store");
+    assert_eq!(ssa.instructions[1].opcode_name(), "shape_dim");
+    assert_eq!(ssa.instructions[2].opcode_name(), "load_tile");
+    assert_eq!(ssa.instructions[3].opcode_name(), "load_tile");
+    assert_eq!(ssa.instructions[4].opcode_name(), "add");
+    assert_eq!(ssa.instructions[5].opcode_name(), "store");
 }

@@ -1,6 +1,21 @@
-use super::ast::{BinOpKind, KernelDecl, KernelExpr, KernelParam, KernelStmt};
+use super::ast::{BinOpKind, KernelDecl, KernelExpr, KernelParam, KernelShapeDim, KernelStmt};
 
 pub fn parse_kernel(input: &syn::ItemFn) -> syn::Result<KernelDecl> {
+    // Extract const params from generic parameters
+    let const_params: Vec<syn::Ident> = input
+        .sig
+        .generics
+        .params
+        .iter()
+        .filter_map(|p| {
+            if let syn::GenericParam::Const(c) = p {
+                Some(c.ident.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
     let params = input
         .sig
         .inputs
@@ -46,6 +61,22 @@ pub fn parse_kernel(input: &syn::ItemFn) -> syn::Result<KernelDecl> {
                     parse_for_loop(for_loop, &mut body)?;
                     continue;
                 }
+                if let syn::Expr::Assign(assign) = expr {
+                    let name = match assign.left.as_ref() {
+                        syn::Expr::Path(path) => {
+                            path.path.segments.last().unwrap().ident.clone()
+                        }
+                        _ => {
+                            return Err(syn::Error::new_spanned(
+                                &assign.left,
+                                "assignment target must be an ident",
+                            ))
+                        }
+                    };
+                    let expr = parse_expr(&assign.right)?;
+                    body.push(KernelStmt::Assign { name, expr });
+                    continue;
+                }
                 if let syn::Expr::MethodCall(call) = expr {
                     if call.method == "store" {
                         let target = match call.receiver.as_ref() {
@@ -82,6 +113,7 @@ pub fn parse_kernel(input: &syn::ItemFn) -> syn::Result<KernelDecl> {
 
     Ok(KernelDecl {
         name: input.sig.ident.clone(),
+        const_params,
         params,
         body,
     })
@@ -149,6 +181,22 @@ fn parse_for_loop(for_loop: &syn::ExprForLoop, body: &mut Vec<KernelStmt>) -> sy
                 loop_body.push(KernelStmt::Let { name, expr });
             }
             syn::Stmt::Expr(inner_expr, _) => {
+                if let syn::Expr::Assign(assign) = inner_expr {
+                    let name = match assign.left.as_ref() {
+                        syn::Expr::Path(path) => {
+                            path.path.segments.last().unwrap().ident.clone()
+                        }
+                        _ => {
+                            return Err(syn::Error::new_spanned(
+                                &assign.left,
+                                "assignment target must be an ident",
+                            ))
+                        }
+                    };
+                    let expr = parse_expr(&assign.right)?;
+                    loop_body.push(KernelStmt::Assign { name, expr });
+                    continue;
+                }
                 if let syn::Expr::MethodCall(call) = inner_expr {
                     if call.method == "store" {
                         let target = match call.receiver.as_ref() {
@@ -220,7 +268,7 @@ fn parse_param(arg: &syn::FnArg) -> syn::Result<KernelParam> {
     })
 }
 
-fn extract_shape_from_type(ty: &syn::Type) -> Option<Vec<i64>> {
+fn extract_shape_from_type(ty: &syn::Type) -> Option<Vec<KernelShapeDim>> {
     let syn::Type::Path(type_path) = ty else {
         return None;
     };
@@ -237,38 +285,68 @@ fn extract_shape_from_type(ty: &syn::Type) -> Option<Vec<i64>> {
     let syn::GenericArgument::Const(const_expr) = &args.args[1] else {
         return None;
     };
-    if let syn::Expr::Array(arr) = const_expr {
-        let mut shape = Vec::new();
-        for elem in &arr.elems {
-            if let syn::Expr::Lit(syn::ExprLit {
-                lit: syn::Lit::Int(lit_int),
-                ..
-            }) = elem
-            {
-                shape.push(lit_int.base10_parse::<i64>().unwrap_or(-1));
-            } else if let syn::Expr::Unary(syn::ExprUnary {
-                op: syn::UnOp::Neg(_),
-                expr,
-                ..
-            }) = elem
-            {
-                if let syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Int(lit_int),
-                    ..
-                }) = expr.as_ref()
-                {
-                    let val: i64 = lit_int.base10_parse().unwrap_or(1);
-                    shape.push(-val);
-                }
+    extract_shape_expr(const_expr)
+}
+
+fn extract_shape_expr(expr: &syn::Expr) -> Option<Vec<KernelShapeDim>> {
+    match expr {
+        syn::Expr::Block(block) => {
+            let tail = block.block.stmts.last()?;
+            if let syn::Stmt::Expr(expr, _) = tail {
+                extract_shape_expr(expr)
             } else {
-                shape.push(-1);
+                None
             }
         }
-        if !shape.is_empty() {
-            return Some(shape);
+        syn::Expr::Array(arr) => {
+            let mut shape = Vec::new();
+            for elem in &arr.elems {
+                let dim = match elem {
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Int(lit_int),
+                        ..
+                    }) => {
+                        let value = lit_int.base10_parse::<i64>().unwrap_or(-1);
+                        if value == -1 {
+                            KernelShapeDim::Dynamic
+                        } else {
+                            KernelShapeDim::Constant(value)
+                        }
+                    }
+                    syn::Expr::Unary(syn::ExprUnary {
+                        op: syn::UnOp::Neg(_),
+                        expr,
+                        ..
+                    }) => {
+                        if let syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Int(lit_int),
+                            ..
+                        }) = expr.as_ref()
+                        {
+                            let value = lit_int.base10_parse::<i64>().unwrap_or(1);
+                            KernelShapeDim::Constant(-value)
+                        } else {
+                            KernelShapeDim::Dynamic
+                        }
+                    }
+                    syn::Expr::Path(path) => path
+                        .path
+                        .get_ident()
+                        .cloned()
+                        .map(KernelShapeDim::Symbol)
+                        .unwrap_or(KernelShapeDim::Dynamic),
+                    _ => KernelShapeDim::Dynamic,
+                };
+                shape.push(dim);
+            }
+            if shape.is_empty() {
+                None
+            } else {
+                Some(shape)
+            }
         }
+        _ => None,
     }
-    None
 }
 
 fn parse_expr(expr: &syn::Expr) -> syn::Result<KernelExpr> {
