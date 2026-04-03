@@ -11,13 +11,30 @@ pub fn lower_kernel_to_hir(decl: &KernelDecl) -> proc_macro2::TokenStream {
         } else {
             quote! { ::sile::hir::ParamKind::Input }
         };
+        let shape = if let Some(dims) = &param.shape {
+            let dim_exprs: Vec<_> = dims
+                .iter()
+                .map(|d| {
+                    if *d == -1 {
+                        quote! { ::sile::hir::ShapeExpr::dynamic() }
+                    } else {
+                        quote! { ::sile::hir::ShapeExpr::constant(#d as i64) }
+                    }
+                })
+                .collect();
+            quote! {
+                ::sile::hir::ShapeExpr::tuple(vec![#(#dim_exprs),*])
+            }
+        } else {
+            quote! { ::sile::hir::ShapeExpr::dynamic() }
+        };
         quote! {
             ::sile::hir::Param::new(
                 #name,
                 #kind,
                 ::sile::hir::Type::tensor(
                     ::sile::hir::ElemType::F32,
-                    ::sile::hir::ShapeExpr::dynamic(),
+                    #shape,
                 ),
             )
         }
@@ -56,6 +73,25 @@ fn lower_stmt(stmt: &KernelStmt) -> proc_macro2::TokenStream {
                 }
             }
         }
+        KernelStmt::ForLoop {
+            var,
+            start,
+            end,
+            body,
+        } => {
+            let var_name = var.to_string();
+            let start_val = lower_expr(start);
+            let end_val = lower_expr(end);
+            let body_stmts: Vec<_> = body.iter().map(|s| lower_stmt(s)).collect();
+            quote! {
+                ::sile::hir::Stmt::ForLoop {
+                    var: #var_name.to_string(),
+                    start: #start_val,
+                    end: #end_val,
+                    body: vec![#(#body_stmts),*],
+                }
+            }
+        }
     }
 }
 
@@ -69,6 +105,10 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
             let val: i32 = lit.base10_parse().unwrap_or(0);
             quote! { ::sile::hir::Expr::ScalarI32(#val) }
         }
+        KernelExpr::FloatLit(lit) => {
+            let val: f32 = lit.base10_parse().unwrap_or(0.0);
+            quote! { ::sile::hir::Expr::ScalarF32(#val) }
+        }
         KernelExpr::Call { func, args } => {
             let func_name = func.to_string();
             let args_exprs: Vec<_> = args.iter().map(lower_expr).collect();
@@ -78,6 +118,24 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
                     quote! {
                         ::sile::hir::Expr::Builtin {
                             op: ::sile::hir::BuiltinOp::LoadTileLike2D,
+                            args: vec![#(#all_args),*],
+                        }
+                    }
+                }
+                "constant" => {
+                    let all_args = args_exprs;
+                    quote! {
+                        ::sile::hir::Expr::Builtin {
+                            op: ::sile::hir::BuiltinOp::Constant,
+                            args: vec![#(#all_args),*],
+                        }
+                    }
+                }
+                "mma" => {
+                    let all_args = args_exprs;
+                    quote! {
+                        ::sile::hir::Expr::Builtin {
+                            op: ::sile::hir::BuiltinOp::Mma,
                             args: vec![#(#all_args),*],
                         }
                     }
@@ -186,7 +244,7 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
                     }
                     if let syn::Expr::Lit(lit) = elem {
                         if let syn::Lit::Int(lit_int) = &lit.lit {
-                            let val: i32 = lit_int.base10_parse().unwrap_or(-1);
+                            let val: i64 = lit_int.base10_parse().unwrap_or(-1);
                             return quote! { ::sile::hir::ShapeExpr::constant(#val) };
                         }
                     }
@@ -200,13 +258,87 @@ fn lower_expr(expr: &KernelExpr) -> proc_macro2::TokenStream {
             }
         }
         KernelExpr::FieldAccess { target, field } => {
-            let target_expr = lower_expr(target);
-            if field == "0" {
-                // tile::id().0 → 取第一个字段
-                target_expr
-            } else {
-                quote! { ::sile::hir::Expr::Var(#field.to_string()) }
+            // Handle a.shape().N -> ShapeDim(ShapeOf(a), N)
+            if let KernelExpr::MethodCall {
+                receiver, method, ..
+            } = target.as_ref()
+            {
+                if method.to_string() == "shape" {
+                    let dim_idx: i32 = field.parse().unwrap_or(0);
+                    let receiver_lowered = lower_expr(receiver);
+                    return quote! {
+                        ::sile::hir::Expr::Builtin {
+                            op: ::sile::hir::BuiltinOp::ShapeDim,
+                            args: vec![#receiver_lowered, ::sile::hir::Expr::ScalarI32(#dim_idx)],
+                        }
+                    };
+                }
             }
+            // Handle tile::id().N -> ShapeDim(ProgramId, N)
+            if let KernelExpr::Call { func, .. } = target.as_ref() {
+                if func.to_string() == "id" {
+                    let dim_idx: i32 = field.parse().unwrap_or(0);
+                    return quote! {
+                        ::sile::hir::Expr::Builtin {
+                            op: ::sile::hir::BuiltinOp::ShapeDim,
+                            args: vec![
+                                ::sile::hir::Expr::Builtin {
+                                    op: ::sile::hir::BuiltinOp::ProgramId,
+                                    args: vec![],
+                                },
+                                ::sile::hir::Expr::ScalarI32(#dim_idx),
+                            ],
+                        }
+                    };
+                }
+            }
+            // Fallback: just pass through for .0, otherwise Var
+            if field == "0" {
+                lower_expr(target)
+            } else {
+                let field_name = field.to_string();
+                quote! { ::sile::hir::Expr::Var(#field_name.to_string()) }
+            }
+        }
+        KernelExpr::Index { target, index } => {
+            // Handle a.shape()[N] -> ShapeDim(ShapeOf(a), N)
+            if let KernelExpr::MethodCall {
+                receiver, method, ..
+            } = target.as_ref()
+            {
+                if method.to_string() == "shape" {
+                    let dim_idx = match index.as_ref() {
+                        KernelExpr::Lit(lit) => lit.base10_parse::<i32>().unwrap_or(0),
+                        KernelExpr::Var(ident) => {
+                            let name = ident.to_string();
+                            return quote! {
+                                ::sile::hir::Expr::Builtin {
+                                    op: ::sile::hir::BuiltinOp::ShapeDim,
+                                    args: vec![
+                                        ::sile::hir::Expr::Builtin {
+                                            op: ::sile::hir::BuiltinOp::ShapeOf,
+                                            args: vec![#(lower_expr(receiver))],
+                                        },
+                                        ::sile::hir::Expr::Var(#name.to_string()),
+                                    ],
+                                }
+                            };
+                        }
+                        _ => 0,
+                    };
+                    let receiver_lowered = lower_expr(receiver);
+                    return quote! {
+                        ::sile::hir::Expr::Builtin {
+                            op: ::sile::hir::BuiltinOp::ShapeDim,
+                            args: vec![#receiver_lowered, ::sile::hir::Expr::ScalarI32(#dim_idx)],
+                        }
+                    };
+                }
+            }
+            // Fallback: just lower both sides
+            let target_lowered = lower_expr(target);
+            let index_lowered = lower_expr(index);
+            quote! { ::sile::hir::Expr::Var("idx".to_string()) }
         }
     }
 }

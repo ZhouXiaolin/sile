@@ -3,7 +3,7 @@ use std::fmt;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShapeExpr {
     Dynamic,
-    Constant(i32),
+    Constant(i64),
     Symbol(String),
     Tuple(Vec<ShapeExpr>),
 }
@@ -33,7 +33,7 @@ impl ShapeExpr {
     pub fn dynamic() -> Self {
         Self::Dynamic
     }
-    pub fn constant(value: i32) -> Self {
+    pub fn constant(value: i64) -> Self {
         Self::Constant(value)
     }
     pub fn symbol(name: impl Into<String>) -> Self {

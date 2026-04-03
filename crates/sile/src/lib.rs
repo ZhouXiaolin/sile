@@ -1,6 +1,3 @@
-#![feature(generic_const_exprs)]
-#![allow(incomplete_features)]
-
 pub mod backend;
 pub mod backend_ir;
 pub mod codegen;
@@ -26,22 +23,30 @@ pub use hir::{
 pub use kernel::{KernelArg, KernelLauncher, LaunchConfig};
 pub use sile_macros::kernel;
 pub use stream::Stream;
-pub use tensor::{unpartition, DList, DListNil, Partition, Rank, Tensor};
+pub use tensor::Tensor;
 pub use tile::Tile;
 
-// Free functions for kernel context (softmax example)
-pub fn load_tile_like_2d<R: Rank>(x: &Tensor<f32>, y: &Tensor<f32, R>) -> Tile<f32, R> {
+// Free functions for kernel context
+pub fn load_tile_like_2d(x: &Tensor<f32>, y: &Tensor<f32>) -> Tile<f32> {
     Tile::new(y.shape().to_vec())
 }
 
-pub fn reduce_max<R: Rank>(tile: Tile<f32, R>, _axis: i32) -> Tile<f32, DListNil> {
+pub fn reduce_max(tile: Tile<f32>, _axis: i32) -> Tile<f32> {
     Tile::new(vec![tile.shape[0]])
 }
 
-pub fn reduce_sum<R: Rank>(tile: Tile<f32, R>, _axis: i32) -> Tile<f32, DListNil> {
+pub fn reduce_sum(tile: Tile<f32>, _axis: i32) -> Tile<f32> {
     Tile::new(vec![tile.shape[0]])
 }
 
-pub fn exp<R: Rank>(tile: Tile<f32, R>) -> Tile<f32, R> {
+pub fn exp(tile: Tile<f32>) -> Tile<f32> {
     tile.exp()
+}
+
+pub fn constant<const N: usize>(_value: f32, _shape: [i64; N]) -> Tile<f32> {
+    Tile::new(_shape.iter().copied().collect())
+}
+
+pub fn mma(_a: Tile<f32>, _b: Tile<f32>, _c: Tile<f32>) -> Tile<f32> {
+    Tile::new(vec![])
 }

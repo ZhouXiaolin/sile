@@ -22,6 +22,10 @@ pub enum BuiltinOp {
     Reshape,
     Broadcast,
     ShapeOf,
+    Mma,
+    Constant,
+    ScalarDiv,
+    ShapeDim,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,7 +35,7 @@ pub struct Param {
     pub ty: Type,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Kernel {
     pub name: String,
     pub const_params: Vec<String>,
@@ -39,7 +43,7 @@ pub struct Kernel {
     pub body: Vec<Stmt>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Stmt {
     Let {
         name: String,
@@ -50,13 +54,20 @@ pub enum Stmt {
         target: String,
         value: Expr,
     },
+    ForLoop {
+        var: String,
+        start: Expr,
+        end: Expr,
+        body: Vec<Stmt>,
+    },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     Var(String),
     Shape(ShapeExpr),
     ScalarI32(i32),
+    ScalarF32(f32),
     Builtin { op: BuiltinOp, args: Vec<Expr> },
 }
 
@@ -97,6 +108,7 @@ impl Expr {
             Self::Var(_) => "var",
             Self::Shape(_) => "shape",
             Self::ScalarI32(_) => "scalar",
+            Self::ScalarF32(_) => "scalar_f32",
         }
     }
 }

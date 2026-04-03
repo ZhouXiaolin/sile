@@ -10,8 +10,21 @@ use crate::{
 };
 
 type KernelFn1D = unsafe extern "C" fn(*const f32, *const f32, *mut f32, i64, i64);
-
-type KernelFnSoftmax = unsafe extern "C" fn(*const f32, *mut f32, i64, i64, i64, i64);
+type KernelFnSoftmax = unsafe extern "C" fn(*const f32, *mut f32, i64, i64, i64, i64, i64);
+type KernelFnMatMul = unsafe extern "C" fn(
+    *const f32,
+    *const f32,
+    *mut f32,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+);
 
 pub struct CpuBackend;
 
@@ -108,6 +121,29 @@ impl crate::backend::Backend for CpuBackend {
 
                     for gx in 0..launch.grid[0] {
                         func(a_ptr, b_ptr, c_ptr, gx as i64, tile_size);
+                    }
+                }
+                BackendOp::MatMul2D => {
+                    let func: libloading::Symbol<KernelFnMatMul> = library
+                        .get(symbol_name.as_bytes())
+                        .map_err(|e| crate::Error::Compile(e.to_string()))?;
+
+                    let a_ptr = args[0].mut_ptr;
+                    let b_ptr = args[1].mut_ptr;
+                    let c_ptr = args[2].mut_ptr;
+                    let m = args[0].shape[0];
+                    let n = args[1].shape[1];
+                    let k = args[0].shape[1];
+                    let bm = tile_size;
+                    let bn = args[2].shape[1] / launch.grid[1] as i64;
+                    let bk = k;
+
+                    for gx in 0..launch.grid[0] {
+                        for gy in 0..launch.grid[1] {
+                            func(
+                                a_ptr, b_ptr, c_ptr, gx as i64, gy as i64, m, n, k, bm, bn, bk,
+                            );
+                        }
                     }
                 }
             }

@@ -26,14 +26,15 @@ pub fn check_kernel(kernel: &Kernel) -> Result<TypedKernel, error::TypeError> {
 
 fn infer_expr(expr: &Expr, _locals: &BTreeMap<String, Type>) -> Result<Type, error::TypeError> {
     match expr {
-        Expr::Builtin { op, .. } => infer_builtin(*op, &[]),
-        Expr::Var(_) => Ok(Type::Shape), // placeholder
+        Expr::Builtin { op, args } => infer_builtin(*op, args),
+        Expr::Var(_) => Ok(Type::Shape),
         Expr::Shape(_) => Ok(Type::Shape),
         Expr::ScalarI32(_) => Ok(Type::Scalar(crate::hir::ElemType::F32)),
+        Expr::ScalarF32(_) => Ok(Type::Scalar(crate::hir::ElemType::F32)),
     }
 }
 
-fn infer_builtin(op: BuiltinOp, _args: &[Type]) -> Result<Type, error::TypeError> {
+fn infer_builtin(op: BuiltinOp, _args: &[Expr]) -> Result<Type, error::TypeError> {
     match op {
         BuiltinOp::ProgramId => Ok(Type::Shape),
         BuiltinOp::LoadTile => Ok(Type::tile(
@@ -56,6 +57,15 @@ fn infer_builtin(op: BuiltinOp, _args: &[Type]) -> Result<Type, error::TypeError
             crate::hir::ElemType::F32,
             ShapeExpr::symbol("S"),
         )),
+        BuiltinOp::Mma => Ok(Type::tile(
+            crate::hir::ElemType::F32,
+            ShapeExpr::tuple([ShapeExpr::symbol("BM"), ShapeExpr::symbol("BN")]),
+        )),
+        BuiltinOp::Constant => Ok(Type::tile(
+            crate::hir::ElemType::F32,
+            ShapeExpr::tuple([ShapeExpr::symbol("BM"), ShapeExpr::symbol("BN")]),
+        )),
+        BuiltinOp::ScalarDiv | BuiltinOp::ShapeDim | BuiltinOp::ShapeOf => Ok(Type::Shape),
         other => Err(error::TypeError::unsupported_builtin(format!("{other:?}"))),
     }
 }

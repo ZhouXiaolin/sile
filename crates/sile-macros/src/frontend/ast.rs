@@ -9,6 +9,7 @@ pub struct KernelDecl {
 pub struct KernelParam {
     pub name: syn::Ident,
     pub is_mut: bool,
+    pub shape: Option<Vec<i64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -20,6 +21,12 @@ pub enum KernelStmt {
     Store {
         target: syn::Ident,
         value: KernelExpr,
+    },
+    ForLoop {
+        var: syn::Ident,
+        start: KernelExpr,
+        end: KernelExpr,
+        body: Vec<KernelStmt>,
     },
 }
 
@@ -45,6 +52,11 @@ pub enum KernelExpr {
     FieldAccess {
         target: Box<KernelExpr>,
         field: String,
+    },
+    FloatLit(syn::LitFloat),
+    Index {
+        target: Box<KernelExpr>,
+        index: Box<KernelExpr>,
     },
 }
 
