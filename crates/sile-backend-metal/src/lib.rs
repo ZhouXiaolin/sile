@@ -2,10 +2,10 @@ pub mod codegen_metal;
 
 use metal::{CommandQueue, ComputePipelineState, Device, Library};
 use sile_core::{KernelArg, LaunchConfig, Result, Stream};
-use sile_hir::Kernel;
-use sile_lir::ir::Function;
+use sile_hir::ParamKind;
+use sile_lir::ExecutableKernel;
 
-use crate::codegen_metal::{generate, BufferKind, KernelGenInfo};
+use crate::codegen_metal::generate;
 
 pub struct MetalBackend {
     device: Device,
@@ -19,54 +19,6 @@ impl MetalBackend {
             .ok_or_else(|| sile_core::Error::UnsupportedBackend("no Metal device found"))?;
         let queue = device.new_command_queue();
         Ok(Self { device, queue })
-    }
-
-    fn build_kernel_gen_info(kernel: &Kernel) -> KernelGenInfo {
-        KernelGenInfo {
-            name: kernel.name.clone(),
-            num_buffers: kernel.params.len(),
-            buffer_kinds: kernel
-                .params
-                .iter()
-                .map(|p| match p.kind {
-                    sile_hir::ParamKind::Input => BufferKind::Input,
-                    sile_hir::ParamKind::Output => BufferKind::Output,
-                })
-                .collect(),
-            num_shapes: kernel
-                .params
-                .iter()
-                .map(|param| match &param.ty {
-                    sile_hir::Type::Tensor { shape, .. } | sile_hir::Type::Tile { shape, .. } => {
-                        shape.rank()
-                    }
-                    sile_hir::Type::Shape | sile_hir::Type::Scalar(_) => 0,
-                })
-                .sum(),
-            param_ranks: kernel
-                .params
-                .iter()
-                .map(|param| match &param.ty {
-                    sile_hir::Type::Tensor { shape, .. } | sile_hir::Type::Tile { shape, .. } => {
-                        shape.rank()
-                    }
-                    sile_hir::Type::Shape | sile_hir::Type::Scalar(_) => 0,
-                })
-                .collect(),
-            shape_offsets: {
-                let mut offsets = Vec::with_capacity(kernel.params.len());
-                let mut next = 0usize;
-                for param in &kernel.params {
-                    offsets.push(next);
-                    next += match &param.ty {
-                        sile_hir::Type::Tensor { shape, .. }
-                        | sile_hir::Type::Tile { shape, .. } => shape.rank(),
-                        sile_hir::Type::Shape | sile_hir::Type::Scalar(_) => 0,
-                    };
-                }
-                offsets
-            },
-        }
     }
 
     fn compile_shader(&self, source: &str) -> Result<Library> {
@@ -113,14 +65,12 @@ impl MetalBackend {
 impl sile_lir::Backend for MetalBackend {
     fn execute(
         &self,
-        func: &Function,
-        kernel: &Kernel,
+        kernel: &ExecutableKernel,
         args: &[KernelArg<'_>],
         launch: &LaunchConfig,
         _stream: &Stream,
     ) -> Result<()> {
-        let info = Self::build_kernel_gen_info(kernel);
-        let source = generate(func, &info)?;
+        let source = generate(&kernel.func, &kernel.abi, &kernel.value_info)?;
 
         let library = self.compile_shader(&source)?;
         let fn_name = format!("sile_kernel_{}", kernel.name);
@@ -175,7 +125,7 @@ impl sile_lir::Backend for MetalBackend {
         command_buffer.wait_until_completed();
 
         for (i, arg) in args.iter().enumerate() {
-            let is_output = matches!(info.buffer_kinds.get(i), Some(BufferKind::Output));
+            let is_output = matches!(kernel.abi.params.get(i).map(|param| param.kind), Some(ParamKind::Output));
             if is_output {
                 let result = self.download_from_device(&mtl_buffers[i]);
                 let len = arg.shape.iter().product::<i64>() as usize;
