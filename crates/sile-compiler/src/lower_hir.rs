@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
-use crate::hir::{BuiltinOp, Expr, ShapeExpr, Stmt, Type};
-use crate::ssa::ir::{SsaInstruction, SsaOpcode, SsaProgram, SsaValue};
-use crate::typeck::TypedKernel;
+use sile_hir::typeck::TypedKernel;
+use sile_hir::{BuiltinOp, Expr, ShapeExpr, Stmt};
+
+use crate::mir::ir::{SsaInstruction, SsaOpcode, SsaProgram, SsaValue};
 
 struct LowerCtx<'a> {
     typed: &'a TypedKernel,
@@ -130,7 +131,13 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx<'_>) -> SsaValue {
                     immediates.extend(shape);
                     immediates
                 });
-                record_tile_shape(&value, args.get(1).map(|arg| extract_const_shape(arg, ctx)).unwrap_or_default(), ctx);
+                record_tile_shape(
+                    &value,
+                    args.get(1)
+                        .map(|arg| extract_const_shape(arg, ctx))
+                        .unwrap_or_default(),
+                    ctx,
+                );
                 value
             }
             BuiltinOp::LoadTile => {
@@ -149,10 +156,9 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx<'_>) -> SsaValue {
                         vec![base, SsaValue::Const(0), *col_tile],
                         vec![2, 1, *cols, 0],
                     ),
-                    ([rows, cols], [row_tile, col_tile]) => (
-                        vec![base, *row_tile, *col_tile],
-                        vec![2, *rows, *cols, 1],
-                    ),
+                    ([rows, cols], [row_tile, col_tile]) => {
+                        (vec![base, *row_tile, *col_tile], vec![2, *rows, *cols, 1])
+                    }
                     _ => {
                         let mut uses = vec![base];
                         uses.extend(coords);
@@ -213,7 +219,8 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx<'_>) -> SsaValue {
                 let tile_m = acc_shape.first().copied().unwrap_or(1);
                 let tile_n = acc_shape.get(1).copied().unwrap_or(1);
                 let tile_k = lhs_shape.get(1).copied().unwrap_or(1);
-                let value = emit_instruction(ctx, SsaOpcode::Mma, uses, vec![tile_m, tile_n, tile_k]);
+                let value =
+                    emit_instruction(ctx, SsaOpcode::Mma, uses, vec![tile_m, tile_n, tile_k]);
                 record_tile_shape(&value, vec![tile_m, tile_n], ctx);
                 value
             }
@@ -290,19 +297,19 @@ fn eval_i64(expr: &Expr, ctx: &LowerCtx<'_>) -> i64 {
             })
             .or_else(|| ctx.const_values.get(name).copied())
             .unwrap_or(0),
-        Expr::Builtin { op, args } if *op == BuiltinOp::ShapeDim => args
-            .get(1)
-            .map(|arg| eval_i64(arg, ctx))
-            .unwrap_or(0),
+        Expr::Builtin { op, args } if *op == BuiltinOp::ShapeDim => {
+            args.get(1).map(|arg| eval_i64(arg, ctx)).unwrap_or(0)
+        }
         _ => 0,
     }
 }
 
 fn extract_const_shape(expr: &Expr, ctx: &LowerCtx<'_>) -> Vec<i64> {
     match expr {
-        Expr::Shape(ShapeExpr::Tuple(dims)) => {
-            dims.iter().map(|dim| resolve_const_shape_dim(dim, ctx)).collect()
-        }
+        Expr::Shape(ShapeExpr::Tuple(dims)) => dims
+            .iter()
+            .map(|dim| resolve_const_shape_dim(dim, ctx))
+            .collect(),
         Expr::Shape(dim) => vec![resolve_const_shape_dim(dim, ctx)],
         _ => vec![],
     }
@@ -310,9 +317,10 @@ fn extract_const_shape(expr: &Expr, ctx: &LowerCtx<'_>) -> Vec<i64> {
 
 fn extract_runtime_shape(expr: &Expr, ctx: &LowerCtx<'_>) -> Vec<SsaValue> {
     match expr {
-        Expr::Shape(ShapeExpr::Tuple(dims)) => {
-            dims.iter().map(|dim| resolve_runtime_shape_dim(dim, ctx)).collect()
-        }
+        Expr::Shape(ShapeExpr::Tuple(dims)) => dims
+            .iter()
+            .map(|dim| resolve_runtime_shape_dim(dim, ctx))
+            .collect(),
         Expr::Shape(dim) => vec![resolve_runtime_shape_dim(dim, ctx)],
         _ => vec![],
     }
@@ -342,8 +350,13 @@ fn resolve_runtime_shape_dim(dim: &ShapeExpr, ctx: &LowerCtx<'_>) -> SsaValue {
 }
 
 fn param_shape_2d(target: &str, ctx: &LowerCtx<'_>) -> Option<[i64; 2]> {
-    let param = ctx.typed.kernel.params.iter().find(|param| param.name == target)?;
-    let Type::Tensor { shape, .. } = &param.ty else {
+    let param = ctx
+        .typed
+        .kernel
+        .params
+        .iter()
+        .find(|param| param.name == target)?;
+    let sile_hir::Type::Tensor { shape, .. } = &param.ty else {
         return None;
     };
     let dims = match shape {
@@ -357,29 +370,26 @@ fn param_shape_2d(target: &str, ctx: &LowerCtx<'_>) -> Option<[i64; 2]> {
 }
 
 fn find_program_dim(ctx: &LowerCtx<'_>, dim: i64) -> Option<SsaValue> {
-    ctx.locals
-        .values()
-        .copied()
-        .find(|value| match value {
-            SsaValue::Local(idx) => ctx
-                .defs
-                .get(idx)
-                .map(|inst| {
-                    inst.opcode == SsaOpcode::ShapeDim
-                        && inst.immediates.first().copied() == Some(dim)
-                        && inst
-                            .uses
-                            .first()
-                            .and_then(|base| match base {
-                                SsaValue::Local(base_idx) => ctx.defs.get(base_idx),
-                                _ => None,
-                            })
-                            .map(|base| base.opcode == SsaOpcode::ProgramId)
-                            .unwrap_or(false)
-                })
-                .unwrap_or(false),
-            _ => false,
-        })
+    ctx.locals.values().copied().find(|value| match value {
+        SsaValue::Local(idx) => ctx
+            .defs
+            .get(idx)
+            .map(|inst| {
+                inst.opcode == SsaOpcode::ShapeDim
+                    && inst.immediates.first().copied() == Some(dim)
+                    && inst
+                        .uses
+                        .first()
+                        .and_then(|base| match base {
+                            SsaValue::Local(base_idx) => ctx.defs.get(base_idx),
+                            _ => None,
+                        })
+                        .map(|base| base.opcode == SsaOpcode::ProgramId)
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false),
+        _ => false,
+    })
 }
 
 fn ensure_program_dim(ctx: &mut LowerCtx<'_>, dim: i64) -> SsaValue {
@@ -423,9 +433,9 @@ fn infer_result_tile_shape(
     ctx: &LowerCtx<'_>,
 ) -> Option<Vec<i64>> {
     match op {
-        BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Mul | BuiltinOp::Div | BuiltinOp::Exp => {
-            uses.iter().find_map(|value| tile_shape_of_value(*value, ctx))
-        }
+        BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Mul | BuiltinOp::Div | BuiltinOp::Exp => uses
+            .iter()
+            .find_map(|value| tile_shape_of_value(*value, ctx)),
         BuiltinOp::ReduceMax | BuiltinOp::ReduceSum => uses
             .first()
             .and_then(|value| tile_shape_of_value(*value, ctx))
@@ -465,9 +475,9 @@ fn type_shape_for_name(name: &str, ctx: &LowerCtx<'_>) -> Option<Vec<i64>> {
         .and_then(|param| resolve_type_shape(&param.ty, ctx))
 }
 
-fn resolve_type_shape(ty: &Type, ctx: &LowerCtx<'_>) -> Option<Vec<i64>> {
+fn resolve_type_shape(ty: &sile_hir::Type, ctx: &LowerCtx<'_>) -> Option<Vec<i64>> {
     match ty {
-        Type::Tensor { shape, .. } | Type::Tile { shape, .. } => match shape {
+        sile_hir::Type::Tensor { shape, .. } | sile_hir::Type::Tile { shape, .. } => match shape {
             ShapeExpr::Tuple(dims) => Some(
                 dims.iter()
                     .map(|dim| resolve_const_shape_dim(dim, ctx))
@@ -475,6 +485,6 @@ fn resolve_type_shape(ty: &Type, ctx: &LowerCtx<'_>) -> Option<Vec<i64>> {
             ),
             other => Some(vec![resolve_const_shape_dim(other, ctx)]),
         },
-        Type::Shape | Type::Scalar(_) => None,
+        sile_hir::Type::Shape | sile_hir::Type::Scalar(_) => None,
     }
 }

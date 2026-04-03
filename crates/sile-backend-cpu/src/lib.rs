@@ -1,14 +1,16 @@
+pub mod codegen_c;
+pub mod scheduling;
+
 use std::{ffi::c_void, fs, process::Command};
 
 use libloading::Library;
 use tempfile::tempdir;
 
-use crate::{
-    codegen::c::{BufferKind, KernelGenInfo},
-    hir::Type,
-    kernel::{KernelArg, LaunchConfig},
-    lir, Result, Stream,
-};
+use sile_core::{KernelArg, LaunchConfig, Result, Stream};
+use sile_hir::{Kernel, Type};
+use sile_lir::ir::Function;
+
+use crate::codegen_c::{generate, BufferKind, KernelGenInfo};
 
 type KernelFn = unsafe extern "C" fn(*const *const c_void, i64, i64, *const i64, i64);
 
@@ -37,25 +39,21 @@ impl CpuBackend {
                 return Ok(candidate);
             }
         }
-        Err(crate::Error::UnsupportedBackend("no C compiler found"))
+        Err(sile_core::Error::UnsupportedBackend(
+            "no C compiler found".into(),
+        ))
     }
 
-    fn compile_kernel_from_hir(kernel: &crate::hir::Kernel) -> Result<String> {
-        let typed = crate::typeck::check_kernel(kernel)
-            .map_err(|err| crate::Error::Shape(err.to_string()))?;
-        let ssa = crate::passes::canonicalize::run(crate::ssa::lower_typed_kernel_to_ssa(&typed));
-        let ssa = crate::passes::dce::run(ssa);
-        let lir_func = lir::lower_ssa_to_lir(&ssa, &typed);
-
-        let info = KernelGenInfo {
+    fn build_kernel_gen_info(kernel: &Kernel) -> KernelGenInfo {
+        KernelGenInfo {
             name: kernel.name.clone(),
             num_buffers: kernel.params.len(),
             buffer_kinds: kernel
                 .params
                 .iter()
                 .map(|p| match p.kind {
-                    crate::hir::ParamKind::Input => BufferKind::Input,
-                    crate::hir::ParamKind::Output => BufferKind::Output,
+                    sile_hir::ParamKind::Input => BufferKind::Input,
+                    sile_hir::ParamKind::Output => BufferKind::Output,
                 })
                 .collect(),
             num_shapes: kernel
@@ -86,17 +84,21 @@ impl CpuBackend {
                 }
                 offsets
             },
-        };
+        }
+    }
 
-        let code = crate::codegen::c::generate(&lir_func, &info)?;
+    fn compile_kernel(func: &Function, kernel: &Kernel) -> Result<String> {
+        let info = Self::build_kernel_gen_info(kernel);
+        let code = generate(func, &info)?;
         Ok(code)
     }
 }
 
-impl crate::backend::Backend for CpuBackend {
-    fn launch_kernel(
+impl sile_lir::Backend for CpuBackend {
+    fn execute(
         &self,
-        kernel: &crate::hir::Kernel,
+        func: &Function,
+        kernel: &Kernel,
         args: &[KernelArg<'_>],
         launch: &LaunchConfig,
         _stream: &Stream,
@@ -110,7 +112,7 @@ impl crate::backend::Backend for CpuBackend {
         };
         let so_path = dir.path().join(format!("lib{}.{}", kernel.name, ext));
 
-        let c_code = Self::compile_kernel_from_hir(kernel)?;
+        let c_code = Self::compile_kernel(func, kernel)?;
         fs::write(&c_path, &c_code)?;
 
         let compiler = Self::compiler()?;
@@ -145,7 +147,7 @@ impl crate::backend::Backend for CpuBackend {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(crate::Error::Compile(format!(
+            return Err(sile_core::Error::Compile(format!(
                 "C compiler failed:\nstderr:\n{}\nstdout:\n{}\nGenerated C:\n{}",
                 stderr, stdout, c_code
             )));
@@ -153,11 +155,11 @@ impl crate::backend::Backend for CpuBackend {
 
         unsafe {
             let library =
-                Library::new(&so_path).map_err(|e| crate::Error::Compile(e.to_string()))?;
+                Library::new(&so_path).map_err(|e| sile_core::Error::Compile(e.to_string()))?;
             let symbol_name = format!("sile_kernel_{}", kernel.name);
             let func: libloading::Symbol<KernelFn> = library
                 .get(symbol_name.as_bytes())
-                .map_err(|e| crate::Error::Compile(e.to_string()))?;
+                .map_err(|e| sile_core::Error::Compile(e.to_string()))?;
 
             let buffers: Vec<*const c_void> =
                 args.iter().map(|a| a.mut_ptr as *const c_void).collect();

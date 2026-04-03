@@ -1,4 +1,4 @@
-use crate::lir::ir::*;
+use sile_lir::ir::*;
 
 pub struct KernelGenInfo {
     pub name: String,
@@ -22,7 +22,7 @@ struct TilePlan {
     cols: i64,
 }
 
-pub fn generate(func: &Function, info: &KernelGenInfo) -> crate::Result<String> {
+pub fn generate(func: &Function, info: &KernelGenInfo) -> sile_core::Result<String> {
     let mut ctx = CCodegen {
         func,
         info,
@@ -77,7 +77,12 @@ impl<'a> CCodegen<'a> {
             self.param_names.push(format!("buf_{}", i));
         }
 
-        let total_insts: usize = self.func.blocks.iter().map(|block| block.instructions.len()).sum();
+        let total_insts: usize = self
+            .func
+            .blocks
+            .iter()
+            .map(|block| block.instructions.len())
+            .sum();
         for i in 0..total_insts {
             self.inst_names.push(format!("v{}", i));
         }
@@ -212,7 +217,11 @@ fn infer_tile_plan(func: &Function) -> Option<TilePlan> {
 }
 
 fn analyze_instruction_shapes(func: &Function) -> Vec<Option<Vec<i64>>> {
-    let total = func.blocks.iter().map(|block| block.instructions.len()).sum();
+    let total = func
+        .blocks
+        .iter()
+        .map(|block| block.instructions.len())
+        .sum();
     let mut shapes = vec![None; total];
     let mut next_idx = 0usize;
 
@@ -242,8 +251,9 @@ fn analyze_instruction_shapes(func: &Function) -> Vec<Option<Vec<i64>>> {
                 Instruction::Add(lhs, rhs)
                 | Instruction::Sub(lhs, rhs)
                 | Instruction::Mul(lhs, rhs)
-                | Instruction::Div(lhs, rhs) => value_tile_shape(lhs, &shapes)
-                    .or_else(|| value_tile_shape(rhs, &shapes)),
+                | Instruction::Div(lhs, rhs) => {
+                    value_tile_shape(lhs, &shapes).or_else(|| value_tile_shape(rhs, &shapes))
+                }
                 Instruction::Exp(value) | Instruction::FNeg(value) => {
                     value_tile_shape(value, &shapes)
                 }
@@ -694,7 +704,9 @@ fn buffer_dim_expr(
     info: &KernelGenInfo,
 ) -> String {
     match value {
-        Value::Param(param_idx) if *param_idx < info.param_ranks.len() && dim < info.param_ranks[*param_idx] => {
+        Value::Param(param_idx)
+            if *param_idx < info.param_ranks.len() && dim < info.param_ranks[*param_idx] =>
+        {
             format!("{}_dim_{}", param_names[*param_idx], dim)
         }
         _ => "1".to_string(),

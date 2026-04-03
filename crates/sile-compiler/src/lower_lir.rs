@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
-use crate::lir::builder::LirBuilder;
-use crate::lir::ir::{Constant, Function, Instruction, Param, Type, Value};
-use crate::ssa::ir::{SsaInstruction, SsaOpcode, SsaProgram, SsaValue};
-use crate::typeck::TypedKernel;
+use sile_hir::typeck::TypedKernel;
+use sile_lir::builder::LirBuilder;
+use sile_lir::ir::{Constant, Function, Instruction, Param, Type, Value};
+
+use crate::mir::ir::{SsaInstruction, SsaOpcode, SsaProgram, SsaValue};
 
 pub fn lower_ssa_to_lir(ssa: &SsaProgram, typed: &TypedKernel) -> Function {
     let params = lower_kernel_params(typed);
@@ -46,14 +47,10 @@ fn lower_ssa_instruction(
         SsaOpcode::ProgramId => Some(builder.const_int(0)),
         SsaOpcode::ShapeDim => {
             let dim = inst.immediates.first().copied().unwrap_or(0);
-            if inst
-                .uses
-                .first()
-                .and_then(|value| match value {
-                    SsaValue::Local(idx) => opcode_map.get(idx),
-                    _ => None,
-                })
-                == Some(&SsaOpcode::ProgramId)
+            if inst.uses.first().and_then(|value| match value {
+                SsaValue::Local(idx) => opcode_map.get(idx),
+                _ => None,
+            }) == Some(&SsaOpcode::ProgramId)
             {
                 Some(builder.get_tile_coord(dim))
             } else {
@@ -69,14 +66,7 @@ fn lower_ssa_instruction(
                 let buf = resolve_value(&inst.uses[0], value_map);
                 let row_tile = resolve_value(&inst.uses[1], value_map);
                 let col_tile = resolve_value(&inst.uses[2], value_map);
-                Some(builder.tile_load_2d(
-                    buf,
-                    rows,
-                    cols,
-                    row_tile,
-                    col_tile,
-                    stride_shape_idx,
-                ))
+                Some(builder.tile_load_2d(buf, rows, cols, row_tile, col_tile, stride_shape_idx))
             } else {
                 let ptr = resolve_value(&inst.uses[0], value_map);
                 Some(builder.load(ptr, Type::f32()))
@@ -168,11 +158,7 @@ fn lower_ssa_instruction(
         SsaOpcode::Constant => {
             if inst.immediates.len() >= 3 {
                 let init = f32::from_bits(inst.immediates[0] as u32) as f64;
-                Some(builder.tile_alloc(
-                    inst.immediates[1],
-                    inst.immediates[2],
-                    init,
-                ))
+                Some(builder.tile_alloc(inst.immediates[1], inst.immediates[2], init))
             } else {
                 let value = inst.immediates.first().copied().unwrap_or(0);
                 Some(builder.const_float(f32::from_bits(value as u32) as f64))
