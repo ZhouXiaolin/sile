@@ -10,6 +10,8 @@ pub fn lower_mir_to_llir(mir: &MirFunction, typed: &TypedKernel) -> llir::Functi
     let mut ctx = LowerLlirCtx {
         operands: HashMap::new(),
         names: HashMap::new(),
+        program_ids: HashMap::new(),
+        shape_dims: HashMap::new(),
         next_llir_value: next_llir_value(mir),
         next_llir_block: next_llir_block(mir),
     };
@@ -70,8 +72,16 @@ fn lower_param_abis(typed: &TypedKernel) -> Vec<Option<llir::ParamAbi>> {
 struct LowerLlirCtx {
     operands: HashMap<ValueId, llir::Operand>,
     names: HashMap<llir::ValueId, String>,
+    program_ids: HashMap<u8, llir::Operand>,
+    shape_dims: HashMap<(ValueId, usize), llir::Operand>,
     next_llir_value: u32,
     next_llir_block: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum CoordOperandKey {
+    Value(llir::ValueId),
+    ConstI64(i64),
 }
 
 impl LowerLlirCtx {
@@ -104,6 +114,7 @@ struct BlockLowerer<'a> {
     ctx: &'a mut LowerLlirCtx,
     blocks: Vec<PendingBlock>,
     current: usize,
+    pending_tiles: HashMap<ValueId, MirOp>,
 }
 
 impl<'a> BlockLowerer<'a> {
@@ -125,6 +136,7 @@ impl<'a> BlockLowerer<'a> {
                 terminator: None,
             }],
             current: 0,
+            pending_tiles: HashMap::new(),
         }
     }
 
@@ -186,6 +198,132 @@ impl<'a> BlockLowerer<'a> {
             })
             .collect()
     }
+
+    fn defer_tile(&mut self, value: ValueId, op: MirOp) {
+        self.pending_tiles.insert(value, op);
+    }
+
+    fn materialize_tile(&mut self, value: ValueId) {
+        let Some(op) = self.pending_tiles.remove(&value) else {
+            return;
+        };
+        match op {
+            MirOp::TileConstant {
+                value: constant,
+                rows,
+                cols,
+            } => {
+                lower_tile_constant_inst(value, constant, rows, cols, self);
+            }
+            MirOp::TileLoad {
+                buf,
+                row_coord,
+                col_coord,
+                rows,
+                cols,
+                stride_shape_idx,
+            } => {
+                lower_tile_load_inst(
+                    value,
+                    buf,
+                    row_coord,
+                    col_coord,
+                    rows,
+                    cols,
+                    stride_shape_idx,
+                    self,
+                );
+            }
+            MirOp::TileBinary {
+                op,
+                lhs,
+                rhs,
+                rows,
+                cols,
+            } => {
+                let mut pending_tiles = self.pending_tiles.clone();
+                let current_op = MirOp::TileBinary {
+                    op,
+                    lhs,
+                    rhs,
+                    rows,
+                    cols,
+                };
+                pending_tiles.insert(value, current_op.clone());
+                if can_eval_tile_value(value, &pending_tiles, self.mir) {
+                    lower_tile_expr_inst(value, current_op, rows, cols, self);
+                } else {
+                    self.materialize_tile(lhs);
+                    self.materialize_tile(rhs);
+                    lower_tile_binary_inst(value, lhs, rhs, lower_bin_op(op), rows, cols, self);
+                }
+            }
+            MirOp::TileUnary {
+                op,
+                operand,
+                rows,
+                cols,
+            } => {
+                let mut pending_tiles = self.pending_tiles.clone();
+                let current_op = MirOp::TileUnary {
+                    op,
+                    operand,
+                    rows,
+                    cols,
+                };
+                pending_tiles.insert(value, current_op.clone());
+                if can_eval_tile_value(value, &pending_tiles, self.mir) {
+                    lower_tile_expr_inst(value, current_op, rows, cols, self);
+                } else {
+                    self.materialize_tile(operand);
+                    lower_tile_unary_inst(value, operand, op, rows, cols, self);
+                }
+            }
+            MirOp::TileBroadcast {
+                value: src,
+                rows,
+                cols,
+            } => {
+                let mut pending_tiles = self.pending_tiles.clone();
+                let current_op = MirOp::TileBroadcast {
+                    value: src,
+                    rows,
+                    cols,
+                };
+                pending_tiles.insert(value, current_op.clone());
+                if can_eval_tile_value(value, &pending_tiles, self.mir) {
+                    lower_tile_expr_inst(value, current_op, rows, cols, self);
+                } else {
+                    self.materialize_tile(src);
+                    lower_tile_broadcast_inst(value, src, rows, cols, self);
+                }
+            }
+            MirOp::TileReduce {
+                op,
+                value: src,
+                axis,
+                in_rows,
+                in_cols,
+            } => {
+                self.materialize_tile(src);
+                lower_tile_reduce_inst(value, src, op, axis, in_rows, in_cols, self);
+            }
+            MirOp::TileMma {
+                a,
+                b,
+                acc,
+                tile_m,
+                tile_n,
+                tile_k,
+            } => {
+                self.materialize_tile(a);
+                self.materialize_tile(b);
+                self.materialize_tile(acc);
+                lower_tile_mma_inst(value, a, b, acc, tile_m, tile_n, tile_k, self);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn lower_block(
@@ -217,10 +355,14 @@ fn lower_block(
         params,
     );
 
-    for inst in &block.insts {
+    for (inst_idx, inst) in block.insts.iter().enumerate() {
         match &inst.op {
             MirOp::TileConstant { value, rows, cols } => {
-                lower_tile_constant_inst(inst.result, *value, *rows, *cols, &mut builder);
+                if can_defer_tile_inst(block, inst_idx, inst.result) {
+                    builder.defer_tile(inst.result, inst.op.clone());
+                } else {
+                    lower_tile_constant_inst(inst.result, *value, *rows, *cols, &mut builder);
+                }
             }
             MirOp::TileLoad {
                 buf,
@@ -230,16 +372,20 @@ fn lower_block(
                 cols,
                 stride_shape_idx,
             } => {
-                lower_tile_load_inst(
-                    inst.result,
-                    *buf,
-                    *row_coord,
-                    *col_coord,
-                    *rows,
-                    *cols,
-                    *stride_shape_idx,
-                    &mut builder,
-                );
+                if can_defer_tile_inst(block, inst_idx, inst.result) {
+                    builder.defer_tile(inst.result, inst.op.clone());
+                } else {
+                    lower_tile_load_inst(
+                        inst.result,
+                        *buf,
+                        *row_coord,
+                        *col_coord,
+                        *rows,
+                        *cols,
+                        *stride_shape_idx,
+                        &mut builder,
+                    );
+                }
             }
             MirOp::TileStore {
                 buf,
@@ -250,16 +396,29 @@ fn lower_block(
                 cols,
                 stride_shape_idx,
             } => {
-                lower_tile_store_inst(
-                    *buf,
-                    *value,
-                    *row_coord,
-                    *col_coord,
-                    *rows,
-                    *cols,
-                    *stride_shape_idx,
-                    &mut builder,
-                );
+                if builder.pending_tiles.contains_key(value) {
+                    lower_tile_store_fused_inst(
+                        *buf,
+                        *value,
+                        *row_coord,
+                        *col_coord,
+                        *rows,
+                        *cols,
+                        *stride_shape_idx,
+                        &mut builder,
+                    );
+                } else {
+                    lower_tile_store_inst(
+                        *buf,
+                        *value,
+                        *row_coord,
+                        *col_coord,
+                        *rows,
+                        *cols,
+                        *stride_shape_idx,
+                        &mut builder,
+                    );
+                }
             }
             MirOp::TileBinary {
                 op,
@@ -268,15 +427,33 @@ fn lower_block(
                 rows,
                 cols,
             } => {
-                lower_tile_binary_inst(
-                    inst.result,
-                    *lhs,
-                    *rhs,
-                    lower_bin_op(*op),
-                    *rows,
-                    *cols,
-                    &mut builder,
-                );
+                if can_defer_tile_inst(block, inst_idx, inst.result) {
+                    builder.defer_tile(inst.result, inst.op.clone());
+                } else {
+                    let mut pending_tiles = builder.pending_tiles.clone();
+                    pending_tiles.insert(inst.result, inst.op.clone());
+                    if can_eval_tile_value(inst.result, &pending_tiles, mir) {
+                        lower_tile_expr_inst(
+                            inst.result,
+                            inst.op.clone(),
+                            *rows,
+                            *cols,
+                            &mut builder,
+                        );
+                    } else {
+                        builder.materialize_tile(*lhs);
+                        builder.materialize_tile(*rhs);
+                        lower_tile_binary_inst(
+                            inst.result,
+                            *lhs,
+                            *rhs,
+                            lower_bin_op(*op),
+                            *rows,
+                            *cols,
+                            &mut builder,
+                        );
+                    }
+                }
             }
             MirOp::TileUnary {
                 op,
@@ -284,7 +461,31 @@ fn lower_block(
                 rows,
                 cols,
             } => {
-                lower_tile_unary_inst(inst.result, *operand, *op, *rows, *cols, &mut builder);
+                if can_defer_tile_inst(block, inst_idx, inst.result) {
+                    builder.defer_tile(inst.result, inst.op.clone());
+                } else {
+                    let mut pending_tiles = builder.pending_tiles.clone();
+                    pending_tiles.insert(inst.result, inst.op.clone());
+                    if can_eval_tile_value(inst.result, &pending_tiles, mir) {
+                        lower_tile_expr_inst(
+                            inst.result,
+                            inst.op.clone(),
+                            *rows,
+                            *cols,
+                            &mut builder,
+                        );
+                    } else {
+                        builder.materialize_tile(*operand);
+                        lower_tile_unary_inst(
+                            inst.result,
+                            *operand,
+                            *op,
+                            *rows,
+                            *cols,
+                            &mut builder,
+                        );
+                    }
+                }
             }
             MirOp::TileMma {
                 a,
@@ -294,6 +495,9 @@ fn lower_block(
                 tile_n,
                 tile_k,
             } => {
+                builder.materialize_tile(*a);
+                builder.materialize_tile(*b);
+                builder.materialize_tile(*acc);
                 lower_tile_mma_inst(
                     inst.result,
                     *a,
@@ -312,6 +516,7 @@ fn lower_block(
                 in_rows,
                 in_cols,
             } => {
+                builder.materialize_tile(*value);
                 lower_tile_reduce_inst(
                     inst.result,
                     *value,
@@ -323,7 +528,24 @@ fn lower_block(
                 );
             }
             MirOp::TileBroadcast { value, rows, cols } => {
-                lower_tile_broadcast_inst(inst.result, *value, *rows, *cols, &mut builder);
+                if can_defer_tile_inst(block, inst_idx, inst.result) {
+                    builder.defer_tile(inst.result, inst.op.clone());
+                } else {
+                    let mut pending_tiles = builder.pending_tiles.clone();
+                    pending_tiles.insert(inst.result, inst.op.clone());
+                    if can_eval_tile_value(inst.result, &pending_tiles, mir) {
+                        lower_tile_expr_inst(
+                            inst.result,
+                            inst.op.clone(),
+                            *rows,
+                            *cols,
+                            &mut builder,
+                        );
+                    } else {
+                        builder.materialize_tile(*value);
+                        lower_tile_broadcast_inst(inst.result, *value, *rows, *cols, &mut builder);
+                    }
+                }
             }
             _ => {
                 builder.with_current_insts(|ctx, mir, out| lower_inst(inst, mir, ctx, out));
@@ -333,6 +555,23 @@ fn lower_block(
 
     let terminator = lower_terminator(&block.terminator, builder.ctx);
     builder.finish(terminator)
+}
+
+fn can_defer_tile_inst(block: &MirBlock, inst_idx: usize, value: ValueId) -> bool {
+    if MirFunction::terminator_uses(&block.terminator).contains(&value) {
+        return false;
+    }
+    let mut uses = 0usize;
+    for inst in block.insts.iter().skip(inst_idx + 1) {
+        uses += MirFunction::inst_uses(&inst.op)
+            .into_iter()
+            .filter(|used| *used == value)
+            .count();
+        if uses > 1 {
+            return false;
+        }
+    }
+    uses == 1
 }
 
 fn lower_inst(
@@ -359,10 +598,15 @@ fn lower_inst(
                 .insert(llir_value(inst.result), format!("v{}", inst.result.0));
         }
         MirOp::ProgramId { dim } => {
+            if let Some(operand) = ctx.program_ids.get(&(*dim as u8)).cloned() {
+                ctx.operands.insert(inst.result, operand);
+                return;
+            }
             let llir_id = llir_value(inst.result);
             ctx.names.insert(llir_id, format!("v{}", inst.result.0));
-            ctx.operands
-                .insert(inst.result, llir::Operand::Value(llir_id));
+            let operand = llir::Operand::Value(llir_id);
+            ctx.operands.insert(inst.result, operand.clone());
+            ctx.program_ids.insert(*dim as u8, operand);
             out.push(llir::Inst {
                 result: Some(llir_id),
                 result_name: Some(format!("v{}", inst.result.0)),
@@ -375,10 +619,15 @@ fn lower_inst(
             });
         }
         MirOp::ShapeDim { buf, dim } => {
+            if let Some(operand) = ctx.shape_dims.get(&(*buf, *dim)).cloned() {
+                ctx.operands.insert(inst.result, operand);
+                return;
+            }
             let llir_id = llir_value(inst.result);
             ctx.names.insert(llir_id, format!("v{}", inst.result.0));
-            ctx.operands
-                .insert(inst.result, llir::Operand::Value(llir_id));
+            let operand = llir::Operand::Value(llir_id);
+            ctx.operands.insert(inst.result, operand.clone());
+            ctx.shape_dims.insert((*buf, *dim), operand);
             out.push(llir::Inst {
                 result: Some(llir_id),
                 result_name: Some(format!("v{}", inst.result.0)),
@@ -703,90 +952,241 @@ fn alloc_tile_result(
     llir::Operand::Value(llir_id)
 }
 
-fn lower_linear_index_loop(
+fn lower_nested_tile_loop(
     builder: &mut BlockLowerer<'_>,
     prefix: &str,
-    trip_count: i64,
-    mut body: impl FnMut(&mut LowerLlirCtx, &MirFunction, &mut Vec<llir::Inst>, llir::Operand),
+    rows: i64,
+    cols: i64,
+    mut body: impl FnMut(
+        &mut LowerLlirCtx,
+        &MirFunction,
+        &mut Vec<llir::Inst>,
+        llir::Operand,
+        llir::Operand,
+    ),
 ) {
-    let (header, header_params) = builder.create_block(prefix, vec![("loop_idx", llir::Type::I64)]);
+    if rows == 1 {
+        let (header, header_params) = builder.create_block(
+            &format!("{prefix}_col_header"),
+            vec![("loop_col", llir::Type::I64)],
+        );
+        let (body_block, body_params) = builder.create_block(
+            &format!("{prefix}_body"),
+            vec![("loop_col", llir::Type::I64)],
+        );
+        let (continue_block, _) = builder.create_block(&format!("{prefix}_continue"), vec![]);
+
+        builder.set_current_terminator(llir::Terminator::Br {
+            target: header,
+            args: vec![const_i64(0)],
+        });
+
+        builder.switch_to(header);
+        let col = llir::Operand::Value(header_params[0].id);
+        let header_term = builder.with_current_insts(|ctx, _, out| {
+            let cond = emit_cmp(
+                ctx,
+                out,
+                llir::CmpPred::Slt,
+                col.clone(),
+                const_i64(cols),
+                llir::Type::I1,
+            );
+            llir::Terminator::CondBr {
+                cond,
+                true_target: body_block,
+                true_args: vec![col.clone()],
+                false_target: continue_block,
+                false_args: vec![],
+            }
+        });
+        builder.set_current_terminator(header_term);
+
+        builder.switch_to(body_block);
+        let body_col = llir::Operand::Value(body_params[0].id);
+        let body_term = builder.with_current_insts(|ctx, mir, out| {
+            body(ctx, mir, out, const_i64(0), body_col.clone());
+            let next_col = emit_bin(
+                ctx,
+                out,
+                llir::BinOp::Add,
+                body_col.clone(),
+                const_i64(1),
+                llir::Type::I64,
+            );
+            llir::Terminator::Br {
+                target: header,
+                args: vec![next_col],
+            }
+        });
+        builder.set_current_terminator(body_term);
+        builder.switch_to(continue_block);
+        return;
+    }
+
+    if cols == 1 {
+        let (header, header_params) = builder.create_block(
+            &format!("{prefix}_row_header"),
+            vec![("loop_row", llir::Type::I64)],
+        );
+        let (body_block, body_params) = builder.create_block(
+            &format!("{prefix}_body"),
+            vec![("loop_row", llir::Type::I64)],
+        );
+        let (continue_block, _) = builder.create_block(&format!("{prefix}_continue"), vec![]);
+
+        builder.set_current_terminator(llir::Terminator::Br {
+            target: header,
+            args: vec![const_i64(0)],
+        });
+
+        builder.switch_to(header);
+        let row = llir::Operand::Value(header_params[0].id);
+        let header_term = builder.with_current_insts(|ctx, _, out| {
+            let cond = emit_cmp(
+                ctx,
+                out,
+                llir::CmpPred::Slt,
+                row.clone(),
+                const_i64(rows),
+                llir::Type::I1,
+            );
+            llir::Terminator::CondBr {
+                cond,
+                true_target: body_block,
+                true_args: vec![row.clone()],
+                false_target: continue_block,
+                false_args: vec![],
+            }
+        });
+        builder.set_current_terminator(header_term);
+
+        builder.switch_to(body_block);
+        let body_row = llir::Operand::Value(body_params[0].id);
+        let body_term = builder.with_current_insts(|ctx, mir, out| {
+            body(ctx, mir, out, body_row.clone(), const_i64(0));
+            let next_row = emit_bin(
+                ctx,
+                out,
+                llir::BinOp::Add,
+                body_row.clone(),
+                const_i64(1),
+                llir::Type::I64,
+            );
+            llir::Terminator::Br {
+                target: header,
+                args: vec![next_row],
+            }
+        });
+        builder.set_current_terminator(body_term);
+        builder.switch_to(continue_block);
+        return;
+    }
+
+    let (row_header, row_params) = builder.create_block(
+        &format!("{prefix}_row_header"),
+        vec![("loop_row", llir::Type::I64)],
+    );
+    let (col_header, col_params) = builder.create_block(
+        &format!("{prefix}_col_header"),
+        vec![("loop_row", llir::Type::I64), ("loop_col", llir::Type::I64)],
+    );
     let (body_block, body_params) = builder.create_block(
         &format!("{prefix}_body"),
-        vec![("loop_idx", llir::Type::I64)],
+        vec![("loop_row", llir::Type::I64), ("loop_col", llir::Type::I64)],
+    );
+    let (row_latch, row_latch_params) = builder.create_block(
+        &format!("{prefix}_row_latch"),
+        vec![("loop_row", llir::Type::I64)],
     );
     let (continue_block, _) = builder.create_block(&format!("{prefix}_continue"), vec![]);
 
     builder.set_current_terminator(llir::Terminator::Br {
-        target: header,
+        target: row_header,
         args: vec![const_i64(0)],
     });
 
-    builder.switch_to(header);
-    let header_idx = llir::Operand::Value(header_params[0].id);
-    let header_term = builder.with_current_insts(|ctx, _, out| {
+    builder.switch_to(row_header);
+    let row = llir::Operand::Value(row_params[0].id);
+    let row_term = builder.with_current_insts(|ctx, _, out| {
         let cond = emit_cmp(
             ctx,
             out,
             llir::CmpPred::Slt,
-            header_idx.clone(),
-            const_i64(trip_count),
+            row.clone(),
+            const_i64(rows),
+            llir::Type::I1,
+        );
+        llir::Terminator::CondBr {
+            cond,
+            true_target: col_header,
+            true_args: vec![row.clone(), const_i64(0)],
+            false_target: continue_block,
+            false_args: vec![],
+        }
+    });
+    builder.set_current_terminator(row_term);
+
+    builder.switch_to(col_header);
+    let col_row = llir::Operand::Value(col_params[0].id);
+    let col = llir::Operand::Value(col_params[1].id);
+    let col_term = builder.with_current_insts(|ctx, _, out| {
+        let cond = emit_cmp(
+            ctx,
+            out,
+            llir::CmpPred::Slt,
+            col.clone(),
+            const_i64(cols),
             llir::Type::I1,
         );
         llir::Terminator::CondBr {
             cond,
             true_target: body_block,
-            true_args: vec![header_idx.clone()],
-            false_target: continue_block,
-            false_args: vec![],
+            true_args: vec![col_row.clone(), col.clone()],
+            false_target: row_latch,
+            false_args: vec![col_row.clone()],
         }
     });
-    builder.set_current_terminator(header_term);
+    builder.set_current_terminator(col_term);
 
     builder.switch_to(body_block);
-    let body_idx = llir::Operand::Value(body_params[0].id);
+    let body_row = llir::Operand::Value(body_params[0].id);
+    let body_col = llir::Operand::Value(body_params[1].id);
     let body_term = builder.with_current_insts(|ctx, mir, out| {
-        body(ctx, mir, out, body_idx.clone());
-        let next_idx = emit_bin(
+        body(ctx, mir, out, body_row.clone(), body_col.clone());
+        let next_col = emit_bin(
             ctx,
             out,
             llir::BinOp::Add,
-            body_idx.clone(),
+            body_col.clone(),
             const_i64(1),
             llir::Type::I64,
         );
         llir::Terminator::Br {
-            target: header,
-            args: vec![next_idx],
+            target: col_header,
+            args: vec![body_row.clone(), next_col],
         }
     });
     builder.set_current_terminator(body_term);
-    builder.switch_to(continue_block);
-}
 
-fn linear_index_to_coords(
-    ctx: &mut LowerLlirCtx,
-    out: &mut Vec<llir::Inst>,
-    idx: llir::Operand,
-    cols: i64,
-) -> (llir::Operand, llir::Operand) {
-    let row = emit_bin(
-        ctx,
-        out,
-        llir::BinOp::Div,
-        idx.clone(),
-        const_i64(cols),
-        llir::Type::I64,
-    );
-    let row_base = emit_bin(
-        ctx,
-        out,
-        llir::BinOp::Mul,
-        row.clone(),
-        const_i64(cols),
-        llir::Type::I64,
-    );
-    let col = emit_bin(ctx, out, llir::BinOp::Sub, idx, row_base, llir::Type::I64);
-    (row, col)
+    builder.switch_to(row_latch);
+    let latch_row = llir::Operand::Value(row_latch_params[0].id);
+    let row_latch_term = builder.with_current_insts(|ctx, _, out| {
+        let next_row = emit_bin(
+            ctx,
+            out,
+            llir::BinOp::Add,
+            latch_row.clone(),
+            const_i64(1),
+            llir::Type::I64,
+        );
+        llir::Terminator::Br {
+            target: row_header,
+            args: vec![next_row],
+        }
+    });
+    builder.set_current_terminator(row_latch_term);
+    builder.switch_to(continue_block);
 }
 
 fn lower_tile_constant_inst(
@@ -797,12 +1197,12 @@ fn lower_tile_constant_inst(
     builder: &mut BlockLowerer<'_>,
 ) {
     let dst_tile = alloc_tile_result(builder, result, rows, cols);
-    lower_linear_index_loop(
+    lower_nested_tile_loop(
         builder,
         "tile_const_loop",
-        rows * cols,
-        move |ctx, _, out, idx| {
-            let (row, col) = linear_index_to_coords(ctx, out, idx, cols);
+        rows,
+        cols,
+        move |ctx, _, out, row, col| {
             let dst_ptr = emit_gep(
                 ctx,
                 out,
@@ -840,7 +1240,7 @@ fn lower_tile_load_inst(
                 out,
                 llir::BinOp::Mul,
                 tile_coord,
-                const_i64(rows * cols),
+                const_i64(cols),
                 llir::Type::I64,
             );
             (Some(base), None, None, None)
@@ -866,14 +1266,35 @@ fn lower_tile_load_inst(
         }
     });
 
-    lower_linear_index_loop(
+    if rank > 1 {
+        lower_tile_load_rank2_loop(
+            builder,
+            dst_tile,
+            buf_operand,
+            row_base.expect("row base"),
+            col_base.expect("col base"),
+            stride.expect("stride"),
+            rows,
+            cols,
+        );
+        return;
+    }
+
+    lower_nested_tile_loop(
         builder,
         "tile_load_loop",
-        rows * cols,
-        move |ctx, _, out, idx| {
-            let (local_row, local_col) = linear_index_to_coords(ctx, out, idx.clone(), cols);
+        rows,
+        cols,
+        move |ctx, _, out, local_row, local_col| {
             let linear_index = if let Some(tile_base) = tile_base.clone() {
-                emit_bin(ctx, out, llir::BinOp::Add, tile_base, idx, llir::Type::I64)
+                emit_bin(
+                    ctx,
+                    out,
+                    llir::BinOp::Add,
+                    tile_base,
+                    local_col.clone(),
+                    llir::Type::I64,
+                )
             } else {
                 let src_row = emit_bin(
                     ctx,
@@ -979,12 +1400,26 @@ fn lower_tile_store_inst(
         }
     });
 
-    lower_linear_index_loop(
+    if rank > 1 {
+        lower_tile_store_rank2_loop(
+            builder,
+            buf_operand,
+            value_operand,
+            row_base.expect("row base"),
+            col_base.expect("col base"),
+            stride.expect("stride"),
+            rows,
+            cols,
+        );
+        return;
+    }
+
+    lower_nested_tile_loop(
         builder,
         "tile_store_loop",
-        rows * cols,
-        move |ctx, _, out, idx| {
-            let (local_row, local_col) = linear_index_to_coords(ctx, out, idx.clone(), cols);
+        rows,
+        cols,
+        move |ctx, _, out, local_row, local_col| {
             let src_ptr = emit_gep(
                 ctx,
                 out,
@@ -994,7 +1429,14 @@ fn lower_tile_store_inst(
             );
             let scalar = emit_load(ctx, out, src_ptr, llir::Type::F32);
             let linear_index = if let Some(tile_base) = tile_base.clone() {
-                emit_bin(ctx, out, llir::BinOp::Add, tile_base, idx, llir::Type::I64)
+                emit_bin(
+                    ctx,
+                    out,
+                    llir::BinOp::Add,
+                    tile_base,
+                    local_col.clone(),
+                    llir::Type::I64,
+                )
             } else {
                 let dst_row = emit_bin(
                     ctx,
@@ -1041,6 +1483,571 @@ fn lower_tile_store_inst(
     );
 }
 
+fn lower_tile_store_fused_inst(
+    buf: ValueId,
+    value: ValueId,
+    row_coord: ValueId,
+    col_coord: ValueId,
+    rows: i64,
+    cols: i64,
+    stride_shape_idx: usize,
+    builder: &mut BlockLowerer<'_>,
+) {
+    let pending_tiles = builder.pending_tiles.clone();
+    if !can_eval_tile_value(value, &pending_tiles, builder.mir) {
+        builder.materialize_tile(value);
+        lower_tile_store_inst(
+            buf,
+            value,
+            row_coord,
+            col_coord,
+            rows,
+            cols,
+            stride_shape_idx,
+            builder,
+        );
+        return;
+    }
+
+    let buf_operand = resolve_operand(buf, builder.ctx);
+    let rank = buffer_rank_of(buf, builder.mir);
+    let fused_load_bases = builder.with_current_insts(|ctx, mir, out| {
+        let mut bases = HashMap::new();
+        let mut coord_bases = HashMap::new();
+        collect_fused_load_bases(
+            value,
+            &pending_tiles,
+            ctx,
+            mir,
+            out,
+            &mut bases,
+            &mut coord_bases,
+        );
+        bases
+    });
+
+    let (tile_base, row_base, col_base, stride) = builder.with_current_insts(|ctx, _, out| {
+        if rank <= 1 {
+            let mut coord_bases = HashMap::new();
+            let base = get_or_create_1d_tile_base(
+                row_coord,
+                col_coord,
+                rows * cols,
+                ctx,
+                out,
+                &mut coord_bases,
+            );
+            (Some(base), None, None, None)
+        } else {
+            let row_operand = resolve_operand(row_coord, ctx);
+            let col_operand = resolve_operand(col_coord, ctx);
+            let row_base = emit_bin(
+                ctx,
+                out,
+                llir::BinOp::Mul,
+                row_operand.clone(),
+                const_i64(rows),
+                llir::Type::I64,
+            );
+            let col_base = emit_bin(
+                ctx,
+                out,
+                llir::BinOp::Mul,
+                col_operand.clone(),
+                const_i64(cols),
+                llir::Type::I64,
+            );
+            let stride = emit_shape_dim(ctx, out, buf_operand.clone(), stride_shape_idx);
+            (None, Some(row_base), Some(col_base), Some(stride))
+        }
+    });
+
+    lower_nested_tile_loop(
+        builder,
+        "tile_store_fused_loop",
+        rows,
+        cols,
+        move |ctx, mir, out, local_row, local_col| {
+            let scalar = eval_tile_scalar(
+                value,
+                local_row.clone(),
+                local_col.clone(),
+                ctx,
+                mir,
+                &pending_tiles,
+                &fused_load_bases,
+                out,
+            );
+            let linear_index = if let Some(tile_base) = tile_base.clone() {
+                emit_bin(
+                    ctx,
+                    out,
+                    llir::BinOp::Add,
+                    tile_base,
+                    local_col.clone(),
+                    llir::Type::I64,
+                )
+            } else {
+                let dst_row = emit_bin(
+                    ctx,
+                    out,
+                    llir::BinOp::Add,
+                    row_base.clone().expect("row base"),
+                    local_row,
+                    llir::Type::I64,
+                );
+                let dst_col = emit_bin(
+                    ctx,
+                    out,
+                    llir::BinOp::Add,
+                    col_base.clone().expect("col base"),
+                    local_col,
+                    llir::Type::I64,
+                );
+                let row_offset = emit_bin(
+                    ctx,
+                    out,
+                    llir::BinOp::Mul,
+                    dst_row,
+                    stride.clone().expect("stride"),
+                    llir::Type::I64,
+                );
+                emit_bin(
+                    ctx,
+                    out,
+                    llir::BinOp::Add,
+                    row_offset,
+                    dst_col,
+                    llir::Type::I64,
+                )
+            };
+            let dst_ptr = emit_gep(
+                ctx,
+                out,
+                buf_operand.clone(),
+                vec![linear_index],
+                llir::Type::ptr(llir::AddressSpace::Global, llir::Type::F32),
+            );
+            emit_store(out, dst_ptr, scalar);
+        },
+    );
+}
+
+fn lower_tile_expr_inst(
+    result: ValueId,
+    root_op: MirOp,
+    rows: i64,
+    cols: i64,
+    builder: &mut BlockLowerer<'_>,
+) {
+    let dst_tile = alloc_tile_result(builder, result, rows, cols);
+    let mut pending_tiles = builder.pending_tiles.clone();
+    pending_tiles.insert(result, root_op);
+    let fused_load_bases = builder.with_current_insts(|ctx, mir, out| {
+        let mut bases = HashMap::new();
+        let mut coord_bases = HashMap::new();
+        collect_fused_load_bases(
+            result,
+            &pending_tiles,
+            ctx,
+            mir,
+            out,
+            &mut bases,
+            &mut coord_bases,
+        );
+        bases
+    });
+
+    lower_nested_tile_loop(
+        builder,
+        "tile_expr_loop",
+        rows,
+        cols,
+        move |ctx, mir, out, row, col| {
+            let scalar = eval_tile_scalar(
+                result,
+                row.clone(),
+                col.clone(),
+                ctx,
+                mir,
+                &pending_tiles,
+                &fused_load_bases,
+                out,
+            );
+            let dst_ptr = emit_gep(
+                ctx,
+                out,
+                dst_tile.clone(),
+                vec![row, col],
+                llir::Type::ptr(llir::AddressSpace::Private, llir::Type::F32),
+            );
+            emit_store(out, dst_ptr, scalar);
+        },
+    );
+}
+
+fn lower_tile_load_rank2_loop(
+    builder: &mut BlockLowerer<'_>,
+    dst_tile: llir::Operand,
+    buf_operand: llir::Operand,
+    row_base: llir::Operand,
+    col_base: llir::Operand,
+    stride: llir::Operand,
+    rows: i64,
+    cols: i64,
+) {
+    let (row_header, row_params) =
+        builder.create_block("tile_load_row_header", vec![("loop_row", llir::Type::I64)]);
+    let (row_setup, row_setup_params) =
+        builder.create_block("tile_load_row_setup", vec![("loop_row", llir::Type::I64)]);
+    let (col_header, col_header_params) = builder.create_block(
+        "tile_load_col_header",
+        vec![
+            ("loop_row", llir::Type::I64),
+            ("row_offset", llir::Type::I64),
+            ("loop_col", llir::Type::I64),
+        ],
+    );
+    let (body_block, body_params) = builder.create_block(
+        "tile_load_body",
+        vec![
+            ("loop_row", llir::Type::I64),
+            ("row_offset", llir::Type::I64),
+            ("loop_col", llir::Type::I64),
+        ],
+    );
+    let (row_latch, row_latch_params) =
+        builder.create_block("tile_load_row_latch", vec![("loop_row", llir::Type::I64)]);
+    let (continue_block, _) = builder.create_block("tile_load_continue", vec![]);
+
+    builder.set_current_terminator(llir::Terminator::Br {
+        target: row_header,
+        args: vec![const_i64(0)],
+    });
+
+    builder.switch_to(row_header);
+    let row = llir::Operand::Value(row_params[0].id);
+    let row_term = builder.with_current_insts(|ctx, _, out| {
+        let cond = emit_cmp(
+            ctx,
+            out,
+            llir::CmpPred::Slt,
+            row.clone(),
+            const_i64(rows),
+            llir::Type::I1,
+        );
+        llir::Terminator::CondBr {
+            cond,
+            true_target: row_setup,
+            true_args: vec![row.clone()],
+            false_target: continue_block,
+            false_args: vec![],
+        }
+    });
+    builder.set_current_terminator(row_term);
+
+    builder.switch_to(row_setup);
+    let setup_row = llir::Operand::Value(row_setup_params[0].id);
+    let row_setup_term = builder.with_current_insts(|ctx, _, out| {
+        let src_row = emit_bin(
+            ctx,
+            out,
+            llir::BinOp::Add,
+            row_base.clone(),
+            setup_row.clone(),
+            llir::Type::I64,
+        );
+        let row_offset = emit_bin(
+            ctx,
+            out,
+            llir::BinOp::Mul,
+            src_row,
+            stride.clone(),
+            llir::Type::I64,
+        );
+        llir::Terminator::Br {
+            target: col_header,
+            args: vec![setup_row.clone(), row_offset, const_i64(0)],
+        }
+    });
+    builder.set_current_terminator(row_setup_term);
+
+    builder.switch_to(col_header);
+    let col_row = llir::Operand::Value(col_header_params[0].id);
+    let row_offset = llir::Operand::Value(col_header_params[1].id);
+    let col = llir::Operand::Value(col_header_params[2].id);
+    let col_term = builder.with_current_insts(|ctx, _, out| {
+        let cond = emit_cmp(
+            ctx,
+            out,
+            llir::CmpPred::Slt,
+            col.clone(),
+            const_i64(cols),
+            llir::Type::I1,
+        );
+        llir::Terminator::CondBr {
+            cond,
+            true_target: body_block,
+            true_args: vec![col_row.clone(), row_offset.clone(), col.clone()],
+            false_target: row_latch,
+            false_args: vec![col_row.clone()],
+        }
+    });
+    builder.set_current_terminator(col_term);
+
+    builder.switch_to(body_block);
+    let body_row = llir::Operand::Value(body_params[0].id);
+    let body_row_offset = llir::Operand::Value(body_params[1].id);
+    let body_col = llir::Operand::Value(body_params[2].id);
+    let body_term = builder.with_current_insts(|ctx, _, out| {
+        let src_col = emit_bin(
+            ctx,
+            out,
+            llir::BinOp::Add,
+            col_base.clone(),
+            body_col.clone(),
+            llir::Type::I64,
+        );
+        let linear_index = emit_bin(
+            ctx,
+            out,
+            llir::BinOp::Add,
+            body_row_offset.clone(),
+            src_col,
+            llir::Type::I64,
+        );
+        let src_ptr = emit_gep(
+            ctx,
+            out,
+            buf_operand.clone(),
+            vec![linear_index],
+            llir::Type::ptr(llir::AddressSpace::Global, llir::Type::F32),
+        );
+        let loaded = emit_load(ctx, out, src_ptr, llir::Type::F32);
+        let dst_ptr = emit_gep(
+            ctx,
+            out,
+            dst_tile.clone(),
+            vec![body_row.clone(), body_col.clone()],
+            llir::Type::ptr(llir::AddressSpace::Private, llir::Type::F32),
+        );
+        emit_store(out, dst_ptr, loaded);
+        let next_col = emit_bin(
+            ctx,
+            out,
+            llir::BinOp::Add,
+            body_col.clone(),
+            const_i64(1),
+            llir::Type::I64,
+        );
+        llir::Terminator::Br {
+            target: col_header,
+            args: vec![body_row.clone(), body_row_offset.clone(), next_col],
+        }
+    });
+    builder.set_current_terminator(body_term);
+
+    builder.switch_to(row_latch);
+    let latch_row = llir::Operand::Value(row_latch_params[0].id);
+    let row_latch_term = builder.with_current_insts(|ctx, _, out| {
+        let next_row = emit_bin(
+            ctx,
+            out,
+            llir::BinOp::Add,
+            latch_row.clone(),
+            const_i64(1),
+            llir::Type::I64,
+        );
+        llir::Terminator::Br {
+            target: row_header,
+            args: vec![next_row],
+        }
+    });
+    builder.set_current_terminator(row_latch_term);
+    builder.switch_to(continue_block);
+}
+
+fn lower_tile_store_rank2_loop(
+    builder: &mut BlockLowerer<'_>,
+    buf_operand: llir::Operand,
+    value_operand: llir::Operand,
+    row_base: llir::Operand,
+    col_base: llir::Operand,
+    stride: llir::Operand,
+    rows: i64,
+    cols: i64,
+) {
+    let (row_header, row_params) =
+        builder.create_block("tile_store_row_header", vec![("loop_row", llir::Type::I64)]);
+    let (row_setup, row_setup_params) =
+        builder.create_block("tile_store_row_setup", vec![("loop_row", llir::Type::I64)]);
+    let (col_header, col_header_params) = builder.create_block(
+        "tile_store_col_header",
+        vec![
+            ("loop_row", llir::Type::I64),
+            ("row_offset", llir::Type::I64),
+            ("loop_col", llir::Type::I64),
+        ],
+    );
+    let (body_block, body_params) = builder.create_block(
+        "tile_store_body",
+        vec![
+            ("loop_row", llir::Type::I64),
+            ("row_offset", llir::Type::I64),
+            ("loop_col", llir::Type::I64),
+        ],
+    );
+    let (row_latch, row_latch_params) =
+        builder.create_block("tile_store_row_latch", vec![("loop_row", llir::Type::I64)]);
+    let (continue_block, _) = builder.create_block("tile_store_continue", vec![]);
+
+    builder.set_current_terminator(llir::Terminator::Br {
+        target: row_header,
+        args: vec![const_i64(0)],
+    });
+
+    builder.switch_to(row_header);
+    let row = llir::Operand::Value(row_params[0].id);
+    let row_term = builder.with_current_insts(|ctx, _, out| {
+        let cond = emit_cmp(
+            ctx,
+            out,
+            llir::CmpPred::Slt,
+            row.clone(),
+            const_i64(rows),
+            llir::Type::I1,
+        );
+        llir::Terminator::CondBr {
+            cond,
+            true_target: row_setup,
+            true_args: vec![row.clone()],
+            false_target: continue_block,
+            false_args: vec![],
+        }
+    });
+    builder.set_current_terminator(row_term);
+
+    builder.switch_to(row_setup);
+    let setup_row = llir::Operand::Value(row_setup_params[0].id);
+    let row_setup_term = builder.with_current_insts(|ctx, _, out| {
+        let dst_row = emit_bin(
+            ctx,
+            out,
+            llir::BinOp::Add,
+            row_base.clone(),
+            setup_row.clone(),
+            llir::Type::I64,
+        );
+        let row_offset = emit_bin(
+            ctx,
+            out,
+            llir::BinOp::Mul,
+            dst_row,
+            stride.clone(),
+            llir::Type::I64,
+        );
+        llir::Terminator::Br {
+            target: col_header,
+            args: vec![setup_row.clone(), row_offset, const_i64(0)],
+        }
+    });
+    builder.set_current_terminator(row_setup_term);
+
+    builder.switch_to(col_header);
+    let col_row = llir::Operand::Value(col_header_params[0].id);
+    let row_offset = llir::Operand::Value(col_header_params[1].id);
+    let col = llir::Operand::Value(col_header_params[2].id);
+    let col_term = builder.with_current_insts(|ctx, _, out| {
+        let cond = emit_cmp(
+            ctx,
+            out,
+            llir::CmpPred::Slt,
+            col.clone(),
+            const_i64(cols),
+            llir::Type::I1,
+        );
+        llir::Terminator::CondBr {
+            cond,
+            true_target: body_block,
+            true_args: vec![col_row.clone(), row_offset.clone(), col.clone()],
+            false_target: row_latch,
+            false_args: vec![col_row.clone()],
+        }
+    });
+    builder.set_current_terminator(col_term);
+
+    builder.switch_to(body_block);
+    let body_row = llir::Operand::Value(body_params[0].id);
+    let body_row_offset = llir::Operand::Value(body_params[1].id);
+    let body_col = llir::Operand::Value(body_params[2].id);
+    let body_term = builder.with_current_insts(|ctx, _, out| {
+        let src_ptr = emit_gep(
+            ctx,
+            out,
+            value_operand.clone(),
+            vec![body_row.clone(), body_col.clone()],
+            llir::Type::ptr(llir::AddressSpace::Private, llir::Type::F32),
+        );
+        let scalar = emit_load(ctx, out, src_ptr, llir::Type::F32);
+        let dst_col = emit_bin(
+            ctx,
+            out,
+            llir::BinOp::Add,
+            col_base.clone(),
+            body_col.clone(),
+            llir::Type::I64,
+        );
+        let linear_index = emit_bin(
+            ctx,
+            out,
+            llir::BinOp::Add,
+            body_row_offset.clone(),
+            dst_col,
+            llir::Type::I64,
+        );
+        let dst_ptr = emit_gep(
+            ctx,
+            out,
+            buf_operand.clone(),
+            vec![linear_index],
+            llir::Type::ptr(llir::AddressSpace::Global, llir::Type::F32),
+        );
+        emit_store(out, dst_ptr, scalar);
+        let next_col = emit_bin(
+            ctx,
+            out,
+            llir::BinOp::Add,
+            body_col.clone(),
+            const_i64(1),
+            llir::Type::I64,
+        );
+        llir::Terminator::Br {
+            target: col_header,
+            args: vec![body_row.clone(), body_row_offset.clone(), next_col],
+        }
+    });
+    builder.set_current_terminator(body_term);
+
+    builder.switch_to(row_latch);
+    let latch_row = llir::Operand::Value(row_latch_params[0].id);
+    let row_latch_term = builder.with_current_insts(|ctx, _, out| {
+        let next_row = emit_bin(
+            ctx,
+            out,
+            llir::BinOp::Add,
+            latch_row.clone(),
+            const_i64(1),
+            llir::Type::I64,
+        );
+        llir::Terminator::Br {
+            target: row_header,
+            args: vec![next_row],
+        }
+    });
+    builder.set_current_terminator(row_latch_term);
+    builder.switch_to(continue_block);
+}
+
 fn lower_tile_binary_inst(
     result: ValueId,
     lhs: ValueId,
@@ -1053,12 +2060,12 @@ fn lower_tile_binary_inst(
     let dst_tile = alloc_tile_result(builder, result, rows, cols);
     let lhs_tile = resolve_operand(lhs, builder.ctx);
     let rhs_tile = resolve_operand(rhs, builder.ctx);
-    lower_linear_index_loop(
+    lower_nested_tile_loop(
         builder,
         "tile_binary_loop",
-        rows * cols,
-        move |ctx, _, out, idx| {
-            let (row, col) = linear_index_to_coords(ctx, out, idx, cols);
+        rows,
+        cols,
+        move |ctx, _, out, row, col| {
             let lhs =
                 load_tile_scalar_dynamic(ctx, out, lhs_tile.clone(), row.clone(), col.clone());
             let rhs =
@@ -1076,6 +2083,263 @@ fn lower_tile_binary_inst(
     );
 }
 
+fn eval_tile_scalar(
+    value: ValueId,
+    row: llir::Operand,
+    col: llir::Operand,
+    ctx: &mut LowerLlirCtx,
+    mir: &MirFunction,
+    pending_tiles: &HashMap<ValueId, MirOp>,
+    fused_load_bases: &HashMap<ValueId, llir::Operand>,
+    out: &mut Vec<llir::Inst>,
+) -> llir::Operand {
+    if let Some(op) = pending_tiles.get(&value).cloned() {
+        match op {
+            MirOp::TileConstant { value, .. } => return const_f32(value),
+            MirOp::TileLoad {
+                buf,
+                row_coord,
+                col_coord,
+                rows,
+                cols,
+                stride_shape_idx,
+            } => {
+                let buf_operand = resolve_operand(buf, ctx);
+                let rank = buffer_rank_of(buf, mir);
+                let linear_index = if rank <= 1 {
+                    let tile_base = fused_load_bases.get(&value).cloned().unwrap_or_else(|| {
+                        let mut coord_bases = HashMap::new();
+                        get_or_create_1d_tile_base(
+                            row_coord,
+                            col_coord,
+                            rows * cols,
+                            ctx,
+                            out,
+                            &mut coord_bases,
+                        )
+                    });
+                    emit_bin(ctx, out, llir::BinOp::Add, tile_base, col, llir::Type::I64)
+                } else {
+                    let row_operand = resolve_operand(row_coord, ctx);
+                    let col_operand = resolve_operand(col_coord, ctx);
+                    let row_base = emit_bin(
+                        ctx,
+                        out,
+                        llir::BinOp::Mul,
+                        row_operand,
+                        const_i64(rows),
+                        llir::Type::I64,
+                    );
+                    let col_base = emit_bin(
+                        ctx,
+                        out,
+                        llir::BinOp::Mul,
+                        col_operand,
+                        const_i64(cols),
+                        llir::Type::I64,
+                    );
+                    let src_row =
+                        emit_bin(ctx, out, llir::BinOp::Add, row_base, row, llir::Type::I64);
+                    let src_col =
+                        emit_bin(ctx, out, llir::BinOp::Add, col_base, col, llir::Type::I64);
+                    let stride = emit_shape_dim(ctx, out, buf_operand.clone(), stride_shape_idx);
+                    let row_offset =
+                        emit_bin(ctx, out, llir::BinOp::Mul, src_row, stride, llir::Type::I64);
+                    emit_bin(
+                        ctx,
+                        out,
+                        llir::BinOp::Add,
+                        row_offset,
+                        src_col,
+                        llir::Type::I64,
+                    )
+                };
+                let src_ptr = emit_gep(
+                    ctx,
+                    out,
+                    buf_operand,
+                    vec![linear_index],
+                    llir::Type::ptr(llir::AddressSpace::Global, llir::Type::F32),
+                );
+                return emit_load(ctx, out, src_ptr, llir::Type::F32);
+            }
+            MirOp::TileBinary { op, lhs, rhs, .. } => {
+                let lhs = eval_tile_scalar(
+                    lhs,
+                    row.clone(),
+                    col.clone(),
+                    ctx,
+                    mir,
+                    pending_tiles,
+                    fused_load_bases,
+                    out,
+                );
+                let rhs = eval_tile_scalar(
+                    rhs,
+                    row,
+                    col,
+                    ctx,
+                    mir,
+                    pending_tiles,
+                    fused_load_bases,
+                    out,
+                );
+                return emit_bin(ctx, out, lower_bin_op(op), lhs, rhs, llir::Type::F32);
+            }
+            MirOp::TileUnary { op, operand, .. } => {
+                let src = eval_tile_scalar(
+                    operand,
+                    row.clone(),
+                    col.clone(),
+                    ctx,
+                    mir,
+                    pending_tiles,
+                    fused_load_bases,
+                    out,
+                );
+                return match op {
+                    UnaryOp::Neg => emit_bin(
+                        ctx,
+                        out,
+                        llir::BinOp::Sub,
+                        const_f32(0.0),
+                        src,
+                        llir::Type::F32,
+                    ),
+                    UnaryOp::Exp => {
+                        emit_intrinsic(ctx, out, llir::Intrinsic::Exp, vec![src], llir::Type::F32)
+                    }
+                };
+            }
+            MirOp::TileBroadcast { value: src, .. } => {
+                let (src_rows, src_cols) = tile_dims_of(src, mir).unwrap_or((1, 1));
+                let src_row = if src_rows == 1 { const_i64(0) } else { row };
+                let src_col = if src_cols == 1 { const_i64(0) } else { col };
+                return eval_tile_scalar(
+                    src,
+                    src_row,
+                    src_col,
+                    ctx,
+                    mir,
+                    pending_tiles,
+                    fused_load_bases,
+                    out,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    load_tile_scalar_dynamic(ctx, out, resolve_operand(value, ctx), row, col)
+}
+
+fn can_eval_tile_value(
+    value: ValueId,
+    pending_tiles: &HashMap<ValueId, MirOp>,
+    mir: &MirFunction,
+) -> bool {
+    let Some(op) = pending_tiles.get(&value) else {
+        return tile_dims_of(value, mir).is_some();
+    };
+    match op {
+        MirOp::TileConstant { .. } | MirOp::TileLoad { .. } => true,
+        MirOp::TileBinary { lhs, rhs, .. } => {
+            can_eval_tile_value(*lhs, pending_tiles, mir)
+                && can_eval_tile_value(*rhs, pending_tiles, mir)
+        }
+        MirOp::TileUnary { operand, .. } => can_eval_tile_value(*operand, pending_tiles, mir),
+        MirOp::TileBroadcast { value, .. } => can_eval_tile_value(*value, pending_tiles, mir),
+        _ => false,
+    }
+}
+
+fn collect_fused_load_bases(
+    value: ValueId,
+    pending_tiles: &HashMap<ValueId, MirOp>,
+    ctx: &mut LowerLlirCtx,
+    mir: &MirFunction,
+    out: &mut Vec<llir::Inst>,
+    bases: &mut HashMap<ValueId, llir::Operand>,
+    coord_bases: &mut HashMap<(CoordOperandKey, CoordOperandKey, i64), llir::Operand>,
+) {
+    let Some(op) = pending_tiles.get(&value).cloned() else {
+        return;
+    };
+    match op {
+        MirOp::TileLoad {
+            buf,
+            row_coord,
+            col_coord,
+            rows,
+            cols,
+            ..
+        } => {
+            if buffer_rank_of(buf, mir) <= 1 && !bases.contains_key(&value) {
+                let tile_base = get_or_create_1d_tile_base(
+                    row_coord,
+                    col_coord,
+                    rows * cols,
+                    ctx,
+                    out,
+                    coord_bases,
+                );
+                bases.insert(value, tile_base);
+            }
+        }
+        MirOp::TileBinary { lhs, rhs, .. } => {
+            collect_fused_load_bases(lhs, pending_tiles, ctx, mir, out, bases, coord_bases);
+            collect_fused_load_bases(rhs, pending_tiles, ctx, mir, out, bases, coord_bases);
+        }
+        MirOp::TileUnary { operand, .. } => {
+            collect_fused_load_bases(operand, pending_tiles, ctx, mir, out, bases, coord_bases);
+        }
+        MirOp::TileBroadcast { value, .. } => {
+            collect_fused_load_bases(value, pending_tiles, ctx, mir, out, bases, coord_bases);
+        }
+        _ => {}
+    }
+}
+
+fn get_or_create_1d_tile_base(
+    row_coord: ValueId,
+    col_coord: ValueId,
+    tile_size: i64,
+    ctx: &mut LowerLlirCtx,
+    out: &mut Vec<llir::Inst>,
+    bases: &mut HashMap<(CoordOperandKey, CoordOperandKey, i64), llir::Operand>,
+) -> llir::Operand {
+    let row_operand = resolve_operand(row_coord, ctx);
+    let col_operand = resolve_operand(col_coord, ctx);
+    let cache_key = operand_coord_key(&row_operand)
+        .zip(operand_coord_key(&col_operand))
+        .map(|(row_key, col_key)| (row_key, col_key, tile_size));
+    if let Some(base) = cache_key.as_ref().and_then(|key| bases.get(key).cloned()) {
+        return base;
+    }
+
+    let tile_coord = lower_1d_tile_coord(ctx, out, row_operand, col_operand);
+    let tile_base = emit_bin(
+        ctx,
+        out,
+        llir::BinOp::Mul,
+        tile_coord,
+        const_i64(tile_size),
+        llir::Type::I64,
+    );
+    if let Some(cache_key) = cache_key {
+        bases.insert(cache_key, tile_base.clone());
+    }
+    tile_base
+}
+
+fn operand_coord_key(operand: &llir::Operand) -> Option<CoordOperandKey> {
+    match operand {
+        llir::Operand::Value(id) => Some(CoordOperandKey::Value(*id)),
+        llir::Operand::Const(llir::Constant::Int(value)) => Some(CoordOperandKey::ConstI64(*value)),
+        _ => None,
+    }
+}
+
 fn lower_tile_unary_inst(
     result: ValueId,
     operand: ValueId,
@@ -1086,12 +2350,12 @@ fn lower_tile_unary_inst(
 ) {
     let dst_tile = alloc_tile_result(builder, result, rows, cols);
     let src_tile = resolve_operand(operand, builder.ctx);
-    lower_linear_index_loop(
+    lower_nested_tile_loop(
         builder,
         "tile_unary_loop",
-        rows * cols,
-        move |ctx, _, out, idx| {
-            let (row, col) = linear_index_to_coords(ctx, out, idx, cols);
+        rows,
+        cols,
+        move |ctx, _, out, row, col| {
             let src =
                 load_tile_scalar_dynamic(ctx, out, src_tile.clone(), row.clone(), col.clone());
             let result = match op {
@@ -1129,12 +2393,12 @@ fn lower_tile_broadcast_inst(
     let dst_tile = alloc_tile_result(builder, result, rows, cols);
     let src_tile = resolve_operand(value, builder.ctx);
     let (src_rows, src_cols) = tile_dims_of(value, builder.mir).unwrap_or((1, 1));
-    lower_linear_index_loop(
+    lower_nested_tile_loop(
         builder,
         "tile_broadcast_loop",
-        rows * cols,
-        move |ctx, _, out, idx| {
-            let (row, col) = linear_index_to_coords(ctx, out, idx, cols);
+        rows,
+        cols,
+        move |ctx, _, out, row, col| {
             let src_row = if src_rows == 1 {
                 const_i64(0)
             } else {
