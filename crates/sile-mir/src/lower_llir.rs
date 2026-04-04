@@ -5,8 +5,23 @@ use sile_hir::typeck::TypedKernel;
 use sile_llir as llir;
 
 use crate::ir::*;
+use crate::passes::{LlirLoweringPlan, build_llir_lowering_plan};
 
-pub fn lower_mir_to_llir(mir: &MirFunction, typed: &TypedKernel) -> llir::Function {
+/// Lowers MIR into raw LLIR without running any LLIR optimization pipeline.
+///
+/// This function is intentionally the semantic boundary between MIR and LLIR.
+/// Target-independent cleanups and profitability-driven rewrites should live in
+/// explicit MIR/LLIR passes instead of being encoded here long term.
+pub fn lower_mir_to_llir_raw(mir: &MirFunction, typed: &TypedKernel) -> llir::Function {
+    let plan = build_llir_lowering_plan(mir);
+    lower_mir_to_llir_raw_with_plan(mir, typed, &plan)
+}
+
+pub fn lower_mir_to_llir_raw_with_plan(
+    mir: &MirFunction,
+    typed: &TypedKernel,
+    plan: &LlirLoweringPlan,
+) -> llir::Function {
     let mut ctx = LowerLlirCtx {
         operands: HashMap::new(),
         names: HashMap::new(),
@@ -37,7 +52,7 @@ pub fn lower_mir_to_llir(mir: &MirFunction, typed: &TypedKernel) -> llir::Functi
     let blocks = mir
         .blocks
         .iter()
-        .flat_map(|block| lower_block(block, mir, &mut ctx))
+        .flat_map(|block| lower_block(block, mir, plan, &mut ctx))
         .collect();
 
     llir::Function {
@@ -47,6 +62,10 @@ pub fn lower_mir_to_llir(mir: &MirFunction, typed: &TypedKernel) -> llir::Functi
         entry: llir_block(mir.entry),
         metadata: Vec::new(),
     }
+}
+
+pub fn lower_mir_to_llir(mir: &MirFunction, typed: &TypedKernel) -> llir::Function {
+    lower_mir_to_llir_raw(mir, typed)
 }
 
 fn lower_param_abis(typed: &TypedKernel) -> Vec<Option<llir::ParamAbi>> {
@@ -111,6 +130,7 @@ struct PendingBlock {
 
 struct BlockLowerer<'a> {
     mir: &'a MirFunction,
+    plan: &'a LlirLoweringPlan,
     ctx: &'a mut LowerLlirCtx,
     blocks: Vec<PendingBlock>,
     current: usize,
@@ -120,6 +140,7 @@ struct BlockLowerer<'a> {
 impl<'a> BlockLowerer<'a> {
     fn new(
         mir: &'a MirFunction,
+        plan: &'a LlirLoweringPlan,
         ctx: &'a mut LowerLlirCtx,
         id: llir::BlockId,
         name: String,
@@ -127,6 +148,7 @@ impl<'a> BlockLowerer<'a> {
     ) -> Self {
         Self {
             mir,
+            plan,
             ctx,
             blocks: vec![PendingBlock {
                 id,
@@ -250,7 +272,10 @@ impl<'a> BlockLowerer<'a> {
                     cols,
                 };
                 pending_tiles.insert(value, current_op.clone());
-                if can_eval_tile_value(value, &pending_tiles, self.mir) {
+                if self
+                    .plan
+                    .can_eval_tile_value(value, &pending_tiles, self.mir)
+                {
                     lower_tile_expr_inst(value, current_op, rows, cols, self);
                 } else {
                     self.materialize_tile(lhs);
@@ -272,7 +297,10 @@ impl<'a> BlockLowerer<'a> {
                     cols,
                 };
                 pending_tiles.insert(value, current_op.clone());
-                if can_eval_tile_value(value, &pending_tiles, self.mir) {
+                if self
+                    .plan
+                    .can_eval_tile_value(value, &pending_tiles, self.mir)
+                {
                     lower_tile_expr_inst(value, current_op, rows, cols, self);
                 } else {
                     self.materialize_tile(operand);
@@ -291,7 +319,10 @@ impl<'a> BlockLowerer<'a> {
                     cols,
                 };
                 pending_tiles.insert(value, current_op.clone());
-                if can_eval_tile_value(value, &pending_tiles, self.mir) {
+                if self
+                    .plan
+                    .can_eval_tile_value(value, &pending_tiles, self.mir)
+                {
                     lower_tile_expr_inst(value, current_op, rows, cols, self);
                 } else {
                     self.materialize_tile(src);
@@ -329,6 +360,7 @@ impl<'a> BlockLowerer<'a> {
 fn lower_block(
     block: &MirBlock,
     mir: &MirFunction,
+    plan: &LlirLoweringPlan,
     ctx: &mut LowerLlirCtx,
 ) -> Vec<llir::BasicBlock> {
     let params = block
@@ -349,16 +381,17 @@ fn lower_block(
 
     let mut builder = BlockLowerer::new(
         mir,
+        plan,
         ctx,
         llir_block(block.id),
         format!("bb{}", block.id.0),
         params,
     );
 
-    for (inst_idx, inst) in block.insts.iter().enumerate() {
+    for inst in &block.insts {
         match &inst.op {
             MirOp::TileConstant { value, rows, cols } => {
-                if can_defer_tile_inst(block, inst_idx, inst.result) {
+                if builder.plan.should_defer(inst.result) {
                     builder.defer_tile(inst.result, inst.op.clone());
                 } else {
                     lower_tile_constant_inst(inst.result, *value, *rows, *cols, &mut builder);
@@ -372,7 +405,7 @@ fn lower_block(
                 cols,
                 stride_shape_idx,
             } => {
-                if can_defer_tile_inst(block, inst_idx, inst.result) {
+                if builder.plan.should_defer(inst.result) {
                     builder.defer_tile(inst.result, inst.op.clone());
                 } else {
                     lower_tile_load_inst(
@@ -427,12 +460,15 @@ fn lower_block(
                 rows,
                 cols,
             } => {
-                if can_defer_tile_inst(block, inst_idx, inst.result) {
+                if builder.plan.should_defer(inst.result) {
                     builder.defer_tile(inst.result, inst.op.clone());
                 } else {
                     let mut pending_tiles = builder.pending_tiles.clone();
                     pending_tiles.insert(inst.result, inst.op.clone());
-                    if can_eval_tile_value(inst.result, &pending_tiles, mir) {
+                    if builder
+                        .plan
+                        .can_eval_tile_value(inst.result, &pending_tiles, mir)
+                    {
                         lower_tile_expr_inst(
                             inst.result,
                             inst.op.clone(),
@@ -461,12 +497,15 @@ fn lower_block(
                 rows,
                 cols,
             } => {
-                if can_defer_tile_inst(block, inst_idx, inst.result) {
+                if builder.plan.should_defer(inst.result) {
                     builder.defer_tile(inst.result, inst.op.clone());
                 } else {
                     let mut pending_tiles = builder.pending_tiles.clone();
                     pending_tiles.insert(inst.result, inst.op.clone());
-                    if can_eval_tile_value(inst.result, &pending_tiles, mir) {
+                    if builder
+                        .plan
+                        .can_eval_tile_value(inst.result, &pending_tiles, mir)
+                    {
                         lower_tile_expr_inst(
                             inst.result,
                             inst.op.clone(),
@@ -528,12 +567,15 @@ fn lower_block(
                 );
             }
             MirOp::TileBroadcast { value, rows, cols } => {
-                if can_defer_tile_inst(block, inst_idx, inst.result) {
+                if builder.plan.should_defer(inst.result) {
                     builder.defer_tile(inst.result, inst.op.clone());
                 } else {
                     let mut pending_tiles = builder.pending_tiles.clone();
                     pending_tiles.insert(inst.result, inst.op.clone());
-                    if can_eval_tile_value(inst.result, &pending_tiles, mir) {
+                    if builder
+                        .plan
+                        .can_eval_tile_value(inst.result, &pending_tiles, mir)
+                    {
                         lower_tile_expr_inst(
                             inst.result,
                             inst.op.clone(),
@@ -556,24 +598,6 @@ fn lower_block(
     let terminator = lower_terminator(&block.terminator, builder.ctx);
     builder.finish(terminator)
 }
-
-fn can_defer_tile_inst(block: &MirBlock, inst_idx: usize, value: ValueId) -> bool {
-    if MirFunction::terminator_uses(&block.terminator).contains(&value) {
-        return false;
-    }
-    let mut uses = 0usize;
-    for inst in block.insts.iter().skip(inst_idx + 1) {
-        uses += MirFunction::inst_uses(&inst.op)
-            .into_iter()
-            .filter(|used| *used == value)
-            .count();
-        if uses > 1 {
-            return false;
-        }
-    }
-    uses == 1
-}
-
 fn lower_inst(
     inst: &MirInst,
     mir: &MirFunction,
@@ -1494,7 +1518,10 @@ fn lower_tile_store_fused_inst(
     builder: &mut BlockLowerer<'_>,
 ) {
     let pending_tiles = builder.pending_tiles.clone();
-    if !can_eval_tile_value(value, &pending_tiles, builder.mir) {
+    if !builder
+        .plan
+        .can_eval_tile_value(value, &pending_tiles, builder.mir)
+    {
         builder.materialize_tile(value);
         lower_tile_store_inst(
             buf,
@@ -2232,27 +2259,6 @@ fn eval_tile_scalar(
 
     load_tile_scalar_dynamic(ctx, out, resolve_operand(value, ctx), row, col)
 }
-
-fn can_eval_tile_value(
-    value: ValueId,
-    pending_tiles: &HashMap<ValueId, MirOp>,
-    mir: &MirFunction,
-) -> bool {
-    let Some(op) = pending_tiles.get(&value) else {
-        return tile_dims_of(value, mir).is_some();
-    };
-    match op {
-        MirOp::TileConstant { .. } | MirOp::TileLoad { .. } => true,
-        MirOp::TileBinary { lhs, rhs, .. } => {
-            can_eval_tile_value(*lhs, pending_tiles, mir)
-                && can_eval_tile_value(*rhs, pending_tiles, mir)
-        }
-        MirOp::TileUnary { operand, .. } => can_eval_tile_value(*operand, pending_tiles, mir),
-        MirOp::TileBroadcast { value, .. } => can_eval_tile_value(*value, pending_tiles, mir),
-        _ => false,
-    }
-}
-
 fn collect_fused_load_bases(
     value: ValueId,
     pending_tiles: &HashMap<ValueId, MirOp>,

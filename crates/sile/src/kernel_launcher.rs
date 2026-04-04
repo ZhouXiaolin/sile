@@ -2,6 +2,8 @@ use sile_core::{Device, KernelArg, LaunchConfig, Result, Stream};
 use sile_hir::Kernel;
 use sile_llir::format_function as format_llir_function;
 
+use crate::compiler::compile_to_llir;
+
 pub struct KernelLauncher<'a> {
     kernel: &'static Kernel,
     args: Vec<KernelArg<'a>>,
@@ -36,9 +38,7 @@ impl<'a> KernelLauncher<'a> {
         let typed = sile_hir::typeck::check_kernel(self.kernel)
             .map_err(|e| sile_core::Error::Shape(e.to_string()))?;
 
-        let mir = sile_mir::lower_to_mir(&typed);
-        let mir = sile_mir::dce::run(mir);
-        let llir_func = sile_mir::lower_mir_to_llir(&mir, &typed);
+        let (_, llir_func) = compile_to_llir(&typed)?;
 
         if std::env::var_os("SILE_PRINT_LLIR").is_some() {
             eprintln!("{}", format_llir_function(&llir_func));

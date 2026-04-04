@@ -24,11 +24,7 @@ pub mod mir {
 pub mod llir {
     pub use sile_llir::*;
 }
-pub mod compiler {
-    pub use sile_mir::dce;
-    pub use sile_mir::lower_mir_to_llir;
-    pub use sile_mir::lower_to_mir;
-}
+pub mod compiler;
 pub mod codegen {
     pub mod llir_c {
         pub use sile_backend_cpu::codegen_llir_c::*;
