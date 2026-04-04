@@ -1,16 +1,16 @@
 use sile::{Device, Tensor};
 
 #[sile::kernel]
-fn matmul<const BM: i64, const BN: i64, const BK: i64, const K_BLOCKS: i64>(
-    a: &Tensor<f32, { [-1, -1] }>,
-    b: &Tensor<f32, { [-1, -1] }>,
+fn matmul<const BM: i64, const BN: i64, const BK: i64, const K: i64>(
+    a: &Tensor<f32, { [-1, K] }>,
+    b: &Tensor<f32, { [K, -1] }>,
     c: &mut Tensor<f32, { [BM, BN] }>,
 ) {
     let m_idx = sile::tile::id().0;
     let n_idx = sile::tile::id().1;
 
     let mut acc = sile::constant(0.0, [BM, BN]);
-    for k_idx in 0..K_BLOCKS {
+    for k_idx in 0..(a.shape()[1] / BK) {
         let a_tile = a.load_tile([BM, BK], [m_idx, k_idx]);
         let b_tile = b.load_tile([BK, BN], [k_idx, n_idx]);
         acc = sile::mma(a_tile, b_tile, acc.clone());
@@ -26,7 +26,7 @@ fn cpu_backend_executes_matmul_through_tile_pipeline() {
     const BM: i64 = 2;
     const BN: i64 = 2;
     const BK: i64 = 2;
-    const K_BLOCKS: i64 = 2;
+    const K: i64 = 4;
 
     let a = Tensor::from_vec(
         vec![
@@ -52,7 +52,7 @@ fn cpu_backend_executes_matmul_through_tile_pipeline() {
     .unwrap();
     let mut c = Tensor::zeros([4, 4], &device).unwrap();
 
-    matmul::<BM, BN, BK, K_BLOCKS>(&a, &b, &mut c)
+    matmul::<BM, BN, BK, K>(&a, &b, &mut c)
         .grid((4, 1, 1))
         .apply(&stream)
         .unwrap();

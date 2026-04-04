@@ -148,19 +148,21 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx<'_>) {
 }
 
 fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut LowerCtx<'_>) {
-    let start_val = eval_i64(start, ctx);
-    let end_val = eval_i64(end, ctx);
+    let start_const = try_eval_i64(start, ctx);
+    let end_const = try_eval_i64(end, ctx);
 
-    // If bounds are compile-time known and small, unroll
-    if end_val - start_val <= 32 {
-        for i in start_val..end_val {
-            let const_val = ctx.emit(MirOp::ConstI64(i), MirType::I64);
-            ctx.locals.insert(var.to_string(), const_val);
-            for inner in body {
-                lower_stmt(inner, ctx);
+    // If bounds are compile-time known and small, unroll.
+    if let (Some(start_val), Some(end_val)) = (start_const, end_const) {
+        if end_val - start_val <= 32 {
+            for i in start_val..end_val {
+                let const_val = ctx.emit(MirOp::ConstI64(i), MirType::I64);
+                ctx.locals.insert(var.to_string(), const_val);
+                for inner in body {
+                    lower_stmt(inner, ctx);
+                }
             }
+            return;
         }
-        return;
     }
 
     // Otherwise: generate CFG loop with block parameters
@@ -211,7 +213,10 @@ fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut 
         .collect();
 
     // Seal entry block → jump to header with initial values
-    let start_v = ctx.emit(MirOp::ConstI64(start_val), MirType::I64);
+    let start_v = match start_const {
+        Some(value) => ctx.emit(MirOp::ConstI64(value), MirType::I64),
+        None => lower_expr(start, ctx),
+    };
     let mut jump_args = vec![start_v];
     jump_args.extend(init_carried.iter().map(|(_, v)| *v));
     ctx.seal_block(MirTerminator::Jump {
@@ -228,7 +233,10 @@ fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut 
         ctx.locals.insert(name.clone(), *param);
     }
 
-    let end_v = ctx.emit(MirOp::ConstI64(end_val), MirType::I64);
+    let end_v = match end_const {
+        Some(value) => ctx.emit(MirOp::ConstI64(value), MirType::I64),
+        None => lower_expr(end, ctx),
+    };
     let cond = ctx.emit(
         MirOp::ICmp {
             op: CmpOp::Lt,
@@ -677,16 +685,49 @@ fn lower_store(target: &str, value: &Expr, ctx: &mut LowerCtx<'_>) {
 // ── Helpers ────────────────────────────────────────────────────────
 
 fn eval_i64(expr: &Expr, ctx: &LowerCtx<'_>) -> i64 {
+    try_eval_i64(expr, ctx).unwrap_or(0)
+}
+
+fn try_eval_i64(expr: &Expr, ctx: &LowerCtx<'_>) -> Option<i64> {
     match expr {
-        Expr::ScalarI64(v) => *v,
-        Expr::ScalarF32(v) => *v as i64,
-        Expr::Var(name) => ctx.const_values.get(name).copied().unwrap_or(0),
+        Expr::ScalarI64(v) => Some(*v),
+        Expr::ScalarF32(v) => Some(*v as i64),
+        Expr::Var(name) => ctx.const_values.get(name).copied(),
         Expr::Builtin {
             op: BuiltinOp::ShapeDim,
             args,
-            ..
-        } => args.get(1).map(|arg| eval_i64(arg, ctx)).unwrap_or(0),
-        _ => 0,
+        } => {
+            let dim = usize::try_from(try_eval_i64(args.get(1)?, ctx)?).ok()?;
+            let shape = expr_shape(args.first()?, ctx)?;
+            let value = *shape.get(dim)?;
+            (value >= 0).then_some(value)
+        }
+        Expr::Builtin {
+            op: BuiltinOp::Add,
+            args,
+        } => Some(try_eval_i64(args.first()?, ctx)? + try_eval_i64(args.get(1)?, ctx)?),
+        Expr::Builtin {
+            op: BuiltinOp::Sub,
+            args,
+        } => Some(try_eval_i64(args.first()?, ctx)? - try_eval_i64(args.get(1)?, ctx)?),
+        Expr::Builtin {
+            op: BuiltinOp::Mul,
+            args,
+        } => Some(try_eval_i64(args.first()?, ctx)? * try_eval_i64(args.get(1)?, ctx)?),
+        Expr::Builtin {
+            op: BuiltinOp::Div | BuiltinOp::ScalarDiv,
+            args,
+        } => {
+            let lhs = try_eval_i64(args.first()?, ctx)?;
+            let rhs = try_eval_i64(args.get(1)?, ctx)?;
+            (rhs != 0).then_some(lhs / rhs)
+        }
+        Expr::Shape(shape) => match shape {
+            ShapeExpr::Constant(v) => Some(*v),
+            ShapeExpr::Symbol(name) => ctx.const_values.get(name).copied(),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -813,6 +854,13 @@ fn expr_shape(expr: &Expr, ctx: &LowerCtx<'_>) -> Option<Vec<i64>> {
             }
         }
         Expr::Var(name) => type_shape_for_name(name, ctx),
+        Expr::Builtin {
+            op: BuiltinOp::ShapeOf,
+            args,
+        } => args.first().and_then(|arg| match arg {
+            Expr::Var(name) => type_shape_for_name(name, ctx),
+            other => expr_shape(other, ctx),
+        }),
         _ => None,
     }
 }

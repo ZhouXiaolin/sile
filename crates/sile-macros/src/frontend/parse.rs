@@ -438,6 +438,7 @@ fn parse_expr(expr: &syn::Expr) -> syn::Result<KernelExpr> {
             Ok(KernelExpr::Call { func, args })
         }
         syn::Expr::Reference(reference) => parse_expr(&reference.expr),
+        syn::Expr::Paren(paren) => parse_expr(&paren.expr),
         syn::Expr::Index(index) => {
             let target = parse_expr(&index.expr)?;
             let idx = parse_expr(&index.index)?;

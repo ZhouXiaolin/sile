@@ -7,10 +7,10 @@ fn softmax<const BM: i64, const BN: i64>(
 ) {
     let tile_x = x.load_tile_like_2d(y);
     let tile_x_max = reduce_max(tile_x.clone(), 1);
-    let tile_x_max = tile_x_max.reshape([BM, 1]).broadcast(&[BM, BN]);
+    let tile_x_max = tile_x_max.reshape([BM, 1]).broadcast(y.shape());
     let num = exp(tile_x - tile_x_max);
     let denom = reduce_sum(num.clone(), 1);
-    let denom = denom.reshape([BM, 1]).broadcast(&[BM, BN]);
+    let denom = denom.reshape([BM, 1]).broadcast(y.shape());
     y.store(num / denom);
 }
 
