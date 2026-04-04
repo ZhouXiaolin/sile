@@ -1,6 +1,4 @@
-pub mod codegen_c;
 pub mod codegen_llir_c;
-pub mod scheduling;
 
 use std::{ffi::c_void, fs, process::Command};
 
@@ -8,11 +6,8 @@ use libloading::Library;
 use sile_llir::Function as LlirFunction;
 use tempfile::tempdir;
 
-use sile_core::{KernelArg, LaunchConfig, Result, Stream};
-use sile_lir::ExecutableKernel;
-
-use crate::codegen_c::generate;
 use crate::codegen_llir_c::generate_kernel as generate_llir_kernel;
+use sile_core::{KernelArg, LaunchConfig, Result, Stream};
 
 type KernelFn = unsafe extern "C" fn(*const *const c_void, i64, i64, *const i64, i64);
 
@@ -44,11 +39,6 @@ impl CpuBackend {
         Err(sile_core::Error::UnsupportedBackend(
             "no C compiler found".into(),
         ))
-    }
-
-    fn compile_kernel(kernel: &ExecutableKernel) -> Result<String> {
-        let code = generate(&kernel.func, &kernel.abi, &kernel.value_info)?;
-        Ok(code)
     }
 
     fn compile_llir_kernel(func: &LlirFunction) -> Result<String> {
@@ -159,18 +149,5 @@ impl CpuBackend {
     ) -> Result<()> {
         let c_code = Self::compile_llir_kernel(func)?;
         self.execute_compiled_source(&func.name, &c_code, args, launch, true)
-    }
-}
-
-impl sile_lir::Backend for CpuBackend {
-    fn execute(
-        &self,
-        kernel: &ExecutableKernel,
-        args: &[KernelArg<'_>],
-        launch: &LaunchConfig,
-        _stream: &Stream,
-    ) -> Result<()> {
-        let c_code = Self::compile_kernel(kernel)?;
-        self.execute_compiled_source(&kernel.name, &c_code, args, launch, false)
     }
 }

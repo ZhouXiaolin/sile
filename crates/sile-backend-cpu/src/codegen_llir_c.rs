@@ -114,20 +114,6 @@ impl<'a> CCodegen<'a> {
         self.out.push('\n');
 
         self.out.push_str(
-            "#define tile_splat_f32(dst, value, rows, cols) do { \\\n\
-  float* _dst = (float*)(dst); \\\n\
-  int64_t _rows = (rows); \\\n\
-  int64_t _cols = (cols); \\\n\
-  float _value = (float)(value); \\\n\
-  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
-    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
-      _dst[_r * _cols + _c] = _value; \\\n\
-    } \\\n\
-  } \\\n\
-} while (0)\n\n",
-        );
-
-        self.out.push_str(
             "#define tile_load_2d_f32(dst, buf, row_tile, col_tile, rows, cols, stride_shape_idx) do { \\\n\
   float* _dst = (float*)(dst); \\\n\
   const float* _buf = (const float*)(buf); \\\n\
@@ -180,104 +166,6 @@ impl<'a> CCodegen<'a> {
         );
 
         self.out.push_str(
-            "#define tile_add_f32(dst, lhs, rhs, rows, cols) do { \\\n\
-  float* _dst = (float*)(dst); \\\n\
-  const float* _lhs = (const float*)(lhs); \\\n\
-  const float* _rhs = (const float*)(rhs); \\\n\
-  int64_t _rows = (rows); \\\n\
-  int64_t _cols = (cols); \\\n\
-  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
-    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
-      _dst[_r * _cols + _c] = _lhs[_r * _cols + _c] + _rhs[_r * _cols + _c]; \\\n\
-    } \\\n\
-  } \\\n\
-} while (0)\n\n",
-        );
-        self.out.push_str(
-            "#define tile_sub_f32(dst, lhs, rhs, rows, cols) do { \\\n\
-  float* _dst = (float*)(dst); \\\n\
-  const float* _lhs = (const float*)(lhs); \\\n\
-  const float* _rhs = (const float*)(rhs); \\\n\
-  int64_t _rows = (rows); \\\n\
-  int64_t _cols = (cols); \\\n\
-  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
-    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
-      _dst[_r * _cols + _c] = _lhs[_r * _cols + _c] - _rhs[_r * _cols + _c]; \\\n\
-    } \\\n\
-  } \\\n\
-} while (0)\n\n",
-        );
-        self.out.push_str(
-            "#define tile_mul_f32(dst, lhs, rhs, rows, cols) do { \\\n\
-  float* _dst = (float*)(dst); \\\n\
-  const float* _lhs = (const float*)(lhs); \\\n\
-  const float* _rhs = (const float*)(rhs); \\\n\
-  int64_t _rows = (rows); \\\n\
-  int64_t _cols = (cols); \\\n\
-  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
-    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
-      _dst[_r * _cols + _c] = _lhs[_r * _cols + _c] * _rhs[_r * _cols + _c]; \\\n\
-    } \\\n\
-  } \\\n\
-} while (0)\n\n",
-        );
-        self.out.push_str(
-            "#define tile_div_f32(dst, lhs, rhs, rows, cols) do { \\\n\
-  float* _dst = (float*)(dst); \\\n\
-  const float* _lhs = (const float*)(lhs); \\\n\
-  const float* _rhs = (const float*)(rhs); \\\n\
-  int64_t _rows = (rows); \\\n\
-  int64_t _cols = (cols); \\\n\
-  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
-    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
-      _dst[_r * _cols + _c] = _lhs[_r * _cols + _c] / _rhs[_r * _cols + _c]; \\\n\
-    } \\\n\
-  } \\\n\
-} while (0)\n\n",
-        );
-
-        self.out.push_str(
-            "#define tile_exp_f32(dst, src, rows, cols) do { \\\n\
-  float* _dst = (float*)(dst); \\\n\
-  const float* _src = (const float*)(src); \\\n\
-  int64_t _rows = (rows); \\\n\
-  int64_t _cols = (cols); \\\n\
-  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
-    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
-      _dst[_r * _cols + _c] = expf(_src[_r * _cols + _c]); \\\n\
-    } \\\n\
-  } \\\n\
-} while (0)\n\n",
-        );
-        self.out.push_str(
-            "#define tile_neg_f32(dst, src, rows, cols) do { \\\n\
-  float* _dst = (float*)(dst); \\\n\
-  const float* _src = (const float*)(src); \\\n\
-  int64_t _rows = (rows); \\\n\
-  int64_t _cols = (cols); \\\n\
-  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
-    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
-      _dst[_r * _cols + _c] = -_src[_r * _cols + _c]; \\\n\
-    } \\\n\
-  } \\\n\
-} while (0)\n\n",
-        );
-
-        self.out.push_str(
-            "#define tile_broadcast_f32(dst, src, rows, cols) do { \\\n\
-  float* _dst = (float*)(dst); \\\n\
-  const float* _src = (const float*)(src); \\\n\
-  int64_t _rows = (rows); \\\n\
-  int64_t _cols = (cols); \\\n\
-  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
-    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
-      _dst[_r * _cols + _c] = _src[_r]; \\\n\
-    } \\\n\
-  } \\\n\
-} while (0)\n\n",
-        );
-
-        self.out.push_str(
             "#define llir_matmul_fragment(dst, a, b, acc, tile_m, tile_n, tile_k) do { \\\n\
   float* _dst = (float*)(dst); \\\n\
   const float* _a = (const float*)(a); \\\n\
@@ -291,55 +179,6 @@ impl<'a> CCodegen<'a> {
       _dst[_r * _n + _c] = _acc[_r * _n + _c]; \\\n\
       for (int64_t _k = 0; _k < _k_lim; ++_k) { \\\n\
         _dst[_r * _n + _c] += _a[_r * _k_lim + _k] * _b[_k * _n + _c]; \\\n\
-      } \\\n\
-    } \\\n\
-  } \\\n\
-} while (0)\n\n",
-        );
-
-        self.out.push_str(
-            "#define llir_reduce_add(dst, src, axis, in_rows, in_cols) do { \\\n\
-  float* _dst = (float*)(dst); \\\n\
-  const float* _src = (const float*)(src); \\\n\
-  int64_t _axis = (axis); \\\n\
-  int64_t _rows = (in_rows); \\\n\
-  int64_t _cols = (in_cols); \\\n\
-  if (_axis == 1) { \\\n\
-    for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
-      _dst[_r] = 0.0f; \\\n\
-      for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
-        _dst[_r] += _src[_r * _cols + _c]; \\\n\
-      } \\\n\
-    } \\\n\
-  } else { \\\n\
-    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
-      _dst[_c] = 0.0f; \\\n\
-      for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
-        _dst[_c] += _src[_r * _cols + _c]; \\\n\
-      } \\\n\
-    } \\\n\
-  } \\\n\
-} while (0)\n\n",
-        );
-        self.out.push_str(
-            "#define llir_reduce_max(dst, src, axis, in_rows, in_cols) do { \\\n\
-  float* _dst = (float*)(dst); \\\n\
-  const float* _src = (const float*)(src); \\\n\
-  int64_t _axis = (axis); \\\n\
-  int64_t _rows = (in_rows); \\\n\
-  int64_t _cols = (in_cols); \\\n\
-  if (_axis == 1) { \\\n\
-    for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
-      _dst[_r] = _src[_r * _cols]; \\\n\
-      for (int64_t _c = 1; _c < _cols; ++_c) { \\\n\
-        _dst[_r] = fmaxf(_dst[_r], _src[_r * _cols + _c]); \\\n\
-      } \\\n\
-    } \\\n\
-  } else { \\\n\
-    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
-      _dst[_c] = _src[_c]; \\\n\
-      for (int64_t _r = 1; _r < _rows; ++_r) { \\\n\
-        _dst[_c] = fmaxf(_dst[_c], _src[_r * _cols + _c]); \\\n\
       } \\\n\
     } \\\n\
   } \\\n\
@@ -1088,8 +927,7 @@ fn intrinsic_name(intrinsic: &llir::Intrinsic) -> String {
         llir::Intrinsic::ThreadId { dim } => format!("llir_thread_id_{}", dim),
         llir::Intrinsic::BlockId { dim } => format!("llir_block_id_{}", dim),
         llir::Intrinsic::Barrier { .. } => "llir_barrier".to_string(),
+        llir::Intrinsic::Exp => "expf".to_string(),
         llir::Intrinsic::MatmulFragment => "llir_matmul_fragment".to_string(),
-        llir::Intrinsic::ReduceAdd => "llir_reduce_add".to_string(),
-        llir::Intrinsic::ReduceMax => "llir_reduce_max".to_string(),
     }
 }

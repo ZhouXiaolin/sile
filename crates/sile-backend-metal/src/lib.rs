@@ -1,14 +1,11 @@
 pub mod codegen_llir_metal;
-pub mod codegen_metal;
 
 use metal::{CommandQueue, ComputePipelineState, Device, Library};
 use sile_core::{KernelArg, LaunchConfig, Result, Stream};
 use sile_hir::ParamKind;
-use sile_lir::ExecutableKernel;
 use sile_llir::Function as LlirFunction;
 
 use crate::codegen_llir_metal::generate as generate_llir_metal;
-use crate::codegen_metal::generate;
 
 pub struct MetalBackend {
     device: Device,
@@ -144,19 +141,5 @@ impl MetalBackend {
         }
 
         Ok(())
-    }
-}
-
-impl sile_lir::Backend for MetalBackend {
-    fn execute(
-        &self,
-        kernel: &ExecutableKernel,
-        args: &[KernelArg<'_>],
-        launch: &LaunchConfig,
-        _stream: &Stream,
-    ) -> Result<()> {
-        let source = generate(&kernel.func, &kernel.abi, &kernel.value_info)?;
-        let param_kinds: Vec<_> = kernel.abi.params.iter().map(|param| param.kind).collect();
-        self.execute_source(&kernel.name, &source, &param_kinds, args, launch)
     }
 }

@@ -391,16 +391,8 @@ impl<'a> MetalCodegen<'a> {
         args: &[llir::Operand],
     ) -> sile_core::Result<()> {
         match func {
-            "tile_splat_f32" => self.emit_tile_splat(args),
             "tile_load_2d_f32" => self.emit_tile_load(args),
             "tile_store_2d_f32" => self.emit_tile_store(args),
-            "tile_add_f32" => self.emit_tile_binary(args, "+"),
-            "tile_sub_f32" => self.emit_tile_binary(args, "-"),
-            "tile_mul_f32" => self.emit_tile_binary(args, "*"),
-            "tile_div_f32" => self.emit_tile_binary(args, "/"),
-            "tile_exp_f32" => self.emit_tile_unary(args, "metal::exp"),
-            "tile_neg_f32" => self.emit_tile_unary(args, "-"),
-            "tile_broadcast_f32" => self.emit_tile_broadcast(args),
             other => Err(sile_core::Error::Compile(format!(
                 "unsupported LLIR helper call for Metal codegen: {other}"
             ))),
@@ -439,9 +431,25 @@ impl<'a> MetalCodegen<'a> {
             llir::Intrinsic::Barrier { .. } => Err(sile_core::Error::Compile(
                 "barrier intrinsic is not yet supported in LLIR Metal codegen".into(),
             )),
+            llir::Intrinsic::Exp => {
+                let Some(id) = result else {
+                    return Err(sile_core::Error::Compile(
+                        "exp intrinsic must produce a result".into(),
+                    ));
+                };
+                let [arg] = args else {
+                    return Err(sile_core::Error::Compile(
+                        "exp intrinsic expects one argument".into(),
+                    ));
+                };
+                self.writeln(&format!(
+                    "{} = metal::exp({});",
+                    self.value_name(id),
+                    self.format_operand(arg)
+                ));
+                Ok(())
+            }
             llir::Intrinsic::MatmulFragment => self.emit_matmul_fragment(args),
-            llir::Intrinsic::ReduceAdd => self.emit_reduce(args, false),
-            llir::Intrinsic::ReduceMax => self.emit_reduce(args, true),
         }
     }
 
@@ -473,22 +481,6 @@ impl<'a> MetalCodegen<'a> {
                 )
             })?;
         Ok(format!("shapes[{offset}]"))
-    }
-
-    fn emit_tile_splat(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
-        let [dst, value, rows, cols] = args else {
-            return Err(sile_core::Error::Compile(
-                "tile_splat_f32 expects four arguments".into(),
-            ));
-        };
-        let rows = const_usize(rows, "tile_splat rows")?;
-        let cols = const_usize(cols, "tile_splat cols")?;
-        let dst = self.format_operand(dst);
-        let value = self.format_operand(value);
-        self.emit_nested_tile_loop("splat", rows, cols, |ctx, r, c| {
-            ctx.writeln(&format!("{dst}[{r}][{c}] = {value};"));
-        });
-        Ok(())
     }
 
     fn emit_tile_load(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
@@ -551,61 +543,6 @@ impl<'a> MetalCodegen<'a> {
         Ok(())
     }
 
-    fn emit_tile_binary(&mut self, args: &[llir::Operand], op: &str) -> sile_core::Result<()> {
-        let [dst, lhs, rhs, rows, cols] = args else {
-            return Err(sile_core::Error::Compile(
-                "tile binary helper expects five arguments".into(),
-            ));
-        };
-        let rows = const_usize(rows, "tile binary rows")?;
-        let cols = const_usize(cols, "tile binary cols")?;
-        let dst = self.format_operand(dst);
-        let lhs = self.format_operand(lhs);
-        let rhs = self.format_operand(rhs);
-        self.emit_nested_tile_loop("tile_bin", rows, cols, |ctx, r, c| {
-            ctx.writeln(&format!(
-                "{dst}[{r}][{c}] = {lhs}[{r}][{c}] {op} {rhs}[{r}][{c}];"
-            ));
-        });
-        Ok(())
-    }
-
-    fn emit_tile_unary(&mut self, args: &[llir::Operand], op: &str) -> sile_core::Result<()> {
-        let [dst, src, rows, cols] = args else {
-            return Err(sile_core::Error::Compile(
-                "tile unary helper expects four arguments".into(),
-            ));
-        };
-        let rows = const_usize(rows, "tile unary rows")?;
-        let cols = const_usize(cols, "tile unary cols")?;
-        let dst = self.format_operand(dst);
-        let src = self.format_operand(src);
-        self.emit_nested_tile_loop("tile_un", rows, cols, |ctx, r, c| {
-            if op == "-" {
-                ctx.writeln(&format!("{dst}[{r}][{c}] = -{src}[{r}][{c}];"));
-            } else {
-                ctx.writeln(&format!("{dst}[{r}][{c}] = {op}({src}[{r}][{c}]);"));
-            }
-        });
-        Ok(())
-    }
-
-    fn emit_tile_broadcast(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
-        let [dst, src, rows, cols] = args else {
-            return Err(sile_core::Error::Compile(
-                "tile_broadcast_f32 expects four arguments".into(),
-            ));
-        };
-        let rows = const_usize(rows, "tile broadcast rows")?;
-        let cols = const_usize(cols, "tile broadcast cols")?;
-        let dst = self.format_operand(dst);
-        let src = self.format_operand(src);
-        self.emit_nested_tile_loop("tile_bcast", rows, cols, |ctx, r, c| {
-            ctx.writeln(&format!("{dst}[{r}][{c}] = {src}[{r}][0];"));
-        });
-        Ok(())
-    }
-
     fn emit_matmul_fragment(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
         let [dst, a, b, acc, tile_m, tile_n, tile_k] = args else {
             return Err(sile_core::Error::Compile(
@@ -642,84 +579,6 @@ impl<'a> MetalCodegen<'a> {
         self.writeln("}");
         self.indent -= 1;
         self.writeln("}");
-        Ok(())
-    }
-
-    fn emit_reduce(&mut self, args: &[llir::Operand], is_max: bool) -> sile_core::Result<()> {
-        let [dst, src, axis, in_rows, in_cols] = args else {
-            return Err(sile_core::Error::Compile(
-                "reduce intrinsic expects five arguments".into(),
-            ));
-        };
-        let axis = const_usize(axis, "reduce axis")?;
-        let in_rows = const_usize(in_rows, "reduce rows")?;
-        let in_cols = const_usize(in_cols, "reduce cols")?;
-        let dst = self.format_operand(dst);
-        let src = self.format_operand(src);
-
-        match axis {
-            1 => {
-                self.writeln(&format!(
-                    "for (int red_r = 0; red_r < {in_rows}; ++red_r) {{"
-                ));
-                self.indent += 1;
-                let init = if is_max {
-                    format!("{src}[red_r][0]")
-                } else {
-                    "0.0f".into()
-                };
-                self.writeln(&format!("{dst}[red_r][0] = {init};"));
-                self.writeln(&format!(
-                    "for (int red_c = {}; red_c < {in_cols}; ++red_c) {{",
-                    if is_max { 1 } else { 0 }
-                ));
-                self.indent += 1;
-                if is_max {
-                    self.writeln(&format!(
-                        "{dst}[red_r][0] = metal::max({dst}[red_r][0], {src}[red_r][red_c]);"
-                    ));
-                } else {
-                    self.writeln(&format!("{dst}[red_r][0] += {src}[red_r][red_c];"));
-                }
-                self.indent -= 1;
-                self.writeln("}");
-                self.indent -= 1;
-                self.writeln("}");
-            }
-            0 => {
-                self.writeln(&format!(
-                    "for (int red_c = 0; red_c < {in_cols}; ++red_c) {{"
-                ));
-                self.indent += 1;
-                let init = if is_max {
-                    format!("{src}[0][red_c]")
-                } else {
-                    "0.0f".into()
-                };
-                self.writeln(&format!("{dst}[0][red_c] = {init};"));
-                self.writeln(&format!(
-                    "for (int red_r = {}; red_r < {in_rows}; ++red_r) {{",
-                    if is_max { 1 } else { 0 }
-                ));
-                self.indent += 1;
-                if is_max {
-                    self.writeln(&format!(
-                        "{dst}[0][red_c] = metal::max({dst}[0][red_c], {src}[red_r][red_c]);"
-                    ));
-                } else {
-                    self.writeln(&format!("{dst}[0][red_c] += {src}[red_r][red_c];"));
-                }
-                self.indent -= 1;
-                self.writeln("}");
-                self.indent -= 1;
-                self.writeln("}");
-            }
-            other => {
-                return Err(sile_core::Error::Compile(format!(
-                    "unsupported reduction axis in LLIR Metal codegen: {other}"
-                )));
-            }
-        }
         Ok(())
     }
 

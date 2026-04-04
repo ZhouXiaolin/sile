@@ -221,15 +221,14 @@ fn lower_inst(
                 },
                 metadata: vec![llir::Metadata::Alignment(16)],
             });
-            out.push(void_call(
-                "tile_splat_f32",
-                vec![
-                    llir::Operand::Value(llir_id),
-                    llir::Operand::Const(llir::Constant::Float(*value)),
-                    llir::Operand::Const(llir::Constant::Int(*rows)),
-                    llir::Operand::Const(llir::Constant::Int(*cols)),
-                ],
-            ));
+            lower_tile_constant(
+                ctx,
+                out,
+                llir::Operand::Value(llir_id),
+                *value,
+                *rows,
+                *cols,
+            );
         }
         MirOp::TileLoad {
             buf,
@@ -312,16 +311,16 @@ fn lower_inst(
                 },
                 metadata: vec![llir::Metadata::Alignment(16)],
             });
-            out.push(void_call(
-                tile_binary_helper(*op),
-                vec![
-                    llir::Operand::Value(llir_id),
-                    resolve_operand(*lhs, ctx),
-                    resolve_operand(*rhs, ctx),
-                    llir::Operand::Const(llir::Constant::Int(*rows)),
-                    llir::Operand::Const(llir::Constant::Int(*cols)),
-                ],
-            ));
+            lower_tile_binary(
+                ctx,
+                out,
+                llir::Operand::Value(llir_id),
+                resolve_operand(*lhs, ctx),
+                resolve_operand(*rhs, ctx),
+                lower_bin_op(*op),
+                *rows,
+                *cols,
+            );
         }
         MirOp::TileUnary {
             op,
@@ -344,15 +343,15 @@ fn lower_inst(
                 },
                 metadata: vec![llir::Metadata::Alignment(16)],
             });
-            out.push(void_call(
-                tile_unary_helper(*op),
-                vec![
-                    llir::Operand::Value(llir_id),
-                    resolve_operand(*operand, ctx),
-                    llir::Operand::Const(llir::Constant::Int(*rows)),
-                    llir::Operand::Const(llir::Constant::Int(*cols)),
-                ],
-            ));
+            lower_tile_unary(
+                ctx,
+                out,
+                llir::Operand::Value(llir_id),
+                resolve_operand(*operand, ctx),
+                *op,
+                *rows,
+                *cols,
+            );
         }
         MirOp::TileMma {
             a,
@@ -423,25 +422,16 @@ fn lower_inst(
                 },
                 metadata: vec![llir::Metadata::Alignment(16)],
             });
-            out.push(llir::Inst {
-                result: None,
-                result_name: None,
-                ty: llir::Type::Void,
-                op: llir::InstOp::Intrinsic {
-                    intrinsic: match op {
-                        ReduceOp::Max => llir::Intrinsic::ReduceMax,
-                        ReduceOp::Sum => llir::Intrinsic::ReduceAdd,
-                    },
-                    args: vec![
-                        llir::Operand::Value(llir_id),
-                        resolve_operand(*value, ctx),
-                        llir::Operand::Const(llir::Constant::Int(*axis)),
-                        llir::Operand::Const(llir::Constant::Int(*in_rows)),
-                        llir::Operand::Const(llir::Constant::Int(*in_cols)),
-                    ],
-                },
-                metadata: vec![llir::Metadata::Reduction],
-            });
+            lower_tile_reduce(
+                ctx,
+                out,
+                llir::Operand::Value(llir_id),
+                resolve_operand(*value, ctx),
+                *op,
+                *axis,
+                *in_rows,
+                *in_cols,
+            );
         }
         MirOp::TileBroadcast { value, rows, cols } => {
             let llir_id = llir_value(inst.result);
@@ -459,15 +449,15 @@ fn lower_inst(
                 },
                 metadata: vec![llir::Metadata::Alignment(16)],
             });
-            out.push(void_call(
-                "tile_broadcast_f32",
-                vec![
-                    llir::Operand::Value(llir_id),
-                    resolve_operand(*value, ctx),
-                    llir::Operand::Const(llir::Constant::Int(*rows)),
-                    llir::Operand::Const(llir::Constant::Int(*cols)),
-                ],
-            ));
+            lower_tile_broadcast(
+                mir,
+                ctx,
+                out,
+                llir::Operand::Value(llir_id),
+                *value,
+                *rows,
+                *cols,
+            );
         }
     }
 }
@@ -565,6 +555,35 @@ fn buffer_rank_of(value: ValueId, mir: &MirFunction) -> usize {
     match mir.types.get(&value) {
         Some(MirType::Buffer { rank }) => *rank,
         _ => 1,
+    }
+}
+
+fn tile_dims_of(value: ValueId, mir: &MirFunction) -> Option<(i64, i64)> {
+    match mir.types.get(&value) {
+        Some(MirType::Tile { rows, cols }) => Some((*rows, *cols)),
+        _ => None,
+    }
+}
+
+fn lower_tile_constant(
+    ctx: &mut LowerLlirCtx,
+    out: &mut Vec<llir::Inst>,
+    dst_tile: llir::Operand,
+    value: f64,
+    rows: i64,
+    cols: i64,
+) {
+    for row in 0..rows {
+        for col in 0..cols {
+            let dst_ptr = emit_gep(
+                ctx,
+                out,
+                dst_tile.clone(),
+                vec![const_i64(row), const_i64(col)],
+                llir::Type::ptr(llir::AddressSpace::Private, llir::Type::F32),
+            );
+            emit_store(out, dst_ptr, const_f32(value));
+        }
     }
 }
 
@@ -764,6 +783,248 @@ fn lower_tile_store(
     }
 }
 
+fn lower_tile_binary(
+    ctx: &mut LowerLlirCtx,
+    out: &mut Vec<llir::Inst>,
+    dst_tile: llir::Operand,
+    lhs_tile: llir::Operand,
+    rhs_tile: llir::Operand,
+    op: llir::BinOp,
+    rows: i64,
+    cols: i64,
+) {
+    for row in 0..rows {
+        for col in 0..cols {
+            let lhs_ptr = emit_gep(
+                ctx,
+                out,
+                lhs_tile.clone(),
+                vec![const_i64(row), const_i64(col)],
+                llir::Type::ptr(llir::AddressSpace::Private, llir::Type::F32),
+            );
+            let lhs = emit_load(ctx, out, lhs_ptr, llir::Type::F32);
+            let rhs_ptr = emit_gep(
+                ctx,
+                out,
+                rhs_tile.clone(),
+                vec![const_i64(row), const_i64(col)],
+                llir::Type::ptr(llir::AddressSpace::Private, llir::Type::F32),
+            );
+            let rhs = emit_load(ctx, out, rhs_ptr, llir::Type::F32);
+            let result = emit_bin(ctx, out, op, lhs, rhs, llir::Type::F32);
+            let dst_ptr = emit_gep(
+                ctx,
+                out,
+                dst_tile.clone(),
+                vec![const_i64(row), const_i64(col)],
+                llir::Type::ptr(llir::AddressSpace::Private, llir::Type::F32),
+            );
+            emit_store(out, dst_ptr, result);
+        }
+    }
+}
+
+fn lower_tile_unary(
+    ctx: &mut LowerLlirCtx,
+    out: &mut Vec<llir::Inst>,
+    dst_tile: llir::Operand,
+    src_tile: llir::Operand,
+    op: UnaryOp,
+    rows: i64,
+    cols: i64,
+) {
+    for row in 0..rows {
+        for col in 0..cols {
+            let src_ptr = emit_gep(
+                ctx,
+                out,
+                src_tile.clone(),
+                vec![const_i64(row), const_i64(col)],
+                llir::Type::ptr(llir::AddressSpace::Private, llir::Type::F32),
+            );
+            let src = emit_load(ctx, out, src_ptr, llir::Type::F32);
+            let result = match op {
+                UnaryOp::Neg => emit_bin(
+                    ctx,
+                    out,
+                    llir::BinOp::Sub,
+                    const_f32(0.0),
+                    src,
+                    llir::Type::F32,
+                ),
+                UnaryOp::Exp => {
+                    emit_intrinsic(ctx, out, llir::Intrinsic::Exp, vec![src], llir::Type::F32)
+                }
+            };
+            let dst_ptr = emit_gep(
+                ctx,
+                out,
+                dst_tile.clone(),
+                vec![const_i64(row), const_i64(col)],
+                llir::Type::ptr(llir::AddressSpace::Private, llir::Type::F32),
+            );
+            emit_store(out, dst_ptr, result);
+        }
+    }
+}
+
+fn lower_tile_broadcast(
+    mir: &MirFunction,
+    ctx: &mut LowerLlirCtx,
+    out: &mut Vec<llir::Inst>,
+    dst_tile: llir::Operand,
+    src: ValueId,
+    rows: i64,
+    cols: i64,
+) {
+    let src_tile = resolve_operand(src, ctx);
+    let (src_rows, src_cols) = tile_dims_of(src, mir).unwrap_or((1, 1));
+    for row in 0..rows {
+        for col in 0..cols {
+            let src_row = if src_rows == 1 { 0 } else { row };
+            let src_col = if src_cols == 1 { 0 } else { col };
+            let src_ptr = emit_gep(
+                ctx,
+                out,
+                src_tile.clone(),
+                vec![const_i64(src_row), const_i64(src_col)],
+                llir::Type::ptr(llir::AddressSpace::Private, llir::Type::F32),
+            );
+            let scalar = emit_load(ctx, out, src_ptr, llir::Type::F32);
+            let dst_ptr = emit_gep(
+                ctx,
+                out,
+                dst_tile.clone(),
+                vec![const_i64(row), const_i64(col)],
+                llir::Type::ptr(llir::AddressSpace::Private, llir::Type::F32),
+            );
+            emit_store(out, dst_ptr, scalar);
+        }
+    }
+}
+
+fn lower_tile_reduce(
+    ctx: &mut LowerLlirCtx,
+    out: &mut Vec<llir::Inst>,
+    dst_tile: llir::Operand,
+    src_tile: llir::Operand,
+    op: ReduceOp,
+    axis: i64,
+    in_rows: i64,
+    in_cols: i64,
+) {
+    match axis {
+        1 => {
+            for row in 0..in_rows {
+                let reduced = lower_reduce_accumulate(ctx, out, src_tile.clone(), op, row, in_cols);
+                let dst_ptr = emit_gep(
+                    ctx,
+                    out,
+                    dst_tile.clone(),
+                    vec![const_i64(row), const_i64(0)],
+                    llir::Type::ptr(llir::AddressSpace::Private, llir::Type::F32),
+                );
+                emit_store(out, dst_ptr, reduced);
+            }
+        }
+        0 => {
+            for col in 0..in_cols {
+                let reduced =
+                    lower_reduce_accumulate_col(ctx, out, src_tile.clone(), op, col, in_rows);
+                let dst_ptr = emit_gep(
+                    ctx,
+                    out,
+                    dst_tile.clone(),
+                    vec![const_i64(0), const_i64(col)],
+                    llir::Type::ptr(llir::AddressSpace::Private, llir::Type::F32),
+                );
+                emit_store(out, dst_ptr, reduced);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn lower_reduce_accumulate(
+    ctx: &mut LowerLlirCtx,
+    out: &mut Vec<llir::Inst>,
+    src_tile: llir::Operand,
+    op: ReduceOp,
+    row: i64,
+    cols: i64,
+) -> llir::Operand {
+    let mut acc = match op {
+        ReduceOp::Sum => const_f32(0.0),
+        ReduceOp::Max => load_tile_scalar(ctx, out, src_tile.clone(), row, 0),
+    };
+    let start_col = if matches!(op, ReduceOp::Max) { 1 } else { 0 };
+    for col in start_col..cols {
+        let value = load_tile_scalar(ctx, out, src_tile.clone(), row, col);
+        acc = match op {
+            ReduceOp::Sum => emit_bin(ctx, out, llir::BinOp::Add, acc, value, llir::Type::F32),
+            ReduceOp::Max => emit_max(ctx, out, acc, value),
+        };
+    }
+    acc
+}
+
+fn lower_reduce_accumulate_col(
+    ctx: &mut LowerLlirCtx,
+    out: &mut Vec<llir::Inst>,
+    src_tile: llir::Operand,
+    op: ReduceOp,
+    col: i64,
+    rows: i64,
+) -> llir::Operand {
+    let mut acc = match op {
+        ReduceOp::Sum => const_f32(0.0),
+        ReduceOp::Max => load_tile_scalar(ctx, out, src_tile.clone(), 0, col),
+    };
+    let start_row = if matches!(op, ReduceOp::Max) { 1 } else { 0 };
+    for row in start_row..rows {
+        let value = load_tile_scalar(ctx, out, src_tile.clone(), row, col);
+        acc = match op {
+            ReduceOp::Sum => emit_bin(ctx, out, llir::BinOp::Add, acc, value, llir::Type::F32),
+            ReduceOp::Max => emit_max(ctx, out, acc, value),
+        };
+    }
+    acc
+}
+
+fn load_tile_scalar(
+    ctx: &mut LowerLlirCtx,
+    out: &mut Vec<llir::Inst>,
+    tile: llir::Operand,
+    row: i64,
+    col: i64,
+) -> llir::Operand {
+    let ptr = emit_gep(
+        ctx,
+        out,
+        tile,
+        vec![const_i64(row), const_i64(col)],
+        llir::Type::ptr(llir::AddressSpace::Private, llir::Type::F32),
+    );
+    emit_load(ctx, out, ptr, llir::Type::F32)
+}
+
+fn emit_max(
+    ctx: &mut LowerLlirCtx,
+    out: &mut Vec<llir::Inst>,
+    lhs: llir::Operand,
+    rhs: llir::Operand,
+) -> llir::Operand {
+    let cond = emit_cmp(
+        ctx,
+        out,
+        llir::CmpPred::Ogt,
+        rhs.clone(),
+        lhs.clone(),
+        llir::Type::I1,
+    );
+    emit_select(ctx, out, cond, rhs, lhs, llir::Type::F32)
+}
+
 fn lower_1d_tile_coord(
     ctx: &mut LowerLlirCtx,
     out: &mut Vec<llir::Inst>,
@@ -933,35 +1194,28 @@ fn emit_select(
     llir::Operand::Value(id)
 }
 
+fn emit_intrinsic(
+    ctx: &mut LowerLlirCtx,
+    out: &mut Vec<llir::Inst>,
+    intrinsic: llir::Intrinsic,
+    args: Vec<llir::Operand>,
+    ty: llir::Type,
+) -> llir::Operand {
+    let (id, name) = ctx.fresh_value("v");
+    out.push(llir::Inst {
+        result: Some(id),
+        result_name: Some(name),
+        ty,
+        op: llir::InstOp::Intrinsic { intrinsic, args },
+        metadata: Vec::new(),
+    });
+    llir::Operand::Value(id)
+}
+
 fn const_i64(value: i64) -> llir::Operand {
     llir::Operand::Const(llir::Constant::Int(value))
 }
 
-fn tile_binary_helper(op: BinOp) -> &'static str {
-    match op {
-        BinOp::Add => "tile_add_f32",
-        BinOp::Sub => "tile_sub_f32",
-        BinOp::Mul => "tile_mul_f32",
-        BinOp::Div => "tile_div_f32",
-    }
-}
-
-fn tile_unary_helper(op: UnaryOp) -> &'static str {
-    match op {
-        UnaryOp::Exp => "tile_exp_f32",
-        UnaryOp::Neg => "tile_neg_f32",
-    }
-}
-
-fn void_call(func: &str, args: Vec<llir::Operand>) -> llir::Inst {
-    llir::Inst {
-        result: None,
-        result_name: None,
-        ty: llir::Type::Void,
-        op: llir::InstOp::Call {
-            func: func.into(),
-            args,
-        },
-        metadata: Vec::new(),
-    }
+fn const_f32(value: f64) -> llir::Operand {
+    llir::Operand::Const(llir::Constant::Float(value))
 }

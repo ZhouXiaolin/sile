@@ -428,17 +428,14 @@ dependencies = [
 name = "sile"
 version = "0.1.0"
 dependencies = [
- "libloading",
  "rand",
  "sile-backend-cpu",
  "sile-backend-metal",
  "sile-core",
  "sile-hir",
- "sile-lir",
  "sile-llir",
  "sile-macros",
  "sile-mir",
- "tempfile",
  "thiserror",
 ]
 
@@ -449,7 +446,6 @@ dependencies = [
  "libloading",
  "sile-core",
  "sile-hir",
- "sile-lir",
  "sile-llir",
  "tempfile",
 ]
@@ -461,7 +457,6 @@ dependencies = [
  "metal",
  "sile-core",
  "sile-hir",
- "sile-lir",
  "sile-llir",
 ]
 
@@ -477,14 +472,6 @@ name = "sile-hir"
 version = "0.1.0"
 dependencies = [
  "sile-core",
-]
-
-[[package]]
-name = "sile-lir"
-version = "0.1.0"
-dependencies = [
- "sile-core",
- "sile-hir",
 ]
 
 [[package]]
@@ -506,7 +493,6 @@ name = "sile-mir"
 version = "0.1.0"
 dependencies = [
  "sile-hir",
- "sile-lir",
  "sile-llir",
 ]
 

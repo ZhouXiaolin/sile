@@ -150,9 +150,8 @@ pub enum Intrinsic {
     ThreadId { dim: u8 },
     BlockId { dim: u8 },
     Barrier { scope: SyncScope },
+    Exp,
     MatmulFragment,
-    ReduceAdd,
-    ReduceMax,
 }
 
 #[derive(Clone, Debug, PartialEq)]
