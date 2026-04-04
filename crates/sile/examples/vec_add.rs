@@ -15,18 +15,20 @@ fn vec_add<const TILE: i64>(
 fn main() -> sile::Result<()> {
     let device = Device::default()?;
     let stream = device.create_stream()?;
+    const TILE: i64 = 2;
+    let len = 16i64;
     let a = Tensor::from_vec(
         vec![
             1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
         ],
-        [16],
+        [len],
         &device,
     )?;
-    let b = Tensor::from_vec(vec![2.0; 16], [16], &device)?;
-    let mut c = Tensor::zeros([16], &device)?;
+    let b = Tensor::from_vec(vec![2.0; len as usize], [len], &device)?;
+    let mut c = Tensor::zeros([len], &device)?;
 
-    vec_add::<2>(&a, &b, &mut c)
-        .grid((4, 1, 1))
+    vec_add::<TILE>(&a, &b, &mut c)
+        .grid(((len / TILE) as u32, 1, 1))
         .apply(&stream)?;
 
     println!("{:?}", c.to_vec(&stream)?);
