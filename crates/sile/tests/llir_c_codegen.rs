@@ -6,7 +6,7 @@ use sile::{
 };
 
 #[test]
-fn dynamic_k_matmul_llir_codegen_emits_cfg_style_c() {
+fn dynamic_k_matmul_llir_codegen_emits_structured_c() {
     let kernel = build_dynamic_k_matmul_kernel();
     let typed = typeck::check_kernel(&kernel).unwrap();
 
@@ -16,9 +16,10 @@ fn dynamic_k_matmul_llir_codegen_emits_cfg_style_c() {
     let c = llir_c::generate(&llir_func).unwrap();
 
     assert!(c.contains("void sile_llir_matmul("));
-    assert!(c.contains("goto bb0;"));
-    assert!(c.contains("bb1:"));
-    assert!(c.contains("if (v"));
+    assert!(c.contains("while (true)"));
+    assert!(c.contains("break;"));
+    assert!(!c.contains("goto "));
+    assert!(c.contains("if (!("));
     assert!(c.contains("= &(a["));
     assert!(c.contains("= &(b["));
     assert!(c.contains("= &(c["));

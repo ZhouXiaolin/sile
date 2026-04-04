@@ -10,14 +10,13 @@ pub fn generate(func: &llir::Function) -> sile_core::Result<String> {
     let mut ctx = CCodegen {
         func,
         value_names: build_value_names(func),
-        block_names: build_block_names(func),
         indent: 0,
         out: String::new(),
     };
 
     ctx.emit_prelude();
     ctx.emit_signature();
-    ctx.emit_body();
+    ctx.emit_body()?;
 
     Ok(ctx.out)
 }
@@ -40,7 +39,6 @@ struct TilePlan {
 struct CCodegen<'a> {
     func: &'a llir::Function,
     value_names: HashMap<llir::ValueId, String>,
-    block_names: HashMap<llir::BlockId, String>,
     indent: usize,
     out: String,
 }
@@ -191,35 +189,18 @@ impl<'a> CCodegen<'a> {
         self.indent = 1;
     }
 
-    fn emit_body(&mut self) {
+    fn emit_body(&mut self) -> sile_core::Result<()> {
         self.emit_value_decls();
-        self.writeln(&format!(
-            "goto {};",
-            self.block_names
-                .get(&self.func.entry)
-                .cloned()
-                .unwrap_or_else(|| format!("bb{}", self.func.entry.0))
-        ));
         self.writeln("");
-
-        for block in &self.func.blocks {
-            let label = self
-                .block_names
-                .get(&block.id)
-                .cloned()
-                .unwrap_or_else(|| block.name.clone());
-            self.writeln(&format!("{}:", label));
-            self.indent += 1;
-            for inst in &block.insts {
-                self.emit_inst(inst);
-            }
-            self.emit_terminator(&block.terminator);
-            self.indent -= 1;
-            self.writeln("");
+        if self.emit_structured_from(self.func.entry, &[])?.is_some() {
+            return Err(sile_core::Error::Compile(
+                "structured C codegen unexpectedly stopped at a non-terminal block".into(),
+            ));
         }
 
         self.indent = 0;
         self.out.push_str("}\n");
+        Ok(())
     }
 
     fn emit_value_decls(&mut self) {
@@ -408,58 +389,175 @@ impl<'a> CCodegen<'a> {
         }
     }
 
-    fn emit_terminator(&mut self, term: &llir::Terminator) {
-        match term {
-            llir::Terminator::Br { target, args } => {
-                self.emit_block_param_assignments(*target, args);
-                self.writeln(&format!("goto {};", self.block_name(*target)));
-            }
-            llir::Terminator::CondBr {
-                cond,
-                true_target,
-                true_args,
-                false_target,
-                false_args,
-            } => {
-                self.writeln(&format!("if ({}) {{", self.format_operand(cond)));
-                self.indent += 1;
-                self.emit_block_param_assignments(*true_target, true_args);
-                self.writeln(&format!("goto {};", self.block_name(*true_target)));
-                self.indent -= 1;
-                self.writeln("} else {");
-                self.indent += 1;
-                self.emit_block_param_assignments(*false_target, false_args);
-                self.writeln(&format!("goto {};", self.block_name(*false_target)));
-                self.indent -= 1;
-                self.writeln("}");
-            }
-            llir::Terminator::Switch {
-                value,
-                default,
-                cases,
-            } => {
-                self.writeln(&format!("switch ({}) {{", self.format_operand(value)));
-                self.indent += 1;
-                for (literal, target) in cases {
-                    self.writeln(&format!("case {}:", literal));
-                    self.indent += 1;
-                    self.emit_block_param_assignments(*target, &[]);
-                    self.writeln(&format!("goto {};", self.block_name(*target)));
-                    self.indent -= 1;
-                }
-                self.writeln("default:");
-                self.indent += 1;
-                self.emit_block_param_assignments(*default, &[]);
-                self.writeln(&format!("goto {};", self.block_name(*default)));
-                self.indent -= 1;
-                self.indent -= 1;
-                self.writeln("}");
-            }
-            llir::Terminator::Ret { value } => match value {
-                Some(value) => self.writeln(&format!("return {};", self.format_operand(value))),
-                None => self.writeln("return;"),
-            },
+    fn emit_block_insts(&mut self, block: &llir::BasicBlock) {
+        for inst in &block.insts {
+            self.emit_inst(inst);
         }
+    }
+
+    fn emit_structured_from(
+        &mut self,
+        start: llir::BlockId,
+        stop_targets: &[llir::BlockId],
+    ) -> sile_core::Result<Option<llir::BlockId>> {
+        let mut current = start;
+        loop {
+            let block = self.get_block(current).cloned().ok_or_else(|| {
+                sile_core::Error::Compile(format!("missing LLIR block {:?}", current))
+            })?;
+
+            if let llir::Terminator::Br { target, args } = &block.terminator {
+                if stop_targets.contains(target) {
+                    self.emit_block_insts(&block);
+                    self.emit_block_param_assignments(*target, args);
+                    return Ok(Some(*target));
+                }
+            }
+
+            if self.is_loop_preheader(&block) {
+                current = self.emit_structured_loop_preheader(&block)?;
+                if stop_targets.contains(&current) {
+                    return Ok(Some(current));
+                }
+                continue;
+            }
+
+            if matches!(block.terminator, llir::Terminator::CondBr { .. }) {
+                current = self.emit_structured_loop_header(&block)?;
+                if stop_targets.contains(&current) {
+                    return Ok(Some(current));
+                }
+                continue;
+            }
+
+            self.emit_block_insts(&block);
+            match &block.terminator {
+                llir::Terminator::Br { target, args } => {
+                    self.emit_block_param_assignments(*target, args);
+                    if stop_targets.contains(target) {
+                        return Ok(Some(*target));
+                    }
+                    current = *target;
+                }
+                llir::Terminator::Ret { value: None } => {
+                    self.writeln("return;");
+                    return Ok(None);
+                }
+                llir::Terminator::Ret { value: Some(value) } => {
+                    self.writeln(&format!("return {};", self.format_operand(value)));
+                    return Ok(None);
+                }
+                llir::Terminator::CondBr { .. } => {
+                    return Err(sile_core::Error::Compile(
+                        "LLIR C codegen only supports structured conditional branches".into(),
+                    ));
+                }
+                llir::Terminator::Switch { .. } => {
+                    return Err(sile_core::Error::Compile(
+                        "LLIR C codegen does not yet support structured switch lowering".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn emit_structured_loop_preheader(
+        &mut self,
+        preheader: &llir::BasicBlock,
+    ) -> sile_core::Result<llir::BlockId> {
+        let llir::Terminator::Br {
+            target: header_id,
+            args: header_args,
+        } = &preheader.terminator
+        else {
+            return Err(sile_core::Error::Compile(
+                "structured C loop preheader must end with a branch".into(),
+            ));
+        };
+        let header = self
+            .get_block(*header_id)
+            .cloned()
+            .ok_or_else(|| sile_core::Error::Compile("missing LLIR C loop header".into()))?;
+        let llir::Terminator::CondBr {
+            cond,
+            true_target,
+            true_args,
+            false_target,
+            false_args,
+        } = &header.terminator
+        else {
+            return Err(sile_core::Error::Compile(
+                "structured C loop header must end with a conditional branch".into(),
+            ));
+        };
+
+        self.emit_block_insts(preheader);
+        self.emit_block_param_assignments(*header_id, header_args);
+        self.emit_structured_loop_header_impl(
+            &header,
+            cond,
+            *true_target,
+            true_args,
+            *false_target,
+            false_args,
+        )
+    }
+
+    fn emit_structured_loop_header(
+        &mut self,
+        header: &llir::BasicBlock,
+    ) -> sile_core::Result<llir::BlockId> {
+        let llir::Terminator::CondBr {
+            cond,
+            true_target,
+            true_args,
+            false_target,
+            false_args,
+        } = &header.terminator
+        else {
+            return Err(sile_core::Error::Compile(
+                "structured C loop header must end with a conditional branch".into(),
+            ));
+        };
+        self.emit_structured_loop_header_impl(
+            header,
+            cond,
+            *true_target,
+            true_args,
+            *false_target,
+            false_args,
+        )
+    }
+
+    fn emit_structured_loop_header_impl(
+        &mut self,
+        header: &llir::BasicBlock,
+        cond: &llir::Operand,
+        true_target: llir::BlockId,
+        true_args: &[llir::Operand],
+        false_target: llir::BlockId,
+        false_args: &[llir::Operand],
+    ) -> sile_core::Result<llir::BlockId> {
+        self.writeln("while (true) {");
+        self.indent += 1;
+        self.emit_block_insts(header);
+        self.writeln(&format!("if (!({})) {{", self.format_operand(cond)));
+        self.indent += 1;
+        self.emit_block_param_assignments(false_target, false_args);
+        self.writeln("break;");
+        self.indent -= 1;
+        self.writeln("}");
+
+        self.emit_block_param_assignments(true_target, true_args);
+        let backedge = self.emit_structured_from(true_target, &[header.id])?;
+        if backedge != Some(header.id) {
+            return Err(sile_core::Error::Compile(
+                "structured C loop body did not produce the expected backedge".into(),
+            ));
+        }
+        self.indent -= 1;
+        self.writeln("}");
+        Ok(false_target)
     }
 
     fn emit_block_param_assignments(&mut self, target: llir::BlockId, args: &[llir::Operand]) {
@@ -476,24 +574,24 @@ impl<'a> CCodegen<'a> {
         llir_value_name(&self.value_names, id)
     }
 
-    fn block_name(&self, id: llir::BlockId) -> String {
-        self.block_names
-            .get(&id)
-            .cloned()
-            .unwrap_or_else(|| format!("bb{}", id.0))
+    fn get_block(&self, id: llir::BlockId) -> Option<&llir::BasicBlock> {
+        self.func.blocks.iter().find(|block| block.id == id)
+    }
+
+    fn is_loop_preheader(&self, block: &llir::BasicBlock) -> bool {
+        let llir::Terminator::Br { target: header, .. } = block.terminator else {
+            return false;
+        };
+        matches!(
+            self.get_block(header).map(|block| &block.terminator),
+            Some(llir::Terminator::CondBr { .. })
+        )
     }
 
     fn writeln(&mut self, line: &str) {
         self.out
             .push_str(&format!("{}{}\n", "  ".repeat(self.indent), line));
     }
-}
-
-fn build_block_names(func: &llir::Function) -> HashMap<llir::BlockId, String> {
-    func.blocks
-        .iter()
-        .map(|block| (block.id, block.name.clone()))
-        .collect()
 }
 
 fn generate_wrapper(func: &llir::Function) -> sile_core::Result<String> {

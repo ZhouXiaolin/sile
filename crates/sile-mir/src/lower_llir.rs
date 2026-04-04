@@ -284,14 +284,7 @@ fn lower_block(
                 rows,
                 cols,
             } => {
-                lower_tile_unary_inst(
-                    inst.result,
-                    *operand,
-                    *op,
-                    *rows,
-                    *cols,
-                    &mut builder,
-                );
+                lower_tile_unary_inst(inst.result, *operand, *op, *rows, *cols, &mut builder);
             }
             MirOp::TileMma {
                 a,
@@ -717,8 +710,10 @@ fn lower_linear_index_loop(
     mut body: impl FnMut(&mut LowerLlirCtx, &MirFunction, &mut Vec<llir::Inst>, llir::Operand),
 ) {
     let (header, header_params) = builder.create_block(prefix, vec![("loop_idx", llir::Type::I64)]);
-    let (body_block, body_params) =
-        builder.create_block(&format!("{prefix}_body"), vec![("loop_idx", llir::Type::I64)]);
+    let (body_block, body_params) = builder.create_block(
+        &format!("{prefix}_body"),
+        vec![("loop_idx", llir::Type::I64)],
+    );
     let (continue_block, _) = builder.create_block(&format!("{prefix}_continue"), vec![]);
 
     builder.set_current_terminator(llir::Terminator::Br {
@@ -838,7 +833,8 @@ fn lower_tile_load_inst(
 
     let (tile_base, row_base, col_base, stride) = builder.with_current_insts(|ctx, _, out| {
         if rank <= 1 {
-            let tile_coord = lower_1d_tile_coord(ctx, out, row_operand.clone(), col_operand.clone());
+            let tile_coord =
+                lower_1d_tile_coord(ctx, out, row_operand.clone(), col_operand.clone());
             let base = emit_bin(
                 ctx,
                 out,
@@ -877,14 +873,7 @@ fn lower_tile_load_inst(
         move |ctx, _, out, idx| {
             let (local_row, local_col) = linear_index_to_coords(ctx, out, idx.clone(), cols);
             let linear_index = if let Some(tile_base) = tile_base.clone() {
-                emit_bin(
-                    ctx,
-                    out,
-                    llir::BinOp::Add,
-                    tile_base,
-                    idx,
-                    llir::Type::I64,
-                )
+                emit_bin(ctx, out, llir::BinOp::Add, tile_base, idx, llir::Type::I64)
             } else {
                 let src_row = emit_bin(
                     ctx,
@@ -957,7 +946,8 @@ fn lower_tile_store_inst(
 
     let (tile_base, row_base, col_base, stride) = builder.with_current_insts(|ctx, _, out| {
         if rank <= 1 {
-            let tile_coord = lower_1d_tile_coord(ctx, out, row_operand.clone(), col_operand.clone());
+            let tile_coord =
+                lower_1d_tile_coord(ctx, out, row_operand.clone(), col_operand.clone());
             let base = emit_bin(
                 ctx,
                 out,
@@ -1004,14 +994,7 @@ fn lower_tile_store_inst(
             );
             let scalar = emit_load(ctx, out, src_ptr, llir::Type::F32);
             let linear_index = if let Some(tile_base) = tile_base.clone() {
-                emit_bin(
-                    ctx,
-                    out,
-                    llir::BinOp::Add,
-                    tile_base,
-                    idx,
-                    llir::Type::I64,
-                )
+                emit_bin(ctx, out, llir::BinOp::Add, tile_base, idx, llir::Type::I64)
             } else {
                 let dst_row = emit_bin(
                     ctx,
@@ -1076,8 +1059,10 @@ fn lower_tile_binary_inst(
         rows * cols,
         move |ctx, _, out, idx| {
             let (row, col) = linear_index_to_coords(ctx, out, idx, cols);
-            let lhs = load_tile_scalar_dynamic(ctx, out, lhs_tile.clone(), row.clone(), col.clone());
-            let rhs = load_tile_scalar_dynamic(ctx, out, rhs_tile.clone(), row.clone(), col.clone());
+            let lhs =
+                load_tile_scalar_dynamic(ctx, out, lhs_tile.clone(), row.clone(), col.clone());
+            let rhs =
+                load_tile_scalar_dynamic(ctx, out, rhs_tile.clone(), row.clone(), col.clone());
             let result = emit_bin(ctx, out, op, lhs, rhs, llir::Type::F32);
             let dst_ptr = emit_gep(
                 ctx,
@@ -1107,7 +1092,8 @@ fn lower_tile_unary_inst(
         rows * cols,
         move |ctx, _, out, idx| {
             let (row, col) = linear_index_to_coords(ctx, out, idx, cols);
-            let src = load_tile_scalar_dynamic(ctx, out, src_tile.clone(), row.clone(), col.clone());
+            let src =
+                load_tile_scalar_dynamic(ctx, out, src_tile.clone(), row.clone(), col.clone());
             let result = match op {
                 UnaryOp::Neg => emit_bin(
                     ctx,
@@ -1149,8 +1135,16 @@ fn lower_tile_broadcast_inst(
         rows * cols,
         move |ctx, _, out, idx| {
             let (row, col) = linear_index_to_coords(ctx, out, idx, cols);
-            let src_row = if src_rows == 1 { const_i64(0) } else { row.clone() };
-            let src_col = if src_cols == 1 { const_i64(0) } else { col.clone() };
+            let src_row = if src_rows == 1 {
+                const_i64(0)
+            } else {
+                row.clone()
+            };
+            let src_col = if src_cols == 1 {
+                const_i64(0)
+            } else {
+                col.clone()
+            };
             let scalar = load_tile_scalar_dynamic(ctx, out, src_tile.clone(), src_row, src_col);
             let dst_ptr = emit_gep(
                 ctx,
@@ -1181,10 +1175,14 @@ fn lower_tile_reduce_inst(
     let dst_tile = alloc_tile_result(builder, result, out_rows, out_cols);
     let src_tile = resolve_operand(value, builder.ctx);
 
-    let (outer_header, outer_params) =
-        builder.create_block("tile_reduce_outer_header", vec![("reduce_outer", llir::Type::I64)]);
-    let (outer_body, outer_body_params) =
-        builder.create_block("tile_reduce_outer_body", vec![("reduce_outer", llir::Type::I64)]);
+    let (outer_header, outer_params) = builder.create_block(
+        "tile_reduce_outer_header",
+        vec![("reduce_outer", llir::Type::I64)],
+    );
+    let (outer_body, outer_body_params) = builder.create_block(
+        "tile_reduce_outer_body",
+        vec![("reduce_outer", llir::Type::I64)],
+    );
     let (inner_header, inner_header_params) = builder.create_block(
         "tile_reduce_inner_header",
         vec![
@@ -1247,8 +1245,16 @@ fn lower_tile_reduce_inst(
         let init_acc = match op {
             ReduceOp::Sum => const_f32(0.0),
             ReduceOp::Max => {
-                let src_row = if axis == 1 { out_row.clone() } else { const_i64(0) };
-                let src_col = if axis == 1 { const_i64(0) } else { out_col.clone() };
+                let src_row = if axis == 1 {
+                    out_row.clone()
+                } else {
+                    const_i64(0)
+                };
+                let src_col = if axis == 1 {
+                    const_i64(0)
+                } else {
+                    out_col.clone()
+                };
                 load_tile_scalar_dynamic(ctx, out, src_tile.clone(), src_row, src_col)
             }
         };
