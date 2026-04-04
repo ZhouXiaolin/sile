@@ -1,21 +1,19 @@
 use sile::{
     hir::{BuiltinOp, ElemType, Expr, Kernel, Param, ParamKind, ShapeExpr, Stmt, Type},
-    compiler, passes, ssa, typeck,
+    typeck,
 };
 
 #[test]
 fn c_codegen_emits_vec_add_with_openmp() {
     let kernel = build_vec_add_kernel();
     let typed = typeck::check_kernel(&kernel).unwrap();
-    let ssa = passes::canonicalize::run(ssa::lower_typed_kernel_to_ssa(&typed));
-    let ssa = passes::dce::run(ssa);
-    let executable = compiler::compile(&typed);
-    let c = sile::codegen::c::generate(
-        &executable.func,
-        &executable.abi,
-        &executable.value_info,
-    )
-    .unwrap();
+
+    let executable = sile_mir::lower_to_mir(&typed);
+    let executable = sile_mir::dce::run(executable);
+    let executable = sile_mir::lower_mir_to_lir(&executable, &typed);
+
+    let c = sile::codegen::c::generate(&executable.func, &executable.abi, &executable.value_info)
+        .unwrap();
 
     assert!(c.contains("void sile_kernel_vec_add"));
     assert!(c.contains("#include <omp.h>"));

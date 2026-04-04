@@ -5,23 +5,34 @@ use sile_hir::{ElemType, Param as HirParam, Type as HirType};
 use sile_lir::builder::LirBuilder;
 use sile_lir::{
     Constant, ExecutableKernel, Instruction, KernelAbi, KernelParamAbi, LaunchSemantics,
-    Param as LirParam, ParamPassing, ShapeLayout, Type as LirType, Value, ValueInfo, ValueInfoTable,
+    Param as LirParam, ParamPassing, ShapeLayout, Type as LirType, Value, ValueInfo,
+    ValueInfoTable,
 };
 
 use crate::ir::*;
 
 /// Lower a MIR function to an ExecutableKernel (LIR).
 pub fn lower_mir_to_lir(mir: &MirFunction, typed: &TypedKernel) -> ExecutableKernel {
-    let lir_params: Vec<LirParam> = mir.params.iter().map(|p| LirParam {
-        name: p.name.clone(),
-        ty: LirType::ptr(LirType::f32()),
-    }).collect();
+    let lir_params: Vec<LirParam> = mir
+        .params
+        .iter()
+        .map(|p| LirParam {
+            name: p.name.clone(),
+            ty: LirType::ptr(LirType::f32()),
+        })
+        .collect();
 
     let mut builder = LirBuilder::new(&mir.name, lir_params, LirType::Void);
 
-    let param_info: Vec<ValueInfo> = typed.kernel.params.iter().map(|p| {
-        ValueInfo::Buffer { elem: elem_of_param(p), rank: rank_of_param(p) }
-    }).collect();
+    let param_info: Vec<ValueInfo> = typed
+        .kernel
+        .params
+        .iter()
+        .map(|p| ValueInfo::Buffer {
+            elem: elem_of_param(p),
+            rank: rank_of_param(p),
+        })
+        .collect();
 
     let mut ctx = LowerLirCtx {
         value_map: HashMap::new(),
@@ -111,26 +122,64 @@ fn lower_mir_inst(
         }
         MirOp::TileConstant { value, rows, cols } => {
             let lir_val = builder.tile_alloc(*rows, *cols, *value);
-            let info = ValueInfo::Tile { elem: ElemType::F32, rows: *rows, cols: *cols };
+            let info = ValueInfo::Tile {
+                elem: ElemType::F32,
+                rows: *rows,
+                cols: *cols,
+            };
             ctx.record(inst.result, lir_val, info);
         }
-        MirOp::TileLoad { buf, row_coord, col_coord, rows, cols, stride_shape_idx } => {
+        MirOp::TileLoad {
+            buf,
+            row_coord,
+            col_coord,
+            rows,
+            cols,
+            stride_shape_idx,
+        } => {
             let lir_buf = ctx.resolve(*buf);
             let lir_row = ctx.resolve(*row_coord);
             let lir_col = ctx.resolve(*col_coord);
-            let lir_val = builder.tile_load_2d(lir_buf, *rows, *cols, lir_row, lir_col, *stride_shape_idx);
-            let info = ValueInfo::Tile { elem: ElemType::F32, rows: *rows, cols: *cols };
+            let lir_val =
+                builder.tile_load_2d(lir_buf, *rows, *cols, lir_row, lir_col, *stride_shape_idx);
+            let info = ValueInfo::Tile {
+                elem: ElemType::F32,
+                rows: *rows,
+                cols: *cols,
+            };
             ctx.record(inst.result, lir_val, info);
         }
-        MirOp::TileStore { buf, value, row_coord, col_coord, rows, cols, stride_shape_idx } => {
+        MirOp::TileStore {
+            buf,
+            value,
+            row_coord,
+            col_coord,
+            rows,
+            cols,
+            stride_shape_idx,
+        } => {
             let lir_buf = ctx.resolve(*buf);
             let lir_val = ctx.resolve(*value);
             let lir_row = ctx.resolve(*row_coord);
             let lir_col = ctx.resolve(*col_coord);
-            builder.tile_store_2d(lir_buf, lir_val, *rows, *cols, lir_row, lir_col, *stride_shape_idx);
+            builder.tile_store_2d(
+                lir_buf,
+                lir_val,
+                *rows,
+                *cols,
+                lir_row,
+                lir_col,
+                *stride_shape_idx,
+            );
             ctx.record(inst.result, Value::Const(Constant::Int(0)), ValueInfo::Void);
         }
-        MirOp::TileBinary { op, lhs, rhs, rows, cols } => {
+        MirOp::TileBinary {
+            op,
+            lhs,
+            rhs,
+            rows,
+            cols,
+        } => {
             let lir_lhs = ctx.resolve(*lhs);
             let lir_rhs = ctx.resolve(*rhs);
             let lir_val = match op {
@@ -139,27 +188,57 @@ fn lower_mir_inst(
                 BinOp::Mul => builder.mul(lir_lhs, lir_rhs),
                 BinOp::Div => builder.push_instruction(Instruction::Div(lir_lhs, lir_rhs)),
             };
-            let info = ValueInfo::Tile { elem: ElemType::F32, rows: *rows, cols: *cols };
+            let info = ValueInfo::Tile {
+                elem: ElemType::F32,
+                rows: *rows,
+                cols: *cols,
+            };
             ctx.record(inst.result, lir_val, info);
         }
-        MirOp::TileUnary { op, operand, rows, cols } => {
+        MirOp::TileUnary {
+            op,
+            operand,
+            rows,
+            cols,
+        } => {
             let lir_op = ctx.resolve(*operand);
             let lir_val = match op {
                 UnaryOp::Exp => builder.exp(lir_op),
                 UnaryOp::Neg => builder.push_instruction(Instruction::FNeg(lir_op)),
             };
-            let info = ValueInfo::Tile { elem: ElemType::F32, rows: *rows, cols: *cols };
+            let info = ValueInfo::Tile {
+                elem: ElemType::F32,
+                rows: *rows,
+                cols: *cols,
+            };
             ctx.record(inst.result, lir_val, info);
         }
-        MirOp::TileMma { a, b, acc, tile_m, tile_n, tile_k } => {
+        MirOp::TileMma {
+            a,
+            b,
+            acc,
+            tile_m,
+            tile_n,
+            tile_k,
+        } => {
             let lir_a = ctx.resolve(*a);
             let lir_b = ctx.resolve(*b);
             let lir_acc = ctx.resolve(*acc);
             let lir_val = builder.tile_mma(lir_a, lir_b, lir_acc, *tile_m, *tile_n, *tile_k);
-            let info = ValueInfo::Tile { elem: ElemType::F32, rows: *tile_m, cols: *tile_n };
+            let info = ValueInfo::Tile {
+                elem: ElemType::F32,
+                rows: *tile_m,
+                cols: *tile_n,
+            };
             ctx.record(inst.result, lir_val, info);
         }
-        MirOp::TileReduce { op, value, axis, in_rows, in_cols } => {
+        MirOp::TileReduce {
+            op,
+            value,
+            axis,
+            in_rows,
+            in_cols,
+        } => {
             let lir_val = ctx.resolve(*value);
             let lir_result = match op {
                 ReduceOp::Max => builder.tile_reduce_max(lir_val, *axis, *in_rows, *in_cols),
@@ -170,13 +249,21 @@ fn lower_mir_inst(
             } else {
                 (1i64, *in_cols)
             };
-            let info = ValueInfo::Tile { elem: ElemType::F32, rows: out_rows, cols: out_cols };
+            let info = ValueInfo::Tile {
+                elem: ElemType::F32,
+                rows: out_rows,
+                cols: out_cols,
+            };
             ctx.record(inst.result, lir_result, info);
         }
         MirOp::TileBroadcast { value, rows, cols } => {
             let lir_val = ctx.resolve(*value);
             let lir_result = builder.tile_broadcast(lir_val, *rows, *cols);
-            let info = ValueInfo::Tile { elem: ElemType::F32, rows: *rows, cols: *cols };
+            let info = ValueInfo::Tile {
+                elem: ElemType::F32,
+                rows: *rows,
+                cols: *cols,
+            };
             ctx.record(inst.result, lir_result, info);
         }
         MirOp::IBinary { op, lhs, rhs } => {
@@ -204,23 +291,32 @@ fn lower_mir_inst(
 fn build_kernel_abi(typed: &TypedKernel, program_id_dims: usize) -> KernelAbi {
     let mut offsets = Vec::with_capacity(typed.kernel.params.len());
     let mut next = 0usize;
-    let params = typed.kernel.params.iter().enumerate().map(|(index, param)| {
-        let rank = rank_of_param(param);
-        offsets.push(next);
-        next += rank;
-        KernelParamAbi {
-            index,
-            name: param.name.clone(),
-            kind: param.kind,
-            elem: elem_of_param(param),
-            rank,
-            passing: ParamPassing::Buffer,
-        }
-    }).collect();
+    let params = typed
+        .kernel
+        .params
+        .iter()
+        .enumerate()
+        .map(|(index, param)| {
+            let rank = rank_of_param(param);
+            offsets.push(next);
+            next += rank;
+            KernelParamAbi {
+                index,
+                name: param.name.clone(),
+                kind: param.kind,
+                elem: elem_of_param(param),
+                rank,
+                passing: ParamPassing::Buffer,
+            }
+        })
+        .collect();
 
     KernelAbi {
         params,
-        shape_layout: ShapeLayout { total_dims: next, offsets },
+        shape_layout: ShapeLayout {
+            total_dims: next,
+            offsets,
+        },
         launch: LaunchSemantics { program_id_dims },
     }
 }

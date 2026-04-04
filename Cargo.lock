@@ -438,7 +438,6 @@ dependencies = [
  "rand",
  "sile-backend-cpu",
  "sile-backend-metal",
- "sile-compiler",
  "sile-core",
  "sile-hir",
  "sile-lir",
@@ -467,15 +466,6 @@ dependencies = [
  "sile-core",
  "sile-hir",
  "sile-lir",
-]
-
-[[package]]
-name = "sile-compiler"
-version = "0.1.0"
-dependencies = [
- "sile-hir",
- "sile-lir",
- "sile-mir",
 ]
 
 [[package]]

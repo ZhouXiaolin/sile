@@ -1,9 +1,0 @@
-[package]
-name = "sile-compiler"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-sile-hir = { path = "../sile-hir" }
-sile-lir = { path = "../sile-lir" }
-sile-mir = { path = "../sile-mir" }

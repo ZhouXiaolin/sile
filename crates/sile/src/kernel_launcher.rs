@@ -36,7 +36,9 @@ impl<'a> KernelLauncher<'a> {
         let typed = sile_hir::typeck::check_kernel(self.kernel)
             .map_err(|e| sile_core::Error::Shape(e.to_string()))?;
 
-        let executable = sile_compiler::compile(&typed);
+        let executable = sile_mir::lower_to_mir(&typed);
+        let executable = sile_mir::dce::run(executable);
+        let executable = sile_mir::lower_mir_to_lir(&executable, &typed);
 
         if std::env::var_os("SILE_PRINT_LIR").is_some() {
             eprintln!("{}", format_executable_kernel(&executable));

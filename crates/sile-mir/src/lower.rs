@@ -136,19 +136,18 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx<'_>) {
         Stmt::Store { target, value } => {
             lower_store(target, value, ctx);
         }
-        Stmt::ForLoop { var, start, end, body } => {
+        Stmt::ForLoop {
+            var,
+            start,
+            end,
+            body,
+        } => {
             lower_for_loop(var, start, end, body, ctx);
         }
     }
 }
 
-fn lower_for_loop(
-    var: &str,
-    start: &Expr,
-    end: &Expr,
-    body: &[Stmt],
-    ctx: &mut LowerCtx<'_>,
-) {
+fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut LowerCtx<'_>) {
     let start_val = eval_i64(start, ctx);
     let end_val = eval_i64(end, ctx);
 
@@ -190,9 +189,7 @@ fn lower_for_loop(
     // Collect initial values for carried variables
     let init_carried: Vec<(String, ValueId)> = carried_names
         .iter()
-        .filter_map(|name| {
-            ctx.locals.get(name).map(|v| (name.clone(), *v))
-        })
+        .filter_map(|name| ctx.locals.get(name).map(|v| (name.clone(), *v)))
         .collect();
 
     let header_id = ctx.new_block();
@@ -217,7 +214,10 @@ fn lower_for_loop(
     let start_v = ctx.emit(MirOp::ConstI64(start_val), MirType::I64);
     let mut jump_args = vec![start_v];
     jump_args.extend(init_carried.iter().map(|(_, v)| *v));
-    ctx.seal_block(MirTerminator::Jump { target: header_id, args: jump_args });
+    ctx.seal_block(MirTerminator::Jump {
+        target: header_id,
+        args: jump_args,
+    });
 
     // ── Header block ──
     ctx.current_block = header_id;
@@ -230,7 +230,11 @@ fn lower_for_loop(
 
     let end_v = ctx.emit(MirOp::ConstI64(end_val), MirType::I64);
     let cond = ctx.emit(
-        MirOp::ICmp { op: CmpOp::Lt, lhs: k_param, rhs: end_v },
+        MirOp::ICmp {
+            op: CmpOp::Lt,
+            lhs: k_param,
+            rhs: end_v,
+        },
         MirType::I64,
     );
 
@@ -289,7 +293,11 @@ fn lower_for_loop(
     // k_next = k + 1
     let one = ctx.emit(MirOp::ConstI64(1), MirType::I64);
     let k_next = ctx.emit(
-        MirOp::IBinary { op: BinOp::Add, lhs: body_k_param, rhs: one },
+        MirOp::IBinary {
+            op: BinOp::Add,
+            lhs: body_k_param,
+            rhs: one,
+        },
         MirType::I64,
     );
 
@@ -304,7 +312,10 @@ fn lower_for_loop(
     let mut body_block_params = vec![body_k_param];
     body_block_params.extend(body_carried_params.iter().map(|(_, v)| *v));
 
-    ctx.seal_block(MirTerminator::Jump { target: header_id, args: back_args });
+    ctx.seal_block(MirTerminator::Jump {
+        target: header_id,
+        args: back_args,
+    });
 
     // Store body block params
     if let Some(body_block) = ctx.blocks.last_mut() {
@@ -404,12 +415,16 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx<'_>) -> ValueId {
 
 fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueId {
     match op {
-        BuiltinOp::ProgramId => {
-            ctx.emit(MirOp::ProgramId { dim: 0 }, MirType::I64)
-        }
+        BuiltinOp::ProgramId => ctx.emit(MirOp::ProgramId { dim: 0 }, MirType::I64),
         BuiltinOp::ShapeDim => {
             // ShapeDim(ProgramId, dim) → ProgramId { dim }
-            if matches!(&args[0], Expr::Builtin { op: BuiltinOp::ProgramId, .. }) {
+            if matches!(
+                &args[0],
+                Expr::Builtin {
+                    op: BuiltinOp::ProgramId,
+                    ..
+                }
+            ) {
                 let dim = eval_i64(&args[1], ctx);
                 ctx.emit(MirOp::ProgramId { dim }, MirType::I64)
             } else {
@@ -424,7 +439,8 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 Some(Expr::ScalarI64(v)) => *v as f64,
                 _ => 0.0,
             };
-            let shape = args.get(1)
+            let shape = args
+                .get(1)
                 .map(|arg| extract_const_shape(arg, ctx))
                 .unwrap_or_default();
             let (rows, cols) = shape_to_2d(&shape);
@@ -435,23 +451,33 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
         }
         BuiltinOp::LoadTile => {
             let base = lower_expr(&args[0], ctx);
-            let tile_shape = args.get(1)
+            let tile_shape = args
+                .get(1)
                 .map(|arg| extract_const_shape(arg, ctx))
                 .unwrap_or_default();
-            let coords = args.get(2)
+            let coords = args
+                .get(2)
                 .map(|arg| extract_runtime_coords(arg, ctx))
                 .unwrap_or_default();
             let (rows, cols) = shape_to_2d(&tile_shape);
             let (row_coord, col_coord) = coords_to_2d(&coords, ctx);
             let stride_shape_idx = param_stride_dim(&base, ctx);
             ctx.emit(
-                MirOp::TileLoad { buf: base, row_coord, col_coord, rows, cols, stride_shape_idx },
+                MirOp::TileLoad {
+                    buf: base,
+                    row_coord,
+                    col_coord,
+                    rows,
+                    cols,
+                    stride_shape_idx,
+                },
                 MirType::Tile { rows, cols },
             )
         }
         BuiltinOp::LoadTileLike2D => {
             let input = lower_expr(&args[0], ctx);
-            let shape = args.get(1)
+            let shape = args
+                .get(1)
                 .and_then(|arg| expr_shape(arg, ctx))
                 .unwrap_or_default();
             let (rows, cols) = shape_to_2d(&shape);
@@ -459,19 +485,31 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
             let col_coord = ctx.emit(MirOp::ProgramId { dim: 1 }, MirType::I64);
             let stride_shape_idx = param_stride_dim(&input, ctx);
             ctx.emit(
-                MirOp::TileLoad { buf: input, row_coord, col_coord, rows, cols, stride_shape_idx },
+                MirOp::TileLoad {
+                    buf: input,
+                    row_coord,
+                    col_coord,
+                    rows,
+                    cols,
+                    stride_shape_idx,
+                },
                 MirType::Tile { rows, cols },
             )
         }
         BuiltinOp::Reshape | BuiltinOp::Broadcast => {
             let input = lower_expr(&args[0], ctx);
-            let shape = args.get(1)
+            let shape = args
+                .get(1)
                 .and_then(|expr| expr_shape(expr, ctx))
                 .unwrap_or_default();
             let (rows, cols) = shape_to_2d(&shape);
             if op == BuiltinOp::Broadcast {
                 ctx.emit(
-                    MirOp::TileBroadcast { value: input, rows, cols },
+                    MirOp::TileBroadcast {
+                        value: input,
+                        rows,
+                        cols,
+                    },
                     MirType::Tile { rows, cols },
                 )
             } else {
@@ -489,8 +527,18 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
             let tile_n = acc_shape.1;
             let tile_k = a_shape.1;
             ctx.emit(
-                MirOp::TileMma { a, b, acc, tile_m, tile_n, tile_k },
-                MirType::Tile { rows: tile_m, cols: tile_n },
+                MirOp::TileMma {
+                    a,
+                    b,
+                    acc,
+                    tile_m,
+                    tile_n,
+                    tile_k,
+                },
+                MirType::Tile {
+                    rows: tile_m,
+                    cols: tile_n,
+                },
             )
         }
         BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Mul | BuiltinOp::Div => {
@@ -504,14 +552,25 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 _ => unreachable!(),
             };
             // Check if tile or scalar
-            if let Some((rows, cols)) = tile_shape_of(lhs, ctx).or_else(|| tile_shape_of(rhs, ctx)) {
+            if let Some((rows, cols)) = tile_shape_of(lhs, ctx).or_else(|| tile_shape_of(rhs, ctx))
+            {
                 ctx.emit(
-                    MirOp::TileBinary { op: bin_op, lhs, rhs, rows, cols },
+                    MirOp::TileBinary {
+                        op: bin_op,
+                        lhs,
+                        rhs,
+                        rows,
+                        cols,
+                    },
                     MirType::Tile { rows, cols },
                 )
             } else {
                 ctx.emit(
-                    MirOp::IBinary { op: bin_op, lhs, rhs },
+                    MirOp::IBinary {
+                        op: bin_op,
+                        lhs,
+                        rhs,
+                    },
                     MirType::I64,
                 )
             }
@@ -520,12 +579,22 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
             let operand = lower_expr(&args[0], ctx);
             if let Some((rows, cols)) = tile_shape_of(operand, ctx) {
                 ctx.emit(
-                    MirOp::TileUnary { op: UnaryOp::Exp, operand, rows, cols },
+                    MirOp::TileUnary {
+                        op: UnaryOp::Exp,
+                        operand,
+                        rows,
+                        cols,
+                    },
                     MirType::Tile { rows, cols },
                 )
             } else {
                 ctx.emit(
-                    MirOp::TileUnary { op: UnaryOp::Exp, operand, rows: 1, cols: 1 },
+                    MirOp::TileUnary {
+                        op: UnaryOp::Exp,
+                        operand,
+                        rows: 1,
+                        cols: 1,
+                    },
                     MirType::F32,
                 )
             }
@@ -540,10 +609,23 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
             let (in_rows, in_cols) = tile_shape_of(value, ctx).unwrap_or((1, 1));
             // Default axis = 1 (reduce columns, keep rows)
             let axis = 1i64;
-            let (out_rows, out_cols) = if axis == 1 { (in_rows, 1) } else { (1, in_cols) };
+            let (out_rows, out_cols) = if axis == 1 {
+                (in_rows, 1)
+            } else {
+                (1, in_cols)
+            };
             ctx.emit(
-                MirOp::TileReduce { op: reduce_op, value, axis, in_rows, in_cols },
-                MirType::Tile { rows: out_rows, cols: out_cols },
+                MirOp::TileReduce {
+                    op: reduce_op,
+                    value,
+                    axis,
+                    in_rows,
+                    in_cols,
+                },
+                MirType::Tile {
+                    rows: out_rows,
+                    cols: out_cols,
+                },
             )
         }
         BuiltinOp::ShapeOf | BuiltinOp::ScalarDiv => {
@@ -558,7 +640,10 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
 }
 
 fn lower_store(target: &str, value: &Expr, ctx: &mut LowerCtx<'_>) {
-    let output = ctx.locals.get(target).copied()
+    let output = ctx
+        .locals
+        .get(target)
+        .copied()
         .unwrap_or_else(|| ctx.emit(MirOp::ConstI64(0), MirType::I64));
     let stored = lower_expr(value, ctx);
 
@@ -577,8 +662,13 @@ fn lower_store(target: &str, value: &Expr, ctx: &mut LowerCtx<'_>) {
 
     ctx.emit(
         MirOp::TileStore {
-            buf: output, value: stored, row_coord, col_coord,
-            rows, cols, stride_shape_idx,
+            buf: output,
+            value: stored,
+            row_coord,
+            col_coord,
+            rows,
+            cols,
+            stride_shape_idx,
         },
         MirType::Void,
     );
@@ -590,12 +680,12 @@ fn eval_i64(expr: &Expr, ctx: &LowerCtx<'_>) -> i64 {
     match expr {
         Expr::ScalarI64(v) => *v,
         Expr::ScalarF32(v) => *v as i64,
-        Expr::Var(name) => {
-            ctx.const_values.get(name).copied().unwrap_or(0)
-        }
-        Expr::Builtin { op: BuiltinOp::ShapeDim, args, .. } => {
-            args.get(1).map(|arg| eval_i64(arg, ctx)).unwrap_or(0)
-        }
+        Expr::Var(name) => ctx.const_values.get(name).copied().unwrap_or(0),
+        Expr::Builtin {
+            op: BuiltinOp::ShapeDim,
+            args,
+            ..
+        } => args.get(1).map(|arg| eval_i64(arg, ctx)).unwrap_or(0),
         _ => 0,
     }
 }
@@ -621,9 +711,10 @@ fn resolve_shape_dim(dim: &ShapeExpr, ctx: &LowerCtx<'_>) -> i64 {
 
 fn extract_runtime_coords(expr: &Expr, ctx: &mut LowerCtx<'_>) -> Vec<ValueId> {
     match expr {
-        Expr::Shape(ShapeExpr::Tuple(dims)) => {
-            dims.iter().map(|dim| resolve_runtime_dim(dim, ctx)).collect()
-        }
+        Expr::Shape(ShapeExpr::Tuple(dims)) => dims
+            .iter()
+            .map(|dim| resolve_runtime_dim(dim, ctx))
+            .collect(),
         Expr::Shape(dim) => vec![resolve_runtime_dim(dim, ctx)],
         _ => vec![],
     }
@@ -678,7 +769,9 @@ fn tile_shape_of(value: ValueId, ctx: &LowerCtx<'_>) -> Option<(i64, i64)> {
 
 fn param_shape_2d(name: &str, ctx: &LowerCtx<'_>) -> Option<(i64, i64)> {
     let param = ctx.typed.kernel.params.iter().find(|p| p.name == name)?;
-    let sile_hir::Type::Tensor { shape, .. } = &param.ty else { return None };
+    let sile_hir::Type::Tensor { shape, .. } = &param.ty else {
+        return None;
+    };
     let dims = match shape {
         ShapeExpr::Tuple(dims) if dims.len() == 2 => dims,
         _ => return None,
@@ -713,7 +806,11 @@ fn expr_shape(expr: &Expr, ctx: &LowerCtx<'_>) -> Option<Vec<i64>> {
     match expr {
         Expr::Shape(_) => {
             let shape = extract_const_shape(expr, ctx);
-            if shape.is_empty() { None } else { Some(shape) }
+            if shape.is_empty() {
+                None
+            } else {
+                Some(shape)
+            }
         }
         Expr::Var(name) => type_shape_for_name(name, ctx),
         _ => None,
@@ -724,21 +821,22 @@ fn type_shape_for_name(name: &str, ctx: &LowerCtx<'_>) -> Option<Vec<i64>> {
     if let Some(ty) = ctx.typed.locals.get(name) {
         return resolve_type_shape(ty, ctx);
     }
-    ctx.typed.kernel.params.iter()
+    ctx.typed
+        .kernel
+        .params
+        .iter()
         .find(|p| p.name == name)
         .and_then(|p| resolve_type_shape(&p.ty, ctx))
 }
 
 fn resolve_type_shape(ty: &sile_hir::Type, ctx: &LowerCtx<'_>) -> Option<Vec<i64>> {
     match ty {
-        sile_hir::Type::Tensor { shape, .. } | sile_hir::Type::Tile { shape, .. } => {
-            match shape {
-                ShapeExpr::Tuple(dims) => {
-                    Some(dims.iter().map(|d| resolve_shape_dim(d, ctx)).collect())
-                }
-                other => Some(vec![resolve_shape_dim(other, ctx)]),
+        sile_hir::Type::Tensor { shape, .. } | sile_hir::Type::Tile { shape, .. } => match shape {
+            ShapeExpr::Tuple(dims) => {
+                Some(dims.iter().map(|d| resolve_shape_dim(d, ctx)).collect())
             }
-        }
+            other => Some(vec![resolve_shape_dim(other, ctx)]),
+        },
         sile_hir::Type::Shape | sile_hir::Type::Scalar(_) => None,
     }
 }

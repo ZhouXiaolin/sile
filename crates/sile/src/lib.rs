@@ -21,20 +21,13 @@ pub mod mir {
     pub use sile_mir::lower::lower_to_mir;
     pub use sile_mir::print::format_mir;
 }
-pub mod ssa {
-    pub use sile_compiler::lower_hir::lower_typed_kernel_to_ssa;
-    pub use sile_compiler::mir::ir;
-}
 pub mod lir {
-    pub use sile_compiler::lower_lir::lower_ssa_to_lir;
     pub use sile_lir::ir::*;
 }
 pub mod compiler {
-    pub use sile_compiler::compile;
-    pub use sile_compiler::compile_legacy;
-}
-pub mod passes {
-    pub use sile_compiler::passes::*;
+    pub use sile_mir::dce;
+    pub use sile_mir::lower_mir_to_lir;
+    pub use sile_mir::lower_to_mir;
 }
 pub mod codegen {
     pub mod c {
