@@ -408,7 +408,6 @@ fn format_intrinsic(intrinsic: &Intrinsic) -> String {
         Intrinsic::BlockId { dim } => format!("block_id.{}", dim),
         Intrinsic::Barrier { scope } => format!("barrier.{}", format_scope(scope)),
         Intrinsic::Exp => "exp".to_string(),
-        Intrinsic::MatmulFragment => "matmul_fragment".to_string(),
     }
 }
 

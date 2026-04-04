@@ -449,7 +449,6 @@ impl<'a> MetalCodegen<'a> {
                 ));
                 Ok(())
             }
-            llir::Intrinsic::MatmulFragment => self.emit_matmul_fragment(args),
         }
     }
 
@@ -540,45 +539,6 @@ impl<'a> MetalCodegen<'a> {
                 ));
             }
         });
-        Ok(())
-    }
-
-    fn emit_matmul_fragment(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
-        let [dst, a, b, acc, tile_m, tile_n, tile_k] = args else {
-            return Err(sile_core::Error::Compile(
-                "matmul_fragment expects seven arguments".into(),
-            ));
-        };
-        let tile_m = const_usize(tile_m, "matmul tile_m")?;
-        let tile_n = const_usize(tile_n, "matmul tile_n")?;
-        let tile_k = const_usize(tile_k, "matmul tile_k")?;
-        let dst = self.format_operand(dst);
-        let a = self.format_operand(a);
-        let b = self.format_operand(b);
-        let acc = self.format_operand(acc);
-
-        self.writeln(&format!(
-            "for (int mma_r = 0; mma_r < {tile_m}; ++mma_r) {{"
-        ));
-        self.indent += 1;
-        self.writeln(&format!(
-            "for (int mma_c = 0; mma_c < {tile_n}; ++mma_c) {{"
-        ));
-        self.indent += 1;
-        self.writeln(&format!("{dst}[mma_r][mma_c] = {acc}[mma_r][mma_c];"));
-        self.writeln(&format!(
-            "for (int mma_k = 0; mma_k < {tile_k}; ++mma_k) {{"
-        ));
-        self.indent += 1;
-        self.writeln(&format!(
-            "{dst}[mma_r][mma_c] += {a}[mma_r][mma_k] * {b}[mma_k][mma_c];"
-        ));
-        self.indent -= 1;
-        self.writeln("}");
-        self.indent -= 1;
-        self.writeln("}");
-        self.indent -= 1;
-        self.writeln("}");
         Ok(())
     }
 
