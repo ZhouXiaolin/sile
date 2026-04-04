@@ -1,4 +1,4 @@
-use sile::{exp, reduce_max, reduce_sum, Device, Tensor};
+use sile::{Device, Tensor, exp, reduce_max, reduce_sum};
 
 #[sile::kernel]
 fn softmax<const BM: i64, const BN: i64>(

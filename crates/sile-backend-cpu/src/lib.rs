@@ -1,15 +1,18 @@
 pub mod codegen_c;
+pub mod codegen_llir_c;
 pub mod scheduling;
 
 use std::{ffi::c_void, fs, process::Command};
 
 use libloading::Library;
+use sile_llir::Function as LlirFunction;
 use tempfile::tempdir;
 
 use sile_core::{KernelArg, LaunchConfig, Result, Stream};
 use sile_lir::ExecutableKernel;
 
 use crate::codegen_c::generate;
+use crate::codegen_llir_c::generate_kernel as generate_llir_kernel;
 
 type KernelFn = unsafe extern "C" fn(*const *const c_void, i64, i64, *const i64, i64);
 
@@ -47,27 +50,29 @@ impl CpuBackend {
         let code = generate(&kernel.func, &kernel.abi, &kernel.value_info)?;
         Ok(code)
     }
-}
 
-impl sile_lir::Backend for CpuBackend {
-    fn execute(
+    fn compile_llir_kernel(func: &LlirFunction) -> Result<String> {
+        generate_llir_kernel(func)
+    }
+
+    fn execute_compiled_source(
         &self,
-        kernel: &ExecutableKernel,
+        kernel_name: &str,
+        c_code: &str,
         args: &[KernelArg<'_>],
         launch: &LaunchConfig,
-        _stream: &Stream,
+        llir_mode: bool,
     ) -> Result<()> {
         let dir = tempdir()?;
-        let c_path = dir.path().join(format!("{}.c", kernel.name));
+        let c_path = dir.path().join(format!("{}.c", kernel_name));
         let ext = if cfg!(target_os = "macos") {
             "dylib"
         } else {
             "so"
         };
-        let so_path = dir.path().join(format!("lib{}.{}", kernel.name, ext));
+        let so_path = dir.path().join(format!("lib{}.{}", kernel_name, ext));
 
-        let c_code = Self::compile_kernel(kernel)?;
-        fs::write(&c_path, &c_code)?;
+        fs::write(&c_path, c_code)?;
 
         let compiler = Self::compiler()?;
         let mut cmd = Command::new(compiler);
@@ -110,7 +115,7 @@ impl sile_lir::Backend for CpuBackend {
         unsafe {
             let library =
                 Library::new(&so_path).map_err(|e| sile_core::Error::Compile(e.to_string()))?;
-            let symbol_name = format!("sile_kernel_{}", kernel.name);
+            let symbol_name = format!("sile_kernel_{}", kernel_name);
             let func: libloading::Symbol<KernelFn> = library
                 .get(symbol_name.as_bytes())
                 .map_err(|e| sile_core::Error::Compile(e.to_string()))?;
@@ -120,8 +125,14 @@ impl sile_lir::Backend for CpuBackend {
 
             let shapes: Vec<i64> = args.iter().flat_map(|a| a.shape.iter().copied()).collect();
 
-            let num_threadgroups = launch.grid[0] as i64;
-            let threads_per_group = if args.is_empty() || args[0].shape.is_empty() {
+            let num_threadgroups = if llir_mode {
+                launch.grid.iter().map(|dim| *dim as i64).product::<i64>()
+            } else {
+                launch.grid[0] as i64
+            };
+            let threads_per_group = if llir_mode {
+                1
+            } else if args.is_empty() || args[0].shape.is_empty() {
                 256
             } else {
                 args[0].shape[0] / num_threadgroups
@@ -137,5 +148,29 @@ impl sile_lir::Backend for CpuBackend {
         }
 
         Ok(())
+    }
+
+    pub fn execute_llir(
+        &self,
+        func: &LlirFunction,
+        args: &[KernelArg<'_>],
+        launch: &LaunchConfig,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let c_code = Self::compile_llir_kernel(func)?;
+        self.execute_compiled_source(&func.name, &c_code, args, launch, true)
+    }
+}
+
+impl sile_lir::Backend for CpuBackend {
+    fn execute(
+        &self,
+        kernel: &ExecutableKernel,
+        args: &[KernelArg<'_>],
+        launch: &LaunchConfig,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let c_code = Self::compile_kernel(kernel)?;
+        self.execute_compiled_source(&kernel.name, &c_code, args, launch, false)
     }
 }

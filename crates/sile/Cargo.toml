@@ -8,6 +8,7 @@ sile-core = { path = "../sile-core" }
 sile-hir = { path = "../sile-hir" }
 sile-mir = { path = "../sile-mir" }
 sile-lir = { path = "../sile-lir" }
+sile-llir = { path = "../sile-llir" }
 sile-backend-cpu = { path = "../sile-backend-cpu" }
 sile-backend-metal = { path = "../sile-backend-metal" }
 sile-macros = { path = "../sile-macros" }

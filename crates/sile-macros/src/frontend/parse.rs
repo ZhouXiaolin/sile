@@ -43,7 +43,7 @@ pub fn parse_kernel(input: &syn::ItemFn) -> syn::Result<KernelDecl> {
                         return Err(syn::Error::new_spanned(
                             &local.pat,
                             "expected ident pattern",
-                        ))
+                        ));
                     }
                 };
                 let expr = local
@@ -63,14 +63,12 @@ pub fn parse_kernel(input: &syn::ItemFn) -> syn::Result<KernelDecl> {
                 }
                 if let syn::Expr::Assign(assign) = expr {
                     let name = match assign.left.as_ref() {
-                        syn::Expr::Path(path) => {
-                            path.path.segments.last().unwrap().ident.clone()
-                        }
+                        syn::Expr::Path(path) => path.path.segments.last().unwrap().ident.clone(),
                         _ => {
                             return Err(syn::Error::new_spanned(
                                 &assign.left,
                                 "assignment target must be an ident",
-                            ))
+                            ));
                         }
                     };
                     let expr = parse_expr(&assign.right)?;
@@ -87,7 +85,7 @@ pub fn parse_kernel(input: &syn::ItemFn) -> syn::Result<KernelDecl> {
                                 return Err(syn::Error::new_spanned(
                                     &call.receiver,
                                     "store target must be an ident",
-                                ))
+                                ));
                             }
                         };
                         let value = parse_expr(call.args.first().ok_or_else(|| {
@@ -106,7 +104,7 @@ pub fn parse_kernel(input: &syn::ItemFn) -> syn::Result<KernelDecl> {
                 return Err(syn::Error::new_spanned(
                     other,
                     "unsupported kernel statement",
-                ))
+                ));
             }
         }
     }
@@ -126,7 +124,7 @@ fn parse_for_loop(for_loop: &syn::ExprForLoop, body: &mut Vec<KernelStmt>) -> sy
             return Err(syn::Error::new_spanned(
                 &for_loop.pat,
                 "for loop variable must be an ident",
-            ))
+            ));
         }
     };
     let (start, end) = match for_loop.expr.as_ref() {
@@ -144,7 +142,7 @@ fn parse_for_loop(for_loop: &syn::ExprForLoop, body: &mut Vec<KernelStmt>) -> sy
             return Err(syn::Error::new_spanned(
                 &for_loop.expr,
                 "for loop expression must be a range",
-            ))
+            ));
         }
     };
     let mut loop_body = Vec::new();
@@ -167,7 +165,7 @@ fn parse_for_loop(for_loop: &syn::ExprForLoop, body: &mut Vec<KernelStmt>) -> sy
                         return Err(syn::Error::new_spanned(
                             &local.pat,
                             "expected ident pattern",
-                        ))
+                        ));
                     }
                 };
                 let expr = local
@@ -183,14 +181,12 @@ fn parse_for_loop(for_loop: &syn::ExprForLoop, body: &mut Vec<KernelStmt>) -> sy
             syn::Stmt::Expr(inner_expr, _) => {
                 if let syn::Expr::Assign(assign) = inner_expr {
                     let name = match assign.left.as_ref() {
-                        syn::Expr::Path(path) => {
-                            path.path.segments.last().unwrap().ident.clone()
-                        }
+                        syn::Expr::Path(path) => path.path.segments.last().unwrap().ident.clone(),
                         _ => {
                             return Err(syn::Error::new_spanned(
                                 &assign.left,
                                 "assignment target must be an ident",
-                            ))
+                            ));
                         }
                     };
                     let expr = parse_expr(&assign.right)?;
@@ -207,7 +203,7 @@ fn parse_for_loop(for_loop: &syn::ExprForLoop, body: &mut Vec<KernelStmt>) -> sy
                                 return Err(syn::Error::new_spanned(
                                     &call.receiver,
                                     "store target must be an ident",
-                                ))
+                                ));
                             }
                         };
                         let value = parse_expr(call.args.first().ok_or_else(|| {
@@ -226,7 +222,7 @@ fn parse_for_loop(for_loop: &syn::ExprForLoop, body: &mut Vec<KernelStmt>) -> sy
                 return Err(syn::Error::new_spanned(
                     other,
                     "unsupported statement in for loop",
-                ))
+                ));
             }
         }
     }
@@ -339,11 +335,7 @@ fn extract_shape_expr(expr: &syn::Expr) -> Option<Vec<KernelShapeDim>> {
                 };
                 shape.push(dim);
             }
-            if shape.is_empty() {
-                None
-            } else {
-                Some(shape)
-            }
+            if shape.is_empty() { None } else { Some(shape) }
         }
         _ => None,
     }
@@ -376,7 +368,7 @@ fn parse_expr(expr: &syn::Expr) -> syn::Result<KernelExpr> {
                     return Err(syn::Error::new_spanned(
                         &binary.op,
                         "unsupported binary operator",
-                    ))
+                    ));
                 }
             };
             Ok(KernelExpr::BinaryOp {
@@ -427,7 +419,7 @@ fn parse_expr(expr: &syn::Expr) -> syn::Result<KernelExpr> {
                     return Err(syn::Error::new_spanned(
                         &call.func,
                         "expected simple function call",
-                    ))
+                    ));
                 }
             };
             let args = call

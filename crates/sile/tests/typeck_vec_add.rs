@@ -19,6 +19,12 @@ fn vec_add_typeck_infers_tile_shapes() {
 
     let typed = check_kernel(&kernel).unwrap();
 
-    assert_eq!(typed.locals["tile_a"].category(), sile::hir::ValueCategory::Tile);
-    assert_eq!(typed.locals["tile_b"].category(), sile::hir::ValueCategory::Tile);
+    assert_eq!(
+        typed.locals["tile_a"].category(),
+        sile::hir::ValueCategory::Tile
+    );
+    assert_eq!(
+        typed.locals["tile_b"].category(),
+        sile::hir::ValueCategory::Tile
+    );
 }

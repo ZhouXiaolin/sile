@@ -1,4 +1,4 @@
-use crate::{stream::Stream, Error, Result};
+use crate::{Error, Result, stream::Stream};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CpuDeviceOptions;

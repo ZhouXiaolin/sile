@@ -1,9 +1,9 @@
 use sile::{Device, Tensor};
 
 #[sile::kernel]
-fn matmul<const BM: i64, const BN: i64, const BK: i64, const K: i64>(
-    a: &Tensor<f32, { [-1, K] }>,
-    b: &Tensor<f32, { [K, -1] }>,
+fn matmul<const BM: i64, const BN: i64, const BK: i64>(
+    a: &Tensor<f32, { [-1, -1] }>,
+    b: &Tensor<f32, { [-1, -1] }>,
     c: &mut Tensor<f32, { [BM, BN] }>,
 ) {
     let m_idx = sile::tile::id().0;
@@ -26,8 +26,6 @@ fn cpu_backend_executes_matmul_through_tile_pipeline() {
     const BM: i64 = 2;
     const BN: i64 = 2;
     const BK: i64 = 2;
-    const K: i64 = 4;
-
     let a = Tensor::from_vec(
         vec![
             1.0, 2.0, 3.0, 4.0, //
@@ -52,7 +50,7 @@ fn cpu_backend_executes_matmul_through_tile_pipeline() {
     .unwrap();
     let mut c = Tensor::zeros([4, 4], &device).unwrap();
 
-    matmul::<BM, BN, BK, K>(&a, &b, &mut c)
+    matmul::<BM, BN, BK>(&a, &b, &mut c)
         .grid((4, 1, 1))
         .apply(&stream)
         .unwrap();

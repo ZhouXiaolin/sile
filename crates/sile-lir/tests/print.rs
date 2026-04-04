@@ -1,8 +1,8 @@
 use sile_hir::ParamKind;
 use sile_lir::{
-    print::format_executable_kernel, ElemType, ExecutableKernel, FloatType, Function, KernelAbi,
-    KernelParamAbi, LaunchSemantics, Param, ParamPassing, ShapeLayout, Type, ValueInfo,
-    ValueInfoTable,
+    ElemType, ExecutableKernel, FloatType, Function, KernelAbi, KernelParamAbi, LaunchSemantics,
+    Param, ParamPassing, ShapeLayout, Type, ValueInfo, ValueInfoTable,
+    print::format_executable_kernel,
 };
 
 #[test]

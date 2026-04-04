@@ -1,10 +1,13 @@
+pub mod codegen_llir_metal;
 pub mod codegen_metal;
 
 use metal::{CommandQueue, ComputePipelineState, Device, Library};
 use sile_core::{KernelArg, LaunchConfig, Result, Stream};
 use sile_hir::ParamKind;
 use sile_lir::ExecutableKernel;
+use sile_llir::Function as LlirFunction;
 
+use crate::codegen_llir_metal::generate as generate_llir_metal;
 use crate::codegen_metal::generate;
 
 pub struct MetalBackend {
@@ -60,20 +63,29 @@ impl MetalBackend {
         let len = (buffer.length() / std::mem::size_of::<f32>() as u64) as usize;
         unsafe { std::slice::from_raw_parts(ptr, len).to_vec() }
     }
-}
 
-impl sile_lir::Backend for MetalBackend {
-    fn execute(
+    pub fn execute_llir(
         &self,
-        kernel: &ExecutableKernel,
+        func: &LlirFunction,
+        param_kinds: &[ParamKind],
         args: &[KernelArg<'_>],
         launch: &LaunchConfig,
         _stream: &Stream,
     ) -> Result<()> {
-        let source = generate(&kernel.func, &kernel.abi, &kernel.value_info)?;
+        let source = generate_llir_metal(func)?;
+        self.execute_source(&func.name, &source, param_kinds, args, launch)
+    }
 
-        let library = self.compile_shader(&source)?;
-        let fn_name = format!("sile_kernel_{}", kernel.name);
+    fn execute_source(
+        &self,
+        kernel_name: &str,
+        source: &str,
+        param_kinds: &[ParamKind],
+        args: &[KernelArg<'_>],
+        launch: &LaunchConfig,
+    ) -> Result<()> {
+        let library = self.compile_shader(source)?;
+        let fn_name = format!("sile_kernel_{}", kernel_name);
         let function = self.get_function(&library, &fn_name)?;
         let pipeline = self.create_pipeline(&function)?;
 
@@ -109,10 +121,6 @@ impl sile_lir::Backend for MetalBackend {
         let grid_x = launch.grid[0] as u64;
         let grid_y = launch.grid[1] as u64;
         let grid_z = launch.grid[2] as u64;
-
-        // The current Metal codegen maps one logical tile to one kernel instance and
-        // uses threadgroup-local arrays for intermediates. Running multiple threads in
-        // a threadgroup would make them race on the same temporaries.
         let threads_per_threadgroup = metal::MTLSize::new(1, 1, 1);
 
         encoder.dispatch_thread_groups(
@@ -125,7 +133,7 @@ impl sile_lir::Backend for MetalBackend {
         command_buffer.wait_until_completed();
 
         for (i, arg) in args.iter().enumerate() {
-            let is_output = matches!(kernel.abi.params.get(i).map(|param| param.kind), Some(ParamKind::Output));
+            let is_output = matches!(param_kinds.get(i), Some(ParamKind::Output));
             if is_output {
                 let result = self.download_from_device(&mtl_buffers[i]);
                 let len = arg.shape.iter().product::<i64>() as usize;
@@ -136,5 +144,19 @@ impl sile_lir::Backend for MetalBackend {
         }
 
         Ok(())
+    }
+}
+
+impl sile_lir::Backend for MetalBackend {
+    fn execute(
+        &self,
+        kernel: &ExecutableKernel,
+        args: &[KernelArg<'_>],
+        launch: &LaunchConfig,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let source = generate(&kernel.func, &kernel.abi, &kernel.value_info)?;
+        let param_kinds: Vec<_> = kernel.abi.params.iter().map(|param| param.kind).collect();
+        self.execute_source(&kernel.name, &source, &param_kinds, args, launch)
     }
 }

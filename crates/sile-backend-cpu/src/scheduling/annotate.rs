@@ -1,6 +1,6 @@
 use super::dependency::{
-    analyze_memory_accesses, find_natural_loops, has_loop_carried_dependency, is_reduction_pattern,
-    ReductionType,
+    ReductionType, analyze_memory_accesses, find_natural_loops, has_loop_carried_dependency,
+    is_reduction_pattern,
 };
 use sile_lir::ir::{Constant, Function, Value};
 

@@ -96,9 +96,20 @@ impl<'a> LowerCtx<'a> {
 
     /// Seal the current block with a terminator, push it to blocks list
     fn seal_block(&mut self, terminator: MirTerminator) {
+        let params = if let Some((block_id, params)) = &self.pending_exit_params {
+            if *block_id == self.current_block {
+                let params = params.clone();
+                self.pending_exit_params = None;
+                params
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
         let block = MirBlock {
             id: self.current_block,
-            params: Vec::new(),
+            params,
             insts: std::mem::take(&mut self.current_insts),
             terminator,
         };
@@ -847,11 +858,7 @@ fn expr_shape(expr: &Expr, ctx: &LowerCtx<'_>) -> Option<Vec<i64>> {
     match expr {
         Expr::Shape(_) => {
             let shape = extract_const_shape(expr, ctx);
-            if shape.is_empty() {
-                None
-            } else {
-                Some(shape)
-            }
+            if shape.is_empty() { None } else { Some(shape) }
         }
         Expr::Var(name) => type_shape_for_name(name, ctx),
         Expr::Builtin {

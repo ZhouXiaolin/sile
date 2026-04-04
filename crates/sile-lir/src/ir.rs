@@ -70,6 +70,7 @@ pub enum CmpOp {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Instruction {
+    BlockParam,
     Alloca {
         ty: Type,
     },

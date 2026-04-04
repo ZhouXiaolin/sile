@@ -1,4 +1,4 @@
-use crate::{device::Device, Result};
+use crate::{Result, device::Device};
 
 #[derive(Clone, Debug)]
 pub struct Stream {
