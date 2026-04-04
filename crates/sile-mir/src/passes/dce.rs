@@ -17,9 +17,13 @@ pub fn run(mut func: MirFunction) -> MirFunction {
     }
 
     // Clean up unused types
-    let all_values: HashSet<_> = func.blocks.iter()
+    let all_values: HashSet<_> = func
+        .blocks
+        .iter()
         .flat_map(|b| {
-            b.params.iter().copied()
+            b.params
+                .iter()
+                .copied()
                 .chain(b.insts.iter().map(|i| i.result))
         })
         .chain(func.params.iter().map(|p| p.value))

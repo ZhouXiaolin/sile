@@ -72,7 +72,6 @@ pub struct MirInst {
 #[derive(Clone, Debug, PartialEq)]
 pub enum MirOp {
     // ── Tile operations (shapes resolved to concrete i64) ──
-
     /// Load a tile from a buffer at given coordinates
     TileLoad {
         buf: ValueId,
@@ -94,11 +93,7 @@ pub enum MirOp {
         stride_shape_idx: usize,
     },
     /// Allocate a tile filled with a constant value
-    TileConstant {
-        value: f64,
-        rows: i64,
-        cols: i64,
-    },
+    TileConstant { value: f64, rows: i64, cols: i64 },
     /// Element-wise binary op on tiles
     TileBinary {
         op: BinOp,
@@ -139,7 +134,6 @@ pub enum MirOp {
     },
 
     // ── Scalar / index operations ──
-
     /// Integer binary operation
     IBinary {
         op: BinOp,
@@ -221,10 +215,7 @@ impl fmt::Display for CmpOp {
 #[derive(Clone, Debug, PartialEq)]
 pub enum MirTerminator {
     /// Unconditional jump: goto target(args...)
-    Jump {
-        target: BlockId,
-        args: Vec<ValueId>,
-    },
+    Jump { target: BlockId, args: Vec<ValueId> },
     /// Conditional branch
     Branch {
         cond: ValueId,
@@ -279,10 +270,21 @@ impl MirFunction {
     /// Collect all ValueIds used (read) by a given instruction
     pub fn inst_uses(op: &MirOp) -> Vec<ValueId> {
         match op {
-            MirOp::TileLoad { buf, row_coord, col_coord, .. } => {
+            MirOp::TileLoad {
+                buf,
+                row_coord,
+                col_coord,
+                ..
+            } => {
                 vec![*buf, *row_coord, *col_coord]
             }
-            MirOp::TileStore { buf, value, row_coord, col_coord, .. } => {
+            MirOp::TileStore {
+                buf,
+                value,
+                row_coord,
+                col_coord,
+                ..
+            } => {
                 vec![*buf, *value, *row_coord, *col_coord]
             }
             MirOp::TileConstant { .. } => vec![],
@@ -303,7 +305,12 @@ impl MirFunction {
     pub fn terminator_uses(term: &MirTerminator) -> Vec<ValueId> {
         match term {
             MirTerminator::Jump { args, .. } => args.clone(),
-            MirTerminator::Branch { cond, true_args, false_args, .. } => {
+            MirTerminator::Branch {
+                cond,
+                true_args,
+                false_args,
+                ..
+            } => {
                 let mut uses = vec![*cond];
                 uses.extend(true_args);
                 uses.extend(false_args);
