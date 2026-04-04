@@ -24,6 +24,13 @@ fn dynamic_k_matmul_llir_codegen_emits_structured_metal() {
     assert!(metal.contains("float v15_storage[2][2];"));
     assert!(metal.contains("for (int mma_r = 0; mma_r < 2; ++mma_r)"));
     assert!(metal.contains("shapes[1]"));
+    assert!(metal.contains("= &(a["));
+    assert!(metal.contains("= &(b["));
+    assert!(metal.contains("= &(c["));
+    assert!(metal.contains("= *("));
+    assert!(metal.contains("*("));
+    assert!(!metal.contains("tile_load_2d_f32("));
+    assert!(!metal.contains("tile_store_2d_f32("));
 }
 
 fn build_dynamic_k_matmul_kernel() -> Kernel {

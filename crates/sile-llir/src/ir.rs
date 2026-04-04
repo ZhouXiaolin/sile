@@ -157,6 +157,10 @@ pub enum Intrinsic {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum InstOp {
+    ShapeDim {
+        buf: Operand,
+        dim: usize,
+    },
     Alloca {
         alloc_ty: Type,
         addr_space: AddressSpace,

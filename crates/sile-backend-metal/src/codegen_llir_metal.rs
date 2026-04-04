@@ -270,6 +270,13 @@ impl<'a> MetalCodegen<'a> {
 
     fn emit_inst(&mut self, inst: &llir::Inst) -> sile_core::Result<()> {
         match &inst.op {
+            llir::InstOp::ShapeDim { buf, dim } => {
+                if let Some(id) = inst.result {
+                    let expr = self.emit_shape_dim(buf, *dim)?;
+                    self.writeln(&format!("{} = {};", self.value_name(id), expr));
+                }
+                Ok(())
+            }
             llir::InstOp::Alloca { .. } => Ok(()),
             llir::InstOp::Bin { op, lhs, rhs } => {
                 if let Some(id) = inst.result {
@@ -379,21 +386,11 @@ impl<'a> MetalCodegen<'a> {
 
     fn emit_call(
         &mut self,
-        result: Option<llir::ValueId>,
+        _result: Option<llir::ValueId>,
         func: &str,
         args: &[llir::Operand],
     ) -> sile_core::Result<()> {
         match func {
-            "shape_dim" => {
-                let Some(id) = result else {
-                    return Err(sile_core::Error::Compile(
-                        "shape_dim must produce a result in LLIR Metal codegen".into(),
-                    ));
-                };
-                let expr = self.emit_shape_dim(args)?;
-                self.writeln(&format!("{} = {};", self.value_name(id), expr));
-                Ok(())
-            }
             "tile_splat_f32" => self.emit_tile_splat(args),
             "tile_load_2d_f32" => self.emit_tile_load(args),
             "tile_store_2d_f32" => self.emit_tile_store(args),
@@ -448,13 +445,7 @@ impl<'a> MetalCodegen<'a> {
         }
     }
 
-    fn emit_shape_dim(&self, args: &[llir::Operand]) -> sile_core::Result<String> {
-        let [buf, dim] = args else {
-            return Err(sile_core::Error::Compile(
-                "shape_dim expects two arguments".into(),
-            ));
-        };
-        let dim = const_usize(dim, "shape_dim dimension")?;
+    fn emit_shape_dim(&self, buf: &llir::Operand, dim: usize) -> sile_core::Result<String> {
         let param_idx = self.param_index(buf).ok_or_else(|| {
             sile_core::Error::Compile(
                 "shape_dim currently requires a direct kernel parameter operand".into(),
