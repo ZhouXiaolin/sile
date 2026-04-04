@@ -1,5 +1,5 @@
 mod annotate;
 mod dependency;
 
-pub use annotate::{annotate, ParallelRegion, ReductionOp, ScheduleAnnotation, SimdRegion};
-pub use dependency::{find_natural_loops, has_loop_carried_dependency, LoopInfo};
+pub use annotate::{ParallelRegion, ReductionOp, ScheduleAnnotation, SimdRegion, annotate};
+pub use dependency::{LoopInfo, find_natural_loops, has_loop_carried_dependency};

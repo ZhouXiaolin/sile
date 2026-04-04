@@ -24,14 +24,24 @@ pub mod mir {
 pub mod lir {
     pub use sile_lir::ir::*;
 }
+pub mod llir {
+    pub use sile_llir::*;
+}
 pub mod compiler {
     pub use sile_mir::dce;
     pub use sile_mir::lower_mir_to_lir;
+    pub use sile_mir::lower_mir_to_llir;
     pub use sile_mir::lower_to_mir;
 }
 pub mod codegen {
     pub mod c {
         pub use sile_backend_cpu::codegen_c::*;
+    }
+    pub mod llir_c {
+        pub use sile_backend_cpu::codegen_llir_c::*;
+    }
+    pub mod llir_metal {
+        pub use sile_backend_metal::codegen_llir_metal::*;
     }
 }
 pub mod scheduling {

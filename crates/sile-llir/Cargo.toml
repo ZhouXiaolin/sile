@@ -1,0 +1,6 @@
+[package]
+name = "sile-llir"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

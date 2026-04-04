@@ -80,7 +80,9 @@ fn format_op(op: &MirOp) -> String {
             cols,
             stride_shape_idx,
         } => {
-            format!("tile_load {buf}, [{row_coord}, {col_coord}], shape=[{rows}, {cols}], stride_dim={stride_shape_idx}")
+            format!(
+                "tile_load {buf}, [{row_coord}, {col_coord}], shape=[{rows}, {cols}], stride_dim={stride_shape_idx}"
+            )
         }
         MirOp::TileStore {
             buf,
@@ -91,7 +93,9 @@ fn format_op(op: &MirOp) -> String {
             cols,
             stride_shape_idx,
         } => {
-            format!("tile_store {buf}, {value}, [{row_coord}, {col_coord}], shape=[{rows}, {cols}], stride_dim={stride_shape_idx}")
+            format!(
+                "tile_store {buf}, {value}, [{row_coord}, {col_coord}], shape=[{rows}, {cols}], stride_dim={stride_shape_idx}"
+            )
         }
         MirOp::TileConstant { value, rows, cols } => {
             format!("tile_constant {value}, shape=[{rows}, {cols}]")

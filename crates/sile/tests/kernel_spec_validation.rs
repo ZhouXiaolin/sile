@@ -1,4 +1,4 @@
-use sile::{schedule, Device, Tensor};
+use sile::{Device, Tensor, schedule};
 
 #[sile::kernel]
 fn vec_add(a: &Tensor<f32>, b: &Tensor<f32>, c: &mut Tensor<f32>) {

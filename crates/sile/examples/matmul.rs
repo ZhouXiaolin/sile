@@ -1,9 +1,9 @@
 use sile::{Device, Tensor};
 
 #[sile::kernel]
-fn matmul<const BM: i64, const BN: i64, const BK: i64, const K: i64>(
-    a: &Tensor<f32, { [-1, K] }>,
-    b: &Tensor<f32, { [K, -1] }>,
+fn matmul<const BM: i64, const BN: i64, const BK: i64>(
+    a: &Tensor<f32, { [-1, -1] }>,
+    b: &Tensor<f32, { [-1, -1] }>,
     c: &mut Tensor<f32, { [BM, BN] }>,
 ) {
     let m_idx = sile::tile::id().0;
@@ -25,7 +25,6 @@ fn main() -> Result<(), sile::Error> {
     const BM: i64 = 32;
     const BN: i64 = 16;
     const BK: i64 = 8;
-    const K: i64 = 64;
 
     let a = Tensor::random([m, k], &device)?;
     let b = Tensor::random([k, n], &device)?;
@@ -33,7 +32,7 @@ fn main() -> Result<(), sile::Error> {
 
     let grid = ((m / BM) as u32, (n / BN) as u32, 1u32);
 
-    matmul::<BM, BN, BK, K>(&a, &b, &mut c)
+    matmul::<BM, BN, BK>(&a, &b, &mut c)
         .grid(grid)
         .apply(&stream)?;
 

@@ -46,20 +46,91 @@ pub fn lower_mir_to_lir(mir: &MirFunction, typed: &TypedKernel) -> ExecutableKer
         ctx.value_map.insert(param.value, Value::Param(i));
     }
 
-    let body = builder.append_block("body");
-    builder.switch_to_block(&body);
-
-    // Lower all blocks (for now we only handle single-block / unrolled form)
+    let mut block_labels = HashMap::new();
     for block in &mir.blocks {
-        // Map block params (for loop CFG form these would come from predecessors)
-        // In the unrolled case there are no block params on entry
+        let label = format!("bb{}", block.id.0);
+        builder.append_block(&label);
+        block_labels.insert(block.id, label);
+    }
+
+    for block in &mir.blocks {
+        let label = block_labels
+            .get(&block.id)
+            .cloned()
+            .unwrap_or_else(|| format!("bb{}", block.id.0));
+        builder.switch_to_block(&label);
+
+        for param in &block.params {
+            let info = mir
+                .types
+                .get(param)
+                .map(value_info_from_mir_type)
+                .unwrap_or(ValueInfo::Void);
+            let phi_ty = mir
+                .types
+                .get(param)
+                .map(phi_type_from_mir_type)
+                .unwrap_or(LirType::Void);
+            let lir_val = builder.push_instruction(Instruction::BlockParam);
+            let dest = match &lir_val {
+                Value::Inst(idx) => format!("v{}", idx),
+                _ => unreachable!("block parameter must lower to an instruction value"),
+            };
+            builder.phi(&dest, phi_ty, Vec::new());
+            ctx.record(*param, lir_val, info);
+        }
 
         for inst in &block.insts {
             lower_mir_inst(inst, &mut builder, &param_info, &mut ctx);
         }
+
+        lower_terminator(&block.terminator, &block_labels, &mut builder, &ctx);
     }
 
-    builder.ret(None);
+    for block in &mir.blocks {
+        let pred_label = block_labels
+            .get(&block.id)
+            .cloned()
+            .unwrap_or_else(|| format!("bb{}", block.id.0));
+        match &block.terminator {
+            MirTerminator::Jump { target, args } => {
+                attach_phi_incoming(
+                    *target,
+                    args,
+                    &pred_label,
+                    &block_labels,
+                    &mut builder,
+                    &ctx,
+                );
+            }
+            MirTerminator::Branch {
+                true_target,
+                true_args,
+                false_target,
+                false_args,
+                ..
+            } => {
+                attach_phi_incoming(
+                    *true_target,
+                    true_args,
+                    &pred_label,
+                    &block_labels,
+                    &mut builder,
+                    &ctx,
+                );
+                attach_phi_incoming(
+                    *false_target,
+                    false_args,
+                    &pred_label,
+                    &block_labels,
+                    &mut builder,
+                    &ctx,
+                );
+            }
+            MirTerminator::Return => {}
+        }
+    }
+
     let func = builder.finish();
 
     ExecutableKernel {
@@ -286,6 +357,63 @@ fn lower_mir_inst(
     }
 }
 
+fn lower_terminator(
+    term: &MirTerminator,
+    block_labels: &HashMap<BlockId, String>,
+    builder: &mut LirBuilder,
+    ctx: &LowerLirCtx,
+) {
+    match term {
+        MirTerminator::Jump { target, .. } => {
+            if let Some(label) = block_labels.get(target) {
+                builder.br(label);
+            }
+        }
+        MirTerminator::Branch {
+            cond,
+            true_target,
+            false_target,
+            ..
+        } => {
+            let lir_cond = ctx.resolve(*cond);
+            let true_label = block_labels
+                .get(true_target)
+                .cloned()
+                .unwrap_or_else(|| format!("bb{}", true_target.0));
+            let false_label = block_labels
+                .get(false_target)
+                .cloned()
+                .unwrap_or_else(|| format!("bb{}", false_target.0));
+            builder.cond_br(lir_cond, &true_label, &false_label);
+        }
+        MirTerminator::Return => builder.ret(None),
+    }
+}
+
+fn attach_phi_incoming(
+    target: BlockId,
+    args: &[ValueId],
+    pred_label: &str,
+    block_labels: &HashMap<BlockId, String>,
+    builder: &mut LirBuilder,
+    ctx: &LowerLirCtx,
+) {
+    let Some(target_label) = block_labels.get(&target) else {
+        return;
+    };
+    let Some(block) = builder.func.get_block_mut(target_label) else {
+        return;
+    };
+
+    for (idx, arg) in args.iter().enumerate() {
+        let Some(phi) = block.phi_nodes.get_mut(idx) else {
+            continue;
+        };
+        phi.incoming
+            .push((ctx.resolve(*arg), pred_label.to_string()));
+    }
+}
+
 // ── ABI construction helpers (reused from old lower_lir) ───────────
 
 fn build_kernel_abi(typed: &TypedKernel, program_id_dims: usize) -> KernelAbi {
@@ -332,5 +460,32 @@ fn rank_of_param(param: &HirParam) -> usize {
     match &param.ty {
         HirType::Tensor { shape, .. } | HirType::Tile { shape, .. } => shape.rank(),
         HirType::Shape | HirType::Scalar(_) => 0,
+    }
+}
+
+fn value_info_from_mir_type(ty: &MirType) -> ValueInfo {
+    match ty {
+        MirType::I64 => ValueInfo::Index,
+        MirType::F32 => ValueInfo::Scalar {
+            elem: ElemType::F32,
+        },
+        MirType::Tile { rows, cols } => ValueInfo::Tile {
+            elem: ElemType::F32,
+            rows: *rows,
+            cols: *cols,
+        },
+        MirType::Buffer { rank } => ValueInfo::Buffer {
+            elem: ElemType::F32,
+            rank: *rank,
+        },
+        MirType::Void => ValueInfo::Void,
+    }
+}
+
+fn phi_type_from_mir_type(ty: &MirType) -> LirType {
+    match ty {
+        MirType::I64 => LirType::i64(),
+        MirType::F32 => LirType::f32(),
+        _ => LirType::Void,
     }
 }

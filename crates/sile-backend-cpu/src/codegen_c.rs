@@ -1,6 +1,6 @@
 use sile_hir::ParamKind;
-use sile_lir::{KernelAbi, ValueInfo, ValueInfoTable};
 use sile_lir::ir::*;
+use sile_lir::{KernelAbi, ValueInfo, ValueInfoTable};
 
 #[derive(Clone, Copy)]
 struct TilePlan {
@@ -18,6 +18,7 @@ pub fn generate(
         func,
         abi,
         tile_plan: infer_tile_plan(func),
+        inst_info: &value_info.instructions,
         inst_shapes: instruction_shapes(value_info),
         param_names: Vec::new(),
         inst_names: Vec::new(),
@@ -36,6 +37,7 @@ struct CCodegen<'a> {
     func: &'a Function,
     abi: &'a KernelAbi,
     tile_plan: Option<TilePlan>,
+    inst_info: &'a [ValueInfo],
     inst_shapes: Vec<Option<Vec<i64>>>,
     param_names: Vec<String>,
     inst_names: Vec<String>,
@@ -102,6 +104,8 @@ impl<'a> CCodegen<'a> {
         self.writeln("(void)num_shapes;");
         self.writeln("");
 
+        self.emit_block_param_decls();
+
         self.writeln("#pragma omp parallel for schedule(static)");
         self.writeln("for (int64_t tg = 0; tg < num_threadgroups; ++tg) {");
         self.indent += 1;
@@ -140,12 +144,15 @@ impl<'a> CCodegen<'a> {
         self.indent += 1;
 
         let mut inst_offset = 0;
+        if let Some(entry_label) = self.func.blocks.first().map(|block| block.label.clone()) {
+            self.writeln(&format!("goto {};", entry_label));
+            self.writeln("");
+        }
         for block in &self.func.blocks {
-            if block.label == "body" {
-                self.emit_block(block, inst_offset);
-            }
+            self.emit_block(block, inst_offset);
             inst_offset += block.instructions.len();
         }
+        self.writeln("sile_block_end:;");
 
         self.indent -= 1;
         self.writeln("}");
@@ -159,6 +166,8 @@ impl<'a> CCodegen<'a> {
     }
 
     fn emit_block(&mut self, block: &BasicBlock, base_offset: usize) {
+        self.writeln(&format!("{}:", block.label));
+        self.indent += 1;
         for (idx, inst) in block.instructions.iter().enumerate() {
             let global_idx = base_offset + idx;
             let code = emit_instruction(
@@ -178,6 +187,202 @@ impl<'a> CCodegen<'a> {
                 }
             }
         }
+        self.emit_terminator(block);
+        self.indent -= 1;
+        self.writeln("");
+    }
+
+    fn emit_terminator(&mut self, block: &BasicBlock) {
+        match &block.terminator {
+            Terminator::Br { target } => {
+                self.emit_phi_assignments(&block.label, target);
+                self.writeln(&format!("goto {};", target));
+            }
+            Terminator::CondBr {
+                cond,
+                true_target,
+                false_target,
+            } => {
+                let cond_name = resolve_value_name(cond, &self.param_names, &self.inst_names);
+                self.writeln(&format!("if ({}) {{", cond_name));
+                self.indent += 1;
+                self.emit_phi_assignments(&block.label, true_target);
+                self.writeln(&format!("goto {};", true_target));
+                self.indent -= 1;
+                self.writeln("} else {");
+                self.indent += 1;
+                self.emit_phi_assignments(&block.label, false_target);
+                self.writeln(&format!("goto {};", false_target));
+                self.indent -= 1;
+                self.writeln("}");
+            }
+            Terminator::Switch { .. } => {
+                self.writeln("goto sile_block_end;");
+            }
+            Terminator::Ret(_) => {
+                self.writeln("goto sile_block_end;");
+            }
+        }
+    }
+
+    fn emit_phi_assignments(&mut self, pred_label: &str, target_label: &str) {
+        let Some(target_block) = self.func.get_block(target_label) else {
+            return;
+        };
+        let phi_nodes = target_block.phi_nodes.clone();
+
+        for phi in &phi_nodes {
+            let Some((incoming, _)) = phi.incoming.iter().find(|(_, pred)| pred == pred_label)
+            else {
+                continue;
+            };
+            let Some(info) = self.value_info_for_name(&phi.dest).cloned() else {
+                continue;
+            };
+            match info {
+                ValueInfo::Tile { rows, cols, .. } => {
+                    let row_idx = format!("{}_r", phi.dest);
+                    let col_idx = format!("{}_c", phi.dest);
+                    match incoming {
+                        Value::Const(Constant::Int(v)) => {
+                            self.writeln(&format!(
+                                "for (int64_t {} = 0; {} < {}; ++{}) {{",
+                                row_idx, row_idx, rows, row_idx
+                            ));
+                            self.indent += 1;
+                            self.writeln(&format!(
+                                "for (int64_t {} = 0; {} < {}; ++{}) {{",
+                                col_idx, col_idx, cols, col_idx
+                            ));
+                            self.indent += 1;
+                            self.writeln(&format!(
+                                "{}[{}][{}] = {};",
+                                phi.dest, row_idx, col_idx, v
+                            ));
+                            self.indent -= 1;
+                            self.writeln("}");
+                            self.indent -= 1;
+                            self.writeln("}");
+                        }
+                        Value::Const(Constant::Float(v)) => {
+                            self.writeln(&format!(
+                                "for (int64_t {} = 0; {} < {}; ++{}) {{",
+                                row_idx, row_idx, rows, row_idx
+                            ));
+                            self.indent += 1;
+                            self.writeln(&format!(
+                                "for (int64_t {} = 0; {} < {}; ++{}) {{",
+                                col_idx, col_idx, cols, col_idx
+                            ));
+                            self.indent += 1;
+                            self.writeln(&format!(
+                                "{}[{}][{}] = {}f;",
+                                phi.dest,
+                                row_idx,
+                                col_idx,
+                                float_literal(*v)
+                            ));
+                            self.indent -= 1;
+                            self.writeln("}");
+                            self.indent -= 1;
+                            self.writeln("}");
+                        }
+                        Value::Const(Constant::Bool(v)) => {
+                            let literal = if *v { "1" } else { "0" };
+                            self.writeln(&format!(
+                                "for (int64_t {} = 0; {} < {}; ++{}) {{",
+                                row_idx, row_idx, rows, row_idx
+                            ));
+                            self.indent += 1;
+                            self.writeln(&format!(
+                                "for (int64_t {} = 0; {} < {}; ++{}) {{",
+                                col_idx, col_idx, cols, col_idx
+                            ));
+                            self.indent += 1;
+                            self.writeln(&format!(
+                                "{}[{}][{}] = {};",
+                                phi.dest, row_idx, col_idx, literal
+                            ));
+                            self.indent -= 1;
+                            self.writeln("}");
+                            self.indent -= 1;
+                            self.writeln("}");
+                        }
+                        _ => {
+                            let incoming_name =
+                                resolve_value_name(incoming, &self.param_names, &self.inst_names);
+                            self.writeln(&format!(
+                                "for (int64_t {} = 0; {} < {}; ++{}) {{",
+                                row_idx, row_idx, rows, row_idx
+                            ));
+                            self.indent += 1;
+                            self.writeln(&format!(
+                                "for (int64_t {} = 0; {} < {}; ++{}) {{",
+                                col_idx, col_idx, cols, col_idx
+                            ));
+                            self.indent += 1;
+                            self.writeln(&format!(
+                                "{}[{}][{}] = {}[{}][{}];",
+                                phi.dest, row_idx, col_idx, incoming_name, row_idx, col_idx
+                            ));
+                            self.indent -= 1;
+                            self.writeln("}");
+                            self.indent -= 1;
+                            self.writeln("}");
+                        }
+                    }
+                }
+                ValueInfo::Scalar { .. } => {
+                    let incoming_name =
+                        resolve_value_name(incoming, &self.param_names, &self.inst_names);
+                    self.writeln(&format!("{} = {};", phi.dest, incoming_name));
+                }
+                _ => {
+                    let incoming_name =
+                        resolve_value_name(incoming, &self.param_names, &self.inst_names);
+                    self.writeln(&format!("{} = {};", phi.dest, incoming_name));
+                }
+            }
+        }
+    }
+
+    fn emit_block_param_decls(&mut self) {
+        let mut inst_idx = 0usize;
+        let mut emitted = false;
+        for block in &self.func.blocks {
+            for inst in &block.instructions {
+                if matches!(inst, Instruction::BlockParam) {
+                    let name = self
+                        .inst_names
+                        .get(inst_idx)
+                        .cloned()
+                        .unwrap_or_else(|| format!("v{}", inst_idx));
+                    if let Some(info) = self.inst_info.get(inst_idx) {
+                        match info {
+                            ValueInfo::Tile { rows, cols, .. } => {
+                                self.writeln(&format!("float {}[{}][{}];", name, rows, cols));
+                            }
+                            ValueInfo::Scalar { .. } => {
+                                self.writeln(&format!("float {} = 0.0f;", name));
+                            }
+                            _ => {
+                                self.writeln(&format!("int64_t {} = 0;", name));
+                            }
+                        }
+                        emitted = true;
+                    }
+                }
+                inst_idx += 1;
+            }
+        }
+        if emitted {
+            self.writeln("");
+        }
+    }
+
+    fn value_info_for_name(&self, name: &str) -> Option<&ValueInfo> {
+        let idx = name.strip_prefix('v')?.parse::<usize>().ok()?;
+        self.inst_info.get(idx)
     }
 
     fn writeln(&mut self, line: &str) {
@@ -234,6 +439,7 @@ fn emit_instruction(
     let result_shape = inst_shapes.get(inst_idx).and_then(|shape| shape.clone());
 
     match inst {
+        Instruction::BlockParam => String::new(),
         Instruction::Alloca { .. } => String::new(),
         Instruction::Load { ptr, .. } => {
             let ptr_name = resolve_value_name(ptr, param_names, inst_names);
@@ -649,12 +855,7 @@ fn emit_instruction(
     }
 }
 
-fn buffer_dim_expr(
-    value: &Value,
-    dim: usize,
-    param_names: &[String],
-    abi: &KernelAbi,
-) -> String {
+fn buffer_dim_expr(value: &Value, dim: usize, param_names: &[String], abi: &KernelAbi) -> String {
     match value {
         Value::Param(param_idx)
             if *param_idx < abi.params.len() && dim < abi.params[*param_idx].rank =>

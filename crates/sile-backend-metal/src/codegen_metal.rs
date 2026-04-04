@@ -1,12 +1,59 @@
+use std::collections::HashMap;
+
 use sile_hir::ParamKind;
-use sile_lir::{KernelAbi, ValueInfo, ValueInfoTable};
 use sile_lir::ir::*;
+use sile_lir::{KernelAbi, ValueInfo, ValueInfoTable};
 
 #[derive(Clone, Copy)]
 struct TilePlan {
     output_param: usize,
     rows: i64,
     cols: i64,
+}
+
+struct StructuredLoop {
+    entry: String,
+    header: String,
+    body: String,
+    exit: String,
+}
+
+impl StructuredLoop {
+    fn analyze(func: &Function) -> Option<Self> {
+        let entry = func.blocks.first()?;
+        let Terminator::Br { target: header } = &entry.terminator else {
+            return None;
+        };
+        let header_block = func.get_block(header)?;
+        let Terminator::CondBr {
+            true_target,
+            false_target,
+            ..
+        } = &header_block.terminator
+        else {
+            return None;
+        };
+        let body_block = func.get_block(true_target)?;
+        let Terminator::Br {
+            target: back_target,
+        } = &body_block.terminator
+        else {
+            return None;
+        };
+        if back_target != header {
+            return None;
+        }
+        let exit_block = func.get_block(false_target)?;
+        if !matches!(exit_block.terminator, Terminator::Ret(_)) {
+            return None;
+        }
+        Some(Self {
+            entry: entry.label.clone(),
+            header: header.clone(),
+            body: true_target.clone(),
+            exit: false_target.clone(),
+        })
+    }
 }
 
 pub fn generate(
@@ -18,6 +65,7 @@ pub fn generate(
         func,
         abi,
         tile_plan: infer_tile_plan(func),
+        inst_info: &value_info.instructions,
         inst_shapes: instruction_shapes(value_info),
         param_names: Vec::new(),
         inst_names: Vec::new(),
@@ -36,6 +84,7 @@ struct MetalCodegen<'a> {
     func: &'a Function,
     abi: &'a KernelAbi,
     tile_plan: Option<TilePlan>,
+    inst_info: &'a [ValueInfo],
     inst_shapes: Vec<Option<Vec<i64>>>,
     param_names: Vec<String>,
     inst_names: Vec<String>,
@@ -111,6 +160,7 @@ impl<'a> MetalCodegen<'a> {
         }
 
         self.writeln("");
+        self.emit_block_param_decls();
 
         if let Some(plan) = self.tile_plan {
             let output_name = self.param_names[plan.output_param].clone();
@@ -141,12 +191,14 @@ impl<'a> MetalCodegen<'a> {
         }
         self.indent += 1;
 
-        let mut inst_offset = 0;
-        for block in &self.func.blocks {
-            if block.label == "body" {
-                self.emit_block(block, inst_offset);
+        let inst_offsets = instruction_offsets(self.func);
+        if let Some(loop_cfg) = StructuredLoop::analyze(self.func) {
+            self.emit_structured_loop(&loop_cfg, &inst_offsets);
+        } else {
+            for block in &self.func.blocks {
+                let base_offset = inst_offsets.get(&block.label).copied().unwrap_or_default();
+                self.emit_block_instructions(block, base_offset);
             }
-            inst_offset += block.instructions.len();
         }
 
         self.indent -= 1;
@@ -155,7 +207,7 @@ impl<'a> MetalCodegen<'a> {
         self.out.push_str("}\n");
     }
 
-    fn emit_block(&mut self, block: &BasicBlock, base_offset: usize) {
+    fn emit_block_instructions(&mut self, block: &BasicBlock, base_offset: usize) {
         for (idx, inst) in block.instructions.iter().enumerate() {
             let global_idx = base_offset + idx;
             let code = emit_instruction(
@@ -175,6 +227,234 @@ impl<'a> MetalCodegen<'a> {
                 }
             }
         }
+    }
+
+    fn emit_structured_loop(
+        &mut self,
+        loop_cfg: &StructuredLoop,
+        inst_offsets: &HashMap<String, usize>,
+    ) {
+        let entry_block = self
+            .func
+            .get_block(&loop_cfg.entry)
+            .cloned()
+            .expect("entry block");
+        let header_block = self
+            .func
+            .get_block(&loop_cfg.header)
+            .cloned()
+            .expect("header block");
+        let body_block = self
+            .func
+            .get_block(&loop_cfg.body)
+            .cloned()
+            .expect("body block");
+        let exit_block = self
+            .func
+            .get_block(&loop_cfg.exit)
+            .cloned()
+            .expect("exit block");
+
+        let entry_offset = inst_offsets
+            .get(&loop_cfg.entry)
+            .copied()
+            .unwrap_or_default();
+        let header_offset = inst_offsets
+            .get(&loop_cfg.header)
+            .copied()
+            .unwrap_or_default();
+        let body_offset = inst_offsets
+            .get(&loop_cfg.body)
+            .copied()
+            .unwrap_or_default();
+        let exit_offset = inst_offsets
+            .get(&loop_cfg.exit)
+            .copied()
+            .unwrap_or_default();
+
+        self.emit_block_instructions(&entry_block, entry_offset);
+        self.emit_phi_assignments(&loop_cfg.entry, &loop_cfg.header);
+
+        let cond_name = match &header_block.terminator {
+            Terminator::CondBr { cond, .. } => {
+                resolve_value_name(cond, &self.param_names, &self.inst_names)
+            }
+            _ => unreachable!("structured loop header must branch"),
+        };
+
+        self.writeln("while (true) {");
+        self.indent += 1;
+        self.emit_block_instructions(&header_block, header_offset);
+        self.writeln(&format!("if (!({})) {{", cond_name));
+        self.indent += 1;
+        self.emit_phi_assignments(&loop_cfg.header, &loop_cfg.exit);
+        self.writeln("break;");
+        self.indent -= 1;
+        self.writeln("}");
+        self.emit_phi_assignments(&loop_cfg.header, &loop_cfg.body);
+        self.emit_block_instructions(&body_block, body_offset);
+        self.emit_phi_assignments(&loop_cfg.body, &loop_cfg.header);
+        self.indent -= 1;
+        self.writeln("}");
+
+        self.emit_block_instructions(&exit_block, exit_offset);
+    }
+
+    fn emit_phi_assignments(&mut self, pred_label: &str, target_label: &str) {
+        let Some(target_block) = self.func.get_block(target_label) else {
+            return;
+        };
+        let phi_nodes = target_block.phi_nodes.clone();
+
+        for phi in &phi_nodes {
+            let Some((incoming, _)) = phi.incoming.iter().find(|(_, pred)| pred == pred_label)
+            else {
+                continue;
+            };
+            let Some(info) = self.value_info_for_name(&phi.dest).cloned() else {
+                continue;
+            };
+            match info {
+                ValueInfo::Tile { rows, cols, .. } => {
+                    let dst_arr = format!("{}_tlocal", phi.dest);
+                    match incoming {
+                        Value::Const(Constant::Int(v)) => {
+                            self.writeln(&format!(
+                                "for (int {0}r = 0; {0}r < {1}; ++{0}r)",
+                                phi.dest, rows
+                            ));
+                            self.indent += 1;
+                            self.writeln(&format!(
+                                "for (int {0}c = 0; {0}c < {1}; ++{0}c)",
+                                phi.dest, cols
+                            ));
+                            self.indent += 1;
+                            self.writeln(&format!(
+                                "{}[{}r][{}c] = {};",
+                                dst_arr, phi.dest, phi.dest, v
+                            ));
+                            self.indent -= 1;
+                            self.indent -= 1;
+                        }
+                        Value::Const(Constant::Float(v)) => {
+                            self.writeln(&format!(
+                                "for (int {0}r = 0; {0}r < {1}; ++{0}r)",
+                                phi.dest, rows
+                            ));
+                            self.indent += 1;
+                            self.writeln(&format!(
+                                "for (int {0}c = 0; {0}c < {1}; ++{0}c)",
+                                phi.dest, cols
+                            ));
+                            self.indent += 1;
+                            self.writeln(&format!(
+                                "{}[{}r][{}c] = {}f;",
+                                dst_arr,
+                                phi.dest,
+                                phi.dest,
+                                float_literal(*v)
+                            ));
+                            self.indent -= 1;
+                            self.indent -= 1;
+                        }
+                        Value::Const(Constant::Bool(v)) => {
+                            let literal = if *v { "1" } else { "0" };
+                            self.writeln(&format!(
+                                "for (int {0}r = 0; {0}r < {1}; ++{0}r)",
+                                phi.dest, rows
+                            ));
+                            self.indent += 1;
+                            self.writeln(&format!(
+                                "for (int {0}c = 0; {0}c < {1}; ++{0}c)",
+                                phi.dest, cols
+                            ));
+                            self.indent += 1;
+                            self.writeln(&format!(
+                                "{}[{}r][{}c] = {};",
+                                dst_arr, phi.dest, phi.dest, literal
+                            ));
+                            self.indent -= 1;
+                            self.indent -= 1;
+                        }
+                        _ => {
+                            let src_arr = resolve_tile_array_name(
+                                incoming,
+                                &self.param_names,
+                                &self.inst_names,
+                            );
+                            self.writeln(&format!(
+                                "for (int {0}r = 0; {0}r < {1}; ++{0}r)",
+                                phi.dest, rows
+                            ));
+                            self.indent += 1;
+                            self.writeln(&format!(
+                                "for (int {0}c = 0; {0}c < {1}; ++{0}c)",
+                                phi.dest, cols
+                            ));
+                            self.indent += 1;
+                            self.writeln(&format!(
+                                "{}[{}r][{}c] = {}[{}r][{}c];",
+                                dst_arr, phi.dest, phi.dest, src_arr, phi.dest, phi.dest
+                            ));
+                            self.indent -= 1;
+                            self.indent -= 1;
+                        }
+                    }
+                }
+                ValueInfo::Scalar { .. } => {
+                    let incoming_name =
+                        resolve_value_name(incoming, &self.param_names, &self.inst_names);
+                    self.writeln(&format!("{} = {};", phi.dest, incoming_name));
+                }
+                _ => {
+                    let incoming_name =
+                        resolve_value_name(incoming, &self.param_names, &self.inst_names);
+                    self.writeln(&format!("{} = {};", phi.dest, incoming_name));
+                }
+            }
+        }
+    }
+
+    fn emit_block_param_decls(&mut self) {
+        let mut inst_idx = 0usize;
+        let mut emitted = false;
+        for block in &self.func.blocks {
+            for inst in &block.instructions {
+                if matches!(inst, Instruction::BlockParam) {
+                    let name = self
+                        .inst_names
+                        .get(inst_idx)
+                        .cloned()
+                        .unwrap_or_else(|| format!("v{}", inst_idx));
+                    if let Some(info) = self.inst_info.get(inst_idx) {
+                        match info {
+                            ValueInfo::Tile { rows, cols, .. } => {
+                                self.writeln(&format!(
+                                    "threadgroup float {}_tlocal[{}][{}];",
+                                    name, rows, cols
+                                ));
+                            }
+                            ValueInfo::Scalar { .. } => {
+                                self.writeln(&format!("float {} = 0.0f;", name));
+                            }
+                            _ => {
+                                self.writeln(&format!("int {} = 0;", name));
+                            }
+                        }
+                        emitted = true;
+                    }
+                }
+                inst_idx += 1;
+            }
+        }
+        if emitted {
+            self.writeln("");
+        }
+    }
+
+    fn value_info_for_name(&self, name: &str) -> Option<&ValueInfo> {
+        let idx = name.strip_prefix('v')?.parse::<usize>().ok()?;
+        self.inst_info.get(idx)
     }
 
     fn writeln(&mut self, line: &str) {
@@ -215,6 +495,16 @@ fn instruction_shapes(value_info: &ValueInfoTable) -> Vec<Option<Vec<i64>>> {
         .collect()
 }
 
+fn instruction_offsets(func: &Function) -> HashMap<String, usize> {
+    let mut offsets = HashMap::new();
+    let mut next = 0usize;
+    for block in &func.blocks {
+        offsets.insert(block.label.clone(), next);
+        next += block.instructions.len();
+    }
+    offsets
+}
+
 fn emit_instruction(
     inst: &Instruction,
     param_names: &[String],
@@ -231,6 +521,7 @@ fn emit_instruction(
     let result_shape = inst_shapes.get(inst_idx).and_then(|shape| shape.clone());
 
     match inst {
+        Instruction::BlockParam => String::new(),
         Instruction::Add(lhs, rhs) => {
             if let Some([rows, cols]) = shape2(&result_shape) {
                 return emit_tile_binary(
@@ -462,12 +753,7 @@ fn emit_instruction(
     }
 }
 
-fn buffer_dim_expr(
-    value: &Value,
-    dim: usize,
-    param_names: &[String],
-    abi: &KernelAbi,
-) -> String {
+fn buffer_dim_expr(value: &Value, dim: usize, param_names: &[String], abi: &KernelAbi) -> String {
     match value {
         Value::Param(param_idx)
             if *param_idx < abi.params.len() && dim < abi.params[*param_idx].rank =>
@@ -501,11 +787,7 @@ fn resolve_value_name(value: &Value, param_names: &[String], inst_names: &[Strin
     }
 }
 
-fn resolve_tile_array_name(
-    value: &Value,
-    param_names: &[String],
-    inst_names: &[String],
-) -> String {
+fn resolve_tile_array_name(value: &Value, param_names: &[String], inst_names: &[String]) -> String {
     let name = resolve_value_name(value, param_names, inst_names);
     if matches!(value, Value::Inst(_)) {
         format!("{}_tlocal", name)

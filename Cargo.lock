@@ -435,6 +435,7 @@ dependencies = [
  "sile-core",
  "sile-hir",
  "sile-lir",
+ "sile-llir",
  "sile-macros",
  "sile-mir",
  "tempfile",
@@ -449,6 +450,7 @@ dependencies = [
  "sile-core",
  "sile-hir",
  "sile-lir",
+ "sile-llir",
  "tempfile",
 ]
 
@@ -460,6 +462,7 @@ dependencies = [
  "sile-core",
  "sile-hir",
  "sile-lir",
+ "sile-llir",
 ]
 
 [[package]]
@@ -485,6 +488,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sile-llir"
+version = "0.1.0"
+
+[[package]]
 name = "sile-macros"
 version = "0.1.0"
 dependencies = [
@@ -500,6 +507,7 @@ version = "0.1.0"
 dependencies = [
  "sile-hir",
  "sile-lir",
+ "sile-llir",
 ]
 
 [[package]]

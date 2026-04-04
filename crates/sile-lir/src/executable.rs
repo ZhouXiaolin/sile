@@ -1,4 +1,4 @@
-use sile_hir::{types::ElemType, ParamKind};
+use sile_hir::{ParamKind, types::ElemType};
 
 use crate::ir::Function;
 

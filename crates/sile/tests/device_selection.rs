@@ -1,5 +1,5 @@
-use std::sync::{Mutex, OnceLock};
 use sile::Device;
+use std::sync::{Mutex, OnceLock};
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
