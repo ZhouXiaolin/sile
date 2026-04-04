@@ -164,26 +164,6 @@ impl<'a> CCodegen<'a> {
   } \\\n\
 } while (0)\n\n",
         );
-
-        self.out.push_str(
-            "#define llir_matmul_fragment(dst, a, b, acc, tile_m, tile_n, tile_k) do { \\\n\
-  float* _dst = (float*)(dst); \\\n\
-  const float* _a = (const float*)(a); \\\n\
-  const float* _b = (const float*)(b); \\\n\
-  const float* _acc = (const float*)(acc); \\\n\
-  int64_t _m = (tile_m); \\\n\
-  int64_t _n = (tile_n); \\\n\
-  int64_t _k_lim = (tile_k); \\\n\
-  for (int64_t _r = 0; _r < _m; ++_r) { \\\n\
-    for (int64_t _c = 0; _c < _n; ++_c) { \\\n\
-      _dst[_r * _n + _c] = _acc[_r * _n + _c]; \\\n\
-      for (int64_t _k = 0; _k < _k_lim; ++_k) { \\\n\
-        _dst[_r * _n + _c] += _a[_r * _k_lim + _k] * _b[_k * _n + _c]; \\\n\
-      } \\\n\
-    } \\\n\
-  } \\\n\
-} while (0)\n\n",
-        );
     }
 
     fn emit_signature(&mut self) {
@@ -928,6 +908,5 @@ fn intrinsic_name(intrinsic: &llir::Intrinsic) -> String {
         llir::Intrinsic::BlockId { dim } => format!("llir_block_id_{}", dim),
         llir::Intrinsic::Barrier { .. } => "llir_barrier".to_string(),
         llir::Intrinsic::Exp => "expf".to_string(),
-        llir::Intrinsic::MatmulFragment => "llir_matmul_fragment".to_string(),
     }
 }

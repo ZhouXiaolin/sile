@@ -151,7 +151,6 @@ pub enum Intrinsic {
     BlockId { dim: u8 },
     Barrier { scope: SyncScope },
     Exp,
-    MatmulFragment,
 }
 
 #[derive(Clone, Debug, PartialEq)]

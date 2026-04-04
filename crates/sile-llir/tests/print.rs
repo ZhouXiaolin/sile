@@ -148,20 +148,28 @@ fn prints_dynamic_k_matmul_like_cfg() {
                 insts: vec![
                     Inst {
                         result: Some(ValueId(12)),
-                        result_name: Some("acc_next".into()),
-                        ty: private_tile_ptr.clone(),
-                        op: InstOp::Intrinsic {
-                            intrinsic: Intrinsic::MatmulFragment,
-                            args: vec![
-                                Operand::Value(ValueId(0)),
-                                Operand::Value(ValueId(1)),
-                                Operand::Value(ValueId(11)),
-                            ],
+                        result_name: Some("tmp_mul".into()),
+                        ty: Type::F32,
+                        op: InstOp::Bin {
+                            op: BinOp::Mul,
+                            lhs: Operand::Const(Constant::Float(2.0)),
+                            rhs: Operand::Const(Constant::Float(3.0)),
                         },
                         metadata: vec![Metadata::Unroll(4)],
                     },
                     Inst {
                         result: Some(ValueId(13)),
+                        result_name: Some("tmp_add".into()),
+                        ty: Type::F32,
+                        op: InstOp::Bin {
+                            op: BinOp::Add,
+                            lhs: Operand::Value(ValueId(12)),
+                            rhs: Operand::Const(Constant::Float(1.0)),
+                        },
+                        metadata: vec![],
+                    },
+                    Inst {
+                        result: Some(ValueId(14)),
                         result_name: Some("k_next".into()),
                         ty: Type::I64,
                         op: InstOp::Bin {
@@ -174,14 +182,14 @@ fn prints_dynamic_k_matmul_like_cfg() {
                 ],
                 terminator: Terminator::Br {
                     target: BlockId(1),
-                    args: vec![Operand::Value(ValueId(13)), Operand::Value(ValueId(12))],
+                    args: vec![Operand::Value(ValueId(14)), Operand::Value(ValueId(11))],
                 },
             },
             BasicBlock {
                 id: BlockId(3),
                 name: "exit".into(),
                 params: vec![BlockParam {
-                    id: ValueId(14),
+                    id: ValueId(15),
                     name: "acc_final".into(),
                     ty: private_tile_ptr,
                 }],
@@ -191,7 +199,7 @@ fn prints_dynamic_k_matmul_like_cfg() {
                     ty: Type::Void,
                     op: InstOp::Store {
                         ptr: Operand::Value(ValueId(2)),
-                        value: Operand::Value(ValueId(14)),
+                        value: Operand::Value(ValueId(15)),
                     },
                     metadata: vec![Metadata::WriteOnly],
                 }],
@@ -206,7 +214,8 @@ fn prints_dynamic_k_matmul_like_cfg() {
     assert!(printed.contains("ptr<global, f32> %a [rank=2, shape_offset=0]"));
     assert!(printed.contains("loop_header(%k: i64, %acc: ptr<private, [2 x [2 x f32]]>)"));
     assert!(printed.contains("%k_end = shape.dim %a, 1"));
-    assert!(printed.contains("intrinsic matmul_fragment(%a, %b, %acc_body)"));
+    assert!(printed.contains("%tmp_mul = mul 2.0, 3.0"));
+    assert!(printed.contains("%tmp_add = add %tmp_mul, 1.0"));
     assert!(printed.contains("condbr %cond, label %loop_body(%k, %acc), label %exit(%acc)"));
     assert!(printed.contains("[align=16]"));
     assert!(printed.contains("[unroll=4]"));

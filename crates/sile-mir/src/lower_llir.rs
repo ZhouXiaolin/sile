@@ -376,24 +376,17 @@ fn lower_inst(
                 },
                 metadata: vec![llir::Metadata::Alignment(16)],
             });
-            out.push(llir::Inst {
-                result: None,
-                result_name: None,
-                ty: llir::Type::Void,
-                op: llir::InstOp::Intrinsic {
-                    intrinsic: llir::Intrinsic::MatmulFragment,
-                    args: vec![
-                        llir::Operand::Value(llir_id),
-                        resolve_operand(*a, ctx),
-                        resolve_operand(*b, ctx),
-                        resolve_operand(*acc, ctx),
-                        llir::Operand::Const(llir::Constant::Int(*tile_m)),
-                        llir::Operand::Const(llir::Constant::Int(*tile_n)),
-                        llir::Operand::Const(llir::Constant::Int(*tile_k)),
-                    ],
-                },
-                metadata: vec![llir::Metadata::Unroll(4)],
-            });
+            lower_tile_mma(
+                ctx,
+                out,
+                llir::Operand::Value(llir_id),
+                resolve_operand(*a, ctx),
+                resolve_operand(*b, ctx),
+                resolve_operand(*acc, ctx),
+                *tile_m,
+                *tile_n,
+                *tile_k,
+            );
         }
         MirOp::TileReduce {
             op,
@@ -942,6 +935,38 @@ fn lower_tile_reduce(
             }
         }
         _ => {}
+    }
+}
+
+fn lower_tile_mma(
+    ctx: &mut LowerLlirCtx,
+    out: &mut Vec<llir::Inst>,
+    dst_tile: llir::Operand,
+    a_tile: llir::Operand,
+    b_tile: llir::Operand,
+    acc_tile: llir::Operand,
+    tile_m: i64,
+    tile_n: i64,
+    tile_k: i64,
+) {
+    for row in 0..tile_m {
+        for col in 0..tile_n {
+            let mut acc = load_tile_scalar(ctx, out, acc_tile.clone(), row, col);
+            for k in 0..tile_k {
+                let a = load_tile_scalar(ctx, out, a_tile.clone(), row, k);
+                let b = load_tile_scalar(ctx, out, b_tile.clone(), k, col);
+                let product = emit_bin(ctx, out, llir::BinOp::Mul, a, b, llir::Type::F32);
+                acc = emit_bin(ctx, out, llir::BinOp::Add, acc, product, llir::Type::F32);
+            }
+            let dst_ptr = emit_gep(
+                ctx,
+                out,
+                dst_tile.clone(),
+                vec![const_i64(row), const_i64(col)],
+                llir::Type::ptr(llir::AddressSpace::Private, llir::Type::F32),
+            );
+            emit_store(out, dst_ptr, acc);
+        }
     }
 }
 
