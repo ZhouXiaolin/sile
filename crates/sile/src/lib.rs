@@ -16,6 +16,11 @@ pub use tile::Tile;
 pub mod typeck {
     pub use sile_hir::typeck::*;
 }
+pub mod mir {
+    pub use sile_mir::ir::*;
+    pub use sile_mir::lower::lower_to_mir;
+    pub use sile_mir::print::format_mir;
+}
 pub mod ssa {
     pub use sile_compiler::lower_hir::lower_typed_kernel_to_ssa;
     pub use sile_compiler::mir::ir;
@@ -26,6 +31,7 @@ pub mod lir {
 }
 pub mod compiler {
     pub use sile_compiler::compile;
+    pub use sile_compiler::compile_legacy;
 }
 pub mod passes {
     pub use sile_compiler::passes::*;

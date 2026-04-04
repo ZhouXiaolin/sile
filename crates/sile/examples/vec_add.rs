@@ -1,4 +1,4 @@
-use sile::{tile, Device, Tensor};
+use sile::{Device, Tensor, tile};
 
 #[sile::kernel]
 fn vec_add<const TILE: i64>(
@@ -25,7 +25,7 @@ fn main() -> sile::Result<()> {
     let b = Tensor::from_vec(vec![2.0; 16], [16], &device)?;
     let mut c = Tensor::zeros([16], &device)?;
 
-    vec_add::<4>(&a, &b, &mut c)
+    vec_add::<2>(&a, &b, &mut c)
         .grid((4, 1, 1))
         .apply(&stream)?;
 
