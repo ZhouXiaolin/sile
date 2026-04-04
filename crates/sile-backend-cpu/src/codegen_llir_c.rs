@@ -448,6 +448,16 @@ impl<'a> CCodegen<'a> {
 
     fn emit_inst(&mut self, inst: &llir::Inst) {
         match &inst.op {
+            llir::InstOp::ShapeDim { buf, dim } => {
+                if let Some(id) = inst.result {
+                    self.writeln(&format!(
+                        "{} = sile_shape_dim((const float*){}, {});",
+                        self.value_name(id),
+                        self.format_operand(buf),
+                        dim
+                    ));
+                }
+            }
             llir::InstOp::Alloca { .. } => {}
             llir::InstOp::Call { func, args } => {
                 if let Some(id) = inst.result {
@@ -835,7 +845,110 @@ fn infer_tile_plan(func: &llir::Function) -> Option<TilePlan> {
             }
         }
     }
+
+    let inst_by_result = func
+        .blocks
+        .iter()
+        .flat_map(|block| block.insts.iter())
+        .filter_map(|inst| inst.result.map(|id| (id, inst)))
+        .collect::<HashMap<_, _>>();
+    let value_types = build_value_type_map(func);
+
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let llir::InstOp::Store {
+                ptr: llir::Operand::Value(ptr_id),
+                value: llir::Operand::Value(value_id),
+            } = &inst.op
+            else {
+                continue;
+            };
+            let Some(ptr_inst) = inst_by_result.get(ptr_id) else {
+                continue;
+            };
+            let llir::InstOp::Gep {
+                base: llir::Operand::Value(buf_id),
+                ..
+            } = &ptr_inst.op
+            else {
+                continue;
+            };
+            let Some(output_param) = func.params.iter().position(|param| param.id == *buf_id)
+            else {
+                continue;
+            };
+            let Some((rows, cols)) =
+                infer_tile_dims_from_scalar_store(*value_id, &inst_by_result, &value_types)
+            else {
+                continue;
+            };
+            return Some(TilePlan {
+                output_param,
+                rows,
+                cols,
+            });
+        }
+    }
+
     None
+}
+
+fn build_value_type_map(func: &llir::Function) -> HashMap<llir::ValueId, llir::Type> {
+    let mut types = HashMap::new();
+    for param in &func.params {
+        types.insert(param.id, param.ty.clone());
+    }
+    for block in &func.blocks {
+        for param in &block.params {
+            types.insert(param.id, param.ty.clone());
+        }
+        for inst in &block.insts {
+            if let Some(id) = inst.result {
+                types.insert(id, inst.ty.clone());
+            }
+        }
+    }
+    types
+}
+
+fn infer_tile_dims_from_scalar_store(
+    value_id: llir::ValueId,
+    inst_by_result: &HashMap<llir::ValueId, &llir::Inst>,
+    value_types: &HashMap<llir::ValueId, llir::Type>,
+) -> Option<(usize, usize)> {
+    let load_inst = inst_by_result.get(&value_id)?;
+    let llir::InstOp::Load {
+        ptr: llir::Operand::Value(tile_ptr_id),
+    } = &load_inst.op
+    else {
+        return None;
+    };
+    let tile_gep = inst_by_result.get(tile_ptr_id)?;
+    let llir::InstOp::Gep {
+        base: llir::Operand::Value(tile_id),
+        ..
+    } = &tile_gep.op
+    else {
+        return None;
+    };
+    let tile_ty = value_types.get(tile_id)?;
+    tile_shape_from_type(tile_ty)
+}
+
+fn tile_shape_from_type(ty: &llir::Type) -> Option<(usize, usize)> {
+    let llir::Type::Ptr {
+        addr_space: llir::AddressSpace::Private,
+        pointee,
+    } = ty
+    else {
+        return None;
+    };
+    let dims = array_dims(pointee);
+    match dims.as_slice() {
+        [cols] => Some((1, *cols)),
+        [rows, cols, ..] => Some((*rows, *cols)),
+        _ => None,
+    }
 }
 
 fn c_param_type(ty: &llir::Type) -> String {

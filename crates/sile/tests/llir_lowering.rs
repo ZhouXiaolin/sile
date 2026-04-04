@@ -21,9 +21,15 @@ fn dynamic_k_matmul_lowers_to_llir_with_cfg_and_private_tiles() {
     assert!(printed.contains("bb1("));
     assert!(printed.contains("condbr"));
     assert!(printed.contains("ptr<private, [2 x [2 x f32]]>"));
+    assert!(printed.contains("shape.dim %a, 1"));
     assert!(printed.contains("intrinsic matmul_fragment"));
-    assert!(printed.contains("call @tile_load_2d_f32"));
-    assert!(printed.contains("call @tile_store_2d_f32"));
+    assert!(printed.contains("gep %a, ["));
+    assert!(printed.contains("gep %b, ["));
+    assert!(printed.contains("gep %c, ["));
+    assert!(printed.contains("load %v"));
+    assert!(printed.contains("store %v"));
+    assert!(!printed.contains("call @tile_load_2d_f32"));
+    assert!(!printed.contains("call @tile_store_2d_f32"));
 }
 
 fn build_dynamic_k_matmul_kernel() -> Kernel {

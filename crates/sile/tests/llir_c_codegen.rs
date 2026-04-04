@@ -20,7 +20,13 @@ fn dynamic_k_matmul_llir_codegen_emits_cfg_style_c() {
     assert!(c.contains("bb1:"));
     assert!(c.contains("if (v"));
     assert!(c.contains("llir_matmul_fragment("));
-    assert!(c.contains("tile_load_2d_f32("));
+    assert!(c.contains("= &(a["));
+    assert!(c.contains("= &(b["));
+    assert!(c.contains("= &(c["));
+    assert!(c.contains("= *("));
+    assert!(c.contains("*("));
+    assert_eq!(c.matches("tile_load_2d_f32(").count(), 1);
+    assert_eq!(c.matches("tile_store_2d_f32(").count(), 1);
     assert!(c.contains("float v"));
 }
 

@@ -115,6 +115,9 @@ fn format_block_params(params: &[BlockParam], names: &HashMap<ValueId, String>) 
 
 fn format_inst(inst: &Inst, names: &HashMap<ValueId, String>) -> String {
     let body = match &inst.op {
+        InstOp::ShapeDim { buf, dim } => {
+            format!("shape.dim {}, {}", format_operand(buf, names), dim)
+        }
         InstOp::Alloca {
             alloc_ty,
             addr_space,

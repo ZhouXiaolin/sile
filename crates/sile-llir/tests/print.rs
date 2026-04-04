@@ -104,12 +104,9 @@ fn prints_dynamic_k_matmul_like_cfg() {
                         result: Some(ValueId(8)),
                         result_name: Some("k_end".into()),
                         ty: Type::I64,
-                        op: InstOp::Call {
-                            func: "shape_dim".into(),
-                            args: vec![
-                                Operand::Value(ValueId(0)),
-                                Operand::Const(Constant::Int(1)),
-                            ],
+                        op: InstOp::ShapeDim {
+                            buf: Operand::Value(ValueId(0)),
+                            dim: 1,
                         },
                         metadata: vec![],
                     },
@@ -208,6 +205,7 @@ fn prints_dynamic_k_matmul_like_cfg() {
     assert!(printed.contains("define void @matmul_dynamic_k"));
     assert!(printed.contains("ptr<global, f32> %a [rank=2, shape_offset=0]"));
     assert!(printed.contains("loop_header(%k: i64, %acc: ptr<private, [2 x [2 x f32]]>)"));
+    assert!(printed.contains("%k_end = shape.dim %a, 1"));
     assert!(printed.contains("intrinsic matmul_fragment(%a, %b, %acc_body)"));
     assert!(printed.contains("condbr %cond, label %loop_body(%k, %acc), label %exit(%acc)"));
     assert!(printed.contains("[align=16]"));
