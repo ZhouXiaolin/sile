@@ -407,9 +407,8 @@ fn format_intrinsic(intrinsic: &Intrinsic) -> String {
         Intrinsic::ThreadId { dim } => format!("thread_id.{}", dim),
         Intrinsic::BlockId { dim } => format!("block_id.{}", dim),
         Intrinsic::Barrier { scope } => format!("barrier.{}", format_scope(scope)),
+        Intrinsic::Exp => "exp".to_string(),
         Intrinsic::MatmulFragment => "matmul_fragment".to_string(),
-        Intrinsic::ReduceAdd => "reduce_add".to_string(),
-        Intrinsic::ReduceMax => "reduce_max".to_string(),
     }
 }
 
