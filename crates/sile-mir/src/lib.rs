@@ -1,6 +1,10 @@
 pub mod ir;
 pub mod lower;
 pub mod lower_llir;
+mod lower_llir_tile_compute;
+mod lower_llir_tile_deferred;
+mod lower_llir_tile_expr;
+mod lower_llir_tile_loops;
 pub mod passes;
 pub mod print;
 
