@@ -24,9 +24,9 @@ fn main() -> Result<(), sile::Error> {
 
     let (m, n, k) = (128i64, 128i64, 64i64);
     const BM: i64 = 32;
-    const BN: i64 = 32;
-    const BK: i64 = 32;
-    const K_BLOCKS: i64 = 2;
+    const BN: i64 = 16;
+    const BK: i64 = 16;
+    const K_BLOCKS: i64 = 4;
 
     let a = Tensor::random([m, k], &device)?;
     let b = Tensor::random([k, n], &device)?;

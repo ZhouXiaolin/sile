@@ -443,6 +443,7 @@ dependencies = [
  "sile-hir",
  "sile-lir",
  "sile-macros",
+ "sile-mir",
  "tempfile",
  "thiserror",
 ]
@@ -474,6 +475,7 @@ version = "0.1.0"
 dependencies = [
  "sile-hir",
  "sile-lir",
+ "sile-mir",
 ]
 
 [[package]]
@@ -506,6 +508,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "sile-mir"
+version = "0.1.0"
+dependencies = [
+ "sile-hir",
+ "sile-lir",
 ]
 
 [[package]]
