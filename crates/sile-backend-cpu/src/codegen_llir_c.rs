@@ -1,5 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
+use sile_backend_common::llir_text::{
+    array_dims, bin_op_symbol, block_param_assignments, build_value_names, cmp_pred_symbol,
+    format_operand as format_llir_operand, value_name as llir_value_name,
+};
 use sile_llir as llir;
 
 pub fn generate(func: &llir::Function) -> sile_core::Result<String> {
@@ -322,7 +326,7 @@ impl<'a> CCodegen<'a> {
                         "{} = {} {} {};",
                         self.value_name(id),
                         self.format_operand(lhs),
-                        c_bin_op(*op),
+                        bin_op_symbol(*op),
                         self.format_operand(rhs)
                     ));
                 }
@@ -333,7 +337,7 @@ impl<'a> CCodegen<'a> {
                         "{} = {} {} {};",
                         self.value_name(id),
                         self.format_operand(lhs),
-                        c_cmp_pred(*pred),
+                        cmp_pred_symbol(*pred),
                         self.format_operand(rhs)
                     ));
                 }
@@ -459,45 +463,17 @@ impl<'a> CCodegen<'a> {
     }
 
     fn emit_block_param_assignments(&mut self, target: llir::BlockId, args: &[llir::Operand]) {
-        let Some(block) = self.func.blocks.iter().find(|block| block.id == target) else {
-            return;
-        };
-        for (param, arg) in block.params.iter().zip(args.iter()) {
-            let name = self
-                .value_names
-                .get(&param.id)
-                .cloned()
-                .unwrap_or_else(|| format!("v{}", param.id.0));
-            self.writeln(&format!("{} = {};", name, self.format_operand(arg)));
+        for (name, arg) in block_param_assignments(self.func, &self.value_names, target, args) {
+            self.writeln(&format!("{name} = {arg};"));
         }
     }
 
     fn format_operand(&self, operand: &llir::Operand) -> String {
-        match operand {
-            llir::Operand::Value(id) => self.value_name(*id),
-            llir::Operand::Const(llir::Constant::Int(value)) => value.to_string(),
-            llir::Operand::Const(llir::Constant::Float(value)) => {
-                if value.fract() == 0.0 {
-                    format!("{value:.1}f")
-                } else {
-                    format!("{value}f")
-                }
-            }
-            llir::Operand::Const(llir::Constant::Bool(value)) => {
-                if *value {
-                    "true".to_string()
-                } else {
-                    "false".to_string()
-                }
-            }
-        }
+        format_llir_operand(&self.value_names, operand)
     }
 
     fn value_name(&self, id: llir::ValueId) -> String {
-        self.value_names
-            .get(&id)
-            .cloned()
-            .unwrap_or_else(|| format!("v{}", id.0))
+        llir_value_name(&self.value_names, id)
     }
 
     fn block_name(&self, id: llir::BlockId) -> String {
@@ -511,24 +487,6 @@ impl<'a> CCodegen<'a> {
         self.out
             .push_str(&format!("{}{}\n", "  ".repeat(self.indent), line));
     }
-}
-
-fn build_value_names(func: &llir::Function) -> HashMap<llir::ValueId, String> {
-    let mut names = HashMap::new();
-    for param in &func.params {
-        names.insert(param.id, param.name.clone());
-    }
-    for block in &func.blocks {
-        for param in &block.params {
-            names.insert(param.id, param.name.clone());
-        }
-        for inst in &block.insts {
-            if let (Some(id), Some(name)) = (inst.result, inst.result_name.as_ref()) {
-                names.insert(id, name.clone());
-            }
-        }
-    }
-    names
 }
 
 fn build_block_names(func: &llir::Function) -> HashMap<llir::BlockId, String> {
@@ -862,44 +820,12 @@ fn c_type(ty: &llir::Type) -> String {
     }
 }
 
-fn array_dims(ty: &llir::Type) -> Vec<usize> {
-    let mut dims = Vec::new();
-    let mut current = ty;
-    while let llir::Type::Array { len, elem } = current {
-        dims.push(*len);
-        current = elem;
-    }
-    dims
-}
-
 fn array_base_type(ty: &llir::Type) -> String {
     let mut current = ty;
     while let llir::Type::Array { elem, .. } = current {
         current = elem;
     }
     c_type(current)
-}
-
-fn c_bin_op(op: llir::BinOp) -> &'static str {
-    match op {
-        llir::BinOp::Add => "+",
-        llir::BinOp::Sub => "-",
-        llir::BinOp::Mul => "*",
-        llir::BinOp::Div => "/",
-        llir::BinOp::And => "&",
-        llir::BinOp::Or => "|",
-    }
-}
-
-fn c_cmp_pred(pred: llir::CmpPred) -> &'static str {
-    match pred {
-        llir::CmpPred::Eq => "==",
-        llir::CmpPred::Ne => "!=",
-        llir::CmpPred::Slt | llir::CmpPred::Olt => "<",
-        llir::CmpPred::Sle | llir::CmpPred::Ole => "<=",
-        llir::CmpPred::Sgt | llir::CmpPred::Ogt => ">",
-        llir::CmpPred::Sge | llir::CmpPred::Oge => ">=",
-    }
 }
 
 fn intrinsic_name(intrinsic: &llir::Intrinsic) -> String {

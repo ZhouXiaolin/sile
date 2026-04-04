@@ -20,7 +20,8 @@ fn dynamic_k_matmul_llir_codegen_emits_structured_metal() {
     assert!(metal.contains("break;"));
     assert!(!metal.contains("goto "));
     assert!(metal.contains("gid.x"));
-    assert!(metal.contains("gid.y"));
+    assert!(metal.contains("gid.x /"));
+    assert!(metal.contains("gid.x %"));
     assert!(metal.contains("float v15_storage[2][2];"));
     assert!(metal.contains("shapes[1]"));
     assert!(metal.contains("= &(a["));
