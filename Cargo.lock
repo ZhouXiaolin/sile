@@ -440,10 +440,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sile-backend-common"
+version = "0.1.0"
+dependencies = [
+ "sile-llir",
+]
+
+[[package]]
 name = "sile-backend-cpu"
 version = "0.1.0"
 dependencies = [
  "libloading",
+ "sile-backend-common",
  "sile-core",
  "sile-hir",
  "sile-llir",
@@ -455,6 +463,7 @@ name = "sile-backend-metal"
 version = "0.1.0"
 dependencies = [
  "metal",
+ "sile-backend-common",
  "sile-core",
  "sile-hir",
  "sile-llir",
