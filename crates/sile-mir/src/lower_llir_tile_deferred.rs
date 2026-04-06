@@ -1,5 +1,6 @@
-use crate::lower_llir::{BlockLowerer, lower_tile_constant_inst, lower_tile_load_inst};
+use crate::lower_llir_core::BlockLowerer;
 use crate::lower_llir_tile_expr::lower_tile_expr_inst;
+use crate::lower_llir_tile_memory::{lower_tile_constant_inst, lower_tile_load_inst};
 use crate::{MirOp, ValueId};
 
 pub(crate) fn materialize_deferred_tile(value: ValueId, builder: &mut BlockLowerer<'_>) {
