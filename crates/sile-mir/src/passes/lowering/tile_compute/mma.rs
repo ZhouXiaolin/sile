@@ -1,7 +1,7 @@
 use sile_llir as llir;
 
 use crate::ValueId;
-use crate::lower_llir_core::{
+use crate::passes::lowering::core::{
     BlockLowerer, alloc_tile_result, const_i64, emit_bin, emit_cmp, emit_gep, emit_store,
     load_tile_scalar_dynamic, resolve_operand,
 };

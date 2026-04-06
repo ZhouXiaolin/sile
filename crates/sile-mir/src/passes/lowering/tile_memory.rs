@@ -1,12 +1,12 @@
 use sile_llir as llir;
 
+use super::tile_loops::{lower_tile_load_rank2_loop, lower_tile_store_rank2_loop};
 use crate::ValueId;
-use crate::lower_llir_core::{
+use crate::passes::lowering::core::{
     BlockLowerer, alloc_tile_result, buffer_rank_of, const_f32, const_i64, emit_bin, emit_gep,
     emit_load, emit_shape_dim, emit_store, lower_1d_tile_coord, lower_nested_tile_loop,
     resolve_operand,
 };
-use crate::lower_llir_tile_loops::{lower_tile_load_rank2_loop, lower_tile_store_rank2_loop};
 
 pub(crate) fn lower_tile_constant_inst(
     result: ValueId,

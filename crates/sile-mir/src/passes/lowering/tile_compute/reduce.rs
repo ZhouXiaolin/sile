@@ -1,6 +1,6 @@
 use sile_llir as llir;
 
-use crate::lower_llir_core::{
+use crate::passes::lowering::core::{
     BlockLowerer, LowerLlirCtx, alloc_tile_result, const_f32, const_i64, emit_bin, emit_cmp,
     emit_gep, emit_load, emit_select, emit_store, load_tile_scalar_dynamic, resolve_operand,
 };

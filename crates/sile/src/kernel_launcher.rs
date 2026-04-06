@@ -2,7 +2,7 @@ use sile_core::{Device, KernelArg, LaunchConfig, Result, Stream};
 use sile_hir::Kernel;
 use sile_llir::format_function as format_llir_function;
 
-use crate::compiler::compile_to_llir;
+use crate::compiler::compile_kernel_to_llir;
 
 pub struct KernelLauncher<'a> {
     kernel: &'static Kernel,
@@ -35,10 +35,7 @@ impl<'a> KernelLauncher<'a> {
                 .ok_or_else(|| sile_core::Error::Shape("grid not set".into()))?,
         };
 
-        let typed = sile_hir::typeck::check_kernel(self.kernel)
-            .map_err(|e| sile_core::Error::Shape(e.to_string()))?;
-
-        let (_, llir_func) = compile_to_llir(&typed)?;
+        let (typed, _, llir_func) = compile_kernel_to_llir(self.kernel)?;
 
         if std::env::var_os("SILE_PRINT_LLIR").is_some() {
             eprintln!("{}", format_llir_function(&llir_func));

@@ -1,9 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use sile_llir as llir;
 
 use crate::ir::*;
-use crate::passes::LlirLoweringPlan;
 
 use super::map::llir_value;
 
@@ -54,17 +53,14 @@ struct PendingBlock {
 
 pub(crate) struct BlockLowerer<'a> {
     mir: &'a MirFunction,
-    plan: &'a LlirLoweringPlan,
     ctx: &'a mut LowerLlirCtx,
     blocks: Vec<PendingBlock>,
     current: usize,
-    materialized_tiles: HashSet<ValueId>,
 }
 
 impl<'a> BlockLowerer<'a> {
     pub(crate) fn new(
         mir: &'a MirFunction,
-        plan: &'a LlirLoweringPlan,
         ctx: &'a mut LowerLlirCtx,
         id: llir::BlockId,
         name: String,
@@ -72,7 +68,6 @@ impl<'a> BlockLowerer<'a> {
     ) -> Self {
         Self {
             mir,
-            plan,
             ctx,
             blocks: vec![PendingBlock {
                 id,
@@ -82,7 +77,6 @@ impl<'a> BlockLowerer<'a> {
                 terminator: None,
             }],
             current: 0,
-            materialized_tiles: HashSet::new(),
         }
     }
 
@@ -151,18 +145,6 @@ impl<'a> BlockLowerer<'a> {
 
     pub(crate) fn mir(&self) -> &MirFunction {
         self.mir
-    }
-
-    pub(crate) fn plan(&self) -> &LlirLoweringPlan {
-        self.plan
-    }
-
-    pub(crate) fn begin_materialize_tile(&mut self, value: ValueId) -> Option<MirOp> {
-        if !self.materialized_tiles.insert(value) {
-            return None;
-        }
-
-        self.plan.deferred_tile_op(value).cloned()
     }
 }
 

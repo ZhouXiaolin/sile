@@ -2,8 +2,8 @@ use sile_llir as llir;
 
 use crate::ValueId;
 
-use crate::lower_llir_core::block::BlockLowerer;
-use crate::lower_llir_core::map::{llir_value, tile_ptr_type, tile_storage_type};
+use crate::passes::lowering::core::block::BlockLowerer;
+use crate::passes::lowering::core::map::{llir_value, tile_ptr_type, tile_storage_type};
 
 pub(crate) fn alloc_tile_result(
     builder: &mut BlockLowerer<'_>,

@@ -1,6 +1,6 @@
 use sile_llir as llir;
 
-use crate::lower_llir_core::block::LowerLlirCtx;
+use crate::passes::lowering::core::block::LowerLlirCtx;
 
 pub(crate) fn lower_1d_tile_coord(
     ctx: &mut LowerLlirCtx,
