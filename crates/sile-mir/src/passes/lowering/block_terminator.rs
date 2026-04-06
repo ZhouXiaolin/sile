@@ -1,7 +1,7 @@
 use sile_llir as llir;
 
+use super::core::{LowerLlirCtx, llir_block, resolve_operand};
 use crate::ir::*;
-use crate::lower_llir_core::{LowerLlirCtx, llir_block, resolve_operand};
 
 pub(crate) fn lower_terminator(term: &MirTerminator, ctx: &LowerLlirCtx) -> llir::Terminator {
     match term {

@@ -1,4 +1,8 @@
 pub mod canonicalize;
+pub mod cse;
+pub mod dce;
+pub mod loop_simplify;
+pub mod simplify_cfg;
 pub mod verify;
 
 use crate::Function;
@@ -30,11 +34,7 @@ pub const RECOMMENDED_PIPELINE: &[LlirPassKind] = &[
 ];
 
 /// Passes that are active today.
-pub const ACTIVE_PIPELINE: &[LlirPassKind] = &[
-    LlirPassKind::VerifyInput,
-    LlirPassKind::Canonicalize,
-    LlirPassKind::VerifyOutput,
-];
+pub const ACTIVE_PIPELINE: &[LlirPassKind] = RECOMMENDED_PIPELINE;
 
 pub fn run_pipeline(mut func: Function, pipeline: &[LlirPassKind]) -> Result<Function, String> {
     for pass in pipeline {
@@ -44,10 +44,10 @@ pub fn run_pipeline(mut func: Function, pipeline: &[LlirPassKind]) -> Result<Fun
                 func
             }
             LlirPassKind::Canonicalize => canonicalize::run(func),
-            LlirPassKind::SimplifyCfg
-            | LlirPassKind::Cse
-            | LlirPassKind::Dce
-            | LlirPassKind::LoopSimplify => func,
+            LlirPassKind::SimplifyCfg => simplify_cfg::run(func),
+            LlirPassKind::Cse => cse::run(func),
+            LlirPassKind::Dce => dce::run(func),
+            LlirPassKind::LoopSimplify => loop_simplify::run(func),
         };
     }
     Ok(func)

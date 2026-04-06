@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use sile_llir as llir;
 
-use crate::lower_llir_core::{
+use crate::passes::lowering::core::{
     BlockLowerer, LowerLlirCtx, alloc_tile_result, buffer_rank_of, const_f32, const_i64, emit_bin,
     emit_gep, emit_intrinsic, emit_load, emit_shape_dim, emit_store, load_tile_scalar_dynamic,
     lower_1d_tile_coord, lower_bin_op, lower_nested_tile_loop, resolve_operand, tile_dims_of,
@@ -23,7 +23,7 @@ pub(crate) fn lower_tile_expr_inst(
     builder: &mut BlockLowerer<'_>,
 ) {
     let dst_tile = alloc_tile_result(builder, result, rows, cols);
-    let pending_tiles = builder.plan().deferred_tiles_with_root(result, root_op);
+    let pending_tiles = HashMap::from([(result, root_op)]);
     let fused_load_bases = builder.with_current_insts(|ctx, mir, out| {
         let mut bases = HashMap::new();
         let mut coord_bases = HashMap::new();

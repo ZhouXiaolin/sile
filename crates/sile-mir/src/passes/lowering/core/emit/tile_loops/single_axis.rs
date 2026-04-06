@@ -1,8 +1,8 @@
 use sile_llir as llir;
 
 use crate::MirFunction;
-use crate::lower_llir_core::block::{BlockLowerer, LowerLlirCtx};
-use crate::lower_llir_core::emit::insts::{const_i64, emit_bin, emit_cmp};
+use crate::passes::lowering::core::block::{BlockLowerer, LowerLlirCtx};
+use crate::passes::lowering::core::emit::insts::{const_i64, emit_bin, emit_cmp};
 
 pub(super) fn lower_single_col_loop(
     builder: &mut BlockLowerer<'_>,

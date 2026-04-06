@@ -1,7 +1,7 @@
 use sile_llir as llir;
 
 use crate::MirFunction;
-use crate::lower_llir_core::block::{BlockLowerer, LowerLlirCtx};
+use crate::passes::lowering::core::block::{BlockLowerer, LowerLlirCtx};
 
 mod grid;
 mod single_axis;

@@ -1,9 +1,9 @@
 use sile_llir as llir;
 
-use crate::ir::*;
-use crate::lower_llir_core::{
+use super::core::{
     LowerLlirCtx, llir_type, llir_value, lower_bin_op, lower_cmp_pred, resolve_operand,
 };
+use crate::ir::*;
 
 pub(crate) fn lower_scalar_inst(
     inst: &MirInst,

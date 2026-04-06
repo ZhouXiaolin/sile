@@ -1,6 +1,6 @@
 use sile_llir as llir;
 
-use crate::lower_llir_core::block::LowerLlirCtx;
+use crate::passes::lowering::core::block::LowerLlirCtx;
 
 pub(crate) fn load_tile_scalar_dynamic(
     ctx: &mut LowerLlirCtx,
