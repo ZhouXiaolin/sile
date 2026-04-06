@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use sile_backend_common::llir_text::{
+use crate::passes::emit::shared::{
     array_dims, bin_op_symbol, block_param_assignments, build_value_names, cmp_pred_symbol,
     format_operand as format_llir_operand, value_name as llir_value_name,
 };

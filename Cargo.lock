@@ -429,8 +429,7 @@ name = "sile"
 version = "0.1.0"
 dependencies = [
  "rand",
- "sile-backend-cpu",
- "sile-backend-metal",
+ "sile-backend",
  "sile-core",
  "sile-hir",
  "sile-llir",
@@ -440,33 +439,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "sile-backend-common"
-version = "0.1.0"
-dependencies = [
- "sile-llir",
-]
-
-[[package]]
-name = "sile-backend-cpu"
+name = "sile-backend"
 version = "0.1.0"
 dependencies = [
  "libloading",
- "sile-backend-common",
+ "metal",
  "sile-core",
  "sile-hir",
  "sile-llir",
  "tempfile",
-]
-
-[[package]]
-name = "sile-backend-metal"
-version = "0.1.0"
-dependencies = [
- "metal",
- "sile-backend-common",
- "sile-core",
- "sile-hir",
- "sile-llir",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use sile_backend_common::llir_text::{
+use crate::passes::emit::shared::{
     array_dims, bin_op_symbol, block_param_assignments, build_param_indices, build_value_names,
     cmp_pred_symbol, format_operand as format_llir_operand, value_name as llir_value_name,
 };
@@ -847,7 +847,7 @@ fn infer_tile_plan(func: &llir::Function) -> Option<TilePlan> {
             else {
                 continue;
             };
-            let Some((rows, cols)) =
+            let Some((_rows, cols)) =
                 infer_tile_dims_from_scalar_store(*value_id, &inst_by_result, &value_types)
             else {
                 continue;

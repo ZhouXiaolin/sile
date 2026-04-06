@@ -1,12 +1,12 @@
 [package]
-name = "sile-backend-cpu"
+name = "sile-backend"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-sile-backend-common = { path = "../sile-backend-common" }
 sile-core = { path = "../sile-core" }
 sile-hir = { path = "../sile-hir" }
 sile-llir = { path = "../sile-llir" }
 libloading.workspace = true
 tempfile.workspace = true
+metal = "0.33.0"

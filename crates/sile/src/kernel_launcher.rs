@@ -1,3 +1,4 @@
+use sile_backend::{cpu::CpuBackend, metal::MetalBackend};
 use sile_core::{Device, KernelArg, LaunchConfig, Result, Stream};
 use sile_hir::Kernel;
 use sile_llir::format_function as format_llir_function;
@@ -43,11 +44,11 @@ impl<'a> KernelLauncher<'a> {
 
         match stream.device() {
             Device::Cpu(_) => {
-                let backend = sile_backend_cpu::CpuBackend::new();
+                let backend = CpuBackend::new();
                 backend.execute_llir(&llir_func, &self.args, &launch, stream)
             }
             Device::Metal(_) => {
-                let backend = sile_backend_metal::MetalBackend::new()?;
+                let backend = MetalBackend::new()?;
                 let param_kinds: Vec<_> =
                     typed.kernel.params.iter().map(|param| param.kind).collect();
                 backend.execute_llir(&llir_func, &param_kinds, &self.args, &launch, stream)

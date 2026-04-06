@@ -6,7 +6,7 @@ use libloading::Library;
 use sile_llir::Function as LlirFunction;
 use tempfile::tempdir;
 
-use crate::codegen_llir_c::generate_kernel as generate_llir_kernel;
+use self::codegen_llir_c::generate_kernel as generate_llir_kernel;
 use sile_core::{KernelArg, LaunchConfig, Result, Stream};
 
 type KernelFn = unsafe extern "C" fn(*const *const c_void, i64, i64, *const i64, i64);
