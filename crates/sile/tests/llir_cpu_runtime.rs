@@ -3,7 +3,7 @@ use sile::{
     hir::{BuiltinOp, ElemType, Expr, Kernel, Param, ParamKind, ShapeExpr, Stmt, Type},
     typeck,
 };
-use sile_backend_cpu::CpuBackend;
+use sile_backend::cpu::CpuBackend;
 
 #[test]
 fn cpu_backend_executes_vec_add_through_llir() {

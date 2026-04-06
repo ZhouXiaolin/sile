@@ -1,7 +1,0 @@
-[package]
-name = "sile-backend-common"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-sile-llir = { path = "../sile-llir" }

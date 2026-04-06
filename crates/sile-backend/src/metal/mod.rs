@@ -5,7 +5,7 @@ use sile_core::{KernelArg, LaunchConfig, Result, Stream};
 use sile_hir::ParamKind;
 use sile_llir::Function as LlirFunction;
 
-use crate::codegen_llir_metal::generate as generate_llir_metal;
+use self::codegen_llir_metal::generate as generate_llir_metal;
 
 pub struct MetalBackend {
     device: Device,
