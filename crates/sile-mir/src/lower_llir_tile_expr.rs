@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use sile_llir as llir;
 
-use crate::lower_llir::{
+use crate::lower_llir_core::{
     BlockLowerer, LowerLlirCtx, alloc_tile_result, buffer_rank_of, const_f32, const_i64, emit_bin,
     emit_gep, emit_intrinsic, emit_load, emit_shape_dim, emit_store, load_tile_scalar_dynamic,
     lower_1d_tile_coord, lower_bin_op, lower_nested_tile_loop, resolve_operand, tile_dims_of,
