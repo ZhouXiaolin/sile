@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::passes::emit::shared::{
-    array_dims, bin_op_symbol, block_param_assignments, build_param_indices, build_value_names,
-    cmp_pred_symbol, format_operand as format_llir_operand, value_name as llir_value_name,
+    self, StructuredCfgMessages, StructuredEmitter, TilePlan, array_dims, block_param_assignments,
+    build_param_indices, build_value_names, format_operand as format_llir_operand, infer_tile_plan,
+    value_name as llir_value_name,
 };
 use sile_llir as llir;
 
@@ -30,12 +31,6 @@ struct MetalCodegen<'a> {
     param_indices: HashMap<llir::ValueId, usize>,
     indent: usize,
     out: String,
-}
-
-#[derive(Clone, Copy)]
-struct TilePlan {
-    output_param: usize,
-    cols: usize,
 }
 
 impl<'a> MetalCodegen<'a> {
@@ -91,173 +86,19 @@ impl<'a> MetalCodegen<'a> {
         start: llir::BlockId,
         stop_targets: &[llir::BlockId],
     ) -> sile_core::Result<Option<llir::BlockId>> {
-        let mut current = start;
-        loop {
-            let block = self.get_block(current).cloned().ok_or_else(|| {
-                sile_core::Error::Compile(format!("missing LLIR block {:?}", current))
-            })?;
-
-            if let llir::Terminator::Br { target, args } = &block.terminator {
-                if stop_targets.contains(target) {
-                    self.emit_block_insts(&block)?;
-                    self.emit_block_param_assignments(*target, args);
-                    return Ok(Some(*target));
-                }
-            }
-
-            if self.is_loop_preheader(&block) {
-                current = self.emit_structured_loop_preheader(&block)?;
-                if stop_targets.contains(&current) {
-                    return Ok(Some(current));
-                }
-                continue;
-            }
-
-            if matches!(block.terminator, llir::Terminator::CondBr { .. }) {
-                current = self.emit_structured_loop_header(&block)?;
-                if stop_targets.contains(&current) {
-                    return Ok(Some(current));
-                }
-                continue;
-            }
-
-            self.emit_block_insts(&block)?;
-            match &block.terminator {
-                llir::Terminator::Br { target, args } => {
-                    self.emit_block_param_assignments(*target, args);
-                    if stop_targets.contains(target) {
-                        return Ok(Some(*target));
-                    }
-                    current = *target;
-                }
-                llir::Terminator::Ret { value: None } => {
-                    self.writeln("return;");
-                    return Ok(None);
-                }
-                llir::Terminator::Ret { value: Some(value) } => {
-                    self.writeln(&format!("return {};", self.format_operand(value)));
-                    return Ok(None);
-                }
-                llir::Terminator::CondBr { .. } => {
-                    return Err(sile_core::Error::Compile(
-                        "LLIR Metal codegen only supports structured conditional branches".into(),
-                    ));
-                }
-                llir::Terminator::Switch { .. } => {
-                    return Err(sile_core::Error::Compile(
-                        "LLIR Metal codegen does not yet support switch terminators".into(),
-                    ));
-                }
-            }
-        }
-    }
-
-    fn emit_structured_loop_preheader(
-        &mut self,
-        preheader: &llir::BasicBlock,
-    ) -> sile_core::Result<llir::BlockId> {
-        let llir::Terminator::Br {
-            target: header_id,
-            args: header_args,
-        } = &preheader.terminator
-        else {
-            return Err(sile_core::Error::Compile(
-                "structured loop preheader must end with a branch".into(),
-            ));
-        };
-        let header = self.get_block(*header_id).cloned().ok_or_else(|| {
-            sile_core::Error::Compile("missing LLIR structured loop header".into())
-        })?;
-        let llir::Terminator::CondBr {
-            cond,
-            true_target,
-            true_args,
-            false_target,
-            false_args,
-        } = &header.terminator
-        else {
-            return Err(sile_core::Error::Compile(
-                "structured loop header must end with a conditional branch".into(),
-            ));
-        };
-
-        self.emit_block_insts(preheader)?;
-        self.emit_block_param_assignments(*header_id, header_args);
-        self.emit_structured_loop_header_impl(
-            &header,
-            cond,
-            *true_target,
-            true_args,
-            *false_target,
-            false_args,
-        )
-    }
-
-    fn emit_structured_loop_header(
-        &mut self,
-        header: &llir::BasicBlock,
-    ) -> sile_core::Result<llir::BlockId> {
-        let llir::Terminator::CondBr {
-            cond,
-            true_target,
-            true_args,
-            false_target,
-            false_args,
-        } = &header.terminator
-        else {
-            return Err(sile_core::Error::Compile(
-                "structured loop header must end with a conditional branch".into(),
-            ));
-        };
-        self.emit_structured_loop_header_impl(
-            header,
-            cond,
-            *true_target,
-            true_args,
-            *false_target,
-            false_args,
-        )
-    }
-
-    fn emit_structured_loop_header_impl(
-        &mut self,
-        header: &llir::BasicBlock,
-        cond: &llir::Operand,
-        true_target: llir::BlockId,
-        true_args: &[llir::Operand],
-        false_target: llir::BlockId,
-        false_args: &[llir::Operand],
-    ) -> sile_core::Result<llir::BlockId> {
-        self.writeln("while (true) {");
-        self.indent += 1;
-        self.emit_block_insts(header)?;
-        self.writeln(&format!("if (!({})) {{", self.format_operand(cond)));
-        self.indent += 1;
-        self.emit_block_param_assignments(false_target, false_args);
-        self.writeln("break;");
-        self.indent -= 1;
-        self.writeln("}");
-
-        self.emit_block_param_assignments(true_target, true_args);
-        let backedge = self.emit_structured_from(true_target, &[header.id])?;
-        if backedge != Some(header.id) {
-            return Err(sile_core::Error::Compile(
-                "structured loop body did not produce the expected backedge".into(),
-            ));
-        }
-        self.indent -= 1;
-        self.writeln("}");
-
-        Ok(false_target)
-    }
-
-    fn is_loop_preheader(&self, block: &llir::BasicBlock) -> bool {
-        let llir::Terminator::Br { target: header, .. } = block.terminator else {
-            return false;
-        };
-        matches!(
-            self.get_block(header).map(|block| &block.terminator),
-            Some(llir::Terminator::CondBr { .. })
+        shared::emit_structured_from(
+            self,
+            self.func,
+            start,
+            stop_targets,
+            StructuredCfgMessages {
+                preheader_must_branch: "structured loop preheader must end with a branch",
+                missing_loop_header: "missing LLIR structured loop header",
+                header_must_cond_br: "structured loop header must end with a conditional branch",
+                loop_backedge_mismatch: "structured loop body did not produce the expected backedge",
+                unsupported_cond_br: "LLIR Metal codegen only supports structured conditional branches",
+                unsupported_switch: "LLIR Metal codegen does not yet support switch terminators",
+            },
         )
     }
 
@@ -296,6 +137,15 @@ impl<'a> MetalCodegen<'a> {
     }
 
     fn emit_inst(&mut self, inst: &llir::Inst) -> sile_core::Result<()> {
+        if let Some(line) = shared::lower_common_inst_line(
+            inst,
+            |id| self.value_name(id),
+            |op| self.format_operand(op),
+        ) {
+            self.writeln(&line);
+            return Ok(());
+        }
+
         match &inst.op {
             llir::InstOp::ShapeDim { buf, dim } => {
                 if let Some(id) = inst.result {
@@ -305,90 +155,6 @@ impl<'a> MetalCodegen<'a> {
                 Ok(())
             }
             llir::InstOp::Alloca { .. } => Ok(()),
-            llir::InstOp::Bin { op, lhs, rhs } => {
-                if let Some(id) = inst.result {
-                    self.writeln(&format!(
-                        "{} = {} {} {};",
-                        self.value_name(id),
-                        self.format_operand(lhs),
-                        bin_op_symbol(*op),
-                        self.format_operand(rhs)
-                    ));
-                }
-                Ok(())
-            }
-            llir::InstOp::Cmp { pred, lhs, rhs } => {
-                if let Some(id) = inst.result {
-                    self.writeln(&format!(
-                        "{} = {} {} {};",
-                        self.value_name(id),
-                        self.format_operand(lhs),
-                        cmp_pred_symbol(*pred),
-                        self.format_operand(rhs)
-                    ));
-                }
-                Ok(())
-            }
-            llir::InstOp::Select {
-                cond,
-                on_true,
-                on_false,
-            } => {
-                if let Some(id) = inst.result {
-                    self.writeln(&format!(
-                        "{} = ({}) ? ({}) : ({});",
-                        self.value_name(id),
-                        self.format_operand(cond),
-                        self.format_operand(on_true),
-                        self.format_operand(on_false)
-                    ));
-                }
-                Ok(())
-            }
-            llir::InstOp::Load { ptr } => {
-                if let Some(id) = inst.result {
-                    self.writeln(&format!(
-                        "{} = *({});",
-                        self.value_name(id),
-                        self.format_operand(ptr)
-                    ));
-                }
-                Ok(())
-            }
-            llir::InstOp::Store { ptr, value } => {
-                self.writeln(&format!(
-                    "*({}) = {};",
-                    self.format_operand(ptr),
-                    self.format_operand(value)
-                ));
-                Ok(())
-            }
-            llir::InstOp::Cast { value, .. } => {
-                if let Some(id) = inst.result {
-                    self.writeln(&format!(
-                        "{} = {};",
-                        self.value_name(id),
-                        self.format_operand(value)
-                    ));
-                }
-                Ok(())
-            }
-            llir::InstOp::Gep { base, indices } => {
-                if let Some(id) = inst.result {
-                    let index_suffix = indices
-                        .iter()
-                        .map(|idx| format!("[{}]", self.format_operand(idx)))
-                        .collect::<Vec<_>>()
-                        .join("");
-                    self.writeln(&format!(
-                        "{} = &({}{});",
-                        self.value_name(id),
-                        self.format_operand(base),
-                        index_suffix
-                    ));
-                }
-                Ok(())
-            }
             llir::InstOp::Memcpy { dst, src, size } => {
                 self.writeln(&format!(
                     "for (int64_t copy_i = 0; copy_i < {}; ++copy_i) {{",
@@ -408,6 +174,7 @@ impl<'a> MetalCodegen<'a> {
             llir::InstOp::Intrinsic { intrinsic, args } => {
                 self.emit_intrinsic(inst.result, intrinsic, args)
             }
+            _ => Ok(()),
         }
     }
 
@@ -665,13 +432,35 @@ impl<'a> MetalCodegen<'a> {
         format_llir_operand(&self.value_names, operand)
     }
 
-    fn get_block(&self, id: llir::BlockId) -> Option<&llir::BasicBlock> {
-        self.func.blocks.iter().find(|block| block.id == id)
-    }
-
     fn writeln(&mut self, line: &str) {
         self.out
             .push_str(&format!("{}{}\n", "  ".repeat(self.indent), line));
+    }
+}
+
+impl StructuredEmitter for MetalCodegen<'_> {
+    fn emit_block_insts(&mut self, block: &llir::BasicBlock) -> sile_core::Result<()> {
+        MetalCodegen::emit_block_insts(self, block)
+    }
+
+    fn emit_block_param_assignments(&mut self, target: llir::BlockId, args: &[llir::Operand]) {
+        MetalCodegen::emit_block_param_assignments(self, target, args);
+    }
+
+    fn format_operand(&self, operand: &llir::Operand) -> String {
+        MetalCodegen::format_operand(self, operand)
+    }
+
+    fn writeln(&mut self, line: &str) {
+        MetalCodegen::writeln(self, line);
+    }
+
+    fn indent_inc(&mut self) {
+        self.indent += 1;
+    }
+
+    fn indent_dec(&mut self) {
+        self.indent -= 1;
     }
 }
 
@@ -812,107 +601,5 @@ fn const_usize(operand: &llir::Operand, what: &str) -> sile_core::Result<usize> 
         _ => Err(sile_core::Error::Compile(format!(
             "{what} must be a non-negative integer constant"
         ))),
-    }
-}
-
-fn infer_tile_plan(func: &llir::Function) -> Option<TilePlan> {
-    let inst_by_result = func
-        .blocks
-        .iter()
-        .flat_map(|block| block.insts.iter())
-        .filter_map(|inst| inst.result.map(|id| (id, inst)))
-        .collect::<HashMap<_, _>>();
-    let value_types = build_value_type_map(func);
-
-    for block in &func.blocks {
-        for inst in &block.insts {
-            let llir::InstOp::Store {
-                ptr: llir::Operand::Value(ptr_id),
-                value: llir::Operand::Value(value_id),
-            } = &inst.op
-            else {
-                continue;
-            };
-            let Some(ptr_inst) = inst_by_result.get(ptr_id) else {
-                continue;
-            };
-            let llir::InstOp::Gep {
-                base: llir::Operand::Value(buf_id),
-                ..
-            } = &ptr_inst.op
-            else {
-                continue;
-            };
-            let Some(output_param) = func.params.iter().position(|param| param.id == *buf_id)
-            else {
-                continue;
-            };
-            let Some((_rows, cols)) =
-                infer_tile_dims_from_scalar_store(*value_id, &inst_by_result, &value_types)
-            else {
-                continue;
-            };
-            return Some(TilePlan { output_param, cols });
-        }
-    }
-
-    None
-}
-
-fn build_value_type_map(func: &llir::Function) -> HashMap<llir::ValueId, llir::Type> {
-    let mut types = HashMap::new();
-    for param in &func.params {
-        types.insert(param.id, param.ty.clone());
-    }
-    for block in &func.blocks {
-        for param in &block.params {
-            types.insert(param.id, param.ty.clone());
-        }
-        for inst in &block.insts {
-            if let Some(id) = inst.result {
-                types.insert(id, inst.ty.clone());
-            }
-        }
-    }
-    types
-}
-
-fn infer_tile_dims_from_scalar_store(
-    value_id: llir::ValueId,
-    inst_by_result: &HashMap<llir::ValueId, &llir::Inst>,
-    value_types: &HashMap<llir::ValueId, llir::Type>,
-) -> Option<(usize, usize)> {
-    let load_inst = inst_by_result.get(&value_id)?;
-    let llir::InstOp::Load {
-        ptr: llir::Operand::Value(tile_ptr_id),
-    } = &load_inst.op
-    else {
-        return None;
-    };
-    let tile_gep = inst_by_result.get(tile_ptr_id)?;
-    let llir::InstOp::Gep {
-        base: llir::Operand::Value(tile_id),
-        ..
-    } = &tile_gep.op
-    else {
-        return None;
-    };
-    let tile_ty = value_types.get(tile_id)?;
-    tile_shape_from_type(tile_ty)
-}
-
-fn tile_shape_from_type(ty: &llir::Type) -> Option<(usize, usize)> {
-    let llir::Type::Ptr {
-        addr_space: llir::AddressSpace::Private,
-        pointee,
-    } = ty
-    else {
-        return None;
-    };
-    let dims = array_dims(pointee);
-    match dims.as_slice() {
-        [cols] => Some((1, *cols)),
-        [rows, cols, ..] => Some((*rows, *cols)),
-        _ => None,
     }
 }
