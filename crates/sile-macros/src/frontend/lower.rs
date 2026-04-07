@@ -4,7 +4,7 @@ use super::ast::{BinOpKind, KernelDecl, KernelExpr, KernelShapeDim, KernelStmt};
 
 pub fn lower_kernel_to_hir(decl: &KernelDecl) -> proc_macro2::TokenStream {
     let name = decl.name.to_string();
-    let const_params: Vec<String> = decl.const_params.iter().map(|p| p.to_string()).collect();
+    let _const_params: Vec<String> = decl.const_params.iter().map(|p| p.to_string()).collect();
     let params = decl.params.iter().map(|param| {
         let name = param.name.to_string();
         let kind = if param.is_mut {
@@ -95,6 +95,22 @@ fn lower_stmt(stmt: &KernelStmt, const_params: &[syn::Ident]) -> proc_macro2::To
             quote! {
                 ::sile::hir::Stmt::Store {
                     target: #target.to_string(),
+                    value: #value,
+                }
+            }
+        }
+        KernelStmt::AtomicAdd {
+            target,
+            index,
+            value,
+        } => {
+            let target = target.to_string();
+            let index = lower_expr(index, const_params);
+            let value = lower_expr(value, const_params);
+            quote! {
+                ::sile::hir::Stmt::AtomicAdd {
+                    target: #target.to_string(),
+                    index: #index,
                     value: #value,
                 }
             }
@@ -363,9 +379,14 @@ fn lower_expr(expr: &KernelExpr, const_params: &[syn::Ident]) -> proc_macro2::To
                 }
             }
             // Fallback: just lower both sides
-            let target_lowered = lower_expr(target, const_params);
-            let index_lowered = lower_expr(index, const_params);
-            quote! { ::sile::hir::Expr::Var("idx".to_string()) }
+            let _target_lowered = lower_expr(target, const_params);
+            let _index_lowered = lower_expr(index, const_params);
+            quote! {
+                ::sile::hir::Expr::Builtin {
+                    op: ::sile::hir::BuiltinOp::Index,
+                    args: vec![#_target_lowered, #_index_lowered],
+                }
+            }
         }
     }
 }

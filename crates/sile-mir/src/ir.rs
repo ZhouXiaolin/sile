@@ -92,6 +92,14 @@ pub enum MirOp {
         cols: i64,
         stride_shape_idx: usize,
     },
+    /// Atomically accumulate a scalar into a buffer element
+    AtomicAdd {
+        buf: ValueId,
+        value: ValueId,
+        row_coord: ValueId,
+        col_coord: ValueId,
+        stride_shape_idx: usize,
+    },
     /// Allocate a tile filled with a constant value
     TileConstant { value: f64, rows: i64, cols: i64 },
     /// Element-wise binary op on tiles
@@ -131,6 +139,12 @@ pub enum MirOp {
         value: ValueId,
         rows: i64,
         cols: i64,
+    },
+    /// Read a scalar element from a tile
+    TileExtract {
+        tile: ValueId,
+        row_coord: ValueId,
+        col_coord: ValueId,
     },
 
     // ── Scalar / index operations ──
@@ -287,12 +301,26 @@ impl MirFunction {
             } => {
                 vec![*buf, *value, *row_coord, *col_coord]
             }
+            MirOp::AtomicAdd {
+                buf,
+                value,
+                row_coord,
+                col_coord,
+                ..
+            } => {
+                vec![*buf, *value, *row_coord, *col_coord]
+            }
             MirOp::TileConstant { .. } => vec![],
             MirOp::TileBinary { lhs, rhs, .. } => vec![*lhs, *rhs],
             MirOp::TileUnary { operand, .. } => vec![*operand],
             MirOp::TileMma { a, b, acc, .. } => vec![*a, *b, *acc],
             MirOp::TileReduce { value, .. } => vec![*value],
             MirOp::TileBroadcast { value, .. } => vec![*value],
+            MirOp::TileExtract {
+                tile,
+                row_coord,
+                col_coord,
+            } => vec![*tile, *row_coord, *col_coord],
             MirOp::IBinary { lhs, rhs, .. } => vec![*lhs, *rhs],
             MirOp::ICmp { lhs, rhs, .. } => vec![*lhs, *rhs],
             MirOp::ConstI64(_) | MirOp::ConstF64(_) => vec![],

@@ -143,6 +143,11 @@ fn format_inst(inst: &Inst, names: &HashMap<ValueId, String>) -> String {
             format_operand(ptr, names),
             format_operand(value, names)
         ),
+        InstOp::AtomicAdd { ptr, value } => format!(
+            "atomic_add {}, {}",
+            format_operand(ptr, names),
+            format_operand(value, names)
+        ),
         InstOp::Memcpy { dst, src, size } => format!(
             "memcpy {}, {}, {}",
             format_operand(dst, names),

@@ -703,6 +703,7 @@ fn inst_operands(op: &InstOp) -> Vec<Operand> {
         }
         InstOp::Load { ptr } => vec![ptr.clone()],
         InstOp::Store { ptr, value } => vec![ptr.clone(), value.clone()],
+        InstOp::AtomicAdd { ptr, value } => vec![ptr.clone(), value.clone()],
         InstOp::Memcpy { dst, src, size } => vec![dst.clone(), src.clone(), size.clone()],
         InstOp::Bin { lhs, rhs, .. } | InstOp::Cmp { lhs, rhs, .. } => {
             vec![lhs.clone(), rhs.clone()]
@@ -738,7 +739,10 @@ fn terminator_operands(terminator: &Terminator) -> Vec<Operand> {
 
 fn is_removable_inst(op: &InstOp) -> bool {
     match op {
-        InstOp::Store { .. } | InstOp::Memcpy { .. } | InstOp::Call { .. } => false,
+        InstOp::Store { .. }
+        | InstOp::AtomicAdd { .. }
+        | InstOp::Memcpy { .. }
+        | InstOp::Call { .. } => false,
         InstOp::Intrinsic {
             intrinsic: Intrinsic::Barrier { .. },
             ..
@@ -828,6 +832,10 @@ fn remap_inst_op(
             ptr: remap_operand(ptr, operand_map, result_map),
         },
         InstOp::Store { ptr, value } => InstOp::Store {
+            ptr: remap_operand(ptr, operand_map, result_map),
+            value: remap_operand(value, operand_map, result_map),
+        },
+        InstOp::AtomicAdd { ptr, value } => InstOp::AtomicAdd {
             ptr: remap_operand(ptr, operand_map, result_map),
             value: remap_operand(value, operand_map, result_map),
         },

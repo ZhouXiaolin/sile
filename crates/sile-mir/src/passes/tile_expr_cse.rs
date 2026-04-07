@@ -71,8 +71,17 @@ fn expr_key(op: &MirOp) -> Option<String> {
         MirOp::TileBroadcast { value, rows, cols } => {
             Some(format!("tile_broadcast:{}:{rows}:{cols}", value.0))
         }
+        MirOp::TileExtract {
+            tile,
+            row_coord,
+            col_coord,
+        } => Some(format!(
+            "tile_extract:{}:{}:{}",
+            tile.0, row_coord.0, col_coord.0
+        )),
         MirOp::TileLoad { .. }
         | MirOp::TileStore { .. }
+        | MirOp::AtomicAdd { .. }
         | MirOp::TileMma { .. }
         | MirOp::TileReduce { .. } => None,
     }
@@ -119,6 +128,19 @@ fn rewrite_op(op: MirOp, replacements: &HashMap<ValueId, ValueId>) -> MirOp {
             col_coord: rewrite(col_coord),
             rows,
             cols,
+            stride_shape_idx,
+        },
+        MirOp::AtomicAdd {
+            buf,
+            value,
+            row_coord,
+            col_coord,
+            stride_shape_idx,
+        } => MirOp::AtomicAdd {
+            buf: rewrite(buf),
+            value: rewrite(value),
+            row_coord: rewrite(row_coord),
+            col_coord: rewrite(col_coord),
             stride_shape_idx,
         },
         MirOp::TileConstant { value, rows, cols } => MirOp::TileConstant { value, rows, cols },
@@ -178,6 +200,15 @@ fn rewrite_op(op: MirOp, replacements: &HashMap<ValueId, ValueId>) -> MirOp {
             value: rewrite(value),
             rows,
             cols,
+        },
+        MirOp::TileExtract {
+            tile,
+            row_coord,
+            col_coord,
+        } => MirOp::TileExtract {
+            tile: rewrite(tile),
+            row_coord: rewrite(row_coord),
+            col_coord: rewrite(col_coord),
         },
         MirOp::IBinary { op, lhs, rhs } => MirOp::IBinary {
             op,

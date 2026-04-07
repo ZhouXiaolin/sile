@@ -1,7 +1,8 @@
 use sile_llir as llir;
 
 use super::core::{
-    LowerLlirCtx, llir_type, llir_value, lower_bin_op, lower_cmp_pred, resolve_operand,
+    LowerLlirCtx, const_i64, emit_bin, emit_gep, emit_shape_dim, llir_type, llir_value,
+    load_tile_scalar_dynamic, lower_bin_op, lower_cmp_pred, resolve_operand,
 };
 use crate::ir::*;
 
@@ -103,6 +104,80 @@ pub(crate) fn lower_scalar_inst(
                 },
                 metadata: Vec::new(),
             });
+        }
+        MirOp::AtomicAdd {
+            buf,
+            value,
+            row_coord,
+            col_coord,
+            stride_shape_idx,
+        } => {
+            let buf_operand = resolve_operand(*buf, ctx);
+            let row_operand = resolve_operand(*row_coord, ctx);
+            let col_operand = resolve_operand(*col_coord, ctx);
+            let linear_index = match mir.types.get(buf) {
+                Some(MirType::Buffer { rank }) if *rank <= 1 => col_operand,
+                _ => {
+                    let stride = emit_shape_dim(ctx, out, buf_operand.clone(), *stride_shape_idx);
+                    let row_offset = emit_bin(
+                        ctx,
+                        out,
+                        llir::BinOp::Mul,
+                        row_operand,
+                        stride,
+                        llir::Type::I64,
+                    );
+                    emit_bin(
+                        ctx,
+                        out,
+                        llir::BinOp::Add,
+                        row_offset,
+                        col_operand,
+                        llir::Type::I64,
+                    )
+                }
+            };
+            let ptr = emit_gep(
+                ctx,
+                out,
+                buf_operand,
+                vec![linear_index],
+                llir::Type::ptr(llir::AddressSpace::Global, llir::Type::F32),
+            );
+            let value_operand = match mir.types.get(value) {
+                Some(MirType::Tile { rows: 1, cols: 1 }) => load_tile_scalar_dynamic(
+                    ctx,
+                    out,
+                    resolve_operand(*value, ctx),
+                    const_i64(0),
+                    const_i64(0),
+                ),
+                _ => resolve_operand(*value, ctx),
+            };
+            out.push(llir::Inst {
+                result: None,
+                result_name: None,
+                ty: llir::Type::Void,
+                op: llir::InstOp::AtomicAdd {
+                    ptr,
+                    value: value_operand,
+                },
+                metadata: Vec::new(),
+            });
+        }
+        MirOp::TileExtract {
+            tile,
+            row_coord,
+            col_coord,
+        } => {
+            let value = load_tile_scalar_dynamic(
+                ctx,
+                out,
+                resolve_operand(*tile, ctx),
+                resolve_operand(*row_coord, ctx),
+                resolve_operand(*col_coord, ctx),
+            );
+            ctx.operands.insert(inst.result, value);
         }
         MirOp::TileLoad { .. }
         | MirOp::TileStore { .. }

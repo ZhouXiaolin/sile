@@ -1,4 +1,4 @@
-use std::ops::{Add, Div, Mul, Sub};
+use std::ops::{Add, Div, Index, Mul, Sub};
 
 #[derive(Clone, Copy, Debug)]
 pub struct TileId(pub i64, pub i64, pub i64);
@@ -71,5 +71,14 @@ impl Div for Tile<f32> {
     type Output = Self;
     fn div(self, _rhs: Self) -> Self {
         Tile::new(self.shape)
+    }
+}
+
+impl Index<usize> for Tile<f32> {
+    type Output = f32;
+
+    fn index(&self, _index: usize) -> &Self::Output {
+        static ZERO: f32 = 0.0;
+        &ZERO
     }
 }
