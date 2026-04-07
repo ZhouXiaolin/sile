@@ -1,0 +1,6 @@
+[package]
+name = "sile-llvm-ir"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

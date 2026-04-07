@@ -3,9 +3,9 @@ pub mod codegen;
 use metal::{CommandQueue, ComputePipelineState, Device, Library};
 use sile_core::{KernelArg, LaunchConfig, Result, Stream};
 use sile_hir::ParamKind;
-use sile_llir::Function as LlirFunction;
+use sile_llvm_ir::Function as LlvmIrFunction;
 
-use self::codegen::generate as generate_llir_metal;
+use self::codegen::generate as generate_llvm_ir_metal;
 use crate::emit::infer_tile_plan;
 
 pub struct MetalBackend {
@@ -64,18 +64,22 @@ impl MetalBackend {
 
     pub fn execute_llir(
         &self,
-        func: &LlirFunction,
+        func: &LlvmIrFunction,
         param_kinds: &[ParamKind],
         args: &[KernelArg<'_>],
         launch: &LaunchConfig,
         _stream: &Stream,
     ) -> Result<()> {
-        let source = generate_llir_metal(func)?;
-        let launch = self.normalize_llir_launch(func, launch);
+        let source = generate_llvm_ir_metal(func)?;
+        let launch = self.normalize_llvm_ir_launch(func, launch);
         self.execute_source(&func.name, &source, param_kinds, args, &launch)
     }
 
-    fn normalize_llir_launch(&self, func: &LlirFunction, launch: &LaunchConfig) -> LaunchConfig {
+    fn normalize_llvm_ir_launch(
+        &self,
+        func: &LlvmIrFunction,
+        launch: &LaunchConfig,
+    ) -> LaunchConfig {
         let Some(plan) = infer_tile_plan(func) else {
             return *launch;
         };

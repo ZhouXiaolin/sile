@@ -1,7 +1,6 @@
 use sile_core::{Error, Result};
 use sile_hir::{Kernel, typeck::TypedKernel};
-use sile_llir::Function as LlirFunction;
-use sile_mir::MirFunction;
+use sile_llvm_ir::Function as LlvmIrFunction;
 
 pub use sile_backend::{BackendArtifact, CodegenTarget, compile as compile_backend};
 
@@ -12,105 +11,131 @@ pub use sile_hir::{
     verify_typed_kernel as verify_hir_typed_kernel,
 };
 
-pub use sile_llir::{
-    ACTIVE_LLIR_PIPELINE, LlirPassKind, RECOMMENDED_LLIR_PIPELINE, run_llir_passes,
-    run_llir_pipeline,
+pub use sile_llvm_ir::{
+    ACTIVE_LLVM_IR_PIPELINE, LlvmIrPassKind, RECOMMENDED_LLVM_IR_PIPELINE, run_llvm_ir_passes,
+    run_llvm_ir_pipeline,
 };
-pub use sile_mir::passes::{
-    ACTIVE_PIPELINE as ACTIVE_MIR_PIPELINE, MirPassKind,
-    RECOMMENDED_PIPELINE as RECOMMENDED_MIR_PIPELINE, run_default_pipeline as run_mir_passes,
-    run_pipeline as run_mir_pipeline,
+pub use sile_tile_ir::passes::{
+    ACTIVE_PIPELINE as ACTIVE_TILE_IR_PIPELINE,
+    RECOMMENDED_PIPELINE as RECOMMENDED_TILE_IR_PIPELINE, TileIrPassKind,
+    run_default_pipeline as run_tile_ir_passes, run_pipeline as run_tile_ir_pipeline,
 };
-pub use sile_mir::{
-    ACTIVE_LLIR_LOWERING_PIPELINE, LlirLoweringPassKind, RECOMMENDED_LLIR_LOWERING_PIPELINE, dce,
-    lower_mir_to_llir, lower_to_mir, run_default_llir_lowering_pipeline,
-    run_llir_lowering_pipeline,
+pub use sile_tile_ir::{
+    ACTIVE_LLVM_IR_LOWERING_PIPELINE, LlvmIrLoweringPassKind as LlvmLoweringPassKind,
+    RECOMMENDED_LLVM_IR_LOWERING_PIPELINE, TileIrFunction, dce, format_tile_ir,
+    lower_tile_ir_to_llvm_ir, lower_to_tile_ir,
+    run_default_llvm_ir_lowering_pipeline as run_default_llvm_lowering_pipeline,
+    run_llvm_ir_lowering_pipeline as run_llvm_lowering_pipeline,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HirToMirPassKind {
-    LowerToMir,
+pub enum HirToTileIrPassKind {
+    LowerToTileIr,
 }
 
-pub const ACTIVE_HIR_TO_MIR_PIPELINE: &[HirToMirPassKind] = &[HirToMirPassKind::LowerToMir];
+pub const ACTIVE_HIR_TO_TILE_IR_PIPELINE: &[HirToTileIrPassKind] =
+    &[HirToTileIrPassKind::LowerToTileIr];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HirPassKind {
     TypeCheck,
-    LowerToMir,
+    LowerToTileIr,
 }
 
-pub const ACTIVE_HIR_PIPELINE: &[HirPassKind] = &[HirPassKind::TypeCheck, HirPassKind::LowerToMir];
+pub const ACTIVE_HIR_PIPELINE: &[HirPassKind] =
+    &[HirPassKind::TypeCheck, HirPassKind::LowerToTileIr];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MirToLirPassKind {
-    Mir(MirPassKind),
-    LowerMirToLir,
+pub enum TileIrToLlvmIrPassKind {
+    TileIr(TileIrPassKind),
+    LowerTileIrToLlvmIr,
 }
 
-pub fn compose_mir_to_lir_pipeline(mir_pipeline: &[MirPassKind]) -> Vec<MirToLirPassKind> {
-    let mut pipeline = mir_pipeline
+pub fn compose_tile_ir_to_llvm_ir_pipeline(
+    tile_ir_pipeline: &[TileIrPassKind],
+) -> Vec<TileIrToLlvmIrPassKind> {
+    let mut pipeline = tile_ir_pipeline
         .iter()
         .copied()
-        .map(MirToLirPassKind::Mir)
+        .map(TileIrToLlvmIrPassKind::TileIr)
         .collect::<Vec<_>>();
-    pipeline.push(MirToLirPassKind::LowerMirToLir);
+    pipeline.push(TileIrToLlvmIrPassKind::LowerTileIrToLlvmIr);
     pipeline
 }
 
-pub fn run_hir_to_mir_pipeline(
+pub fn run_hir_to_tile_ir_pipeline(
     typed: &TypedKernel,
-    pipeline: &[HirToMirPassKind],
-) -> Result<MirFunction> {
-    verify_typed_kernel(typed, "HIR->MIR input")?;
+    pipeline: &[HirToTileIrPassKind],
+) -> Result<TileIrFunction> {
+    verify_typed_kernel(typed, "HIR->Tile IR input")?;
 
-    let mut mir = None;
+    let mut tile_ir = None;
     for pass in pipeline {
         match pass {
-            HirToMirPassKind::LowerToMir => {
-                mir = Some(lower_to_mir(typed));
+            HirToTileIrPassKind::LowerToTileIr => {
+                tile_ir = Some(lower_to_tile_ir(typed));
             }
         }
     }
 
-    let mir = mir.ok_or_else(|| Error::Compile("HIR->MIR pipeline did not produce MIR".into()))?;
-    verify_mir_via_pipeline(&mir, "HIR->MIR output")?;
-    Ok(mir)
+    let tile_ir = tile_ir
+        .ok_or_else(|| Error::Compile("HIR->Tile IR pipeline did not produce Tile IR".into()))?;
+    verify_tile_ir(&tile_ir, "HIR->Tile IR output")?;
+    Ok(tile_ir)
 }
 
-pub fn run_mir_to_lir_pipeline(
+pub fn run_tile_ir_to_llvm_ir_pipeline(
     typed: &TypedKernel,
-    mut mir: MirFunction,
-    pipeline: &[MirToLirPassKind],
-) -> Result<(MirFunction, LlirFunction)> {
-    verify_typed_kernel(typed, "MIR->LIR typed input")?;
-    ensure_mir_to_lir_pipeline_contract(pipeline)?;
+    mut tile_ir: TileIrFunction,
+    pipeline: &[TileIrToLlvmIrPassKind],
+) -> Result<(TileIrFunction, LlvmIrFunction)> {
+    verify_typed_kernel(typed, "Tile IR->LLVM IR typed input")?;
 
-    let mut llir = None;
+    let mut llvm_ir = None;
 
     for pass in pipeline {
         match pass {
-            MirToLirPassKind::Mir(kind) => {
-                mir = run_mir_pipeline(mir, &[*kind]).map_err(Error::Shape)?;
+            TileIrToLlvmIrPassKind::TileIr(kind) => {
+                tile_ir = run_tile_ir_pipeline(tile_ir, &[*kind]).map_err(Error::Shape)?;
             }
-            MirToLirPassKind::LowerMirToLir => {
-                llir =
-                    Some(run_default_llir_lowering_pipeline(&mir, typed).map_err(Error::Compile)?);
+            TileIrToLlvmIrPassKind::LowerTileIrToLlvmIr => {
+                llvm_ir = Some(
+                    run_default_llvm_lowering_pipeline(&tile_ir, typed).map_err(Error::Compile)?,
+                );
             }
         }
     }
 
-    let llir =
-        llir.ok_or_else(|| Error::Compile("MIR->LIR pipeline did not produce LIR".into()))?;
-    Ok((mir, llir))
+    let llvm_ir = llvm_ir.ok_or_else(|| {
+        Error::Compile("Tile IR->LLVM IR pipeline did not produce LLVM IR".into())
+    })?;
+    Ok((tile_ir, llvm_ir))
+}
+
+pub fn compile_to_llvm_ir(typed: &TypedKernel) -> Result<(TileIrFunction, LlvmIrFunction)> {
+    let tile_ir = run_hir_to_tile_ir_pipeline(typed, ACTIVE_HIR_TO_TILE_IR_PIPELINE)?;
+    let tile_to_llvm = compose_tile_ir_to_llvm_ir_pipeline(ACTIVE_TILE_IR_PIPELINE);
+    let (tile_ir, llvm_ir) = run_tile_ir_to_llvm_ir_pipeline(typed, tile_ir, &tile_to_llvm)?;
+    let llvm_ir = finalize_llvm_ir_for_backend(llvm_ir)?;
+    Ok((tile_ir, llvm_ir))
+}
+
+pub fn compile_kernel_to_llvm_ir(
+    kernel: &'static Kernel,
+) -> Result<(TypedKernel, TileIrFunction, LlvmIrFunction)> {
+    let (typed, tile_ir) = run_hir_pipeline(kernel, ACTIVE_HIR_PIPELINE)?;
+    let tile_to_llvm = compose_tile_ir_to_llvm_ir_pipeline(ACTIVE_TILE_IR_PIPELINE);
+    let (tile_ir, llvm_ir) = run_tile_ir_to_llvm_ir_pipeline(&typed, tile_ir, &tile_to_llvm)?;
+    let llvm_ir = finalize_llvm_ir_for_backend(llvm_ir)?;
+    Ok((typed, tile_ir, llvm_ir))
 }
 
 pub fn run_hir_pipeline(
     kernel: &'static Kernel,
     pipeline: &[HirPassKind],
-) -> Result<(TypedKernel, MirFunction)> {
+) -> Result<(TypedKernel, TileIrFunction)> {
     let mut typed = None;
-    let mut mir = None;
+    let mut tile_ir = None;
 
     for pass in pipeline {
         match pass {
@@ -127,102 +152,57 @@ pub fn run_hir_pipeline(
                     .map_err(|e| Error::Shape(e.to_string()))?,
                 );
             }
-            HirPassKind::LowerToMir => {
+            HirPassKind::LowerToTileIr => {
                 let typed_ref = typed.as_ref().ok_or_else(|| {
-                    Error::Compile("LowerToMir requires TypeCheck earlier in pipeline".into())
+                    Error::Compile("LowerToTileIr requires TypeCheck earlier in pipeline".into())
                 })?;
-                mir = Some(lower_to_mir(typed_ref));
+                tile_ir = Some(lower_to_tile_ir(typed_ref));
             }
         }
     }
 
     let typed =
         typed.ok_or_else(|| Error::Compile("HIR pipeline did not produce TypedKernel".into()))?;
-    let mir = mir.ok_or_else(|| Error::Compile("HIR pipeline did not produce MIR".into()))?;
-    verify_mir_via_pipeline(&mir, "HIR output MIR")?;
-    Ok((typed, mir))
+    let tile_ir =
+        tile_ir.ok_or_else(|| Error::Compile("HIR pipeline did not produce Tile IR".into()))?;
+    verify_tile_ir(&tile_ir, "HIR output Tile IR")?;
+    Ok((typed, tile_ir))
 }
 
 fn verify_typed_kernel(typed: &TypedKernel, stage: &str) -> Result<()> {
     verify_hir_typed_kernel(typed).map_err(|err| Error::Compile(format!("{stage}: {err}")))
 }
 
-fn verify_mir_function(mir: &MirFunction, stage: &str) -> Result<()> {
-    run_mir_pipeline(mir.clone(), &[MirPassKind::VerifyInput])
+fn verify_tile_ir(tile_ir: &TileIrFunction, stage: &str) -> Result<()> {
+    run_tile_ir_pipeline(tile_ir.clone(), &[TileIrPassKind::VerifyInput])
         .map(|_| ())
         .map_err(|err| Error::Compile(format!("{stage}: {err}")))
 }
 
-fn verify_mir_via_pipeline(mir: &MirFunction, stage: &str) -> Result<()> {
-    verify_mir_function(mir, stage)
-}
-
-fn ensure_mir_to_lir_pipeline_contract(pipeline: &[MirToLirPassKind]) -> Result<()> {
-    let has_verify_input = pipeline
-        .iter()
-        .any(|pass| matches!(pass, MirToLirPassKind::Mir(MirPassKind::VerifyInput)));
-    let has_verify_output = pipeline
-        .iter()
-        .any(|pass| matches!(pass, MirToLirPassKind::Mir(MirPassKind::VerifyOutput)));
-    let has_lower = pipeline
-        .iter()
-        .any(|pass| matches!(pass, MirToLirPassKind::LowerMirToLir));
-
-    if !has_lower {
-        return Err(Error::Compile(
-            "MIR->LIR pipeline must include LowerMirToLir".into(),
-        ));
-    }
-    if !has_verify_input || !has_verify_output {
-        return Err(Error::Compile(
-            "MIR->LIR pipeline must include MIR VerifyInput and VerifyOutput passes".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn finalize_llir_for_backend(llir: LlirFunction) -> Result<LlirFunction> {
-    run_llir_pipeline(llir, ACTIVE_LLIR_PIPELINE).map_err(Error::Shape)
-}
-
-pub fn compile_to_llir(typed: &TypedKernel) -> Result<(MirFunction, LlirFunction)> {
-    let mir = run_hir_to_mir_pipeline(typed, ACTIVE_HIR_TO_MIR_PIPELINE)?;
-    let mir_to_lir = compose_mir_to_lir_pipeline(ACTIVE_MIR_PIPELINE);
-    let (mir, llir) = run_mir_to_lir_pipeline(typed, mir, &mir_to_lir)?;
-    let llir = finalize_llir_for_backend(llir)?;
-    Ok((mir, llir))
-}
-
-pub fn compile_kernel_to_llir(
-    kernel: &'static Kernel,
-) -> Result<(TypedKernel, MirFunction, LlirFunction)> {
-    let (typed, mir) = run_hir_pipeline(kernel, ACTIVE_HIR_PIPELINE)?;
-    let mir_to_lir = compose_mir_to_lir_pipeline(ACTIVE_MIR_PIPELINE);
-    let (mir, llir) = run_mir_to_lir_pipeline(&typed, mir, &mir_to_lir)?;
-    let llir = finalize_llir_for_backend(llir)?;
-    Ok((typed, mir, llir))
+fn finalize_llvm_ir_for_backend(llvm_ir: LlvmIrFunction) -> Result<LlvmIrFunction> {
+    run_llvm_ir_pipeline(llvm_ir, ACTIVE_LLVM_IR_PIPELINE).map_err(Error::Shape)
 }
 
 pub fn compile_to_backend_source(
     typed: &TypedKernel,
     target: CodegenTarget,
-) -> Result<(MirFunction, LlirFunction, BackendArtifact)> {
-    let mir = run_hir_to_mir_pipeline(typed, ACTIVE_HIR_TO_MIR_PIPELINE)?;
-    let mir_to_lir = compose_mir_to_lir_pipeline(ACTIVE_MIR_PIPELINE);
-    let (mir, llir) = run_mir_to_lir_pipeline(typed, mir, &mir_to_lir)?;
-    let llir = finalize_llir_for_backend(llir)?;
-    let artifact = compile_backend(&llir, target)?;
-    Ok((mir, llir, artifact))
+) -> Result<(TileIrFunction, LlvmIrFunction, BackendArtifact)> {
+    let tile_ir = run_hir_to_tile_ir_pipeline(typed, ACTIVE_HIR_TO_TILE_IR_PIPELINE)?;
+    let tile_to_llvm = compose_tile_ir_to_llvm_ir_pipeline(ACTIVE_TILE_IR_PIPELINE);
+    let (tile_ir, llvm_ir) = run_tile_ir_to_llvm_ir_pipeline(typed, tile_ir, &tile_to_llvm)?;
+    let llvm_ir = finalize_llvm_ir_for_backend(llvm_ir)?;
+    let artifact = compile_backend(&llvm_ir, target)?;
+    Ok((tile_ir, llvm_ir, artifact))
 }
 
 pub fn compile_kernel_to_backend_source(
     kernel: &'static Kernel,
     target: CodegenTarget,
-) -> Result<(TypedKernel, MirFunction, LlirFunction, BackendArtifact)> {
-    let (typed, mir) = run_hir_pipeline(kernel, ACTIVE_HIR_PIPELINE)?;
-    let mir_to_lir = compose_mir_to_lir_pipeline(ACTIVE_MIR_PIPELINE);
-    let (mir, llir) = run_mir_to_lir_pipeline(&typed, mir, &mir_to_lir)?;
-    let llir = finalize_llir_for_backend(llir)?;
-    let artifact = compile_backend(&llir, target)?;
-    Ok((typed, mir, llir, artifact))
+) -> Result<(TypedKernel, TileIrFunction, LlvmIrFunction, BackendArtifact)> {
+    let (typed, tile_ir) = run_hir_pipeline(kernel, ACTIVE_HIR_PIPELINE)?;
+    let tile_to_llvm = compose_tile_ir_to_llvm_ir_pipeline(ACTIVE_TILE_IR_PIPELINE);
+    let (tile_ir, llvm_ir) = run_tile_ir_to_llvm_ir_pipeline(&typed, tile_ir, &tile_to_llvm)?;
+    let llvm_ir = finalize_llvm_ir_for_backend(llvm_ir)?;
+    let artifact = compile_backend(&llvm_ir, target)?;
+    Ok((typed, tile_ir, llvm_ir, artifact))
 }
