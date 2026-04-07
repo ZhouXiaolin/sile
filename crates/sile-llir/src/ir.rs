@@ -174,6 +174,10 @@ pub enum InstOp {
         ptr: Operand,
         value: Operand,
     },
+    AtomicAdd {
+        ptr: Operand,
+        value: Operand,
+    },
     Memcpy {
         dst: Operand,
         src: Operand,

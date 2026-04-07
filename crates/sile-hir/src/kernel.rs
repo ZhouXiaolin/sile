@@ -26,6 +26,7 @@ pub enum BuiltinOp {
     Constant,
     ScalarDiv,
     ShapeDim,
+    Index,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +57,11 @@ pub enum Stmt {
     },
     Store {
         target: String,
+        value: Expr,
+    },
+    AtomicAdd {
+        target: String,
+        index: Expr,
         value: Expr,
     },
     ForLoop {

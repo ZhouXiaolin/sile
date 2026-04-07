@@ -73,5 +73,5 @@ fn find_live_values(func: &MirFunction) -> HashSet<crate::ValueId> {
 }
 
 fn is_side_effect(op: &MirOp) -> bool {
-    matches!(op, MirOp::TileStore { .. })
+    matches!(op, MirOp::TileStore { .. } | MirOp::AtomicAdd { .. })
 }

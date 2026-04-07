@@ -76,6 +76,7 @@ fn expr_key(op: &InstOp) -> Option<String> {
         InstOp::Alloca { .. }
         | InstOp::Load { .. }
         | InstOp::Store { .. }
+        | InstOp::AtomicAdd { .. }
         | InstOp::Memcpy { .. }
         | InstOp::Call { .. }
         | InstOp::Intrinsic { .. } => None,
@@ -136,6 +137,10 @@ fn rewrite_op(op: InstOp, replacements: &HashMap<ValueId, ValueId>) -> InstOp {
         },
         InstOp::Load { ptr } => InstOp::Load { ptr: rewrite(ptr) },
         InstOp::Store { ptr, value } => InstOp::Store {
+            ptr: rewrite(ptr),
+            value: rewrite(value),
+        },
+        InstOp::AtomicAdd { ptr, value } => InstOp::AtomicAdd {
             ptr: rewrite(ptr),
             value: rewrite(value),
         },

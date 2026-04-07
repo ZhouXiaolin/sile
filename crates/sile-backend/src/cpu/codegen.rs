@@ -497,6 +497,14 @@ impl<'a> CCodegen<'a> {
                     self.format_operand(size)
                 ));
             }
+            llir::InstOp::AtomicAdd { ptr, value } => {
+                self.writeln("#pragma omp atomic update");
+                self.writeln(&format!(
+                    "(*{}) += {};",
+                    self.format_operand(ptr),
+                    self.format_operand(value)
+                ));
+            }
             _ => {}
         }
     }

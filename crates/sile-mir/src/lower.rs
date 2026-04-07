@@ -147,6 +147,13 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx<'_>) {
         Stmt::Store { target, value } => {
             lower_store(target, value, ctx);
         }
+        Stmt::AtomicAdd {
+            target,
+            index,
+            value,
+        } => {
+            lower_atomic_add(target, index, value, ctx);
+        }
         Stmt::ForLoop {
             var,
             start,
@@ -626,8 +633,9 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 _ => unreachable!(),
             };
             let (in_rows, in_cols) = tile_shape_of(value, ctx).unwrap_or((1, 1));
-            // Default axis = 1 (reduce columns, keep rows)
-            let axis = 1i64;
+            let requested_axis = args.get(1).map(|arg| eval_i64(arg, ctx)).unwrap_or(1);
+            // 1D tiles are lowered as 1xN, so their only logical axis maps to cols.
+            let axis = if in_rows == 1 { 1 } else { requested_axis };
             let (out_rows, out_cols) = if axis == 1 {
                 (in_rows, 1)
             } else {
@@ -650,6 +658,23 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
         BuiltinOp::ShapeOf | BuiltinOp::ScalarDiv => {
             let v = lower_expr(&args[0], ctx);
             v
+        }
+        BuiltinOp::Index => {
+            let target = lower_expr(&args[0], ctx);
+            let coords = match args.get(1) {
+                Some(Expr::Shape(_)) => extract_runtime_coords(&args[1], ctx),
+                Some(index) => vec![lower_expr(index, ctx)],
+                None => vec![],
+            };
+            let (row_coord, col_coord) = coords_to_2d(&coords, ctx);
+            ctx.emit(
+                MirOp::TileExtract {
+                    tile: target,
+                    row_coord,
+                    col_coord,
+                },
+                MirType::F32,
+            )
         }
         BuiltinOp::Store => {
             // Handled in lower_store
@@ -687,6 +712,32 @@ fn lower_store(target: &str, value: &Expr, ctx: &mut LowerCtx<'_>) {
             col_coord,
             rows,
             cols,
+            stride_shape_idx,
+        },
+        MirType::Void,
+    );
+}
+
+fn lower_atomic_add(target: &str, index: &Expr, value: &Expr, ctx: &mut LowerCtx<'_>) {
+    let output = ctx
+        .locals
+        .get(target)
+        .copied()
+        .unwrap_or_else(|| ctx.emit(MirOp::ConstI64(0), MirType::I64));
+    let accumulated = lower_expr(value, ctx);
+    let coords = match index {
+        Expr::Shape(_) => extract_runtime_coords(index, ctx),
+        _ => vec![lower_expr(index, ctx)],
+    };
+    let (row_coord, col_coord) = coords_to_2d(&coords, ctx);
+    let stride_shape_idx = param_stride_dim(&output, ctx);
+
+    ctx.emit(
+        MirOp::AtomicAdd {
+            buf: output,
+            value: accumulated,
+            row_coord,
+            col_coord,
             stride_shape_idx,
         },
         MirType::Void,

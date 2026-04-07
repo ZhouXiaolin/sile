@@ -94,6 +94,38 @@ pub fn parse_kernel(input: &syn::ItemFn) -> syn::Result<KernelDecl> {
                         body.push(KernelStmt::Store { target, value });
                         continue;
                     }
+                    if call.method == "atomic_add" {
+                        let target = match call.receiver.as_ref() {
+                            syn::Expr::Path(path) => {
+                                path.path.segments.last().unwrap().ident.clone()
+                            }
+                            _ => {
+                                return Err(syn::Error::new_spanned(
+                                    &call.receiver,
+                                    "atomic_add target must be an ident",
+                                ));
+                            }
+                        };
+                        let mut args = call.args.iter();
+                        let index = parse_expr(args.next().ok_or_else(|| {
+                            syn::Error::new_spanned(call, "atomic_add requires index argument")
+                        })?)?;
+                        let value = parse_expr(args.next().ok_or_else(|| {
+                            syn::Error::new_spanned(call, "atomic_add requires value argument")
+                        })?)?;
+                        if args.next().is_some() {
+                            return Err(syn::Error::new_spanned(
+                                call,
+                                "atomic_add expects exactly two arguments",
+                            ));
+                        }
+                        body.push(KernelStmt::AtomicAdd {
+                            target,
+                            index,
+                            value,
+                        });
+                        continue;
+                    }
                 }
                 return Err(syn::Error::new_spanned(
                     expr,
@@ -210,6 +242,38 @@ fn parse_for_loop(for_loop: &syn::ExprForLoop, body: &mut Vec<KernelStmt>) -> sy
                             syn::Error::new_spanned(call, "store requires one argument")
                         })?)?;
                         loop_body.push(KernelStmt::Store { target, value });
+                        continue;
+                    }
+                    if call.method == "atomic_add" {
+                        let target = match call.receiver.as_ref() {
+                            syn::Expr::Path(path) => {
+                                path.path.segments.last().unwrap().ident.clone()
+                            }
+                            _ => {
+                                return Err(syn::Error::new_spanned(
+                                    &call.receiver,
+                                    "atomic_add target must be an ident",
+                                ));
+                            }
+                        };
+                        let mut args = call.args.iter();
+                        let index = parse_expr(args.next().ok_or_else(|| {
+                            syn::Error::new_spanned(call, "atomic_add requires index argument")
+                        })?)?;
+                        let value = parse_expr(args.next().ok_or_else(|| {
+                            syn::Error::new_spanned(call, "atomic_add requires value argument")
+                        })?)?;
+                        if args.next().is_some() {
+                            return Err(syn::Error::new_spanned(
+                                call,
+                                "atomic_add expects exactly two arguments",
+                            ));
+                        }
+                        loop_body.push(KernelStmt::AtomicAdd {
+                            target,
+                            index,
+                            value,
+                        });
                         continue;
                     }
                 }

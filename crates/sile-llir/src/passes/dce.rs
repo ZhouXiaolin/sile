@@ -72,7 +72,10 @@ fn find_def_inst(func: &Function, value: ValueId) -> Option<&crate::Inst> {
 
 fn is_side_effecting(op: &InstOp) -> bool {
     match op {
-        InstOp::Store { .. } | InstOp::Memcpy { .. } | InstOp::Call { .. } => true,
+        InstOp::Store { .. }
+        | InstOp::AtomicAdd { .. }
+        | InstOp::Memcpy { .. }
+        | InstOp::Call { .. } => true,
         InstOp::Intrinsic { intrinsic, .. } => {
             matches!(intrinsic, crate::Intrinsic::Barrier { .. })
         }
@@ -92,6 +95,7 @@ fn inst_operands(op: &InstOp) -> Vec<&Operand> {
         }
         InstOp::Load { ptr } => vec![ptr],
         InstOp::Store { ptr, value } => vec![ptr, value],
+        InstOp::AtomicAdd { ptr, value } => vec![ptr, value],
         InstOp::Memcpy { dst, src, size } => vec![dst, src, size],
         InstOp::Bin { lhs, rhs, .. } | InstOp::Cmp { lhs, rhs, .. } => vec![lhs, rhs],
         InstOp::Cast { value, .. } => vec![value],

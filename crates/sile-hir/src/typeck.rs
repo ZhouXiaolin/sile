@@ -62,6 +62,10 @@ pub fn check_kernel(kernel: &Kernel) -> Result<TypedKernel, TypeError> {
                 locals.insert(name.clone(), ty);
             }
             Stmt::Store { .. } | Stmt::ForLoop { .. } => {}
+            Stmt::AtomicAdd { index, value, .. } => {
+                let _ = infer_expr(index, &locals)?;
+                let _ = infer_expr(value, &locals)?;
+            }
         }
     }
     Ok(TypedKernel {
@@ -106,6 +110,7 @@ fn infer_builtin(op: BuiltinOp, _args: &[Expr]) -> Result<Type, TypeError> {
             ElemType::F32,
             ShapeExpr::tuple([ShapeExpr::symbol("BM"), ShapeExpr::symbol("BN")]),
         )),
+        BuiltinOp::Index => Ok(Type::Scalar(ElemType::F32)),
         BuiltinOp::ScalarDiv | BuiltinOp::ShapeDim | BuiltinOp::ShapeOf => Ok(Type::Shape),
         other => Err(TypeError::unsupported_builtin(format!("{other:?}"))),
     }

@@ -34,6 +34,11 @@ pub enum KernelStmt {
         target: syn::Ident,
         value: KernelExpr,
     },
+    AtomicAdd {
+        target: syn::Ident,
+        index: KernelExpr,
+        value: KernelExpr,
+    },
     ForLoop {
         var: syn::Ident,
         start: KernelExpr,

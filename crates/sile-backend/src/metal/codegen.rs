@@ -154,6 +154,14 @@ impl<'a> MetalCodegen<'a> {
                 self.writeln("}");
                 Ok(())
             }
+            llir::InstOp::AtomicAdd { ptr, value } => {
+                self.writeln(&format!(
+                    "atomic_fetch_add_explicit((device atomic_float*)({}), {}, memory_order_relaxed);",
+                    self.format_operand(ptr),
+                    self.format_operand(value)
+                ));
+                Ok(())
+            }
             llir::InstOp::Call { func, args } => self.emit_call(inst.result, func, args),
             llir::InstOp::Intrinsic { intrinsic, args } => {
                 self.emit_intrinsic(inst.result, intrinsic, args)

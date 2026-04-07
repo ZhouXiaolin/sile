@@ -28,6 +28,17 @@ fn matmul<const BM: i64, const BN: i64, const BK: i64>(
     c.store(acc);
 }
 
+#[sile::kernel]
+fn parallel_reduce<const TILE: i64>(
+    a: &Tensor<f32, { [-1] }>,
+    out: &mut Tensor<f32, { [1] }>,
+) {
+    let pid = sile::tile::id().0;
+    let tile_a = a.load_tile([TILE], [pid]);
+    let sum_tile = sile::reduce_sum(tile_a, 0);
+    out.atomic_add(0, sum_tile[0]);
+}
+
 #[test]
 fn metal_backend_executes_vec_add_through_compiler_pipeline() {
     let device = Device::metal();
@@ -94,4 +105,27 @@ fn metal_backend_executes_dynamic_k_matmul() {
         28.0, 30.0, 208.0, 150.0,
     ];
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn metal_backend_executes_parallel_reduce_with_atomic_add() {
+    let device = Device::metal();
+    let stream = device.create_stream().unwrap();
+
+    const TILE: i64 = 1000;
+    const LEN: i64 = 100_000;
+
+    let a = Tensor::from_vec(vec![1.0; LEN as usize], [LEN], &device).unwrap();
+    let mut out = Tensor::zeros([1], &device).unwrap();
+
+    let run = parallel_reduce::<TILE>(&a, &mut out)
+        .grid(((LEN / TILE) as u32, 1, 1))
+        .apply(&stream);
+    if matches!(&run, Err(sile::Error::UnsupportedBackend(_))) {
+        return;
+    }
+    run.unwrap();
+
+    let result = out.to_vec(&stream).unwrap()[0];
+    assert!((result - LEN as f32).abs() < 1e-3);
 }

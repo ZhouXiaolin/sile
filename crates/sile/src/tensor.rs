@@ -125,4 +125,8 @@ impl Tensor<f32> {
     pub fn store(&mut self, _value: Tile<f32>) {
         // no-op in host context; handled by codegen
     }
+
+    pub fn atomic_add(&mut self, _index: usize, _value: f32) {
+        // no-op in host context; handled by codegen
+    }
 }

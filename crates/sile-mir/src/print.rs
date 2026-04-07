@@ -97,6 +97,17 @@ fn format_op(op: &MirOp) -> String {
                 "tile_store {buf}, {value}, [{row_coord}, {col_coord}], shape=[{rows}, {cols}], stride_dim={stride_shape_idx}"
             )
         }
+        MirOp::AtomicAdd {
+            buf,
+            value,
+            row_coord,
+            col_coord,
+            stride_shape_idx,
+        } => {
+            format!(
+                "atomic_add {buf}, {value}, [{row_coord}, {col_coord}], stride_dim={stride_shape_idx}"
+            )
+        }
         MirOp::TileConstant { value, rows, cols } => {
             format!("tile_constant {value}, shape=[{rows}, {cols}]")
         }
@@ -138,6 +149,13 @@ fn format_op(op: &MirOp) -> String {
         }
         MirOp::TileBroadcast { value, rows, cols } => {
             format!("tile_broadcast {value}, shape=[{rows}, {cols}]")
+        }
+        MirOp::TileExtract {
+            tile,
+            row_coord,
+            col_coord,
+        } => {
+            format!("tile_extract {tile}, [{row_coord}, {col_coord}]")
         }
         MirOp::IBinary { op, lhs, rhs } => {
             format!("i_{op} {lhs}, {rhs}")

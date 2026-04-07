@@ -158,5 +158,5 @@ fn verify_defined(
 
 #[allow(dead_code)]
 fn _is_side_effecting(op: &MirOp) -> bool {
-    matches!(op, MirOp::TileStore { .. })
+    matches!(op, MirOp::TileStore { .. } | MirOp::AtomicAdd { .. })
 }
