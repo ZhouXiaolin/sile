@@ -1,5 +1,5 @@
 use sile_backend::{BackendArtifact, CodegenTarget, compile};
-use sile_llir::{
+use sile_llvm_ir::{
     BasicBlock, BlockId, Constant, Function, Inst, InstOp, Intrinsic, Operand, Terminator, Type,
     ValueId,
 };
@@ -96,9 +96,11 @@ fn compile_rejects_metal_unknown_helper_call() {
         Terminator::Ret { value: None },
     );
 
-    let err =
-        compile(&func, CodegenTarget::Metal).expect_err("unknown helper should be rejected");
-    assert!(err.to_string().contains("only supports tile helper calls"));
+    let err = compile(&func, CodegenTarget::Metal).expect_err("call should be rejected");
+    assert!(
+        err.to_string()
+            .contains("does not support LLVM IR call instructions")
+    );
 }
 
 #[test]
@@ -117,8 +119,8 @@ fn c_compile_allows_thread_id_intrinsic() {
         Terminator::Ret { value: None },
     );
 
-    let artifact = compile(&func, CodegenTarget::C)
-        .expect("C target should allow thread_id intrinsic");
+    let artifact =
+        compile(&func, CodegenTarget::C).expect("C target should allow thread_id intrinsic");
     match artifact {
         BackendArtifact::CSource(source) => {
             assert!(source.contains("#define llir_thread_id_0() (0)"));

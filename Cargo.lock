@@ -432,9 +432,9 @@ dependencies = [
  "sile-backend",
  "sile-core",
  "sile-hir",
- "sile-llir",
+ "sile-llvm-ir",
  "sile-macros",
- "sile-mir",
+ "sile-tile-ir",
  "thiserror",
 ]
 
@@ -446,7 +446,7 @@ dependencies = [
  "metal",
  "sile-core",
  "sile-hir",
- "sile-llir",
+ "sile-llvm-ir",
  "tempfile",
 ]
 
@@ -465,7 +465,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sile-llir"
+name = "sile-llvm-ir"
 version = "0.1.0"
 
 [[package]]
@@ -479,11 +479,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "sile-mir"
+name = "sile-tile-ir"
 version = "0.1.0"
 dependencies = [
  "sile-hir",
- "sile-llir",
+ "sile-llvm-ir",
 ]
 
 [[package]]

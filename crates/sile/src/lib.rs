@@ -16,20 +16,26 @@ pub use tile::Tile;
 pub mod typeck {
     pub use sile_hir::typeck::*;
 }
-pub mod mir {
-    pub use sile_mir::ir::*;
-    pub use sile_mir::lower::lower_to_mir;
-    pub use sile_mir::print::format_mir;
+pub mod tileir {
+    pub use sile_tile_ir::ir::*;
+    pub use sile_tile_ir::{
+        TileIrBlock, TileIrFunction, TileIrInst, TileIrOp, TileIrParam, TileIrTerminator,
+        TileIrType, format_tile_ir, lower_to_tile_ir,
+    };
 }
-pub mod llir {
-    pub use sile_llir::*;
+pub mod llvmir {
+    pub use sile_llvm_ir::{
+        AddressSpace, BasicBlock, BinOp, BlockId, BlockParam, CastOp, CmpPred, Constant, Function,
+        Inst, InstOp, Intrinsic, Metadata, Operand, Param, ParamAbi, SyncScope, Terminator, Type,
+        ValueId, format_llvm_ir,
+    };
 }
 pub mod compiler;
 pub mod codegen {
-    pub mod llir_c {
+    pub mod llvmir_c {
         pub use sile_backend::cpu::codegen::*;
     }
-    pub mod llir_metal {
+    pub mod llvmir_metal {
         pub use sile_backend::metal::codegen::*;
     }
 }

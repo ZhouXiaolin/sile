@@ -1,0 +1,8 @@
+[package]
+name = "sile-tile-ir"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sile-hir = { path = "../sile-hir" }
+sile-llvm-ir = { path = "../sile-llvm-ir" }

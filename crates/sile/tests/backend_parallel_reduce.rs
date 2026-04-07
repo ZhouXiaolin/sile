@@ -1,10 +1,7 @@
 use sile::{Device, Tensor, tile};
 
 #[sile::kernel]
-fn parallel_reduce<const TILE: i64>(
-    a: &Tensor<f32, { [-1] }>,
-    out: &mut Tensor<f32, { [1] }>,
-) {
+fn parallel_reduce<const TILE: i64>(a: &Tensor<f32, { [-1] }>, out: &mut Tensor<f32, { [1] }>) {
     let pid = tile::id().0;
     let tile_a = a.load_tile([TILE], [pid]);
     let sum_tile = sile::reduce_sum(tile_a, 0);

@@ -1,22 +1,24 @@
 use std::collections::HashMap;
 
 use sile_core::{Error, Result};
-use sile_llir as llir;
-use sile_llir::Function as LlirFunction;
+use sile_llvm_ir as llvm_ir;
+use sile_llvm_ir::Function as LlvmIrFunction;
 
-use crate::cpu::codegen::generate as generate_llir_c_source;
-use crate::metal::codegen::generate as generate_llir_metal_source;
+use crate::cpu::codegen::generate as generate_llvm_ir_c_source;
+use crate::metal::codegen::generate as generate_llvm_ir_metal_source;
 use crate::{BackendArtifact, CodegenTarget};
 
-pub fn run(llir: &LlirFunction, target: CodegenTarget) -> Result<BackendArtifact> {
+pub fn run(llvm_ir: &LlvmIrFunction, target: CodegenTarget) -> Result<BackendArtifact> {
     let artifact = match target {
-        CodegenTarget::C => BackendArtifact::CSource(generate_llir_c_source(llir)?),
-        CodegenTarget::Metal => BackendArtifact::MetalSource(generate_llir_metal_source(llir)?),
+        CodegenTarget::C => BackendArtifact::CSource(generate_llvm_ir_c_source(llvm_ir)?),
+        CodegenTarget::Metal => {
+            BackendArtifact::MetalSource(generate_llvm_ir_metal_source(llvm_ir)?)
+        }
     };
     Ok(artifact)
 }
 
-pub fn build_value_names(func: &llir::Function) -> HashMap<llir::ValueId, String> {
+pub fn build_value_names(func: &llvm_ir::Function) -> HashMap<llvm_ir::ValueId, String> {
     let mut names = HashMap::new();
     for param in &func.params {
         names.insert(param.id, param.name.clone());
@@ -34,15 +36,7 @@ pub fn build_value_names(func: &llir::Function) -> HashMap<llir::ValueId, String
     names
 }
 
-pub fn build_param_indices(func: &llir::Function) -> HashMap<llir::ValueId, usize> {
-    func.params
-        .iter()
-        .enumerate()
-        .map(|(idx, param)| (param.id, idx))
-        .collect()
-}
-
-pub fn value_name(value_names: &HashMap<llir::ValueId, String>, id: llir::ValueId) -> String {
+pub fn value_name(value_names: &HashMap<llvm_ir::ValueId, String>, id: llvm_ir::ValueId) -> String {
     value_names
         .get(&id)
         .cloned()
@@ -50,14 +44,14 @@ pub fn value_name(value_names: &HashMap<llir::ValueId, String>, id: llir::ValueI
 }
 
 pub fn format_operand(
-    value_names: &HashMap<llir::ValueId, String>,
-    operand: &llir::Operand,
+    value_names: &HashMap<llvm_ir::ValueId, String>,
+    operand: &llvm_ir::Operand,
 ) -> String {
     match operand {
-        llir::Operand::Value(id) => value_name(value_names, *id),
-        llir::Operand::Const(llir::Constant::Int(value)) => value.to_string(),
-        llir::Operand::Const(llir::Constant::Float(value)) => float_literal(*value),
-        llir::Operand::Const(llir::Constant::Bool(value)) => {
+        llvm_ir::Operand::Value(id) => value_name(value_names, *id),
+        llvm_ir::Operand::Const(llvm_ir::Constant::Int(value)) => value.to_string(),
+        llvm_ir::Operand::Const(llvm_ir::Constant::Float(value)) => float_literal(*value),
+        llvm_ir::Operand::Const(llvm_ir::Constant::Bool(value)) => {
             if *value {
                 "true".into()
             } else {
@@ -68,10 +62,10 @@ pub fn format_operand(
 }
 
 pub fn block_param_assignments(
-    func: &llir::Function,
-    value_names: &HashMap<llir::ValueId, String>,
-    target: llir::BlockId,
-    args: &[llir::Operand],
+    func: &llvm_ir::Function,
+    value_names: &HashMap<llvm_ir::ValueId, String>,
+    target: llvm_ir::BlockId,
+    args: &[llvm_ir::Operand],
 ) -> Vec<(String, String)> {
     let Some(block) = func.blocks.iter().find(|block| block.id == target) else {
         return Vec::new();
@@ -89,35 +83,35 @@ pub fn block_param_assignments(
         .collect()
 }
 
-pub fn array_dims(ty: &llir::Type) -> Vec<usize> {
+pub fn array_dims(ty: &llvm_ir::Type) -> Vec<usize> {
     let mut dims = Vec::new();
     let mut current = ty;
-    while let llir::Type::Array { len, elem } = current {
+    while let llvm_ir::Type::Array { len, elem } = current {
         dims.push(*len);
         current = elem;
     }
     dims
 }
 
-pub fn bin_op_symbol(op: llir::BinOp) -> &'static str {
+pub fn bin_op_symbol(op: llvm_ir::BinOp) -> &'static str {
     match op {
-        llir::BinOp::Add => "+",
-        llir::BinOp::Sub => "-",
-        llir::BinOp::Mul => "*",
-        llir::BinOp::Div => "/",
-        llir::BinOp::And => "&",
-        llir::BinOp::Or => "|",
+        llvm_ir::BinOp::Add => "+",
+        llvm_ir::BinOp::Sub => "-",
+        llvm_ir::BinOp::Mul => "*",
+        llvm_ir::BinOp::Div => "/",
+        llvm_ir::BinOp::And => "&",
+        llvm_ir::BinOp::Or => "|",
     }
 }
 
-pub fn cmp_pred_symbol(pred: llir::CmpPred) -> &'static str {
+pub fn cmp_pred_symbol(pred: llvm_ir::CmpPred) -> &'static str {
     match pred {
-        llir::CmpPred::Eq => "==",
-        llir::CmpPred::Ne => "!=",
-        llir::CmpPred::Slt | llir::CmpPred::Olt => "<",
-        llir::CmpPred::Sle | llir::CmpPred::Ole => "<=",
-        llir::CmpPred::Sgt | llir::CmpPred::Ogt => ">",
-        llir::CmpPred::Sge | llir::CmpPred::Oge => ">=",
+        llvm_ir::CmpPred::Eq => "==",
+        llvm_ir::CmpPred::Ne => "!=",
+        llvm_ir::CmpPred::Slt | llvm_ir::CmpPred::Olt => "<",
+        llvm_ir::CmpPred::Sle | llvm_ir::CmpPred::Ole => "<=",
+        llvm_ir::CmpPred::Sgt | llvm_ir::CmpPred::Ogt => ">",
+        llvm_ir::CmpPred::Sge | llvm_ir::CmpPred::Oge => ">=",
     }
 }
 
@@ -130,16 +124,16 @@ pub fn float_literal(value: f64) -> String {
 }
 
 pub fn lower_common_inst_line<FValue, FOperand>(
-    inst: &llir::Inst,
+    inst: &llvm_ir::Inst,
     value_name: FValue,
     format_operand: FOperand,
 ) -> Option<String>
 where
-    FValue: Fn(llir::ValueId) -> String,
-    FOperand: Fn(&llir::Operand) -> String,
+    FValue: Fn(llvm_ir::ValueId) -> String,
+    FOperand: Fn(&llvm_ir::Operand) -> String,
 {
     match &inst.op {
-        llir::InstOp::Bin { op, lhs, rhs } => inst.result.map(|id| {
+        llvm_ir::InstOp::Bin { op, lhs, rhs } => inst.result.map(|id| {
             format!(
                 "{} = {} {} {};",
                 value_name(id),
@@ -148,7 +142,7 @@ where
                 format_operand(rhs)
             )
         }),
-        llir::InstOp::Cmp { pred, lhs, rhs } => inst.result.map(|id| {
+        llvm_ir::InstOp::Cmp { pred, lhs, rhs } => inst.result.map(|id| {
             format!(
                 "{} = {} {} {};",
                 value_name(id),
@@ -157,7 +151,7 @@ where
                 format_operand(rhs)
             )
         }),
-        llir::InstOp::Select {
+        llvm_ir::InstOp::Select {
             cond,
             on_true,
             on_false,
@@ -170,18 +164,18 @@ where
                 format_operand(on_false)
             )
         }),
-        llir::InstOp::Load { ptr } => inst
+        llvm_ir::InstOp::Load { ptr } => inst
             .result
             .map(|id| format!("{} = *({});", value_name(id), format_operand(ptr))),
-        llir::InstOp::Store { ptr, value } => Some(format!(
+        llvm_ir::InstOp::Store { ptr, value } => Some(format!(
             "*({}) = {};",
             format_operand(ptr),
             format_operand(value)
         )),
-        llir::InstOp::Cast { value, .. } => inst
+        llvm_ir::InstOp::Cast { value, .. } => inst
             .result
             .map(|id| format!("{} = {};", value_name(id), format_operand(value))),
-        llir::InstOp::Gep { base, indices } => inst.result.map(|id| {
+        llvm_ir::InstOp::Gep { base, indices } => inst.result.map(|id| {
             let index_suffix = indices
                 .iter()
                 .map(|idx| format!("[{}]", format_operand(idx)))
@@ -212,9 +206,9 @@ pub fn generate_text<E: TextCodegen>(mut emitter: E) -> Result<String> {
     Ok(emitter.finish())
 }
 
-pub fn emit_value_decls<F>(func: &llir::Function, mut emit_decl: F) -> bool
+pub fn emit_value_decls<F>(func: &llvm_ir::Function, mut emit_decl: F) -> bool
 where
-    F: FnMut(llir::ValueId, &llir::Type),
+    F: FnMut(llvm_ir::ValueId, &llvm_ir::Type),
 {
     let mut declared = HashMap::new();
 
@@ -258,35 +252,7 @@ pub struct TilePlan {
     pub cols: usize,
 }
 
-pub fn infer_tile_plan(func: &llir::Function) -> Option<TilePlan> {
-    for block in &func.blocks {
-        for inst in &block.insts {
-            if let llir::InstOp::Call { func: callee, args } = &inst.op {
-                if callee != "tile_store_2d_f32" {
-                    continue;
-                }
-                let [
-                    llir::Operand::Value(buf_id),
-                    _,
-                    _,
-                    _,
-                    llir::Operand::Const(llir::Constant::Int(rows)),
-                    llir::Operand::Const(llir::Constant::Int(cols)),
-                    _,
-                ] = args.as_slice()
-                else {
-                    continue;
-                };
-                let output_param = func.params.iter().position(|param| param.id == *buf_id)?;
-                return Some(TilePlan {
-                    output_param,
-                    rows: *rows as usize,
-                    cols: *cols as usize,
-                });
-            }
-        }
-    }
-
+pub fn infer_tile_plan(func: &llvm_ir::Function) -> Option<TilePlan> {
     let inst_by_result = func
         .blocks
         .iter()
@@ -297,9 +263,9 @@ pub fn infer_tile_plan(func: &llir::Function) -> Option<TilePlan> {
 
     for block in &func.blocks {
         for inst in &block.insts {
-            let llir::InstOp::Store {
-                ptr: llir::Operand::Value(ptr_id),
-                value: llir::Operand::Value(value_id),
+            let llvm_ir::InstOp::Store {
+                ptr: llvm_ir::Operand::Value(ptr_id),
+                value: llvm_ir::Operand::Value(value_id),
             } = &inst.op
             else {
                 continue;
@@ -307,8 +273,8 @@ pub fn infer_tile_plan(func: &llir::Function) -> Option<TilePlan> {
             let Some(ptr_inst) = inst_by_result.get(ptr_id) else {
                 continue;
             };
-            let llir::InstOp::Gep {
-                base: llir::Operand::Value(buf_id),
+            let llvm_ir::InstOp::Gep {
+                base: llvm_ir::Operand::Value(buf_id),
                 ..
             } = &ptr_inst.op
             else {
@@ -335,9 +301,9 @@ pub fn infer_tile_plan(func: &llir::Function) -> Option<TilePlan> {
 }
 
 pub trait StructuredEmitter {
-    fn emit_block_insts(&mut self, block: &llir::BasicBlock) -> Result<()>;
-    fn emit_block_param_assignments(&mut self, target: llir::BlockId, args: &[llir::Operand]);
-    fn format_operand(&self, operand: &llir::Operand) -> String;
+    fn emit_block_insts(&mut self, block: &llvm_ir::BasicBlock) -> Result<()>;
+    fn emit_block_param_assignments(&mut self, target: llvm_ir::BlockId, args: &[llvm_ir::Operand]);
+    fn format_operand(&self, operand: &llvm_ir::Operand) -> String;
     fn writeln(&mut self, line: &str);
     fn indent_inc(&mut self);
     fn indent_dec(&mut self);
@@ -355,18 +321,18 @@ pub struct StructuredCfgMessages {
 
 pub fn emit_structured_from<E: StructuredEmitter>(
     emitter: &mut E,
-    func: &llir::Function,
-    start: llir::BlockId,
-    stop_targets: &[llir::BlockId],
+    func: &llvm_ir::Function,
+    start: llvm_ir::BlockId,
+    stop_targets: &[llvm_ir::BlockId],
     messages: StructuredCfgMessages,
-) -> Result<Option<llir::BlockId>> {
+) -> Result<Option<llvm_ir::BlockId>> {
     let mut current = start;
     loop {
         let block = get_block(func, current)
             .cloned()
-            .ok_or_else(|| Error::Compile(format!("missing LLIR block {:?}", current)))?;
+            .ok_or_else(|| Error::Compile(format!("missing LLVM IR block {:?}", current)))?;
 
-        if let llir::Terminator::Br { target, args } = &block.terminator
+        if let llvm_ir::Terminator::Br { target, args } = &block.terminator
             && stop_targets.contains(target)
         {
             emitter.emit_block_insts(&block)?;
@@ -382,7 +348,7 @@ pub fn emit_structured_from<E: StructuredEmitter>(
             continue;
         }
 
-        if matches!(block.terminator, llir::Terminator::CondBr { .. }) {
+        if matches!(block.terminator, llvm_ir::Terminator::CondBr { .. }) {
             current = emit_structured_loop_header(emitter, func, &block, messages)?;
             if stop_targets.contains(&current) {
                 return Ok(Some(current));
@@ -392,25 +358,25 @@ pub fn emit_structured_from<E: StructuredEmitter>(
 
         emitter.emit_block_insts(&block)?;
         match &block.terminator {
-            llir::Terminator::Br { target, args } => {
+            llvm_ir::Terminator::Br { target, args } => {
                 emitter.emit_block_param_assignments(*target, args);
                 if stop_targets.contains(target) {
                     return Ok(Some(*target));
                 }
                 current = *target;
             }
-            llir::Terminator::Ret { value: None } => {
+            llvm_ir::Terminator::Ret { value: None } => {
                 emitter.writeln("return;");
                 return Ok(None);
             }
-            llir::Terminator::Ret { value: Some(value) } => {
+            llvm_ir::Terminator::Ret { value: Some(value) } => {
                 emitter.writeln(&format!("return {};", emitter.format_operand(value)));
                 return Ok(None);
             }
-            llir::Terminator::CondBr { .. } => {
+            llvm_ir::Terminator::CondBr { .. } => {
                 return Err(Error::Compile(messages.unsupported_cond_br.into()));
             }
-            llir::Terminator::Switch { .. } => {
+            llvm_ir::Terminator::Switch { .. } => {
                 return Err(Error::Compile(messages.unsupported_switch.into()));
             }
         }
@@ -419,11 +385,11 @@ pub fn emit_structured_from<E: StructuredEmitter>(
 
 fn emit_structured_loop_preheader<E: StructuredEmitter>(
     emitter: &mut E,
-    func: &llir::Function,
-    preheader: &llir::BasicBlock,
+    func: &llvm_ir::Function,
+    preheader: &llvm_ir::BasicBlock,
     messages: StructuredCfgMessages,
-) -> Result<llir::BlockId> {
-    let llir::Terminator::Br {
+) -> Result<llvm_ir::BlockId> {
+    let llvm_ir::Terminator::Br {
         target: header_id,
         args: header_args,
     } = &preheader.terminator
@@ -433,7 +399,7 @@ fn emit_structured_loop_preheader<E: StructuredEmitter>(
     let header = get_block(func, *header_id)
         .cloned()
         .ok_or_else(|| Error::Compile(messages.missing_loop_header.into()))?;
-    let llir::Terminator::CondBr {
+    let llvm_ir::Terminator::CondBr {
         cond,
         true_target,
         true_args,
@@ -461,11 +427,11 @@ fn emit_structured_loop_preheader<E: StructuredEmitter>(
 
 fn emit_structured_loop_header<E: StructuredEmitter>(
     emitter: &mut E,
-    func: &llir::Function,
-    header: &llir::BasicBlock,
+    func: &llvm_ir::Function,
+    header: &llvm_ir::BasicBlock,
     messages: StructuredCfgMessages,
-) -> Result<llir::BlockId> {
-    let llir::Terminator::CondBr {
+) -> Result<llvm_ir::BlockId> {
+    let llvm_ir::Terminator::CondBr {
         cond,
         true_target,
         true_args,
@@ -491,15 +457,15 @@ fn emit_structured_loop_header<E: StructuredEmitter>(
 #[allow(clippy::too_many_arguments)]
 fn emit_structured_loop_header_impl<E: StructuredEmitter>(
     emitter: &mut E,
-    func: &llir::Function,
-    header: &llir::BasicBlock,
-    cond: &llir::Operand,
-    true_target: llir::BlockId,
-    true_args: &[llir::Operand],
-    false_target: llir::BlockId,
-    false_args: &[llir::Operand],
+    func: &llvm_ir::Function,
+    header: &llvm_ir::BasicBlock,
+    cond: &llvm_ir::Operand,
+    true_target: llvm_ir::BlockId,
+    true_args: &[llvm_ir::Operand],
+    false_target: llvm_ir::BlockId,
+    false_args: &[llvm_ir::Operand],
     messages: StructuredCfgMessages,
-) -> Result<llir::BlockId> {
+) -> Result<llvm_ir::BlockId> {
     emitter.writeln("while (true) {");
     emitter.indent_inc();
     emitter.emit_block_insts(header)?;
@@ -521,21 +487,21 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
     Ok(false_target)
 }
 
-fn get_block(func: &llir::Function, id: llir::BlockId) -> Option<&llir::BasicBlock> {
+fn get_block(func: &llvm_ir::Function, id: llvm_ir::BlockId) -> Option<&llvm_ir::BasicBlock> {
     func.blocks.iter().find(|block| block.id == id)
 }
 
-fn is_loop_preheader(func: &llir::Function, block: &llir::BasicBlock) -> bool {
-    let llir::Terminator::Br { target: header, .. } = block.terminator else {
+fn is_loop_preheader(func: &llvm_ir::Function, block: &llvm_ir::BasicBlock) -> bool {
+    let llvm_ir::Terminator::Br { target: header, .. } = block.terminator else {
         return false;
     };
     matches!(
         get_block(func, header).map(|header| &header.terminator),
-        Some(llir::Terminator::CondBr { .. })
+        Some(llvm_ir::Terminator::CondBr { .. })
     )
 }
 
-fn build_value_type_map(func: &llir::Function) -> HashMap<llir::ValueId, llir::Type> {
+fn build_value_type_map(func: &llvm_ir::Function) -> HashMap<llvm_ir::ValueId, llvm_ir::Type> {
     let mut types = HashMap::new();
     for param in &func.params {
         types.insert(param.id, param.ty.clone());
@@ -554,20 +520,20 @@ fn build_value_type_map(func: &llir::Function) -> HashMap<llir::ValueId, llir::T
 }
 
 fn infer_tile_dims_from_scalar_store(
-    value_id: llir::ValueId,
-    inst_by_result: &HashMap<llir::ValueId, &llir::Inst>,
-    value_types: &HashMap<llir::ValueId, llir::Type>,
+    value_id: llvm_ir::ValueId,
+    inst_by_result: &HashMap<llvm_ir::ValueId, &llvm_ir::Inst>,
+    value_types: &HashMap<llvm_ir::ValueId, llvm_ir::Type>,
 ) -> Option<(usize, usize)> {
     let load_inst = inst_by_result.get(&value_id)?;
-    let llir::InstOp::Load {
-        ptr: llir::Operand::Value(tile_ptr_id),
+    let llvm_ir::InstOp::Load {
+        ptr: llvm_ir::Operand::Value(tile_ptr_id),
     } = &load_inst.op
     else {
         return None;
     };
     let tile_gep = inst_by_result.get(tile_ptr_id)?;
-    let llir::InstOp::Gep {
-        base: llir::Operand::Value(tile_id),
+    let llvm_ir::InstOp::Gep {
+        base: llvm_ir::Operand::Value(tile_id),
         ..
     } = &tile_gep.op
     else {
@@ -577,9 +543,9 @@ fn infer_tile_dims_from_scalar_store(
     tile_shape_from_type(tile_ty)
 }
 
-fn tile_shape_from_type(ty: &llir::Type) -> Option<(usize, usize)> {
-    let llir::Type::Ptr {
-        addr_space: llir::AddressSpace::Private,
+fn tile_shape_from_type(ty: &llvm_ir::Type) -> Option<(usize, usize)> {
+    let llvm_ir::Type::Ptr {
+        addr_space: llvm_ir::AddressSpace::Private,
         pointee,
     } = ty
     else {

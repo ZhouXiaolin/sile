@@ -3,10 +3,10 @@ pub mod codegen;
 use std::{ffi::c_void, fs, process::Command};
 
 use libloading::Library;
-use sile_llir::Function as LlirFunction;
+use sile_llvm_ir::Function as LlvmIrFunction;
 use tempfile::tempdir;
 
-use self::codegen::generate as generate_llir_kernel;
+use self::codegen::generate as generate_llvm_ir_kernel;
 use sile_core::{KernelArg, LaunchConfig, Result, Stream};
 
 type KernelFn = unsafe extern "C" fn(*const *const c_void, i64, i64, *const i64, i64);
@@ -41,8 +41,8 @@ impl CpuBackend {
         ))
     }
 
-    fn compile_llir_kernel(func: &LlirFunction) -> Result<String> {
-        generate_llir_kernel(func)
+    fn compile_llvm_ir_kernel(func: &LlvmIrFunction) -> Result<String> {
+        generate_llvm_ir_kernel(func)
     }
 
     fn execute_compiled_source(
@@ -51,7 +51,7 @@ impl CpuBackend {
         c_code: &str,
         args: &[KernelArg<'_>],
         launch: &LaunchConfig,
-        llir_mode: bool,
+        llvm_ir_mode: bool,
     ) -> Result<()> {
         let dir = tempdir()?;
         let c_path = dir.path().join(format!("{}.c", kernel_name));
@@ -115,12 +115,12 @@ impl CpuBackend {
 
             let shapes: Vec<i64> = args.iter().flat_map(|a| a.shape.iter().copied()).collect();
 
-            let num_threadgroups = if llir_mode {
+            let num_threadgroups = if llvm_ir_mode {
                 launch.grid.iter().map(|dim| *dim as i64).product::<i64>()
             } else {
                 launch.grid[0] as i64
             };
-            let threads_per_group = if llir_mode {
+            let threads_per_group = if llvm_ir_mode {
                 1
             } else if args.is_empty() || args[0].shape.is_empty() {
                 256
@@ -142,12 +142,12 @@ impl CpuBackend {
 
     pub fn execute_llir(
         &self,
-        func: &LlirFunction,
+        func: &LlvmIrFunction,
         args: &[KernelArg<'_>],
         launch: &LaunchConfig,
         _stream: &Stream,
     ) -> Result<()> {
-        let c_code = Self::compile_llir_kernel(func)?;
+        let c_code = Self::compile_llvm_ir_kernel(func)?;
         self.execute_compiled_source(&func.name, &c_code, args, launch, true)
     }
 }

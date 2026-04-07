@@ -1,5 +1,5 @@
 use sile_core::Result;
-use sile_llir::Function as LlirFunction;
+use sile_llvm_ir::Function as LlvmIrFunction;
 
 mod emit;
 mod verify;
@@ -19,7 +19,7 @@ pub enum BackendArtifact {
     MetalSource(String),
 }
 
-pub fn compile(llir: &LlirFunction, target: CodegenTarget) -> Result<BackendArtifact> {
-    verify::for_target(llir, target, "Backend compile input")?;
-    emit::run(llir, target)
+pub fn compile(llvm_ir: &LlvmIrFunction, target: CodegenTarget) -> Result<BackendArtifact> {
+    verify::for_target(llvm_ir, target, "Backend compile input")?;
+    emit::run(llvm_ir, target)
 }

@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 sile-core = { path = "../sile-core" }
 sile-hir = { path = "../sile-hir" }
-sile-llir = { path = "../sile-llir" }
+sile-llvm-ir = { path = "../sile-llvm-ir" }
 libloading.workspace = true
 tempfile.workspace = true
 metal = "0.33.0"

@@ -2,31 +2,31 @@ use std::collections::HashMap;
 
 use crate::emit::{
     self, StructuredCfgMessages, StructuredEmitter, TextCodegen, TilePlan, array_dims,
-    block_param_assignments, build_param_indices, build_value_names,
-    format_operand as format_llir_operand, infer_tile_plan, value_name as llir_value_name,
+    block_param_assignments, build_value_names, format_operand as format_llir_operand,
+    infer_tile_plan, value_name as llir_value_name,
 };
-use sile_llir as llir;
+use sile_llvm_ir as llvm_ir;
 
-pub fn generate(func: &llir::Function) -> sile_core::Result<String> {
+const SHAPES_PARAM_NAME: &str = "__sile_shapes";
+
+pub fn generate(func: &llvm_ir::Function) -> sile_core::Result<String> {
     emit::generate_text(MetalCodegen::new(func))
 }
 
 struct MetalCodegen<'a> {
-    func: &'a llir::Function,
+    func: &'a llvm_ir::Function,
     tile_plan: Option<TilePlan>,
-    value_names: HashMap<llir::ValueId, String>,
-    param_indices: HashMap<llir::ValueId, usize>,
+    value_names: HashMap<llvm_ir::ValueId, String>,
     indent: usize,
     out: String,
 }
 
 impl<'a> MetalCodegen<'a> {
-    fn new(func: &'a llir::Function) -> Self {
+    fn new(func: &'a llvm_ir::Function) -> Self {
         Self {
             func,
             tile_plan: infer_tile_plan(func),
             value_names: build_value_names(func),
-            param_indices: build_param_indices(func),
             indent: 0,
             out: String::new(),
         }
@@ -41,22 +41,12 @@ impl<'a> MetalCodegen<'a> {
         self.out
             .push_str(&format!("kernel void sile_kernel_{}(\n", self.func.name));
         for (idx, param) in self.func.params.iter().enumerate() {
-            let comma = if idx + 1 == self.func.params.len() {
-                ",\n"
-            } else {
-                ",\n"
-            };
             self.out.push_str(&format!(
-                "    {} [[buffer({})]]{}",
+                "    {} [[buffer({})]],\n",
                 metal_param_decl(param),
                 idx,
-                comma
             ));
         }
-        self.out.push_str(&format!(
-            "    const device int64_t* shapes [[buffer({})]],\n",
-            self.func.params.len()
-        ));
         self.out
             .push_str("    uint3 gid [[thread_position_in_grid]]) {\n");
         self.indent = 1;
@@ -72,7 +62,7 @@ impl<'a> MetalCodegen<'a> {
         Ok(())
     }
 
-    fn emit_block_insts(&mut self, block: &llir::BasicBlock) -> sile_core::Result<()> {
+    fn emit_block_insts(&mut self, block: &llvm_ir::BasicBlock) -> sile_core::Result<()> {
         for inst in &block.insts {
             self.emit_inst(inst)?;
         }
@@ -81,9 +71,9 @@ impl<'a> MetalCodegen<'a> {
 
     fn emit_structured_from(
         &mut self,
-        start: llir::BlockId,
-        stop_targets: &[llir::BlockId],
-    ) -> sile_core::Result<Option<llir::BlockId>> {
+        start: llvm_ir::BlockId,
+        stop_targets: &[llvm_ir::BlockId],
+    ) -> sile_core::Result<Option<llvm_ir::BlockId>> {
         emit::emit_structured_from(
             self,
             self.func,
@@ -91,11 +81,11 @@ impl<'a> MetalCodegen<'a> {
             stop_targets,
             StructuredCfgMessages {
                 preheader_must_branch: "structured loop preheader must end with a branch",
-                missing_loop_header: "missing LLIR structured loop header",
+                missing_loop_header: "missing LLVM IR structured loop header",
                 header_must_cond_br: "structured loop header must end with a conditional branch",
                 loop_backedge_mismatch: "structured loop body did not produce the expected backedge",
-                unsupported_cond_br: "LLIR Metal codegen only supports structured conditional branches",
-                unsupported_switch: "LLIR Metal codegen does not yet support switch terminators",
+                unsupported_cond_br: "LLVM IR Metal codegen only supports structured conditional branches",
+                unsupported_switch: "LLVM IR Metal codegen does not yet support switch terminators",
             },
         )
     }
@@ -105,11 +95,11 @@ impl<'a> MetalCodegen<'a> {
         let _ = emit::emit_value_decls(func, |id, ty| self.emit_decl(id, ty));
     }
 
-    fn emit_decl(&mut self, id: llir::ValueId, ty: &llir::Type) {
+    fn emit_decl(&mut self, id: llvm_ir::ValueId, ty: &llvm_ir::Type) {
         let name = self.value_name(id);
         match ty {
-            llir::Type::Ptr {
-                addr_space: llir::AddressSpace::Private,
+            llvm_ir::Type::Ptr {
+                addr_space: llvm_ir::AddressSpace::Private,
                 pointee,
             } => {
                 let storage_name = format!("{}_storage", name);
@@ -120,7 +110,7 @@ impl<'a> MetalCodegen<'a> {
         }
     }
 
-    fn emit_inst(&mut self, inst: &llir::Inst) -> sile_core::Result<()> {
+    fn emit_inst(&mut self, inst: &llvm_ir::Inst) -> sile_core::Result<()> {
         if let Some(line) = emit::lower_common_inst_line(
             inst,
             |id| self.value_name(id),
@@ -131,15 +121,8 @@ impl<'a> MetalCodegen<'a> {
         }
 
         match &inst.op {
-            llir::InstOp::ShapeDim { buf, dim } => {
-                if let Some(id) = inst.result {
-                    let expr = self.emit_shape_dim(buf, *dim)?;
-                    self.writeln(&format!("{} = {};", self.value_name(id), expr));
-                }
-                Ok(())
-            }
-            llir::InstOp::Alloca { .. } => Ok(()),
-            llir::InstOp::Memcpy { dst, src, size } => {
+            llvm_ir::InstOp::Alloca { .. } => Ok(()),
+            llvm_ir::InstOp::Memcpy { dst, src, size } => {
                 self.writeln(&format!(
                     "for (int64_t copy_i = 0; copy_i < {}; ++copy_i) {{",
                     self.format_operand(size)
@@ -154,7 +137,7 @@ impl<'a> MetalCodegen<'a> {
                 self.writeln("}");
                 Ok(())
             }
-            llir::InstOp::AtomicAdd { ptr, value } => {
+            llvm_ir::InstOp::AtomicAdd { ptr, value } => {
                 self.writeln(&format!(
                     "atomic_fetch_add_explicit((device atomic_float*)({}), {}, memory_order_relaxed);",
                     self.format_operand(ptr),
@@ -162,50 +145,24 @@ impl<'a> MetalCodegen<'a> {
                 ));
                 Ok(())
             }
-            llir::InstOp::Call { func, args } => self.emit_call(inst.result, func, args),
-            llir::InstOp::Intrinsic { intrinsic, args } => {
+            llvm_ir::InstOp::Call { func, .. } => Err(sile_core::Error::Compile(format!(
+                "LLVM IR Metal codegen does not support call instructions: {func}"
+            ))),
+            llvm_ir::InstOp::Intrinsic { intrinsic, args } => {
                 self.emit_intrinsic(inst.result, intrinsic, args)
             }
             _ => Ok(()),
         }
     }
 
-    fn emit_call(
-        &mut self,
-        _result: Option<llir::ValueId>,
-        func: &str,
-        args: &[llir::Operand],
-    ) -> sile_core::Result<()> {
-        match func {
-            "tile_add_2d_f32" => self.emit_tile_binary(args, "+"),
-            "tile_sub_2d_f32" => self.emit_tile_binary(args, "-"),
-            "tile_mul_2d_f32" => self.emit_tile_binary(args, "*"),
-            "tile_div_2d_f32" => self.emit_tile_binary(args, "/"),
-            "tile_neg_2d_f32" => self.emit_tile_neg(args),
-            "tile_exp_2d_f32" => self.emit_tile_exp(args),
-            "tile_broadcast_2d_f32" => self.emit_tile_broadcast(args),
-            "tile_fill_2d_f32" => self.emit_tile_fill(args),
-            "tile_reduce_sum_axis0_2d_f32" => self.emit_tile_reduce_sum_axis0(args),
-            "tile_reduce_sum_axis1_2d_f32" => self.emit_tile_reduce_sum_axis1(args),
-            "tile_reduce_max_axis0_2d_f32" => self.emit_tile_reduce_max_axis0(args),
-            "tile_reduce_max_axis1_2d_f32" => self.emit_tile_reduce_max_axis1(args),
-            "tile_mma_accumulate_2d_f32" => self.emit_tile_mma(args),
-            "tile_load_2d_f32" => self.emit_tile_load(args),
-            "tile_store_2d_f32" => self.emit_tile_store(args),
-            other => Err(sile_core::Error::Compile(format!(
-                "unsupported LLIR helper call for Metal codegen: {other}"
-            ))),
-        }
-    }
-
     fn emit_intrinsic(
         &mut self,
-        result: Option<llir::ValueId>,
-        intrinsic: &llir::Intrinsic,
-        args: &[llir::Operand],
+        result: Option<llvm_ir::ValueId>,
+        intrinsic: &llvm_ir::Intrinsic,
+        args: &[llvm_ir::Operand],
     ) -> sile_core::Result<()> {
         match intrinsic {
-            llir::Intrinsic::BlockId { dim } => {
+            llvm_ir::Intrinsic::BlockId { dim } => {
                 let Some(id) = result else {
                     return Err(sile_core::Error::Compile(
                         "block_id intrinsic must produce a result".into(),
@@ -215,13 +172,13 @@ impl<'a> MetalCodegen<'a> {
                 self.writeln(&format!("{} = {};", self.value_name(id), axis));
                 Ok(())
             }
-            llir::Intrinsic::ThreadId { .. } => Err(sile_core::Error::Compile(
-                "thread_id intrinsic is not yet supported in LLIR Metal codegen".into(),
+            llvm_ir::Intrinsic::ThreadId { .. } => Err(sile_core::Error::Compile(
+                "thread_id intrinsic is not yet supported in LLVM IR Metal codegen".into(),
             )),
-            llir::Intrinsic::Barrier { .. } => Err(sile_core::Error::Compile(
-                "barrier intrinsic is not yet supported in LLIR Metal codegen".into(),
+            llvm_ir::Intrinsic::Barrier { .. } => Err(sile_core::Error::Compile(
+                "barrier intrinsic is not yet supported in LLVM IR Metal codegen".into(),
             )),
-            llir::Intrinsic::Exp => {
+            llvm_ir::Intrinsic::Exp => {
                 let Some(id) = result else {
                     return Err(sile_core::Error::Compile(
                         "exp intrinsic must produce a result".into(),
@@ -242,412 +199,14 @@ impl<'a> MetalCodegen<'a> {
         }
     }
 
-    fn emit_shape_dim(&self, buf: &llir::Operand, dim: usize) -> sile_core::Result<String> {
-        let param_idx = self.param_index(buf).ok_or_else(|| {
-            sile_core::Error::Compile(
-                "shape_dim currently requires a direct kernel parameter operand".into(),
-            )
-        })?;
-        let rank = self
-            .func
-            .params
-            .get(param_idx)
-            .and_then(|param| param.abi.as_ref().map(|abi| abi.rank))
-            .unwrap_or(1);
-        if dim >= rank {
-            return Err(sile_core::Error::Compile(format!(
-                "shape_dim requested dim {dim} for parameter rank {rank}"
-            )));
-        }
-        let offset = self
-            .func
-            .params
-            .get(param_idx)
-            .and_then(|param| param.abi.as_ref().map(|abi| abi.shape_offset + dim))
-            .ok_or_else(|| {
-                sile_core::Error::Compile(
-                    "shape_dim requires LLIR parameter ABI metadata in Metal codegen".into(),
-                )
-            })?;
-        Ok(format!("shapes[{offset}]"))
-    }
-
-    fn emit_tile_load(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
-        let [dst, buf, row_tile, col_tile, rows, cols, stride_idx] = args else {
-            return Err(sile_core::Error::Compile(
-                "tile_load_2d_f32 expects seven arguments".into(),
-            ));
-        };
-        let rows = const_usize(rows, "tile_load rows")?;
-        let cols = const_usize(cols, "tile_load cols")?;
-        let stride_idx = const_usize(stride_idx, "tile_load stride dim")?;
-        let dst_name = self.format_operand(dst);
-        let buf_name = self.format_operand(buf);
-        let row_tile = self.format_operand(row_tile);
-        let col_tile = self.format_operand(col_tile);
-        let rank = self.buffer_rank(buf, stride_idx);
-
-        self.emit_nested_tile_loop("load", rows, cols, |ctx, r, c| {
-            if rank <= 1 {
-                let tile = format!("(({col_tile}) != 0 ? ({col_tile}) : ({row_tile}))");
-                ctx.writeln(&format!(
-                    "{dst_name}[{r}][{c}] = {buf_name}[({tile} * {cols}) + {c}];"
-                ));
-            } else {
-                let stride = ctx.shape_dim_expr(buf, stride_idx);
-                ctx.writeln(&format!(
-                    "{dst_name}[{r}][{c}] = {buf_name}[(({row_tile} * {rows}) + {r}) * {stride} + (({col_tile} * {cols}) + {c})];"
-                ));
-            }
-        });
-        Ok(())
-    }
-
-    fn emit_tile_fill(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
-        let [dst, value, rows, cols] = args else {
-            return Err(sile_core::Error::Compile(
-                "tile_fill_2d_f32 expects four arguments".into(),
-            ));
-        };
-        let rows = const_usize(rows, "tile_fill rows")?;
-        let cols = const_usize(cols, "tile_fill cols")?;
-        let dst_name = self.format_operand(dst);
-        let value = self.format_operand(value);
-
-        self.emit_nested_tile_loop("fill", rows, cols, |ctx, r, c| {
-            ctx.writeln(&format!("{dst_name}[{r}][{c}] = {value};"));
-        });
-        Ok(())
-    }
-
-    fn emit_tile_binary(&mut self, args: &[llir::Operand], op: &str) -> sile_core::Result<()> {
-        let [dst, lhs, rhs, rows, cols] = args else {
-            return Err(sile_core::Error::Compile(format!(
-                "tile binary helper expects five arguments, got {}",
-                args.len()
-            )));
-        };
-        let rows = const_usize(rows, "tile binary rows")?;
-        let cols = const_usize(cols, "tile binary cols")?;
-        let dst_name = self.format_operand(dst);
-        let lhs_name = self.format_operand(lhs);
-        let rhs_name = self.format_operand(rhs);
-
-        self.emit_nested_tile_loop("binary", rows, cols, |ctx, r, c| {
-            ctx.writeln(&format!(
-                "{dst_name}[{r}][{c}] = {lhs_name}[{r}][{c}] {op} {rhs_name}[{r}][{c}];"
-            ));
-        });
-        Ok(())
-    }
-
-    fn emit_tile_neg(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
-        let [dst, src, rows, cols] = args else {
-            return Err(sile_core::Error::Compile(
-                "tile_neg_2d_f32 expects four arguments".into(),
-            ));
-        };
-        let rows = const_usize(rows, "tile_neg rows")?;
-        let cols = const_usize(cols, "tile_neg cols")?;
-        let dst_name = self.format_operand(dst);
-        let src_name = self.format_operand(src);
-
-        self.emit_nested_tile_loop("neg", rows, cols, |ctx, r, c| {
-            ctx.writeln(&format!("{dst_name}[{r}][{c}] = -{src_name}[{r}][{c}];"));
-        });
-        Ok(())
-    }
-
-    fn emit_tile_exp(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
-        let [dst, src, rows, cols] = args else {
-            return Err(sile_core::Error::Compile(
-                "tile_exp_2d_f32 expects four arguments".into(),
-            ));
-        };
-        let rows = const_usize(rows, "tile_exp rows")?;
-        let cols = const_usize(cols, "tile_exp cols")?;
-        let dst_name = self.format_operand(dst);
-        let src_name = self.format_operand(src);
-
-        self.emit_nested_tile_loop("exp", rows, cols, |ctx, r, c| {
-            ctx.writeln(&format!(
-                "{dst_name}[{r}][{c}] = metal::exp({src_name}[{r}][{c}]);"
-            ));
-        });
-        Ok(())
-    }
-
-    fn emit_tile_broadcast(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
-        let [dst, src, src_rows, src_cols, dst_rows, dst_cols] = args else {
-            return Err(sile_core::Error::Compile(
-                "tile_broadcast_2d_f32 expects six arguments".into(),
-            ));
-        };
-        let src_rows = const_usize(src_rows, "tile_broadcast src_rows")?;
-        let src_cols = const_usize(src_cols, "tile_broadcast src_cols")?;
-        let dst_rows = const_usize(dst_rows, "tile_broadcast dst_rows")?;
-        let dst_cols = const_usize(dst_cols, "tile_broadcast dst_cols")?;
-        let dst_name = self.format_operand(dst);
-        let src_name = self.format_operand(src);
-
-        self.emit_nested_tile_loop("broadcast", dst_rows, dst_cols, |ctx, r, c| {
-            let src_r = if src_rows == 1 { "0" } else { r };
-            let src_c = if src_cols == 1 { "0" } else { c };
-            ctx.writeln(&format!(
-                "{dst_name}[{r}][{c}] = {src_name}[{src_r}][{src_c}];"
-            ));
-        });
-        Ok(())
-    }
-
-    fn emit_tile_mma(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
-        let [dst, a, b, acc, rows, cols, depth] = args else {
-            return Err(sile_core::Error::Compile(
-                "tile_mma_accumulate_2d_f32 expects seven arguments".into(),
-            ));
-        };
-        let rows = const_usize(rows, "tile_mma rows")?;
-        let cols = const_usize(cols, "tile_mma cols")?;
-        let depth = const_usize(depth, "tile_mma depth")?;
-        let dst_name = self.format_operand(dst);
-        let a_name = self.format_operand(a);
-        let b_name = self.format_operand(b);
-        let acc_name = self.format_operand(acc);
-
-        self.emit_nested_tile_loop("mma", rows, cols, |ctx, r, c| {
-            let sum_var = format!("mma_sum_{}_{}", r, c);
-            ctx.writeln(&format!("float {sum_var} = {acc_name}[{r}][{c}];"));
-            ctx.writeln(&format!(
-                "for (int mma_k = 0; mma_k < {depth}; ++mma_k) {{"
-            ));
-            ctx.indent += 1;
-            ctx.writeln(&format!(
-                "{sum_var} += {a_name}[{r}][mma_k] * {b_name}[mma_k][{c}];"
-            ));
-            ctx.indent -= 1;
-            ctx.writeln("}");
-            ctx.writeln(&format!("{dst_name}[{r}][{c}] = {sum_var};"));
-        });
-        Ok(())
-    }
-
-    fn emit_tile_reduce_sum_axis0(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
-        let [dst, src, rows, cols] = args else {
-            return Err(sile_core::Error::Compile(
-                "tile_reduce_sum_axis0_2d_f32 expects four arguments".into(),
-            ));
-        };
-        let rows = const_usize(rows, "tile_reduce_sum_axis0 rows")?;
-        let cols = const_usize(cols, "tile_reduce_sum_axis0 cols")?;
-        let dst_name = self.format_operand(dst);
-        let src_name = self.format_operand(src);
-
-        self.writeln(&format!(
-            "for (int reduce_axis0_c = 0; reduce_axis0_c < {cols}; ++reduce_axis0_c) {{"
-        ));
-        self.indent += 1;
-        self.writeln("float reduce_axis0_sum = 0.0f;");
-        self.writeln(&format!(
-            "for (int reduce_axis0_r = 0; reduce_axis0_r < {rows}; ++reduce_axis0_r) {{"
-        ));
-        self.indent += 1;
-        self.writeln(&format!(
-            "reduce_axis0_sum += {src_name}[reduce_axis0_r][reduce_axis0_c];"
-        ));
-        self.indent -= 1;
-        self.writeln("}");
-        self.writeln(&format!(
-            "{dst_name}[0][reduce_axis0_c] = reduce_axis0_sum;"
-        ));
-        self.indent -= 1;
-        self.writeln("}");
-        Ok(())
-    }
-
-    fn emit_tile_reduce_sum_axis1(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
-        let [dst, src, rows, cols] = args else {
-            return Err(sile_core::Error::Compile(
-                "tile_reduce_sum_axis1_2d_f32 expects four arguments".into(),
-            ));
-        };
-        let rows = const_usize(rows, "tile_reduce_sum_axis1 rows")?;
-        let cols = const_usize(cols, "tile_reduce_sum_axis1 cols")?;
-        let dst_name = self.format_operand(dst);
-        let src_name = self.format_operand(src);
-
-        self.writeln(&format!(
-            "for (int reduce_axis1_r = 0; reduce_axis1_r < {rows}; ++reduce_axis1_r) {{"
-        ));
-        self.indent += 1;
-        self.writeln("float reduce_axis1_sum = 0.0f;");
-        self.writeln(&format!(
-            "for (int reduce_axis1_c = 0; reduce_axis1_c < {cols}; ++reduce_axis1_c) {{"
-        ));
-        self.indent += 1;
-        self.writeln(&format!(
-            "reduce_axis1_sum += {src_name}[reduce_axis1_r][reduce_axis1_c];"
-        ));
-        self.indent -= 1;
-        self.writeln("}");
-        self.writeln(&format!(
-            "{dst_name}[reduce_axis1_r][0] = reduce_axis1_sum;"
-        ));
-        self.indent -= 1;
-        self.writeln("}");
-        Ok(())
-    }
-
-    fn emit_tile_reduce_max_axis0(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
-        let [dst, src, rows, cols] = args else {
-            return Err(sile_core::Error::Compile(
-                "tile_reduce_max_axis0_2d_f32 expects four arguments".into(),
-            ));
-        };
-        let rows = const_usize(rows, "tile_reduce_max_axis0 rows")?;
-        let cols = const_usize(cols, "tile_reduce_max_axis0 cols")?;
-        let dst_name = self.format_operand(dst);
-        let src_name = self.format_operand(src);
-
-        self.writeln(&format!(
-            "for (int reduce_axis0_c = 0; reduce_axis0_c < {cols}; ++reduce_axis0_c) {{"
-        ));
-        self.indent += 1;
-        self.writeln(&format!(
-            "float reduce_axis0_max = {src_name}[0][reduce_axis0_c];"
-        ));
-        self.writeln(&format!(
-            "for (int reduce_axis0_r = 1; reduce_axis0_r < {rows}; ++reduce_axis0_r) {{"
-        ));
-        self.indent += 1;
-        self.writeln(&format!(
-            "float reduce_axis0_value = {src_name}[reduce_axis0_r][reduce_axis0_c];"
-        ));
-        self.writeln(
-            "reduce_axis0_max = (reduce_axis0_value > reduce_axis0_max) ? reduce_axis0_value : reduce_axis0_max;",
-        );
-        self.indent -= 1;
-        self.writeln("}");
-        self.writeln(&format!(
-            "{dst_name}[0][reduce_axis0_c] = reduce_axis0_max;"
-        ));
-        self.indent -= 1;
-        self.writeln("}");
-        Ok(())
-    }
-
-    fn emit_tile_reduce_max_axis1(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
-        let [dst, src, rows, cols] = args else {
-            return Err(sile_core::Error::Compile(
-                "tile_reduce_max_axis1_2d_f32 expects four arguments".into(),
-            ));
-        };
-        let rows = const_usize(rows, "tile_reduce_max_axis1 rows")?;
-        let cols = const_usize(cols, "tile_reduce_max_axis1 cols")?;
-        let dst_name = self.format_operand(dst);
-        let src_name = self.format_operand(src);
-
-        self.writeln(&format!(
-            "for (int reduce_axis1_r = 0; reduce_axis1_r < {rows}; ++reduce_axis1_r) {{"
-        ));
-        self.indent += 1;
-        self.writeln(&format!(
-            "float reduce_axis1_max = {src_name}[reduce_axis1_r][0];"
-        ));
-        self.writeln(&format!(
-            "for (int reduce_axis1_c = 1; reduce_axis1_c < {cols}; ++reduce_axis1_c) {{"
-        ));
-        self.indent += 1;
-        self.writeln(&format!(
-            "float reduce_axis1_value = {src_name}[reduce_axis1_r][reduce_axis1_c];"
-        ));
-        self.writeln(
-            "reduce_axis1_max = (reduce_axis1_value > reduce_axis1_max) ? reduce_axis1_value : reduce_axis1_max;",
-        );
-        self.indent -= 1;
-        self.writeln("}");
-        self.writeln(&format!(
-            "{dst_name}[reduce_axis1_r][0] = reduce_axis1_max;"
-        ));
-        self.indent -= 1;
-        self.writeln("}");
-        Ok(())
-    }
-
-    fn emit_tile_store(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
-        let [buf, value, row_tile, col_tile, rows, cols, stride_idx] = args else {
-            return Err(sile_core::Error::Compile(
-                "tile_store_2d_f32 expects seven arguments".into(),
-            ));
-        };
-        let rows = const_usize(rows, "tile_store rows")?;
-        let cols = const_usize(cols, "tile_store cols")?;
-        let stride_idx = const_usize(stride_idx, "tile_store stride dim")?;
-        let buf_name = self.format_operand(buf);
-        let value_name = self.format_operand(value);
-        let row_tile = self.format_operand(row_tile);
-        let col_tile = self.format_operand(col_tile);
-        let rank = self.buffer_rank(buf, stride_idx);
-
-        self.emit_nested_tile_loop("store", rows, cols, |ctx, r, c| {
-            if rank <= 1 {
-                let tile = format!("(({col_tile}) != 0 ? ({col_tile}) : ({row_tile}))");
-                ctx.writeln(&format!(
-                    "{buf_name}[({tile} * {cols}) + {c}] = {value_name}[{r}][{c}];"
-                ));
-            } else {
-                let stride = ctx.shape_dim_expr(buf, stride_idx);
-                ctx.writeln(&format!(
-                    "{buf_name}[(({row_tile} * {rows}) + {r}) * {stride} + (({col_tile} * {cols}) + {c})] = {value_name}[{r}][{c}];"
-                ));
-            }
-        });
-        Ok(())
-    }
-
-    fn emit_nested_tile_loop<F>(&mut self, prefix: &str, rows: usize, cols: usize, mut body: F)
-    where
-        F: FnMut(&mut Self, &str, &str),
-    {
-        let row_var = format!("{prefix}_r");
-        let col_var = format!("{prefix}_c");
-        self.writeln(&format!(
-            "for (int {row_var} = 0; {row_var} < {rows}; ++{row_var}) {{"
-        ));
-        self.indent += 1;
-        self.writeln(&format!(
-            "for (int {col_var} = 0; {col_var} < {cols}; ++{col_var}) {{"
-        ));
-        self.indent += 1;
-        body(self, &row_var, &col_var);
-        self.indent -= 1;
-        self.writeln("}");
-        self.indent -= 1;
-        self.writeln("}");
-    }
-
-    fn emit_block_param_assignments(&mut self, target: llir::BlockId, args: &[llir::Operand]) {
+    fn emit_block_param_assignments(
+        &mut self,
+        target: llvm_ir::BlockId,
+        args: &[llvm_ir::Operand],
+    ) {
         for (name, arg) in block_param_assignments(self.func, &self.value_names, target, args) {
             self.writeln(&format!("{name} = {arg};"));
         }
-    }
-
-    fn buffer_rank(&self, operand: &llir::Operand, stride_idx: usize) -> usize {
-        self.param_index(operand)
-            .and_then(|idx| self.func.params.get(idx))
-            .and_then(|param| param.abi.as_ref().map(|abi| abi.rank))
-            .unwrap_or_else(|| if stride_idx >= 1 { 2 } else { 1 })
-    }
-
-    fn shape_dim_expr(&self, operand: &llir::Operand, dim: usize) -> String {
-        self.param_index(operand)
-            .and_then(|param_idx| self.func.params.get(param_idx))
-            .and_then(|param| {
-                param
-                    .abi
-                    .as_ref()
-                    .map(|abi| format!("shapes[{}]", abi.shape_offset + dim))
-            })
-            .unwrap_or_else(|| "1".into())
     }
 
     fn logical_block_id_expr(&self, dim: u8) -> sile_core::Result<String> {
@@ -681,7 +240,8 @@ impl<'a> MetalCodegen<'a> {
         let abi = output_param.abi.as_ref().ok_or_else(|| {
             sile_core::Error::Compile("missing output ABI for Metal tile plan".into())
         })?;
-        let tiles_n = format!("(shapes[{}] / {})", abi.shape_offset + 1, plan.cols);
+        let shapes = self.shapes_param_name()?;
+        let tiles_n = format!("({shapes}[{}] / {})", abi.shape_offset + 1, plan.cols);
         Ok(match dim {
             0 => format!("((int64_t)gid.x / {tiles_n})"),
             1 => format!("((int64_t)gid.x % {tiles_n})"),
@@ -694,18 +254,24 @@ impl<'a> MetalCodegen<'a> {
         })
     }
 
-    fn param_index(&self, operand: &llir::Operand) -> Option<usize> {
-        match operand {
-            llir::Operand::Value(id) => self.param_indices.get(id).copied(),
-            _ => None,
-        }
+    fn shapes_param_name(&self) -> sile_core::Result<&str> {
+        self.func
+            .params
+            .iter()
+            .find(|param| param.name == SHAPES_PARAM_NAME)
+            .map(|param| param.name.as_str())
+            .ok_or_else(|| {
+                sile_core::Error::Compile(
+                    "Metal backend requires explicit __sile_shapes parameter in LLVM IR".into(),
+                )
+            })
     }
 
-    fn value_name(&self, id: llir::ValueId) -> String {
+    fn value_name(&self, id: llvm_ir::ValueId) -> String {
         llir_value_name(&self.value_names, id)
     }
 
-    fn format_operand(&self, operand: &llir::Operand) -> String {
+    fn format_operand(&self, operand: &llvm_ir::Operand) -> String {
         format_llir_operand(&self.value_names, operand)
     }
 
@@ -734,15 +300,19 @@ impl TextCodegen for MetalCodegen<'_> {
 }
 
 impl StructuredEmitter for MetalCodegen<'_> {
-    fn emit_block_insts(&mut self, block: &llir::BasicBlock) -> sile_core::Result<()> {
+    fn emit_block_insts(&mut self, block: &llvm_ir::BasicBlock) -> sile_core::Result<()> {
         MetalCodegen::emit_block_insts(self, block)
     }
 
-    fn emit_block_param_assignments(&mut self, target: llir::BlockId, args: &[llir::Operand]) {
+    fn emit_block_param_assignments(
+        &mut self,
+        target: llvm_ir::BlockId,
+        args: &[llvm_ir::Operand],
+    ) {
         MetalCodegen::emit_block_param_assignments(self, target, args);
     }
 
-    fn format_operand(&self, operand: &llir::Operand) -> String {
+    fn format_operand(&self, operand: &llvm_ir::Operand) -> String {
         MetalCodegen::format_operand(self, operand)
     }
 
@@ -759,14 +329,14 @@ impl StructuredEmitter for MetalCodegen<'_> {
     }
 }
 
-fn metal_param_decl(param: &llir::Param) -> String {
+fn metal_param_decl(param: &llvm_ir::Param) -> String {
     let ty = match &param.ty {
-        llir::Type::Ptr {
-            addr_space: llir::AddressSpace::Global,
+        llvm_ir::Type::Ptr {
+            addr_space: llvm_ir::AddressSpace::Global,
             pointee,
         } => format!("device {}* {}", metal_scalar_type(pointee), param.name),
-        llir::Type::Ptr {
-            addr_space: llir::AddressSpace::Constant,
+        llvm_ir::Type::Ptr {
+            addr_space: llvm_ir::AddressSpace::Constant,
             pointee,
         } => format!("constant {}* {}", metal_scalar_type(pointee), param.name),
         other => format!("{} {}", metal_type(other), param.name),
@@ -774,14 +344,14 @@ fn metal_param_decl(param: &llir::Param) -> String {
     ty
 }
 
-fn metal_var_decl(ty: &llir::Type, name: &str) -> String {
+fn metal_var_decl(ty: &llvm_ir::Type, name: &str) -> String {
     match ty {
-        llir::Type::I1 => format!("bool {} = false", name),
-        llir::Type::I32 => format!("int32_t {} = 0", name),
-        llir::Type::I64 => format!("int64_t {} = 0", name),
-        llir::Type::F32 => format!("float {} = 0.0f", name),
-        llir::Type::F64 => format!("double {} = 0.0", name),
-        llir::Type::Ptr {
+        llvm_ir::Type::I1 => format!("bool {} = false", name),
+        llvm_ir::Type::I32 => format!("int32_t {} = 0", name),
+        llvm_ir::Type::I64 => format!("int64_t {} = 0", name),
+        llvm_ir::Type::F32 => format!("float {} = 0.0f", name),
+        llvm_ir::Type::F64 => format!("double {} = 0.0", name),
+        llvm_ir::Type::Ptr {
             addr_space,
             pointee,
         } => metal_ptr_zero_decl(addr_space, pointee, name),
@@ -789,9 +359,9 @@ fn metal_var_decl(ty: &llir::Type, name: &str) -> String {
     }
 }
 
-fn metal_storage_decl(ty: &llir::Type, name: &str) -> String {
+fn metal_storage_decl(ty: &llvm_ir::Type, name: &str) -> String {
     match ty {
-        llir::Type::Array { .. } => {
+        llvm_ir::Type::Array { .. } => {
             let dims = array_dims(ty);
             let base = array_base_type(ty);
             format!(
@@ -808,7 +378,7 @@ fn metal_storage_decl(ty: &llir::Type, name: &str) -> String {
     }
 }
 
-fn metal_private_ptr_bind_decl(pointee: &llir::Type, name: &str, storage_name: &str) -> String {
+fn metal_private_ptr_bind_decl(pointee: &llvm_ir::Type, name: &str, storage_name: &str) -> String {
     let dims = array_dims(pointee);
     let base = array_base_type(pointee);
     if dims.is_empty() {
@@ -824,8 +394,8 @@ fn metal_private_ptr_bind_decl(pointee: &llir::Type, name: &str, storage_name: &
 }
 
 fn metal_ptr_zero_decl(
-    addr_space: &llir::AddressSpace,
-    pointee: &llir::Type,
+    addr_space: &llvm_ir::AddressSpace,
+    pointee: &llvm_ir::Type,
     name: &str,
 ) -> String {
     let dims = array_dims(pointee);
@@ -843,26 +413,26 @@ fn metal_ptr_zero_decl(
     }
 }
 
-fn metal_addr_qual(addr_space: &llir::AddressSpace) -> &'static str {
+fn metal_addr_qual(addr_space: &llvm_ir::AddressSpace) -> &'static str {
     match addr_space {
-        llir::AddressSpace::Generic => "",
-        llir::AddressSpace::Private => "thread ",
-        llir::AddressSpace::Global => "device ",
-        llir::AddressSpace::Constant => "constant ",
-        llir::AddressSpace::Shared => "threadgroup ",
+        llvm_ir::AddressSpace::Generic => "",
+        llvm_ir::AddressSpace::Private => "thread ",
+        llvm_ir::AddressSpace::Global => "device ",
+        llvm_ir::AddressSpace::Constant => "constant ",
+        llvm_ir::AddressSpace::Shared => "threadgroup ",
     }
 }
 
-fn metal_type(ty: &llir::Type) -> String {
+fn metal_type(ty: &llvm_ir::Type) -> String {
     match ty {
-        llir::Type::Void => "void".into(),
-        llir::Type::I1 => "bool".into(),
-        llir::Type::I32 => "int32_t".into(),
-        llir::Type::I64 => "int64_t".into(),
-        llir::Type::F16 => "half".into(),
-        llir::Type::F32 => "float".into(),
-        llir::Type::F64 => "double".into(),
-        llir::Type::Ptr {
+        llvm_ir::Type::Void => "void".into(),
+        llvm_ir::Type::I1 => "bool".into(),
+        llvm_ir::Type::I32 => "int32_t".into(),
+        llvm_ir::Type::I64 => "int64_t".into(),
+        llvm_ir::Type::F16 => "half".into(),
+        llvm_ir::Type::F32 => "float".into(),
+        llvm_ir::Type::F64 => "double".into(),
+        llvm_ir::Type::Ptr {
             addr_space,
             pointee,
         } => format!(
@@ -870,31 +440,22 @@ fn metal_type(ty: &llir::Type) -> String {
             metal_addr_qual(addr_space),
             metal_scalar_type(pointee)
         ),
-        llir::Type::Vector { len, elem } => format!("{}{}", metal_scalar_type(elem), len),
-        llir::Type::Array { len, elem } => format!("{}[{}]", metal_type(elem), len),
+        llvm_ir::Type::Vector { len, elem } => format!("{}{}", metal_scalar_type(elem), len),
+        llvm_ir::Type::Array { len, elem } => format!("{}[{}]", metal_type(elem), len),
     }
 }
 
-fn metal_scalar_type(ty: &llir::Type) -> String {
+fn metal_scalar_type(ty: &llvm_ir::Type) -> String {
     match ty {
-        llir::Type::Array { .. } => array_base_type(ty),
+        llvm_ir::Type::Array { .. } => array_base_type(ty),
         other => metal_type(other),
     }
 }
 
-fn array_base_type(ty: &llir::Type) -> String {
+fn array_base_type(ty: &llvm_ir::Type) -> String {
     let mut current = ty;
-    while let llir::Type::Array { elem, .. } = current {
+    while let llvm_ir::Type::Array { elem, .. } = current {
         current = elem;
     }
     metal_type(current)
-}
-
-fn const_usize(operand: &llir::Operand, what: &str) -> sile_core::Result<usize> {
-    match operand {
-        llir::Operand::Const(llir::Constant::Int(value)) if *value >= 0 => Ok(*value as usize),
-        _ => Err(sile_core::Error::Compile(format!(
-            "{what} must be a non-negative integer constant"
-        ))),
-    }
 }
