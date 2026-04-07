@@ -1,4 +1,4 @@
-pub mod codegen_llir_c;
+pub mod codegen;
 
 use std::{ffi::c_void, fs, process::Command};
 
@@ -6,7 +6,7 @@ use libloading::Library;
 use sile_llir::Function as LlirFunction;
 use tempfile::tempdir;
 
-use self::codegen_llir_c::generate_kernel as generate_llir_kernel;
+use self::codegen::generate as generate_llir_kernel;
 use sile_core::{KernelArg, LaunchConfig, Result, Stream};
 
 type KernelFn = unsafe extern "C" fn(*const *const c_void, i64, i64, *const i64, i64);

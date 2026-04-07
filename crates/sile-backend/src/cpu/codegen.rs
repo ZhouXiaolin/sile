@@ -1,29 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use crate::passes::emit::shared::{
-    self, StructuredCfgMessages, StructuredEmitter, array_dims, block_param_assignments,
-    build_value_names, format_operand as format_llir_operand, infer_tile_plan,
-    value_name as llir_value_name,
+use crate::emit::{
+    self, StructuredCfgMessages, StructuredEmitter, TextCodegen, array_dims,
+    block_param_assignments, build_value_names, format_operand as format_llir_operand,
+    infer_tile_plan, value_name as llir_value_name,
 };
 use sile_llir as llir;
 
 pub fn generate(func: &llir::Function) -> sile_core::Result<String> {
-    let mut ctx = CCodegen {
-        func,
-        value_names: build_value_names(func),
-        indent: 0,
-        out: String::new(),
-    };
-
-    ctx.emit_prelude();
-    ctx.emit_signature();
-    ctx.emit_body()?;
-
-    Ok(ctx.out)
-}
-
-pub fn generate_kernel(func: &llir::Function) -> sile_core::Result<String> {
-    let mut code = generate(func)?;
+    let mut code = emit::generate_text(CCodegen::new(func))?;
     let wrapper = generate_wrapper(func)?;
     code.push('\n');
     code.push_str(&wrapper);
@@ -38,6 +23,15 @@ struct CCodegen<'a> {
 }
 
 impl<'a> CCodegen<'a> {
+    fn new(func: &'a llir::Function) -> Self {
+        Self {
+            func,
+            value_names: build_value_names(func),
+            indent: 0,
+            out: String::new(),
+        }
+    }
+
     fn emit_prelude(&mut self) {
         self.out.push_str("#include <stdint.h>\n");
         self.out.push_str("#include <stdbool.h>\n");
@@ -198,24 +192,8 @@ impl<'a> CCodegen<'a> {
     }
 
     fn emit_value_decls(&mut self) {
-        let mut declared = HashSet::new();
-
-        for block in &self.func.blocks {
-            for param in &block.params {
-                if declared.insert(param.id) {
-                    self.emit_decl(param.id, &param.ty);
-                }
-            }
-            for inst in &block.insts {
-                if let Some(id) = inst.result {
-                    if declared.insert(id) {
-                        self.emit_decl(id, &inst.ty);
-                    }
-                }
-            }
-        }
-
-        if !declared.is_empty() {
+        let func = self.func;
+        if emit::emit_value_decls(func, |id, ty| self.emit_decl(id, ty)) {
             self.writeln("");
         }
     }
@@ -245,7 +223,7 @@ impl<'a> CCodegen<'a> {
     }
 
     fn emit_inst(&mut self, inst: &llir::Inst) {
-        if let Some(line) = shared::lower_common_inst_line(
+        if let Some(line) = emit::lower_common_inst_line(
             inst,
             |id| self.value_name(id),
             |op| self.format_operand(op),
@@ -328,7 +306,7 @@ impl<'a> CCodegen<'a> {
         start: llir::BlockId,
         stop_targets: &[llir::BlockId],
     ) -> sile_core::Result<Option<llir::BlockId>> {
-        shared::emit_structured_from(
+        emit::emit_structured_from(
             self,
             self.func,
             start,
@@ -361,6 +339,24 @@ impl<'a> CCodegen<'a> {
     fn writeln(&mut self, line: &str) {
         self.out
             .push_str(&format!("{}{}\n", "  ".repeat(self.indent), line));
+    }
+}
+
+impl TextCodegen for CCodegen<'_> {
+    fn emit_prelude(&mut self) {
+        CCodegen::emit_prelude(self);
+    }
+
+    fn emit_signature(&mut self) {
+        CCodegen::emit_signature(self);
+    }
+
+    fn emit_body(&mut self) -> sile_core::Result<()> {
+        CCodegen::emit_body(self)
+    }
+
+    fn finish(self) -> String {
+        self.out
     }
 }
 

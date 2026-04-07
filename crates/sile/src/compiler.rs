@@ -3,10 +3,7 @@ use sile_hir::{Kernel, typeck::TypedKernel};
 use sile_llir::Function as LlirFunction;
 use sile_mir::MirFunction;
 
-pub use sile_backend::{
-    BackendArtifact, BackendPassKind, CodegenTarget, compose_backend_pipeline, run_backend_pass,
-    run_backend_pipeline,
-};
+pub use sile_backend::{BackendArtifact, CodegenTarget, compile as compile_backend};
 
 pub use sile_hir::{
     ACTIVE_HIR_PIPELINE as ACTIVE_HIR_TYPECK_PIPELINE, HirPassKind as HirAnalysisPassKind,
@@ -51,12 +48,6 @@ pub enum MirToLirPassKind {
     LowerMirToLir,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LirToBackendPassKind {
-    Llir(LlirPassKind),
-    Backend(BackendPassKind),
-}
-
 pub fn compose_mir_to_lir_pipeline(mir_pipeline: &[MirPassKind]) -> Vec<MirToLirPassKind> {
     let mut pipeline = mir_pipeline
         .iter()
@@ -64,25 +55,6 @@ pub fn compose_mir_to_lir_pipeline(mir_pipeline: &[MirPassKind]) -> Vec<MirToLir
         .map(MirToLirPassKind::Mir)
         .collect::<Vec<_>>();
     pipeline.push(MirToLirPassKind::LowerMirToLir);
-    pipeline
-}
-
-pub fn compose_lir_to_backend_pipeline(
-    llir_pipeline: &[LlirPassKind],
-    codegen: Option<CodegenTarget>,
-) -> Vec<LirToBackendPassKind> {
-    let mut pipeline = llir_pipeline
-        .iter()
-        .copied()
-        .map(LirToBackendPassKind::Llir)
-        .collect::<Vec<_>>();
-    if let Some(target) = codegen {
-        pipeline.extend(
-            compose_backend_pipeline(target)
-                .into_iter()
-                .map(LirToBackendPassKind::Backend),
-        );
-    }
     pipeline
 }
 
@@ -171,32 +143,6 @@ pub fn run_hir_pipeline(
     Ok((typed, mir))
 }
 
-pub fn run_lir_to_backend_pipeline(
-    mut llir: LlirFunction,
-    pipeline: &[LirToBackendPassKind],
-) -> Result<(LlirFunction, Option<BackendArtifact>)> {
-    ensure_lir_to_backend_pipeline_contract(pipeline)?;
-
-    let mut artifact = None;
-
-    for pass in pipeline {
-        match pass {
-            LirToBackendPassKind::Llir(kind) => {
-                llir = run_llir_pipeline(llir, &[*kind]).map_err(Error::Shape)?;
-            }
-            LirToBackendPassKind::Backend(pass) => {
-                let (next_llir, maybe_artifact) = run_backend_pass(llir, *pass)?;
-                llir = next_llir;
-                if let Some(next) = maybe_artifact {
-                    artifact = Some(next);
-                }
-            }
-        }
-    }
-
-    Ok((llir, artifact))
-}
-
 fn verify_typed_kernel(typed: &TypedKernel, stage: &str) -> Result<()> {
     verify_hir_typed_kernel(typed).map_err(|err| Error::Compile(format!("{stage}: {err}")))
 }
@@ -235,52 +181,15 @@ fn ensure_mir_to_lir_pipeline_contract(pipeline: &[MirToLirPassKind]) -> Result<
     Ok(())
 }
 
-fn ensure_lir_to_backend_pipeline_contract(pipeline: &[LirToBackendPassKind]) -> Result<()> {
-    let has_llir_verify_input = pipeline
-        .iter()
-        .any(|pass| matches!(pass, LirToBackendPassKind::Llir(LlirPassKind::VerifyInput)));
-    let has_llir_verify_output = pipeline
-        .iter()
-        .any(|pass| matches!(pass, LirToBackendPassKind::Llir(LlirPassKind::VerifyOutput)));
-
-    if !has_llir_verify_input || !has_llir_verify_output {
-        return Err(Error::Compile(
-            "LIR->Backend pipeline must include LLIR VerifyInput and VerifyOutput passes".into(),
-        ));
-    }
-
-    let has_backend = pipeline
-        .iter()
-        .any(|pass| matches!(pass, LirToBackendPassKind::Backend(_)));
-    if has_backend {
-        let has_backend_verify_input = pipeline.iter().any(|pass| {
-            matches!(
-                pass,
-                LirToBackendPassKind::Backend(BackendPassKind::VerifyInput)
-            )
-        });
-        let has_backend_verify_output = pipeline.iter().any(|pass| {
-            matches!(
-                pass,
-                LirToBackendPassKind::Backend(BackendPassKind::VerifyOutput)
-            )
-        });
-        if !has_backend_verify_input || !has_backend_verify_output {
-            return Err(Error::Compile(
-                "LIR->Backend pipeline must include Backend VerifyInput and VerifyOutput passes when backend stage is enabled".into(),
-            ));
-        }
-    }
-
-    Ok(())
+fn finalize_llir_for_backend(llir: LlirFunction) -> Result<LlirFunction> {
+    run_llir_pipeline(llir, ACTIVE_LLIR_PIPELINE).map_err(Error::Shape)
 }
 
 pub fn compile_to_llir(typed: &TypedKernel) -> Result<(MirFunction, LlirFunction)> {
     let mir = run_hir_to_mir_pipeline(typed, ACTIVE_HIR_TO_MIR_PIPELINE)?;
     let mir_to_lir = compose_mir_to_lir_pipeline(ACTIVE_MIR_PIPELINE);
     let (mir, llir) = run_mir_to_lir_pipeline(typed, mir, &mir_to_lir)?;
-    let lir_to_backend = compose_lir_to_backend_pipeline(ACTIVE_LLIR_PIPELINE, None);
-    let (llir, _) = run_lir_to_backend_pipeline(llir, &lir_to_backend)?;
+    let llir = finalize_llir_for_backend(llir)?;
     Ok((mir, llir))
 }
 
@@ -290,8 +199,7 @@ pub fn compile_kernel_to_llir(
     let (typed, mir) = run_hir_pipeline(kernel, ACTIVE_HIR_PIPELINE)?;
     let mir_to_lir = compose_mir_to_lir_pipeline(ACTIVE_MIR_PIPELINE);
     let (mir, llir) = run_mir_to_lir_pipeline(&typed, mir, &mir_to_lir)?;
-    let lir_to_backend = compose_lir_to_backend_pipeline(ACTIVE_LLIR_PIPELINE, None);
-    let (llir, _) = run_lir_to_backend_pipeline(llir, &lir_to_backend)?;
+    let llir = finalize_llir_for_backend(llir)?;
     Ok((typed, mir, llir))
 }
 
@@ -302,11 +210,8 @@ pub fn compile_to_backend_source(
     let mir = run_hir_to_mir_pipeline(typed, ACTIVE_HIR_TO_MIR_PIPELINE)?;
     let mir_to_lir = compose_mir_to_lir_pipeline(ACTIVE_MIR_PIPELINE);
     let (mir, llir) = run_mir_to_lir_pipeline(typed, mir, &mir_to_lir)?;
-    let lir_to_backend = compose_lir_to_backend_pipeline(ACTIVE_LLIR_PIPELINE, Some(target));
-    let (llir, artifact) = run_lir_to_backend_pipeline(llir, &lir_to_backend)?;
-    let artifact = artifact.ok_or_else(|| {
-        Error::Compile("LIR->Backend pipeline did not produce backend artifact".into())
-    })?;
+    let llir = finalize_llir_for_backend(llir)?;
+    let artifact = compile_backend(&llir, target)?;
     Ok((mir, llir, artifact))
 }
 
@@ -317,10 +222,7 @@ pub fn compile_kernel_to_backend_source(
     let (typed, mir) = run_hir_pipeline(kernel, ACTIVE_HIR_PIPELINE)?;
     let mir_to_lir = compose_mir_to_lir_pipeline(ACTIVE_MIR_PIPELINE);
     let (mir, llir) = run_mir_to_lir_pipeline(&typed, mir, &mir_to_lir)?;
-    let lir_to_backend = compose_lir_to_backend_pipeline(ACTIVE_LLIR_PIPELINE, Some(target));
-    let (llir, artifact) = run_lir_to_backend_pipeline(llir, &lir_to_backend)?;
-    let artifact = artifact.ok_or_else(|| {
-        Error::Compile("LIR->Backend pipeline did not produce backend artifact".into())
-    })?;
+    let llir = finalize_llir_for_backend(llir)?;
+    let artifact = compile_backend(&llir, target)?;
     Ok((typed, mir, llir, artifact))
 }

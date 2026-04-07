@@ -1,11 +1,11 @@
-pub mod codegen_llir_metal;
+pub mod codegen;
 
 use metal::{CommandQueue, ComputePipelineState, Device, Library};
 use sile_core::{KernelArg, LaunchConfig, Result, Stream};
 use sile_hir::ParamKind;
 use sile_llir::Function as LlirFunction;
 
-use self::codegen_llir_metal::generate as generate_llir_metal;
+use self::codegen::generate as generate_llir_metal;
 
 pub struct MetalBackend {
     device: Device,

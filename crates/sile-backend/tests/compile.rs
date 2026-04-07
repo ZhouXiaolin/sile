@@ -1,4 +1,4 @@
-use sile_backend::{CodegenTarget, passes::verify};
+use sile_backend::{BackendArtifact, CodegenTarget, compile};
 use sile_llir::{
     BasicBlock, BlockId, Constant, Function, Inst, InstOp, Intrinsic, Operand, Terminator, Type,
     ValueId,
@@ -6,7 +6,7 @@ use sile_llir::{
 
 fn simple_function(insts: Vec<Inst>, terminator: Terminator) -> Function {
     Function {
-        name: "verify_test".into(),
+        name: "compile_test".into(),
         params: vec![],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -21,7 +21,7 @@ fn simple_function(insts: Vec<Inst>, terminator: Terminator) -> Function {
 }
 
 #[test]
-fn shared_verify_rejects_switch_terminator() {
+fn compile_rejects_switch_terminator() {
     let func = Function {
         name: "switch_test".into(),
         params: vec![],
@@ -49,7 +49,7 @@ fn shared_verify_rejects_switch_terminator() {
         metadata: vec![],
     };
 
-    let err = verify::run(&func, "test").expect_err("switch should be rejected");
+    let err = compile(&func, CodegenTarget::C).expect_err("switch should be rejected");
     assert!(
         err.to_string()
             .contains("does not support switch terminators")
@@ -57,7 +57,7 @@ fn shared_verify_rejects_switch_terminator() {
 }
 
 #[test]
-fn metal_verify_rejects_thread_id_intrinsic() {
+fn compile_rejects_metal_thread_id_intrinsic() {
     let func = simple_function(
         vec![Inst {
             result: Some(ValueId(0)),
@@ -72,8 +72,8 @@ fn metal_verify_rejects_thread_id_intrinsic() {
         Terminator::Ret { value: None },
     );
 
-    let err = verify::run_for_target(&func, CodegenTarget::Metal, "test")
-        .expect_err("thread_id should be rejected for metal");
+    let err =
+        compile(&func, CodegenTarget::Metal).expect_err("thread_id should be rejected for metal");
     assert!(
         err.to_string()
             .contains("does not support thread_id intrinsic")
@@ -81,7 +81,7 @@ fn metal_verify_rejects_thread_id_intrinsic() {
 }
 
 #[test]
-fn metal_verify_rejects_unknown_helper_call() {
+fn compile_rejects_metal_unknown_helper_call() {
     let func = simple_function(
         vec![Inst {
             result: None,
@@ -96,13 +96,13 @@ fn metal_verify_rejects_unknown_helper_call() {
         Terminator::Ret { value: None },
     );
 
-    let err = verify::run_for_target(&func, CodegenTarget::Metal, "test")
-        .expect_err("unknown helper should be rejected for metal");
+    let err =
+        compile(&func, CodegenTarget::Metal).expect_err("unknown helper should be rejected");
     assert!(err.to_string().contains("only supports helper calls"));
 }
 
 #[test]
-fn c_verify_allows_thread_id_intrinsic() {
+fn c_compile_allows_thread_id_intrinsic() {
     let func = simple_function(
         vec![Inst {
             result: Some(ValueId(0)),
@@ -117,6 +117,12 @@ fn c_verify_allows_thread_id_intrinsic() {
         Terminator::Ret { value: None },
     );
 
-    verify::run_for_target(&func, CodegenTarget::C, "test")
+    let artifact = compile(&func, CodegenTarget::C)
         .expect("C target should allow thread_id intrinsic");
+    match artifact {
+        BackendArtifact::CSource(source) => {
+            assert!(source.contains("#define llir_thread_id_0() (0)"));
+        }
+        other => panic!("expected C source, got {other:?}"),
+    }
 }
