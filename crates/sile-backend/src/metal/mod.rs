@@ -6,6 +6,7 @@ use sile_hir::ParamKind;
 use sile_llir::Function as LlirFunction;
 
 use self::codegen::generate as generate_llir_metal;
+use crate::emit::infer_tile_plan;
 
 pub struct MetalBackend {
     device: Device,
@@ -70,7 +71,30 @@ impl MetalBackend {
         _stream: &Stream,
     ) -> Result<()> {
         let source = generate_llir_metal(func)?;
-        self.execute_source(&func.name, &source, param_kinds, args, launch)
+        let launch = self.normalize_llir_launch(func, launch);
+        self.execute_source(&func.name, &source, param_kinds, args, &launch)
+    }
+
+    fn normalize_llir_launch(&self, func: &LlirFunction, launch: &LaunchConfig) -> LaunchConfig {
+        let Some(plan) = infer_tile_plan(func) else {
+            return *launch;
+        };
+        let output_rank = func
+            .params
+            .get(plan.output_param)
+            .and_then(|param| param.abi.as_ref().map(|abi| abi.rank))
+            .unwrap_or(1);
+        if output_rank <= 1 || launch.grid[1] <= 1 {
+            return *launch;
+        }
+
+        LaunchConfig {
+            grid: [
+                launch.grid[0].saturating_mul(launch.grid[1]),
+                1,
+                launch.grid[2],
+            ],
+        }
     }
 
     fn execute_source(

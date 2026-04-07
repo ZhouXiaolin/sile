@@ -104,6 +104,213 @@ impl<'a> CCodegen<'a> {
         self.out.push('\n');
 
         self.out.push_str(
+            "#define tile_fill_2d_f32(dst, value, rows, cols) do { \\\n\
+  float* _dst = (float*)(dst); \\\n\
+  float _value = (value); \\\n\
+  int64_t _rows = (rows); \\\n\
+  int64_t _cols = (cols); \\\n\
+  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
+    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
+      _dst[_r * _cols + _c] = _value; \\\n\
+    } \\\n\
+  } \\\n\
+} while (0)\n\n",
+        );
+
+        self.out.push_str(
+            "#define tile_mma_accumulate_2d_f32(dst, a, b, acc, rows, cols, depth) do { \\\n\
+  float* _dst = (float*)(dst); \\\n\
+  const float* _a = (const float*)(a); \\\n\
+  const float* _b = (const float*)(b); \\\n\
+  const float* _acc = (const float*)(acc); \\\n\
+  int64_t _rows = (rows); \\\n\
+  int64_t _cols = (cols); \\\n\
+  int64_t _depth = (depth); \\\n\
+  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
+    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
+      float _sum = _acc[_r * _cols + _c]; \\\n\
+      for (int64_t _k = 0; _k < _depth; ++_k) { \\\n\
+        _sum += _a[_r * _depth + _k] * _b[_k * _cols + _c]; \\\n\
+      } \\\n\
+      _dst[_r * _cols + _c] = _sum; \\\n\
+    } \\\n\
+  } \\\n\
+} while (0)\n\n",
+        );
+
+        self.out.push_str(
+            "#define tile_add_2d_f32(dst, lhs, rhs, rows, cols) do { \\\n\
+  float* _dst = (float*)(dst); \\\n\
+  const float* _lhs = (const float*)(lhs); \\\n\
+  const float* _rhs = (const float*)(rhs); \\\n\
+  int64_t _rows = (rows); \\\n\
+  int64_t _cols = (cols); \\\n\
+  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
+    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
+      _dst[_r * _cols + _c] = _lhs[_r * _cols + _c] + _rhs[_r * _cols + _c]; \\\n\
+    } \\\n\
+  } \\\n\
+} while (0)\n\n",
+        );
+
+        self.out.push_str(
+            "#define tile_sub_2d_f32(dst, lhs, rhs, rows, cols) do { \\\n\
+  float* _dst = (float*)(dst); \\\n\
+  const float* _lhs = (const float*)(lhs); \\\n\
+  const float* _rhs = (const float*)(rhs); \\\n\
+  int64_t _rows = (rows); \\\n\
+  int64_t _cols = (cols); \\\n\
+  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
+    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
+      _dst[_r * _cols + _c] = _lhs[_r * _cols + _c] - _rhs[_r * _cols + _c]; \\\n\
+    } \\\n\
+  } \\\n\
+} while (0)\n\n",
+        );
+
+        self.out.push_str(
+            "#define tile_mul_2d_f32(dst, lhs, rhs, rows, cols) do { \\\n\
+  float* _dst = (float*)(dst); \\\n\
+  const float* _lhs = (const float*)(lhs); \\\n\
+  const float* _rhs = (const float*)(rhs); \\\n\
+  int64_t _rows = (rows); \\\n\
+  int64_t _cols = (cols); \\\n\
+  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
+    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
+      _dst[_r * _cols + _c] = _lhs[_r * _cols + _c] * _rhs[_r * _cols + _c]; \\\n\
+    } \\\n\
+  } \\\n\
+} while (0)\n\n",
+        );
+
+        self.out.push_str(
+            "#define tile_div_2d_f32(dst, lhs, rhs, rows, cols) do { \\\n\
+  float* _dst = (float*)(dst); \\\n\
+  const float* _lhs = (const float*)(lhs); \\\n\
+  const float* _rhs = (const float*)(rhs); \\\n\
+  int64_t _rows = (rows); \\\n\
+  int64_t _cols = (cols); \\\n\
+  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
+    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
+      _dst[_r * _cols + _c] = _lhs[_r * _cols + _c] / _rhs[_r * _cols + _c]; \\\n\
+    } \\\n\
+  } \\\n\
+} while (0)\n\n",
+        );
+
+        self.out.push_str(
+            "#define tile_neg_2d_f32(dst, src, rows, cols) do { \\\n\
+  float* _dst = (float*)(dst); \\\n\
+  const float* _src = (const float*)(src); \\\n\
+  int64_t _rows = (rows); \\\n\
+  int64_t _cols = (cols); \\\n\
+  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
+    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
+      _dst[_r * _cols + _c] = -_src[_r * _cols + _c]; \\\n\
+    } \\\n\
+  } \\\n\
+} while (0)\n\n",
+        );
+
+        self.out.push_str(
+            "#define tile_exp_2d_f32(dst, src, rows, cols) do { \\\n\
+  float* _dst = (float*)(dst); \\\n\
+  const float* _src = (const float*)(src); \\\n\
+  int64_t _rows = (rows); \\\n\
+  int64_t _cols = (cols); \\\n\
+  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
+    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
+      _dst[_r * _cols + _c] = expf(_src[_r * _cols + _c]); \\\n\
+    } \\\n\
+  } \\\n\
+} while (0)\n\n",
+        );
+
+        self.out.push_str(
+            "#define tile_broadcast_2d_f32(dst, src, src_rows, src_cols, dst_rows, dst_cols) do { \\\n\
+  float* _dst = (float*)(dst); \\\n\
+  const float* _src = (const float*)(src); \\\n\
+  int64_t _src_rows = (src_rows); \\\n\
+  int64_t _src_cols = (src_cols); \\\n\
+  int64_t _dst_rows = (dst_rows); \\\n\
+  int64_t _dst_cols = (dst_cols); \\\n\
+  for (int64_t _r = 0; _r < _dst_rows; ++_r) { \\\n\
+    for (int64_t _c = 0; _c < _dst_cols; ++_c) { \\\n\
+      int64_t _src_r = (_src_rows == 1) ? 0 : _r; \\\n\
+      int64_t _src_c = (_src_cols == 1) ? 0 : _c; \\\n\
+      _dst[_r * _dst_cols + _c] = _src[_src_r * _src_cols + _src_c]; \\\n\
+    } \\\n\
+  } \\\n\
+} while (0)\n\n",
+        );
+
+        self.out.push_str(
+            "#define tile_reduce_sum_axis0_2d_f32(dst, src, rows, cols) do { \\\n\
+  float* _dst = (float*)(dst); \\\n\
+  const float* _src = (const float*)(src); \\\n\
+  int64_t _rows = (rows); \\\n\
+  int64_t _cols = (cols); \\\n\
+  for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
+    float _sum = 0.0f; \\\n\
+    for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
+      _sum += _src[_r * _cols + _c]; \\\n\
+    } \\\n\
+    _dst[_c] = _sum; \\\n\
+  } \\\n\
+} while (0)\n\n",
+        );
+
+        self.out.push_str(
+            "#define tile_reduce_sum_axis1_2d_f32(dst, src, rows, cols) do { \\\n\
+  float* _dst = (float*)(dst); \\\n\
+  const float* _src = (const float*)(src); \\\n\
+  int64_t _rows = (rows); \\\n\
+  int64_t _cols = (cols); \\\n\
+  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
+    float _sum = 0.0f; \\\n\
+    for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
+      _sum += _src[_r * _cols + _c]; \\\n\
+    } \\\n\
+    _dst[_r] = _sum; \\\n\
+  } \\\n\
+} while (0)\n\n",
+        );
+
+        self.out.push_str(
+            "#define tile_reduce_max_axis0_2d_f32(dst, src, rows, cols) do { \\\n\
+  float* _dst = (float*)(dst); \\\n\
+  const float* _src = (const float*)(src); \\\n\
+  int64_t _rows = (rows); \\\n\
+  int64_t _cols = (cols); \\\n\
+  for (int64_t _c = 0; _c < _cols; ++_c) { \\\n\
+    float _max = _src[_c]; \\\n\
+    for (int64_t _r = 1; _r < _rows; ++_r) { \\\n\
+      float _value = _src[_r * _cols + _c]; \\\n\
+      _max = (_value > _max) ? _value : _max; \\\n\
+    } \\\n\
+    _dst[_c] = _max; \\\n\
+  } \\\n\
+} while (0)\n\n",
+        );
+
+        self.out.push_str(
+            "#define tile_reduce_max_axis1_2d_f32(dst, src, rows, cols) do { \\\n\
+  float* _dst = (float*)(dst); \\\n\
+  const float* _src = (const float*)(src); \\\n\
+  int64_t _rows = (rows); \\\n\
+  int64_t _cols = (cols); \\\n\
+  for (int64_t _r = 0; _r < _rows; ++_r) { \\\n\
+    float _max = _src[_r * _cols]; \\\n\
+    for (int64_t _c = 1; _c < _cols; ++_c) { \\\n\
+      float _value = _src[_r * _cols + _c]; \\\n\
+      _max = (_value > _max) ? _value : _max; \\\n\
+    } \\\n\
+    _dst[_r] = _max; \\\n\
+  } \\\n\
+} while (0)\n\n",
+        );
+
+        self.out.push_str(
             "#define tile_load_2d_f32(dst, buf, row_tile, col_tile, rows, cols, stride_shape_idx) do { \\\n\
   float* _dst = (float*)(dst); \\\n\
   const float* _buf = (const float*)(buf); \\\n\

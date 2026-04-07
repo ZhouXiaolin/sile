@@ -49,6 +49,55 @@ fn verify_metal_contract(llir: &LlirFunction, stage: &str) -> Result<()> {
                     _ => {}
                 },
                 sile_llir::InstOp::Call { func, args } => match func.as_str() {
+                    "tile_add_2d_f32" | "tile_sub_2d_f32" | "tile_mul_2d_f32"
+                    | "tile_div_2d_f32" => {
+                        if args.len() != 5 {
+                            return Err(Error::Compile(format!(
+                                "{stage}: Metal backend expects helper `{func}` to have 5 arguments, got {} (block `{}`)",
+                                args.len(),
+                                block.name
+                            )));
+                        }
+                    }
+                    "tile_neg_2d_f32" | "tile_exp_2d_f32" | "tile_fill_2d_f32" => {
+                        if args.len() != 4 {
+                            return Err(Error::Compile(format!(
+                                "{stage}: Metal backend expects helper `{func}` to have 4 arguments, got {} (block `{}`)",
+                                args.len(),
+                                block.name
+                            )));
+                        }
+                    }
+                    "tile_broadcast_2d_f32" => {
+                        if args.len() != 6 {
+                            return Err(Error::Compile(format!(
+                                "{stage}: Metal backend expects helper `{func}` to have 6 arguments, got {} (block `{}`)",
+                                args.len(),
+                                block.name
+                            )));
+                        }
+                    }
+                    "tile_reduce_sum_axis0_2d_f32"
+                    | "tile_reduce_sum_axis1_2d_f32"
+                    | "tile_reduce_max_axis0_2d_f32"
+                    | "tile_reduce_max_axis1_2d_f32" => {
+                        if args.len() != 4 {
+                            return Err(Error::Compile(format!(
+                                "{stage}: Metal backend expects helper `{func}` to have 4 arguments, got {} (block `{}`)",
+                                args.len(),
+                                block.name
+                            )));
+                        }
+                    }
+                    "tile_mma_accumulate_2d_f32" => {
+                        if args.len() != 7 {
+                            return Err(Error::Compile(format!(
+                                "{stage}: Metal backend expects helper `{func}` to have 7 arguments, got {} (block `{}`)",
+                                args.len(),
+                                block.name
+                            )));
+                        }
+                    }
                     "tile_load_2d_f32" | "tile_store_2d_f32" => {
                         if args.len() != 7 {
                             return Err(Error::Compile(format!(
@@ -60,7 +109,7 @@ fn verify_metal_contract(llir: &LlirFunction, stage: &str) -> Result<()> {
                     }
                     _ => {
                         return Err(Error::Compile(format!(
-                            "{stage}: Metal backend only supports helper calls `tile_load_2d_f32` and `tile_store_2d_f32`, got `{func}` (block `{}`)",
+                            "{stage}: Metal backend only supports tile helper calls, got `{func}` (block `{}`)",
                             block.name
                         )));
                     }

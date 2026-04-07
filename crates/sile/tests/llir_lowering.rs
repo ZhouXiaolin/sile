@@ -5,7 +5,7 @@ use sile::{
 };
 
 #[test]
-fn dynamic_k_matmul_lowers_to_llir_with_cfg_and_private_tiles() {
+fn dynamic_k_matmul_lowers_to_helperized_llir_with_cfg_and_private_tiles() {
     let kernel = build_dynamic_k_matmul_kernel();
     let typed = typeck::check_kernel(&kernel).unwrap();
 
@@ -22,21 +22,19 @@ fn dynamic_k_matmul_lowers_to_llir_with_cfg_and_private_tiles() {
     assert!(printed.contains("condbr"));
     assert!(printed.contains("ptr<private, [2 x [2 x f32]]>"));
     assert!(printed.contains("shape.dim %a, 1"));
-    assert!(printed.contains("mul %v"));
-    assert!(printed.contains("add %v"));
-    assert!(printed.contains("gep %a, ["));
-    assert!(printed.contains("gep %b, ["));
-    assert!(printed.contains("gep %c, ["));
-    assert!(printed.contains("load %v"));
-    assert!(printed.contains("store %v"));
+    assert!(printed.contains("call @tile_fill_2d_f32("));
+    assert_eq!(printed.matches("call @tile_load_2d_f32(").count(), 2);
+    assert!(printed.contains("call @tile_mma_accumulate_2d_f32("));
+    assert_eq!(printed.matches("call @tile_store_2d_f32(").count(), 1);
     assert!(!printed.contains("intrinsic matmul_fragment"));
     assert!(!printed.contains("call @tile_splat_f32"));
-    assert!(!printed.contains("call @tile_load_2d_f32"));
-    assert!(!printed.contains("call @tile_store_2d_f32"));
+    assert!(!printed.contains("gep %a, ["));
+    assert!(!printed.contains("gep %b, ["));
+    assert!(!printed.contains("gep %c, ["));
 }
 
 #[test]
-fn vec_add_lowers_to_llir_without_tile_binary_helpers() {
+fn vec_add_lowers_to_helperized_llir() {
     let kernel = build_vec_add_kernel();
     let typed = typeck::check_kernel(&kernel).unwrap();
 
@@ -46,20 +44,18 @@ fn vec_add_lowers_to_llir_without_tile_binary_helpers() {
     let printed = llir::format_function(&llir_func);
 
     assert!(printed.contains("define void @vec_add("));
-    assert!(printed.contains("gep %a, ["));
-    assert!(printed.contains("gep %b, ["));
-    assert!(printed.contains("gep %c, ["));
-    assert!(printed.contains("load %v"));
-    assert!(printed.contains("add %v"));
-    assert!(printed.contains("store %v"));
-    assert!(!printed.contains("call @tile_add_f32"));
-    assert!(!printed.contains("call @tile_sub_f32"));
-    assert!(!printed.contains("call @tile_mul_f32"));
-    assert!(!printed.contains("call @tile_div_f32"));
+    assert_eq!(printed.matches("call @tile_load_2d_f32(").count(), 2);
+    assert_eq!(printed.matches("call @tile_add_2d_f32(").count(), 1);
+    assert_eq!(printed.matches("call @tile_store_2d_f32(").count(), 1);
+    assert!(!printed.contains("gep %a, ["));
+    assert!(!printed.contains("gep %b, ["));
+    assert!(!printed.contains("gep %c, ["));
+    assert!(!printed.contains("load %v"));
+    assert!(!printed.contains("store %v"));
 }
 
 #[test]
-fn softmax_lowers_to_llir_without_reduce_or_broadcast_helpers() {
+fn softmax_lowers_to_helperized_llir() {
     let kernel = build_softmax_kernel();
     let typed = typeck::check_kernel(&kernel).unwrap();
 
@@ -69,11 +65,19 @@ fn softmax_lowers_to_llir_without_reduce_or_broadcast_helpers() {
     let printed = llir::format_function(&llir_func);
 
     assert!(printed.contains("define void @softmax("));
-    assert!(printed.contains("intrinsic exp("));
-    assert!(printed.contains("select %v"));
+    assert_eq!(printed.matches("call @tile_load_2d_f32(").count(), 1);
+    assert_eq!(printed.matches("call @tile_reduce_max_axis1_2d_f32(").count(), 1);
+    assert_eq!(printed.matches("call @tile_broadcast_2d_f32(").count(), 2);
+    assert_eq!(printed.matches("call @tile_sub_2d_f32(").count(), 1);
+    assert_eq!(printed.matches("call @tile_exp_2d_f32(").count(), 1);
+    assert_eq!(printed.matches("call @tile_reduce_sum_axis1_2d_f32(").count(), 1);
+    assert_eq!(printed.matches("call @tile_div_2d_f32(").count(), 1);
+    assert_eq!(printed.matches("call @tile_store_2d_f32(").count(), 1);
     assert!(!printed.contains("intrinsic reduce_add"));
     assert!(!printed.contains("intrinsic reduce_max"));
-    assert!(!printed.contains("call @tile_broadcast_f32"));
+    assert!(!printed.contains("intrinsic exp("));
+    assert!(!printed.contains("tile_reduce_outer_header"));
+    assert!(!printed.contains("tile_expr_loop"));
     assert!(!printed.contains("call @tile_splat_f32"));
 }
 

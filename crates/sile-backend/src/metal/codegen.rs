@@ -169,6 +169,19 @@ impl<'a> MetalCodegen<'a> {
         args: &[llir::Operand],
     ) -> sile_core::Result<()> {
         match func {
+            "tile_add_2d_f32" => self.emit_tile_binary(args, "+"),
+            "tile_sub_2d_f32" => self.emit_tile_binary(args, "-"),
+            "tile_mul_2d_f32" => self.emit_tile_binary(args, "*"),
+            "tile_div_2d_f32" => self.emit_tile_binary(args, "/"),
+            "tile_neg_2d_f32" => self.emit_tile_neg(args),
+            "tile_exp_2d_f32" => self.emit_tile_exp(args),
+            "tile_broadcast_2d_f32" => self.emit_tile_broadcast(args),
+            "tile_fill_2d_f32" => self.emit_tile_fill(args),
+            "tile_reduce_sum_axis0_2d_f32" => self.emit_tile_reduce_sum_axis0(args),
+            "tile_reduce_sum_axis1_2d_f32" => self.emit_tile_reduce_sum_axis1(args),
+            "tile_reduce_max_axis0_2d_f32" => self.emit_tile_reduce_max_axis0(args),
+            "tile_reduce_max_axis1_2d_f32" => self.emit_tile_reduce_max_axis1(args),
+            "tile_mma_accumulate_2d_f32" => self.emit_tile_mma(args),
             "tile_load_2d_f32" => self.emit_tile_load(args),
             "tile_store_2d_f32" => self.emit_tile_store(args),
             other => Err(sile_core::Error::Compile(format!(
@@ -268,8 +281,9 @@ impl<'a> MetalCodegen<'a> {
 
         self.emit_nested_tile_loop("load", rows, cols, |ctx, r, c| {
             if rank <= 1 {
+                let tile = format!("(({col_tile}) != 0 ? ({col_tile}) : ({row_tile}))");
                 ctx.writeln(&format!(
-                    "{dst_name}[{r}][{c}] = {buf_name}[({col_tile} * {cols}) + {c}];"
+                    "{dst_name}[{r}][{c}] = {buf_name}[({tile} * {cols}) + {c}];"
                 ));
             } else {
                 let stride = ctx.shape_dim_expr(buf, stride_idx);
@@ -278,6 +292,276 @@ impl<'a> MetalCodegen<'a> {
                 ));
             }
         });
+        Ok(())
+    }
+
+    fn emit_tile_fill(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
+        let [dst, value, rows, cols] = args else {
+            return Err(sile_core::Error::Compile(
+                "tile_fill_2d_f32 expects four arguments".into(),
+            ));
+        };
+        let rows = const_usize(rows, "tile_fill rows")?;
+        let cols = const_usize(cols, "tile_fill cols")?;
+        let dst_name = self.format_operand(dst);
+        let value = self.format_operand(value);
+
+        self.emit_nested_tile_loop("fill", rows, cols, |ctx, r, c| {
+            ctx.writeln(&format!("{dst_name}[{r}][{c}] = {value};"));
+        });
+        Ok(())
+    }
+
+    fn emit_tile_binary(&mut self, args: &[llir::Operand], op: &str) -> sile_core::Result<()> {
+        let [dst, lhs, rhs, rows, cols] = args else {
+            return Err(sile_core::Error::Compile(format!(
+                "tile binary helper expects five arguments, got {}",
+                args.len()
+            )));
+        };
+        let rows = const_usize(rows, "tile binary rows")?;
+        let cols = const_usize(cols, "tile binary cols")?;
+        let dst_name = self.format_operand(dst);
+        let lhs_name = self.format_operand(lhs);
+        let rhs_name = self.format_operand(rhs);
+
+        self.emit_nested_tile_loop("binary", rows, cols, |ctx, r, c| {
+            ctx.writeln(&format!(
+                "{dst_name}[{r}][{c}] = {lhs_name}[{r}][{c}] {op} {rhs_name}[{r}][{c}];"
+            ));
+        });
+        Ok(())
+    }
+
+    fn emit_tile_neg(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
+        let [dst, src, rows, cols] = args else {
+            return Err(sile_core::Error::Compile(
+                "tile_neg_2d_f32 expects four arguments".into(),
+            ));
+        };
+        let rows = const_usize(rows, "tile_neg rows")?;
+        let cols = const_usize(cols, "tile_neg cols")?;
+        let dst_name = self.format_operand(dst);
+        let src_name = self.format_operand(src);
+
+        self.emit_nested_tile_loop("neg", rows, cols, |ctx, r, c| {
+            ctx.writeln(&format!("{dst_name}[{r}][{c}] = -{src_name}[{r}][{c}];"));
+        });
+        Ok(())
+    }
+
+    fn emit_tile_exp(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
+        let [dst, src, rows, cols] = args else {
+            return Err(sile_core::Error::Compile(
+                "tile_exp_2d_f32 expects four arguments".into(),
+            ));
+        };
+        let rows = const_usize(rows, "tile_exp rows")?;
+        let cols = const_usize(cols, "tile_exp cols")?;
+        let dst_name = self.format_operand(dst);
+        let src_name = self.format_operand(src);
+
+        self.emit_nested_tile_loop("exp", rows, cols, |ctx, r, c| {
+            ctx.writeln(&format!(
+                "{dst_name}[{r}][{c}] = metal::exp({src_name}[{r}][{c}]);"
+            ));
+        });
+        Ok(())
+    }
+
+    fn emit_tile_broadcast(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
+        let [dst, src, src_rows, src_cols, dst_rows, dst_cols] = args else {
+            return Err(sile_core::Error::Compile(
+                "tile_broadcast_2d_f32 expects six arguments".into(),
+            ));
+        };
+        let src_rows = const_usize(src_rows, "tile_broadcast src_rows")?;
+        let src_cols = const_usize(src_cols, "tile_broadcast src_cols")?;
+        let dst_rows = const_usize(dst_rows, "tile_broadcast dst_rows")?;
+        let dst_cols = const_usize(dst_cols, "tile_broadcast dst_cols")?;
+        let dst_name = self.format_operand(dst);
+        let src_name = self.format_operand(src);
+
+        self.emit_nested_tile_loop("broadcast", dst_rows, dst_cols, |ctx, r, c| {
+            let src_r = if src_rows == 1 { "0" } else { r };
+            let src_c = if src_cols == 1 { "0" } else { c };
+            ctx.writeln(&format!(
+                "{dst_name}[{r}][{c}] = {src_name}[{src_r}][{src_c}];"
+            ));
+        });
+        Ok(())
+    }
+
+    fn emit_tile_mma(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
+        let [dst, a, b, acc, rows, cols, depth] = args else {
+            return Err(sile_core::Error::Compile(
+                "tile_mma_accumulate_2d_f32 expects seven arguments".into(),
+            ));
+        };
+        let rows = const_usize(rows, "tile_mma rows")?;
+        let cols = const_usize(cols, "tile_mma cols")?;
+        let depth = const_usize(depth, "tile_mma depth")?;
+        let dst_name = self.format_operand(dst);
+        let a_name = self.format_operand(a);
+        let b_name = self.format_operand(b);
+        let acc_name = self.format_operand(acc);
+
+        self.emit_nested_tile_loop("mma", rows, cols, |ctx, r, c| {
+            let sum_var = format!("mma_sum_{}_{}", r, c);
+            ctx.writeln(&format!("float {sum_var} = {acc_name}[{r}][{c}];"));
+            ctx.writeln(&format!(
+                "for (int mma_k = 0; mma_k < {depth}; ++mma_k) {{"
+            ));
+            ctx.indent += 1;
+            ctx.writeln(&format!(
+                "{sum_var} += {a_name}[{r}][mma_k] * {b_name}[mma_k][{c}];"
+            ));
+            ctx.indent -= 1;
+            ctx.writeln("}");
+            ctx.writeln(&format!("{dst_name}[{r}][{c}] = {sum_var};"));
+        });
+        Ok(())
+    }
+
+    fn emit_tile_reduce_sum_axis0(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
+        let [dst, src, rows, cols] = args else {
+            return Err(sile_core::Error::Compile(
+                "tile_reduce_sum_axis0_2d_f32 expects four arguments".into(),
+            ));
+        };
+        let rows = const_usize(rows, "tile_reduce_sum_axis0 rows")?;
+        let cols = const_usize(cols, "tile_reduce_sum_axis0 cols")?;
+        let dst_name = self.format_operand(dst);
+        let src_name = self.format_operand(src);
+
+        self.writeln(&format!(
+            "for (int reduce_axis0_c = 0; reduce_axis0_c < {cols}; ++reduce_axis0_c) {{"
+        ));
+        self.indent += 1;
+        self.writeln("float reduce_axis0_sum = 0.0f;");
+        self.writeln(&format!(
+            "for (int reduce_axis0_r = 0; reduce_axis0_r < {rows}; ++reduce_axis0_r) {{"
+        ));
+        self.indent += 1;
+        self.writeln(&format!(
+            "reduce_axis0_sum += {src_name}[reduce_axis0_r][reduce_axis0_c];"
+        ));
+        self.indent -= 1;
+        self.writeln("}");
+        self.writeln(&format!(
+            "{dst_name}[0][reduce_axis0_c] = reduce_axis0_sum;"
+        ));
+        self.indent -= 1;
+        self.writeln("}");
+        Ok(())
+    }
+
+    fn emit_tile_reduce_sum_axis1(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
+        let [dst, src, rows, cols] = args else {
+            return Err(sile_core::Error::Compile(
+                "tile_reduce_sum_axis1_2d_f32 expects four arguments".into(),
+            ));
+        };
+        let rows = const_usize(rows, "tile_reduce_sum_axis1 rows")?;
+        let cols = const_usize(cols, "tile_reduce_sum_axis1 cols")?;
+        let dst_name = self.format_operand(dst);
+        let src_name = self.format_operand(src);
+
+        self.writeln(&format!(
+            "for (int reduce_axis1_r = 0; reduce_axis1_r < {rows}; ++reduce_axis1_r) {{"
+        ));
+        self.indent += 1;
+        self.writeln("float reduce_axis1_sum = 0.0f;");
+        self.writeln(&format!(
+            "for (int reduce_axis1_c = 0; reduce_axis1_c < {cols}; ++reduce_axis1_c) {{"
+        ));
+        self.indent += 1;
+        self.writeln(&format!(
+            "reduce_axis1_sum += {src_name}[reduce_axis1_r][reduce_axis1_c];"
+        ));
+        self.indent -= 1;
+        self.writeln("}");
+        self.writeln(&format!(
+            "{dst_name}[reduce_axis1_r][0] = reduce_axis1_sum;"
+        ));
+        self.indent -= 1;
+        self.writeln("}");
+        Ok(())
+    }
+
+    fn emit_tile_reduce_max_axis0(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
+        let [dst, src, rows, cols] = args else {
+            return Err(sile_core::Error::Compile(
+                "tile_reduce_max_axis0_2d_f32 expects four arguments".into(),
+            ));
+        };
+        let rows = const_usize(rows, "tile_reduce_max_axis0 rows")?;
+        let cols = const_usize(cols, "tile_reduce_max_axis0 cols")?;
+        let dst_name = self.format_operand(dst);
+        let src_name = self.format_operand(src);
+
+        self.writeln(&format!(
+            "for (int reduce_axis0_c = 0; reduce_axis0_c < {cols}; ++reduce_axis0_c) {{"
+        ));
+        self.indent += 1;
+        self.writeln(&format!(
+            "float reduce_axis0_max = {src_name}[0][reduce_axis0_c];"
+        ));
+        self.writeln(&format!(
+            "for (int reduce_axis0_r = 1; reduce_axis0_r < {rows}; ++reduce_axis0_r) {{"
+        ));
+        self.indent += 1;
+        self.writeln(&format!(
+            "float reduce_axis0_value = {src_name}[reduce_axis0_r][reduce_axis0_c];"
+        ));
+        self.writeln(
+            "reduce_axis0_max = (reduce_axis0_value > reduce_axis0_max) ? reduce_axis0_value : reduce_axis0_max;",
+        );
+        self.indent -= 1;
+        self.writeln("}");
+        self.writeln(&format!(
+            "{dst_name}[0][reduce_axis0_c] = reduce_axis0_max;"
+        ));
+        self.indent -= 1;
+        self.writeln("}");
+        Ok(())
+    }
+
+    fn emit_tile_reduce_max_axis1(&mut self, args: &[llir::Operand]) -> sile_core::Result<()> {
+        let [dst, src, rows, cols] = args else {
+            return Err(sile_core::Error::Compile(
+                "tile_reduce_max_axis1_2d_f32 expects four arguments".into(),
+            ));
+        };
+        let rows = const_usize(rows, "tile_reduce_max_axis1 rows")?;
+        let cols = const_usize(cols, "tile_reduce_max_axis1 cols")?;
+        let dst_name = self.format_operand(dst);
+        let src_name = self.format_operand(src);
+
+        self.writeln(&format!(
+            "for (int reduce_axis1_r = 0; reduce_axis1_r < {rows}; ++reduce_axis1_r) {{"
+        ));
+        self.indent += 1;
+        self.writeln(&format!(
+            "float reduce_axis1_max = {src_name}[reduce_axis1_r][0];"
+        ));
+        self.writeln(&format!(
+            "for (int reduce_axis1_c = 1; reduce_axis1_c < {cols}; ++reduce_axis1_c) {{"
+        ));
+        self.indent += 1;
+        self.writeln(&format!(
+            "float reduce_axis1_value = {src_name}[reduce_axis1_r][reduce_axis1_c];"
+        ));
+        self.writeln(
+            "reduce_axis1_max = (reduce_axis1_value > reduce_axis1_max) ? reduce_axis1_value : reduce_axis1_max;",
+        );
+        self.indent -= 1;
+        self.writeln("}");
+        self.writeln(&format!(
+            "{dst_name}[reduce_axis1_r][0] = reduce_axis1_max;"
+        ));
+        self.indent -= 1;
+        self.writeln("}");
         Ok(())
     }
 
@@ -298,8 +582,9 @@ impl<'a> MetalCodegen<'a> {
 
         self.emit_nested_tile_loop("store", rows, cols, |ctx, r, c| {
             if rank <= 1 {
+                let tile = format!("(({col_tile}) != 0 ? ({col_tile}) : ({row_tile}))");
                 ctx.writeln(&format!(
-                    "{buf_name}[({col_tile} * {cols}) + {c}] = {value_name}[{r}][{c}];"
+                    "{buf_name}[({tile} * {cols}) + {c}] = {value_name}[{r}][{c}];"
                 ));
             } else {
                 let stride = ctx.shape_dim_expr(buf, stride_idx);
