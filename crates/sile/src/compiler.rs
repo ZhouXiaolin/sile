@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use sile_core::{Error, Result};
 use sile_hir::{Kernel, typeck::TypedKernel};
 use sile_llir::Function as LlirFunction;
@@ -8,6 +6,13 @@ use sile_mir::MirFunction;
 pub use sile_backend::{
     BackendArtifact, BackendPassKind, CodegenTarget, compose_backend_pipeline, run_backend_pass,
     run_backend_pipeline,
+};
+
+pub use sile_hir::{
+    ACTIVE_HIR_PIPELINE as ACTIVE_HIR_TYPECK_PIPELINE, HirPassKind as HirAnalysisPassKind,
+    RECOMMENDED_HIR_PIPELINE as RECOMMENDED_HIR_TYPECK_PIPELINE,
+    run_hir_passes as run_hir_analysis_passes, run_hir_pipeline as run_hir_analysis_pipeline,
+    verify_typed_kernel as verify_hir_typed_kernel,
 };
 
 pub use sile_llir::{
@@ -97,7 +102,7 @@ pub fn run_hir_to_mir_pipeline(
     }
 
     let mir = mir.ok_or_else(|| Error::Compile("HIR->MIR pipeline did not produce MIR".into()))?;
-    verify_mir_function(&mir, "HIR->MIR output")?;
+    verify_mir_via_pipeline(&mir, "HIR->MIR output")?;
     Ok(mir)
 }
 
@@ -107,7 +112,7 @@ pub fn run_mir_to_lir_pipeline(
     pipeline: &[MirToLirPassKind],
 ) -> Result<(MirFunction, LlirFunction)> {
     verify_typed_kernel(typed, "MIR->LIR typed input")?;
-    verify_mir_function(&mir, "MIR->LIR input")?;
+    ensure_mir_to_lir_pipeline_contract(pipeline)?;
 
     let mut llir = None;
 
@@ -125,8 +130,6 @@ pub fn run_mir_to_lir_pipeline(
 
     let llir =
         llir.ok_or_else(|| Error::Compile("MIR->LIR pipeline did not produce LIR".into()))?;
-    verify_mir_function(&mir, "MIR->LIR MIR output")?;
-    verify_llir_function(&llir, "MIR->LIR LIR output")?;
     Ok((mir, llir))
 }
 
@@ -134,8 +137,6 @@ pub fn run_hir_pipeline(
     kernel: &'static Kernel,
     pipeline: &[HirPassKind],
 ) -> Result<(TypedKernel, MirFunction)> {
-    verify_hir_kernel(kernel, "HIR input")?;
-
     let mut typed = None;
     let mut mir = None;
 
@@ -143,15 +144,16 @@ pub fn run_hir_pipeline(
         match pass {
             HirPassKind::TypeCheck => {
                 typed = Some(
-                    sile_hir::typeck::check_kernel(kernel)
-                        .map_err(|e| Error::Shape(e.to_string()))?,
+                    run_hir_analysis_pipeline(
+                        kernel,
+                        &[
+                            HirAnalysisPassKind::VerifyInput,
+                            HirAnalysisPassKind::TypeCheck,
+                            HirAnalysisPassKind::VerifyOutput,
+                        ],
+                    )
+                    .map_err(|e| Error::Shape(e.to_string()))?,
                 );
-                verify_typed_kernel(
-                    typed
-                        .as_ref()
-                        .expect("typed kernel must exist right after typecheck"),
-                    "HIR typecheck output",
-                )?;
             }
             HirPassKind::LowerToMir => {
                 let typed_ref = typed.as_ref().ok_or_else(|| {
@@ -165,8 +167,7 @@ pub fn run_hir_pipeline(
     let typed =
         typed.ok_or_else(|| Error::Compile("HIR pipeline did not produce TypedKernel".into()))?;
     let mir = mir.ok_or_else(|| Error::Compile("HIR pipeline did not produce MIR".into()))?;
-    verify_typed_kernel(&typed, "HIR output typed kernel")?;
-    verify_mir_function(&mir, "HIR output MIR")?;
+    verify_mir_via_pipeline(&mir, "HIR output MIR")?;
     Ok((typed, mir))
 }
 
@@ -174,7 +175,7 @@ pub fn run_lir_to_backend_pipeline(
     mut llir: LlirFunction,
     pipeline: &[LirToBackendPassKind],
 ) -> Result<(LlirFunction, Option<BackendArtifact>)> {
-    verify_llir_function(&llir, "LIR->Backend input")?;
+    ensure_lir_to_backend_pipeline_contract(pipeline)?;
 
     let mut artifact = None;
 
@@ -193,69 +194,85 @@ pub fn run_lir_to_backend_pipeline(
         }
     }
 
-    verify_llir_function(&llir, "LIR->Backend output")?;
     Ok((llir, artifact))
 }
 
-fn verify_hir_kernel(kernel: &Kernel, stage: &str) -> Result<()> {
-    if kernel.name.trim().is_empty() {
-        return Err(Error::Compile(format!(
-            "{stage}: kernel name must not be empty"
-        )));
-    }
-
-    let mut seen_params = HashSet::new();
-    for param in &kernel.params {
-        if param.name.trim().is_empty() {
-            return Err(Error::Compile(format!(
-                "{stage}: kernel param name must not be empty"
-            )));
-        }
-        if !seen_params.insert(param.name.as_str()) {
-            return Err(Error::Compile(format!(
-                "{stage}: duplicate kernel param name `{}`",
-                param.name
-            )));
-        }
-    }
-
-    let mut seen_consts = HashSet::new();
-    for (name, _) in &kernel.const_params {
-        if name.trim().is_empty() {
-            return Err(Error::Compile(format!(
-                "{stage}: const param name must not be empty"
-            )));
-        }
-        if !seen_consts.insert(name.as_str()) {
-            return Err(Error::Compile(format!(
-                "{stage}: duplicate const param name `{name}`"
-            )));
-        }
-    }
-
-    Ok(())
-}
-
 fn verify_typed_kernel(typed: &TypedKernel, stage: &str) -> Result<()> {
-    verify_hir_kernel(&typed.kernel, stage)?;
-    for local in typed.locals.keys() {
-        if local.trim().is_empty() {
-            return Err(Error::Compile(format!(
-                "{stage}: typed local name must not be empty"
-            )));
-        }
-    }
-    Ok(())
+    verify_hir_typed_kernel(typed).map_err(|err| Error::Compile(format!("{stage}: {err}")))
 }
 
 fn verify_mir_function(mir: &MirFunction, stage: &str) -> Result<()> {
-    sile_mir::passes::verify::verify_function(mir)
+    run_mir_pipeline(mir.clone(), &[MirPassKind::VerifyInput])
+        .map(|_| ())
         .map_err(|err| Error::Compile(format!("{stage}: {err}")))
 }
 
-fn verify_llir_function(llir: &LlirFunction, stage: &str) -> Result<()> {
-    sile_llir::passes::verify::verify_function(llir)
-        .map_err(|err| Error::Compile(format!("{stage}: {err}")))
+fn verify_mir_via_pipeline(mir: &MirFunction, stage: &str) -> Result<()> {
+    verify_mir_function(mir, stage)
+}
+
+fn ensure_mir_to_lir_pipeline_contract(pipeline: &[MirToLirPassKind]) -> Result<()> {
+    let has_verify_input = pipeline
+        .iter()
+        .any(|pass| matches!(pass, MirToLirPassKind::Mir(MirPassKind::VerifyInput)));
+    let has_verify_output = pipeline
+        .iter()
+        .any(|pass| matches!(pass, MirToLirPassKind::Mir(MirPassKind::VerifyOutput)));
+    let has_lower = pipeline
+        .iter()
+        .any(|pass| matches!(pass, MirToLirPassKind::LowerMirToLir));
+
+    if !has_lower {
+        return Err(Error::Compile(
+            "MIR->LIR pipeline must include LowerMirToLir".into(),
+        ));
+    }
+    if !has_verify_input || !has_verify_output {
+        return Err(Error::Compile(
+            "MIR->LIR pipeline must include MIR VerifyInput and VerifyOutput passes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_lir_to_backend_pipeline_contract(pipeline: &[LirToBackendPassKind]) -> Result<()> {
+    let has_llir_verify_input = pipeline
+        .iter()
+        .any(|pass| matches!(pass, LirToBackendPassKind::Llir(LlirPassKind::VerifyInput)));
+    let has_llir_verify_output = pipeline
+        .iter()
+        .any(|pass| matches!(pass, LirToBackendPassKind::Llir(LlirPassKind::VerifyOutput)));
+
+    if !has_llir_verify_input || !has_llir_verify_output {
+        return Err(Error::Compile(
+            "LIR->Backend pipeline must include LLIR VerifyInput and VerifyOutput passes".into(),
+        ));
+    }
+
+    let has_backend = pipeline
+        .iter()
+        .any(|pass| matches!(pass, LirToBackendPassKind::Backend(_)));
+    if has_backend {
+        let has_backend_verify_input = pipeline.iter().any(|pass| {
+            matches!(
+                pass,
+                LirToBackendPassKind::Backend(BackendPassKind::VerifyInput)
+            )
+        });
+        let has_backend_verify_output = pipeline.iter().any(|pass| {
+            matches!(
+                pass,
+                LirToBackendPassKind::Backend(BackendPassKind::VerifyOutput)
+            )
+        });
+        if !has_backend_verify_input || !has_backend_verify_output {
+            return Err(Error::Compile(
+                "LIR->Backend pipeline must include Backend VerifyInput and VerifyOutput passes when backend stage is enabled".into(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn compile_to_llir(typed: &TypedKernel) -> Result<(MirFunction, LlirFunction)> {

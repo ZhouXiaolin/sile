@@ -21,6 +21,18 @@ impl TypeError {
             message: format!("unsupported builtin: {}", name.into()),
         }
     }
+
+    pub fn invalid_kernel(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub fn invalid_pipeline(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
 }
 
 impl fmt::Display for TypeError {
