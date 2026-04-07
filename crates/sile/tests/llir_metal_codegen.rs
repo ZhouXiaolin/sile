@@ -6,7 +6,7 @@ use sile::{
 };
 
 #[test]
-fn dynamic_k_matmul_llir_codegen_emits_structured_metal() {
+fn dynamic_k_matmul_llir_codegen_emits_structured_metal_from_helpers() {
     let kernel = build_dynamic_k_matmul_kernel();
     let typed = typeck::check_kernel(&kernel).unwrap();
 
@@ -24,13 +24,11 @@ fn dynamic_k_matmul_llir_codegen_emits_structured_metal() {
     assert!(metal.contains("gid.x %"));
     assert!(metal.contains("float v15_storage[2][2];"));
     assert!(metal.contains("shapes[1]"));
-    assert!(metal.contains("= &(a["));
-    assert!(metal.contains("= &(b["));
-    assert!(metal.contains("= &(c["));
-    assert!(metal.contains("= *("));
-    assert!(metal.contains("*("));
-    assert!(metal.contains(" * "));
-    assert!(metal.contains(" + "));
+    assert!(metal.contains("for (int fill_r = 0;"));
+    assert!(metal.contains("for (int load_r = 0;"));
+    assert!(metal.contains("for (int mma_k = 0;"));
+    assert!(metal.contains("float mma_sum_"));
+    assert!(metal.contains("for (int store_r = 0;"));
     assert!(!metal.contains("matmul_fragment"));
     assert!(!metal.contains("tile_splat_f32("));
     assert!(!metal.contains("tile_load_2d_f32("));
@@ -38,7 +36,7 @@ fn dynamic_k_matmul_llir_codegen_emits_structured_metal() {
 }
 
 #[test]
-fn vec_add_llir_codegen_inlines_tile_elementwise_ops() {
+fn vec_add_llir_codegen_lowers_helpers_into_metal_loops() {
     let kernel = build_vec_add_kernel();
     let typed = typeck::check_kernel(&kernel).unwrap();
 
@@ -48,19 +46,18 @@ fn vec_add_llir_codegen_inlines_tile_elementwise_ops() {
     let metal = llir_metal::generate(&llir_func).unwrap();
 
     assert!(metal.contains("kernel void sile_kernel_vec_add("));
-    assert!(metal.contains("= &(a["));
-    assert!(metal.contains("= &(b["));
-    assert!(metal.contains("= &(c["));
-    assert!(metal.contains("= *("));
-    assert!(metal.contains("+"));
-    assert!(!metal.contains("tile_add_f32("));
-    assert!(!metal.contains("tile_sub_f32("));
-    assert!(!metal.contains("tile_mul_f32("));
-    assert!(!metal.contains("tile_div_f32("));
+    assert!(metal.contains("for (int load_r = 0;"));
+    assert!(metal.contains("for (int binary_r = 0;"));
+    assert!(metal.contains("for (int store_r = 0;"));
+    assert!(metal.contains(" + "));
+    assert!(!metal.contains("tile_add_2d_f32("));
+    assert!(!metal.contains("tile_sub_2d_f32("));
+    assert!(!metal.contains("tile_mul_2d_f32("));
+    assert!(!metal.contains("tile_div_2d_f32("));
 }
 
 #[test]
-fn softmax_llir_codegen_inlines_reduce_and_broadcast_ops() {
+fn softmax_llir_codegen_lowers_reduce_and_broadcast_helpers_into_metal_loops() {
     let kernel = build_softmax_kernel();
     let typed = typeck::check_kernel(&kernel).unwrap();
 
@@ -71,10 +68,14 @@ fn softmax_llir_codegen_inlines_reduce_and_broadcast_ops() {
 
     assert!(metal.contains("kernel void sile_kernel_softmax("));
     assert!(metal.contains("metal::exp("));
-    assert!(metal.contains("? ("));
+    assert!(metal.contains("for (int reduce_axis1_r = 0;"));
+    assert!(metal.contains("for (int broadcast_r = 0;"));
+    assert!(metal.contains("reduce_axis1_max = ("));
     assert!(!metal.contains("llir_reduce_add("));
     assert!(!metal.contains("llir_reduce_max("));
-    assert!(!metal.contains("tile_broadcast_f32("));
+    assert!(!metal.contains("tile_broadcast_2d_f32("));
+    assert!(!metal.contains("tile_reduce_sum_axis1_2d_f32("));
+    assert!(!metal.contains("tile_reduce_max_axis1_2d_f32("));
     assert!(!metal.contains("tile_splat_f32("));
 }
 

@@ -3,11 +3,12 @@ use std::collections::HashMap;
 use sile_llir as llir;
 
 use crate::passes::lowering::core::{
-    BlockLowerer, LowerLlirCtx, alloc_tile_result, buffer_rank_of, const_f32, const_i64, emit_bin,
-    emit_gep, emit_intrinsic, emit_load, emit_shape_dim, emit_store, load_tile_scalar_dynamic,
-    lower_1d_tile_coord, lower_bin_op, lower_nested_tile_loop, resolve_operand, tile_dims_of,
+    BlockLowerer, LowerLlirCtx, alloc_tile_result, buffer_rank_of, const_f32, const_i64,
+    emit_bin, emit_call_void, emit_gep, emit_intrinsic, emit_load, emit_shape_dim, emit_store,
+    load_tile_scalar_dynamic, lower_1d_tile_coord, lower_bin_op, lower_nested_tile_loop,
+    resolve_operand, tile_dims_of,
 };
-use crate::{MirFunction, MirOp, UnaryOp, ValueId};
+use crate::{BinOp, MirFunction, MirOp, UnaryOp, ValueId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum CoordOperandKey {
@@ -23,6 +24,10 @@ pub(crate) fn lower_tile_expr_inst(
     builder: &mut BlockLowerer<'_>,
 ) {
     let dst_tile = alloc_tile_result(builder, result, rows, cols);
+    if try_lower_tile_expr_helper(&root_op, rows, cols, dst_tile.clone(), builder) {
+        return;
+    }
+
     let pending_tiles = HashMap::from([(result, root_op)]);
     let fused_load_bases = builder.with_current_insts(|ctx, mir, out| {
         let mut bases = HashMap::new();
@@ -65,6 +70,80 @@ pub(crate) fn lower_tile_expr_inst(
             emit_store(out, dst_ptr, scalar);
         },
     );
+}
+
+fn try_lower_tile_expr_helper(
+    root_op: &MirOp,
+    rows: i64,
+    cols: i64,
+    dst_tile: llir::Operand,
+    builder: &mut BlockLowerer<'_>,
+) -> bool {
+    match root_op {
+        MirOp::TileBinary { op, lhs, rhs, .. } => {
+            let lhs = resolve_operand(*lhs, builder.ctx());
+            let rhs = resolve_operand(*rhs, builder.ctx());
+            let helper = tile_binary_helper_name(*op);
+            builder.with_current_insts(|_, _, out| {
+                emit_call_void(
+                    out,
+                    helper,
+                    vec![dst_tile, lhs, rhs, const_i64(rows), const_i64(cols)],
+                );
+            });
+            true
+        }
+        MirOp::TileUnary { op, operand, .. } => {
+            let operand = resolve_operand(*operand, builder.ctx());
+            let helper = tile_unary_helper_name(*op);
+            builder.with_current_insts(|_, _, out| {
+                emit_call_void(
+                    out,
+                    helper,
+                    vec![dst_tile, operand, const_i64(rows), const_i64(cols)],
+                );
+            });
+            true
+        }
+        MirOp::TileBroadcast { value, rows: dst_rows, cols: dst_cols } => {
+            let Some((src_rows, src_cols)) = tile_dims_of(*value, builder.mir()) else {
+                return false;
+            };
+            let src = resolve_operand(*value, builder.ctx());
+            builder.with_current_insts(|_, _, out| {
+                emit_call_void(
+                    out,
+                    "tile_broadcast_2d_f32",
+                    vec![
+                        dst_tile,
+                        src,
+                        const_i64(src_rows),
+                        const_i64(src_cols),
+                        const_i64(*dst_rows),
+                        const_i64(*dst_cols),
+                    ],
+                );
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+fn tile_binary_helper_name(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "tile_add_2d_f32",
+        BinOp::Sub => "tile_sub_2d_f32",
+        BinOp::Mul => "tile_mul_2d_f32",
+        BinOp::Div => "tile_div_2d_f32",
+    }
+}
+
+fn tile_unary_helper_name(op: UnaryOp) -> &'static str {
+    match op {
+        UnaryOp::Neg => "tile_neg_2d_f32",
+        UnaryOp::Exp => "tile_exp_2d_f32",
+    }
 }
 
 fn eval_tile_scalar(

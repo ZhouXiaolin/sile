@@ -71,6 +71,19 @@ pub(crate) fn emit_load(
     llir::Operand::Value(id)
 }
 
+pub(crate) fn emit_call_void(out: &mut Vec<llir::Inst>, func: &str, args: Vec<llir::Operand>) {
+    out.push(llir::Inst {
+        result: None,
+        result_name: None,
+        ty: llir::Type::Void,
+        op: llir::InstOp::Call {
+            func: func.into(),
+            args,
+        },
+        metadata: Vec::new(),
+    });
+}
+
 pub(crate) fn emit_store(out: &mut Vec<llir::Inst>, ptr: llir::Operand, value: llir::Operand) {
     out.push(llir::Inst {
         result: None,

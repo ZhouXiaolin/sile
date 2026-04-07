@@ -6,7 +6,7 @@ use sile::{
 };
 
 #[test]
-fn dynamic_k_matmul_llir_codegen_emits_structured_c() {
+fn dynamic_k_matmul_llir_codegen_emits_structured_c_with_tile_helpers() {
     let kernel = build_dynamic_k_matmul_kernel();
     let typed = typeck::check_kernel(&kernel).unwrap();
 
@@ -20,22 +20,17 @@ fn dynamic_k_matmul_llir_codegen_emits_structured_c() {
     assert!(c.contains("break;"));
     assert!(!c.contains("goto "));
     assert!(c.contains("if (!("));
-    assert!(c.contains("= &(a["));
-    assert!(c.contains("= &(b["));
-    assert!(c.contains("= &(c["));
-    assert!(c.contains("= *("));
-    assert!(c.contains("*("));
-    assert!(c.contains("*"));
-    assert!(c.contains("+"));
+    assert_eq!(c.matches("tile_fill_2d_f32(").count(), 2);
+    assert_eq!(c.matches("tile_load_2d_f32(").count(), 3);
+    assert_eq!(c.matches("tile_mma_accumulate_2d_f32(").count(), 2);
+    assert_eq!(c.matches("tile_store_2d_f32(").count(), 2);
     assert!(!c.contains("llir_matmul_fragment("));
     assert!(!c.contains("tile_splat_f32("));
-    assert_eq!(c.matches("tile_load_2d_f32(").count(), 1);
-    assert_eq!(c.matches("tile_store_2d_f32(").count(), 1);
     assert!(c.contains("float v"));
 }
 
 #[test]
-fn vec_add_llir_codegen_inlines_tile_elementwise_ops() {
+fn vec_add_llir_codegen_preserves_tile_helpers() {
     let kernel = build_vec_add_kernel();
     let typed = typeck::check_kernel(&kernel).unwrap();
 
@@ -45,19 +40,13 @@ fn vec_add_llir_codegen_inlines_tile_elementwise_ops() {
     let c = llir_c::generate(&llir_func).unwrap();
 
     assert!(c.contains("void sile_llir_vec_add("));
-    assert!(c.contains("= &(a["));
-    assert!(c.contains("= &(b["));
-    assert!(c.contains("= &(c["));
-    assert!(c.contains("= *("));
-    assert!(c.contains("+"));
-    assert!(!c.contains("tile_add_f32("));
-    assert!(!c.contains("tile_sub_f32("));
-    assert!(!c.contains("tile_mul_f32("));
-    assert!(!c.contains("tile_div_f32("));
+    assert_eq!(c.matches("tile_load_2d_f32(").count(), 3);
+    assert_eq!(c.matches("tile_add_2d_f32(").count(), 2);
+    assert_eq!(c.matches("tile_store_2d_f32(").count(), 2);
 }
 
 #[test]
-fn softmax_llir_codegen_inlines_reduce_and_broadcast_ops() {
+fn softmax_llir_codegen_preserves_reduce_and_broadcast_helpers() {
     let kernel = build_softmax_kernel();
     let typed = typeck::check_kernel(&kernel).unwrap();
 
@@ -67,11 +56,16 @@ fn softmax_llir_codegen_inlines_reduce_and_broadcast_ops() {
     let c = llir_c::generate(&llir_func).unwrap();
 
     assert!(c.contains("void sile_llir_softmax("));
-    assert!(c.contains("expf("));
-    assert!(c.contains("? ("));
+    assert_eq!(c.matches("tile_load_2d_f32(").count(), 2);
+    assert_eq!(c.matches("tile_reduce_max_axis1_2d_f32(").count(), 2);
+    assert_eq!(c.matches("tile_broadcast_2d_f32(").count(), 3);
+    assert_eq!(c.matches("tile_sub_2d_f32(").count(), 2);
+    assert_eq!(c.matches("tile_exp_2d_f32(").count(), 2);
+    assert_eq!(c.matches("tile_reduce_sum_axis1_2d_f32(").count(), 2);
+    assert_eq!(c.matches("tile_div_2d_f32(").count(), 2);
+    assert_eq!(c.matches("tile_store_2d_f32(").count(), 2);
     assert!(!c.contains("llir_reduce_add("));
     assert!(!c.contains("llir_reduce_max("));
-    assert!(!c.contains("tile_broadcast_f32("));
     assert!(!c.contains("tile_splat_f32("));
 }
 

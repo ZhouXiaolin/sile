@@ -4,7 +4,6 @@ mod block_terminator;
 mod core;
 mod tile_compute;
 mod tile_expr;
-mod tile_loops;
 mod tile_memory;
 
 use sile_hir::Type as HirType;

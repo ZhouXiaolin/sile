@@ -98,7 +98,7 @@ fn compile_rejects_metal_unknown_helper_call() {
 
     let err =
         compile(&func, CodegenTarget::Metal).expect_err("unknown helper should be rejected");
-    assert!(err.to_string().contains("only supports helper calls"));
+    assert!(err.to_string().contains("only supports tile helper calls"));
 }
 
 #[test]
