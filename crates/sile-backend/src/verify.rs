@@ -3,19 +3,15 @@ use sile_llir::Function as LlirFunction;
 
 use crate::CodegenTarget;
 
-pub fn run(llir: &LlirFunction, stage: &str) -> Result<()> {
-    verify_shared_backend_contract(llir, stage)
-}
-
-pub fn run_for_target(llir: &LlirFunction, target: CodegenTarget, stage: &str) -> Result<()> {
-    run(llir, stage)?;
+pub(crate) fn for_target(llir: &LlirFunction, target: CodegenTarget, stage: &str) -> Result<()> {
+    verify_shared_contract(llir, stage)?;
     match target {
         CodegenTarget::C => Ok(()),
-        CodegenTarget::Metal => verify_metal_backend_contract(llir, stage),
+        CodegenTarget::Metal => verify_metal_contract(llir, stage),
     }
 }
 
-fn verify_shared_backend_contract(llir: &LlirFunction, stage: &str) -> Result<()> {
+fn verify_shared_contract(llir: &LlirFunction, stage: &str) -> Result<()> {
     for block in &llir.blocks {
         if matches!(block.terminator, sile_llir::Terminator::Switch { .. }) {
             return Err(Error::Compile(format!(
@@ -27,7 +23,7 @@ fn verify_shared_backend_contract(llir: &LlirFunction, stage: &str) -> Result<()
     Ok(())
 }
 
-fn verify_metal_backend_contract(llir: &LlirFunction, stage: &str) -> Result<()> {
+fn verify_metal_contract(llir: &LlirFunction, stage: &str) -> Result<()> {
     for block in &llir.blocks {
         for inst in &block.insts {
             match &inst.op {

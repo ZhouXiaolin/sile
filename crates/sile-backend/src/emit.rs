@@ -2,6 +2,19 @@ use std::collections::HashMap;
 
 use sile_core::{Error, Result};
 use sile_llir as llir;
+use sile_llir::Function as LlirFunction;
+
+use crate::cpu::codegen::generate as generate_llir_c_source;
+use crate::metal::codegen::generate as generate_llir_metal_source;
+use crate::{BackendArtifact, CodegenTarget};
+
+pub fn run(llir: &LlirFunction, target: CodegenTarget) -> Result<BackendArtifact> {
+    let artifact = match target {
+        CodegenTarget::C => BackendArtifact::CSource(generate_llir_c_source(llir)?),
+        CodegenTarget::Metal => BackendArtifact::MetalSource(generate_llir_metal_source(llir)?),
+    };
+    Ok(artifact)
+}
 
 pub fn build_value_names(func: &llir::Function) -> HashMap<llir::ValueId, String> {
     let mut names = HashMap::new();
@@ -183,6 +196,59 @@ where
         }),
         _ => None,
     }
+}
+
+pub trait TextCodegen: Sized {
+    fn emit_prelude(&mut self);
+    fn emit_signature(&mut self);
+    fn emit_body(&mut self) -> Result<()>;
+    fn finish(self) -> String;
+}
+
+pub fn generate_text<E: TextCodegen>(mut emitter: E) -> Result<String> {
+    emitter.emit_prelude();
+    emitter.emit_signature();
+    emitter.emit_body()?;
+    Ok(emitter.finish())
+}
+
+pub fn emit_value_decls<F>(func: &llir::Function, mut emit_decl: F) -> bool
+where
+    F: FnMut(llir::ValueId, &llir::Type),
+{
+    let mut declared = HashMap::new();
+
+    for block in &func.blocks {
+        for param in &block.params {
+            declared.entry(param.id).or_insert(&param.ty);
+        }
+        for inst in &block.insts {
+            if let Some(id) = inst.result {
+                declared.entry(id).or_insert(&inst.ty);
+            }
+        }
+    }
+
+    if declared.is_empty() {
+        return false;
+    }
+
+    for block in &func.blocks {
+        for param in &block.params {
+            if declared.remove(&param.id).is_some() {
+                emit_decl(param.id, &param.ty);
+            }
+        }
+        for inst in &block.insts {
+            if let Some(id) = inst.result
+                && let Some(ty) = declared.remove(&id)
+            {
+                emit_decl(id, ty);
+            }
+        }
+    }
+
+    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

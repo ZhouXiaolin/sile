@@ -1,27 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use crate::passes::emit::shared::{
-    self, StructuredCfgMessages, StructuredEmitter, TilePlan, array_dims, block_param_assignments,
-    build_param_indices, build_value_names, format_operand as format_llir_operand, infer_tile_plan,
-    value_name as llir_value_name,
+use crate::emit::{
+    self, StructuredCfgMessages, StructuredEmitter, TextCodegen, TilePlan, array_dims,
+    block_param_assignments, build_param_indices, build_value_names,
+    format_operand as format_llir_operand, infer_tile_plan, value_name as llir_value_name,
 };
 use sile_llir as llir;
 
 pub fn generate(func: &llir::Function) -> sile_core::Result<String> {
-    let mut ctx = MetalCodegen {
-        func,
-        tile_plan: infer_tile_plan(func),
-        value_names: build_value_names(func),
-        param_indices: build_param_indices(func),
-        indent: 0,
-        out: String::new(),
-    };
-
-    ctx.emit_prelude();
-    ctx.emit_signature();
-    ctx.emit_body()?;
-
-    Ok(ctx.out)
+    emit::generate_text(MetalCodegen::new(func))
 }
 
 struct MetalCodegen<'a> {
@@ -34,6 +21,17 @@ struct MetalCodegen<'a> {
 }
 
 impl<'a> MetalCodegen<'a> {
+    fn new(func: &'a llir::Function) -> Self {
+        Self {
+            func,
+            tile_plan: infer_tile_plan(func),
+            value_names: build_value_names(func),
+            param_indices: build_param_indices(func),
+            indent: 0,
+            out: String::new(),
+        }
+    }
+
     fn emit_prelude(&mut self) {
         self.out.push_str("#include <metal_stdlib>\n");
         self.out.push_str("using namespace metal;\n\n");
@@ -86,7 +84,7 @@ impl<'a> MetalCodegen<'a> {
         start: llir::BlockId,
         stop_targets: &[llir::BlockId],
     ) -> sile_core::Result<Option<llir::BlockId>> {
-        shared::emit_structured_from(
+        emit::emit_structured_from(
             self,
             self.func,
             start,
@@ -103,22 +101,8 @@ impl<'a> MetalCodegen<'a> {
     }
 
     fn emit_value_decls(&mut self) {
-        let mut declared = HashSet::new();
-
-        for block in &self.func.blocks {
-            for param in &block.params {
-                if declared.insert(param.id) {
-                    self.emit_decl(param.id, &param.ty);
-                }
-            }
-            for inst in &block.insts {
-                if let Some(id) = inst.result {
-                    if declared.insert(id) {
-                        self.emit_decl(id, &inst.ty);
-                    }
-                }
-            }
-        }
+        let func = self.func;
+        let _ = emit::emit_value_decls(func, |id, ty| self.emit_decl(id, ty));
     }
 
     fn emit_decl(&mut self, id: llir::ValueId, ty: &llir::Type) {
@@ -137,7 +121,7 @@ impl<'a> MetalCodegen<'a> {
     }
 
     fn emit_inst(&mut self, inst: &llir::Inst) -> sile_core::Result<()> {
-        if let Some(line) = shared::lower_common_inst_line(
+        if let Some(line) = emit::lower_common_inst_line(
             inst,
             |id| self.value_name(id),
             |op| self.format_operand(op),
@@ -435,6 +419,24 @@ impl<'a> MetalCodegen<'a> {
     fn writeln(&mut self, line: &str) {
         self.out
             .push_str(&format!("{}{}\n", "  ".repeat(self.indent), line));
+    }
+}
+
+impl TextCodegen for MetalCodegen<'_> {
+    fn emit_prelude(&mut self) {
+        MetalCodegen::emit_prelude(self);
+    }
+
+    fn emit_signature(&mut self) {
+        MetalCodegen::emit_signature(self);
+    }
+
+    fn emit_body(&mut self) -> sile_core::Result<()> {
+        MetalCodegen::emit_body(self)
+    }
+
+    fn finish(self) -> String {
+        self.out
     }
 }
 

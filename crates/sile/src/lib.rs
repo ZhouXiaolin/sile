@@ -27,10 +27,10 @@ pub mod llir {
 pub mod compiler;
 pub mod codegen {
     pub mod llir_c {
-        pub use sile_backend::cpu::codegen_llir_c::*;
+        pub use sile_backend::cpu::codegen::*;
     }
     pub mod llir_metal {
-        pub use sile_backend::metal::codegen_llir_metal::*;
+        pub use sile_backend::metal::codegen::*;
     }
 }
 pub mod schedule {
