@@ -7,6 +7,18 @@ use crate::passes::lowering::core::{
     lower_nested_tile_loop, resolve_operand,
 };
 
+#[derive(Clone)]
+enum BufferIndexBase {
+    Linear {
+        tile_base: llvm_ir::Operand,
+        tile_cols: i64,
+    },
+    Strided2D {
+        tile_origin: llvm_ir::Operand,
+        stride: llvm_ir::Operand,
+    },
+}
+
 pub(crate) fn lower_tile_constant_inst(
     result: ValueId,
     value: f64,
@@ -34,6 +46,15 @@ pub(crate) fn lower_tile_constant_inst(
     );
 }
 
+pub(crate) fn lower_tile_uninit_inst(
+    result: ValueId,
+    rows: i64,
+    cols: i64,
+    builder: &mut BlockLowerer<'_>,
+) {
+    let _ = alloc_tile_result(builder, result, rows, cols);
+}
+
 pub(crate) fn lower_tile_load_inst(
     result: ValueId,
     buf: ValueId,
@@ -49,6 +70,19 @@ pub(crate) fn lower_tile_load_inst(
     let row_operand = resolve_operand(row_coord, builder.ctx());
     let col_operand = resolve_operand(col_coord, builder.ctx());
     let rank = buffer_rank_of(buf, builder.tile_ir());
+    let index_base = builder.with_current_insts(|ctx, _, out| {
+        build_buffer_index_base(
+            ctx,
+            out,
+            buf_operand.clone(),
+            row_operand.clone(),
+            col_operand.clone(),
+            rows,
+            cols,
+            stride_shape_idx,
+            rank,
+        )
+    });
     let prefix = format!("tile_load_{}", result.0);
     lower_nested_tile_loop(
         builder,
@@ -60,14 +94,9 @@ pub(crate) fn lower_tile_load_inst(
                 ctx,
                 out,
                 buf_operand.clone(),
-                row_operand.clone(),
-                col_operand.clone(),
+                index_base.clone(),
                 row.clone(),
                 col.clone(),
-                rows,
-                cols,
-                stride_shape_idx,
-                rank,
             );
             let value = emit_load(ctx, out, src_ptr, llvm_ir::Type::F32);
             let dst_ptr = emit_gep(
@@ -97,6 +126,19 @@ pub(crate) fn lower_tile_store_inst(
     let row_operand = resolve_operand(row_coord, builder.ctx());
     let col_operand = resolve_operand(col_coord, builder.ctx());
     let rank = buffer_rank_of(buf, builder.tile_ir());
+    let index_base = builder.with_current_insts(|ctx, _, out| {
+        build_buffer_index_base(
+            ctx,
+            out,
+            buf_operand.clone(),
+            row_operand.clone(),
+            col_operand.clone(),
+            rows,
+            cols,
+            stride_shape_idx,
+            rank,
+        )
+    });
     let prefix = format!("tile_store_{}", value.0);
     lower_nested_tile_loop(
         builder,
@@ -110,34 +152,27 @@ pub(crate) fn lower_tile_store_inst(
                 ctx,
                 out,
                 buf_operand.clone(),
-                row_operand.clone(),
-                col_operand.clone(),
+                index_base.clone(),
                 row,
                 col,
-                rows,
-                cols,
-                stride_shape_idx,
-                rank,
             );
             emit_store(out, dst_ptr, src);
         },
     );
 }
 
-fn emit_buffer_element_ptr(
+fn build_buffer_index_base(
     ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
     out: &mut Vec<llvm_ir::Inst>,
     buf: llvm_ir::Operand,
     row_coord: llvm_ir::Operand,
     col_coord: llvm_ir::Operand,
-    tile_row: llvm_ir::Operand,
-    tile_col: llvm_ir::Operand,
     rows: i64,
     cols: i64,
     stride_shape_idx: usize,
     rank: usize,
-) -> llvm_ir::Operand {
-    let linear_index = if rank <= 1 {
+) -> BufferIndexBase {
+    if rank <= 1 {
         let tile_coord = lower_1d_tile_coord(ctx, out, row_coord, col_coord);
         let tile_base = emit_bin(
             ctx,
@@ -147,32 +182,12 @@ fn emit_buffer_element_ptr(
             const_i64(rows * cols),
             llvm_ir::Type::I64,
         );
-        let row_offset = emit_bin(
-            ctx,
-            out,
-            llvm_ir::BinOp::Mul,
-            tile_row,
-            const_i64(cols),
-            llvm_ir::Type::I64,
-        );
-        let element_offset = emit_bin(
-            ctx,
-            out,
-            llvm_ir::BinOp::Add,
-            row_offset,
-            tile_col,
-            llvm_ir::Type::I64,
-        );
-        emit_bin(
-            ctx,
-            out,
-            llvm_ir::BinOp::Add,
+        BufferIndexBase::Linear {
             tile_base,
-            element_offset,
-            llvm_ir::Type::I64,
-        )
+            tile_cols: cols,
+        }
     } else {
-        let row_base = emit_bin(
+        let row_tile_base = emit_bin(
             ctx,
             out,
             llvm_ir::BinOp::Mul,
@@ -180,7 +195,7 @@ fn emit_buffer_element_ptr(
             const_i64(rows),
             llvm_ir::Type::I64,
         );
-        let col_base = emit_bin(
+        let col_tile_base = emit_bin(
             ctx,
             out,
             llvm_ir::BinOp::Mul,
@@ -188,39 +203,97 @@ fn emit_buffer_element_ptr(
             const_i64(cols),
             llvm_ir::Type::I64,
         );
-        let src_row = emit_bin(
-            ctx,
-            out,
-            llvm_ir::BinOp::Add,
-            row_base,
-            tile_row,
-            llvm_ir::Type::I64,
-        );
-        let src_col = emit_bin(
-            ctx,
-            out,
-            llvm_ir::BinOp::Add,
-            col_base,
-            tile_col,
-            llvm_ir::Type::I64,
-        );
-        let stride = emit_shape_dim(ctx, out, buf.clone(), stride_shape_idx);
-        let row_offset = emit_bin(
+        let stride = emit_shape_dim(ctx, out, buf, stride_shape_idx);
+        let row_origin = emit_bin(
             ctx,
             out,
             llvm_ir::BinOp::Mul,
-            src_row,
-            stride,
+            row_tile_base,
+            stride.clone(),
             llvm_ir::Type::I64,
         );
-        emit_bin(
+        let tile_origin = emit_bin(
             ctx,
             out,
             llvm_ir::BinOp::Add,
-            row_offset,
-            src_col,
+            row_origin,
+            col_tile_base,
             llvm_ir::Type::I64,
-        )
+        );
+        BufferIndexBase::Strided2D {
+            tile_origin,
+            stride,
+        }
+    }
+}
+
+fn emit_buffer_element_ptr(
+    ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
+    out: &mut Vec<llvm_ir::Inst>,
+    buf: llvm_ir::Operand,
+    index_base: BufferIndexBase,
+    tile_row: llvm_ir::Operand,
+    tile_col: llvm_ir::Operand,
+) -> llvm_ir::Operand {
+    let linear_index = match index_base {
+        BufferIndexBase::Linear {
+            tile_base,
+            tile_cols,
+        } => {
+            let row_offset = emit_bin(
+                ctx,
+                out,
+                llvm_ir::BinOp::Mul,
+                tile_row,
+                const_i64(tile_cols),
+                llvm_ir::Type::I64,
+            );
+            let element_offset = emit_bin(
+                ctx,
+                out,
+                llvm_ir::BinOp::Add,
+                row_offset,
+                tile_col,
+                llvm_ir::Type::I64,
+            );
+            emit_bin(
+                ctx,
+                out,
+                llvm_ir::BinOp::Add,
+                tile_base,
+                element_offset,
+                llvm_ir::Type::I64,
+            )
+        }
+        BufferIndexBase::Strided2D {
+            tile_origin,
+            stride,
+        } => {
+            let row_offset = emit_bin(
+                ctx,
+                out,
+                llvm_ir::BinOp::Mul,
+                tile_row,
+                stride,
+                llvm_ir::Type::I64,
+            );
+            let with_row = emit_bin(
+                ctx,
+                out,
+                llvm_ir::BinOp::Add,
+                tile_origin,
+                row_offset,
+                llvm_ir::Type::I64,
+            );
+            emit_bin(
+                ctx,
+                out,
+                llvm_ir::BinOp::Add,
+                with_row,
+                tile_col,
+                llvm_ir::Type::I64,
+            )
+        }
     };
 
     emit_gep(

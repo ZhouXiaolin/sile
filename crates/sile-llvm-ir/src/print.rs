@@ -193,7 +193,7 @@ fn format_inst(
         ),
         InstOp::Store { ptr, value } => format!(
             "store {} {}, {} {}",
-            format_operand_type(value, types),
+            format_load_store_value_type(ptr, types),
             format_operand(value, names),
             format_operand_type(ptr, types),
             format_operand(ptr, names)

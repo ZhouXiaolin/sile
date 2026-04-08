@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::emit::{
     self, StructuredCfgMessages, StructuredEmitter, TextCodegen, array_dims,
@@ -20,6 +20,8 @@ pub fn generate(func: &llvm_ir::Function) -> sile_core::Result<String> {
 struct CCodegen<'a> {
     func: &'a llvm_ir::Function,
     value_names: HashMap<llvm_ir::ValueId, String>,
+    alloca_results: HashSet<llvm_ir::ValueId>,
+    declared_values: HashSet<llvm_ir::ValueId>,
     indent: usize,
     out: String,
 }
@@ -29,6 +31,8 @@ impl<'a> CCodegen<'a> {
         Self {
             func,
             value_names: build_value_names(func),
+            alloca_results: collect_alloca_results(func),
+            declared_values: HashSet::new(),
             indent: 0,
             out: String::new(),
         }
@@ -37,6 +41,7 @@ impl<'a> CCodegen<'a> {
     fn emit_prelude(&mut self) {
         self.out.push_str("#include <stdint.h>\n");
         self.out.push_str("#include <stdbool.h>\n");
+        self.out.push_str("#include <omp.h>\n");
         self.out.push_str("#include <math.h>\n");
         self.out.push_str("#include <string.h>\n\n");
 
@@ -101,8 +106,26 @@ impl<'a> CCodegen<'a> {
     }
 
     fn emit_value_decls(&mut self) {
-        let func = self.func;
-        if emit::emit_value_decls(func, |id, ty| self.emit_decl(id, ty)) {
+        let mut emitted_any = false;
+        for block in &self.func.blocks {
+            for param in &block.params {
+                if self.declared_values.insert(param.id) {
+                    self.emit_decl(param.id, &param.ty);
+                    emitted_any = true;
+                }
+            }
+            for inst in &block.insts {
+                if let Some(id) = inst.result
+                    && self.alloca_results.contains(&id)
+                    && self.declared_values.insert(id)
+                {
+                    self.emit_decl(id, &inst.ty);
+                    emitted_any = true;
+                }
+            }
+        }
+
+        if emitted_any {
             self.writeln("");
         }
     }
@@ -117,7 +140,7 @@ impl<'a> CCodegen<'a> {
             llvm_ir::Type::Ptr {
                 addr_space: llvm_ir::AddressSpace::Private,
                 pointee,
-            } => {
+            } if self.alloca_results.contains(&id) => {
                 let storage_name = format!("{}_storage", name);
                 self.writeln(&format!("{};", c_storage_decl(pointee, &storage_name)));
                 self.writeln(&format!(
@@ -137,7 +160,12 @@ impl<'a> CCodegen<'a> {
             |id| self.value_name(id),
             |op| self.format_operand(op),
         ) {
-            self.writeln(&line);
+            if let Some(id) = inst.result {
+                let line = self.line_with_declaration(id, &inst.ty, &line);
+                self.writeln(&line);
+            } else {
+                self.writeln(&line);
+            }
             return Ok(());
         }
 
@@ -146,7 +174,7 @@ impl<'a> CCodegen<'a> {
             llvm_ir::InstOp::Call { func, args } => {
                 if let Some(id) = inst.result {
                     let name = self.value_name(id);
-                    self.writeln(&format!(
+                    let line = format!(
                         "{} = {}({});",
                         name,
                         func,
@@ -154,7 +182,9 @@ impl<'a> CCodegen<'a> {
                             .map(|arg| self.format_operand(arg))
                             .collect::<Vec<_>>()
                             .join(", ")
-                    ));
+                    );
+                    let line = self.line_with_declaration(id, &inst.ty, &line);
+                    self.writeln(&line);
                 } else {
                     self.writeln(&format!(
                         "{}({});",
@@ -177,7 +207,9 @@ impl<'a> CCodegen<'a> {
                         .join(", ")
                 );
                 if let Some(id) = inst.result {
-                    self.writeln(&format!("{} = {};", self.value_name(id), expr));
+                    let line = format!("{} = {};", self.value_name(id), expr);
+                    let line = self.line_with_declaration(id, &inst.ty, &line);
+                    self.writeln(&line);
                 } else {
                     self.writeln(&format!("{};", expr));
                 }
@@ -254,6 +286,25 @@ impl<'a> CCodegen<'a> {
     fn writeln(&mut self, line: &str) {
         self.out
             .push_str(&format!("{}{}\n", "  ".repeat(self.indent), line));
+    }
+
+    fn line_with_declaration(
+        &mut self,
+        id: llvm_ir::ValueId,
+        ty: &llvm_ir::Type,
+        line: &str,
+    ) -> String {
+        if self.declared_values.contains(&id) {
+            return line.to_string();
+        }
+        let name = self.value_name(id);
+        let prefix = format!("{name} = ");
+        let Some(rhs) = line.strip_prefix(&prefix) else {
+            self.declared_values.insert(id);
+            return line.to_string();
+        };
+        self.declared_values.insert(id);
+        format!("{} = {}", c_decl_head(ty, &name), rhs)
     }
 }
 
@@ -440,6 +491,21 @@ fn c_var_decl(ty: &llvm_ir::Type, name: &str) -> String {
     }
 }
 
+fn c_decl_head(ty: &llvm_ir::Type, name: &str) -> String {
+    match ty {
+        llvm_ir::Type::I1 => format!("bool {}", name),
+        llvm_ir::Type::I32 => format!("int32_t {}", name),
+        llvm_ir::Type::I64 => format!("int64_t {}", name),
+        llvm_ir::Type::F32 => format!("float {}", name),
+        llvm_ir::Type::F64 => format!("double {}", name),
+        llvm_ir::Type::Ptr { pointee, .. } => match pointee.as_ref() {
+            llvm_ir::Type::Array { .. } => c_ptr_decl_head(pointee, name),
+            other => format!("{}* {}", c_type(other), name),
+        },
+        other => format!("{} {}", c_type(other), name),
+    }
+}
+
 fn c_storage_decl(ty: &llvm_ir::Type, name: &str) -> String {
     match ty {
         llvm_ir::Type::Array { len, elem } => match elem.as_ref() {
@@ -474,6 +540,21 @@ fn c_ptr_decl(pointee: &llvm_ir::Type, name: &str) -> String {
             .collect::<Vec<_>>()
             .join("");
         format!("{} (*{}){} = NULL", base, name, suffix)
+    }
+}
+
+fn c_ptr_decl_head(pointee: &llvm_ir::Type, name: &str) -> String {
+    let dims = array_dims(pointee);
+    let base = array_base_type(pointee);
+    if dims.is_empty() {
+        format!("{}* {}", base, name)
+    } else {
+        let suffix = dims[1..]
+            .iter()
+            .map(|dim| format!("[{}]", dim))
+            .collect::<Vec<_>>()
+            .join("");
+        format!("{} (*{}){}", base, name, suffix)
     }
 }
 
@@ -521,5 +602,75 @@ fn intrinsic_name(intrinsic: &llvm_ir::Intrinsic) -> String {
         llvm_ir::Intrinsic::BlockId { dim } => format!("llir_block_id_{}", dim),
         llvm_ir::Intrinsic::Barrier { .. } => "llir_barrier".to_string(),
         llvm_ir::Intrinsic::Exp => "expf".to_string(),
+    }
+}
+
+fn collect_alloca_results(func: &llvm_ir::Function) -> HashSet<llvm_ir::ValueId> {
+    func.blocks
+        .iter()
+        .flat_map(|block| block.insts.iter())
+        .filter_map(|inst| match inst.op {
+            llvm_ir::InstOp::Alloca { .. } => inst.result,
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate;
+    use sile_llvm_ir::{
+        AddressSpace, BasicBlock, BlockId, Constant, Function, Inst, InstOp, Operand, Terminator,
+        Type, ValueId,
+    };
+
+    #[test]
+    fn gep_private_ptrs_do_not_materialize_fake_storage_bindings() {
+        let func = Function {
+            name: "ptr_decl".into(),
+            params: vec![],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                name: "entry".into(),
+                params: vec![],
+                insts: vec![
+                    Inst {
+                        result: Some(ValueId(0)),
+                        result_name: Some("tile".into()),
+                        ty: Type::ptr(
+                            AddressSpace::Private,
+                            Type::array(2, Type::array(2, Type::F32)),
+                        ),
+                        op: InstOp::Alloca {
+                            alloc_ty: Type::array(2, Type::array(2, Type::F32)),
+                            addr_space: AddressSpace::Private,
+                        },
+                        metadata: vec![],
+                    },
+                    Inst {
+                        result: Some(ValueId(1)),
+                        result_name: Some("elt".into()),
+                        ty: Type::ptr(AddressSpace::Private, Type::F32),
+                        op: InstOp::Gep {
+                            base: Operand::Value(ValueId(0)),
+                            indices: vec![
+                                Operand::Const(Constant::Int(0)),
+                                Operand::Const(Constant::Int(1)),
+                            ],
+                        },
+                        metadata: vec![],
+                    },
+                ],
+                terminator: Terminator::Ret { value: None },
+            }],
+            entry: BlockId(0),
+            metadata: vec![],
+        };
+
+        let c = generate(&func).unwrap();
+        assert!(c.contains("float tile_storage[2][2];"));
+        assert!(c.contains("float* elt = NULL;"));
+        assert!(!c.contains("float elt_storage;"));
+        assert!(!c.contains("float* elt = &elt_storage;"));
     }
 }

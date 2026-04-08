@@ -2,6 +2,7 @@ pub mod canonicalize_shape;
 pub mod canonicalize_tile_ops;
 pub mod dce;
 pub mod lowering;
+pub mod pointwise_fusion;
 pub mod tile_expr_cse;
 pub mod verify;
 
@@ -17,6 +18,7 @@ pub enum TileIrPassKind {
     VerifyInput,
     CanonicalizeShape,
     CanonicalizeTileOps,
+    PointwiseFusion,
     TileExprCse,
     Dce,
     VerifyOutput,
@@ -30,6 +32,7 @@ pub const RECOMMENDED_PIPELINE: &[TileIrPassKind] = &[
     TileIrPassKind::VerifyInput,
     TileIrPassKind::CanonicalizeShape,
     TileIrPassKind::CanonicalizeTileOps,
+    TileIrPassKind::PointwiseFusion,
     TileIrPassKind::TileExprCse,
     TileIrPassKind::Dce,
     TileIrPassKind::VerifyOutput,
@@ -50,6 +53,7 @@ pub fn run_pipeline(
             }
             TileIrPassKind::CanonicalizeShape => canonicalize_shape::run(func),
             TileIrPassKind::CanonicalizeTileOps => canonicalize_tile_ops::run(func),
+            TileIrPassKind::PointwiseFusion => pointwise_fusion::run(func),
             TileIrPassKind::TileExprCse => tile_expr_cse::run(func),
             TileIrPassKind::Dce => dce::run(func),
         };
