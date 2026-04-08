@@ -42,7 +42,7 @@ struct LowerCtx<'a> {
     types: HashMap<ValueId, TileIrType>,
     mir_params: Vec<TileIrParam>,
     program_id_params: HashMap<i64, ValueId>,
-    shape_dim_params: HashMap<(ValueId, usize), ValueId>,
+    shape_desc_params: HashMap<ValueId, ValueId>,
     blocks: Vec<TileIrBlock>,
     current_block: BlockId,
     entry: BlockId,
@@ -62,7 +62,7 @@ impl<'a> LowerCtx<'a> {
             types: HashMap::new(),
             mir_params: Vec::new(),
             program_id_params: HashMap::new(),
-            shape_dim_params: HashMap::new(),
+            shape_desc_params: HashMap::new(),
             blocks: Vec::new(),
             current_block: BlockId(0),
             entry: BlockId(0),
@@ -109,16 +109,16 @@ impl<'a> LowerCtx<'a> {
             return value;
         }
         let value = self.push_param(
-            format!("__sile_pid{dim}"),
+            format!("__launch_idx{dim}"),
             TileIrType::I64,
-            TileIrParamKind::SileProgramId { dim },
+            TileIrParamKind::LaunchIndex { dim },
         );
         self.program_id_params.insert(dim, value);
         value
     }
 
-    fn get_or_create_shape_dim_param(&mut self, source: ValueId, dim: usize) -> ValueId {
-        if let Some(value) = self.shape_dim_params.get(&(source, dim)).copied() {
+    fn get_or_create_shape_desc_param(&mut self, source: ValueId) -> ValueId {
+        if let Some(value) = self.shape_desc_params.get(&source).copied() {
             return value;
         }
         let source_name = self
@@ -127,12 +127,16 @@ impl<'a> LowerCtx<'a> {
             .find(|param| param.value == source)
             .map(|param| param.name.clone())
             .unwrap_or_else(|| format!("v{}", source.0));
+        let rank = match self.types.get(&source) {
+            Some(TileIrType::Buffer { rank }) => *rank,
+            _ => 1,
+        };
         let value = self.push_param(
-            format!("__sile_shape_{}_{}", source_name, dim),
-            TileIrType::I64,
-            TileIrParamKind::SileShapeDim { source, dim },
+            format!("__shape_{}", source_name),
+            TileIrType::ShapeDesc { rank },
+            TileIrParamKind::ShapeDesc { source },
         );
-        self.shape_dim_params.insert((source, dim), value);
+        self.shape_desc_params.insert(source, value);
         value
     }
 
@@ -498,7 +502,8 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
             } else {
                 let base = lower_expr(&args[0], ctx);
                 let dim = eval_i64(&args[1], ctx) as usize;
-                ctx.get_or_create_shape_dim_param(base, dim)
+                let shape = ctx.get_or_create_shape_desc_param(base);
+                ctx.emit(TileIrOp::ShapeDim { shape, dim }, TileIrType::I64)
             }
         }
         BuiltinOp::Constant => {
@@ -519,6 +524,7 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
         }
         BuiltinOp::LoadTile => {
             let base = lower_expr(&args[0], ctx);
+            let _ = ctx.get_or_create_shape_desc_param(base);
             let tile_shape = args
                 .get(1)
                 .map(|arg| extract_const_shape(arg, ctx))
@@ -544,6 +550,7 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
         }
         BuiltinOp::LoadTileLike2D => {
             let input = lower_expr(&args[0], ctx);
+            let _ = ctx.get_or_create_shape_desc_param(input);
             let shape = args
                 .get(1)
                 .and_then(|arg| expr_shape(arg, ctx))
@@ -750,14 +757,25 @@ fn lower_store(target: &str, value: &Expr, ctx: &mut LowerCtx<'_>) {
         .get(target)
         .copied()
         .unwrap_or_else(|| ctx.emit(TileIrOp::ConstI64(0), TileIrType::I64));
+    let _ = ctx.get_or_create_shape_desc_param(output);
     let stored = lower_expr(value, ctx);
 
     let (rows, cols) = tile_shape_of(stored, ctx)
         .or_else(|| param_shape_2d(target, ctx))
         .unwrap_or((1, 1));
 
-    let row_coord = ctx.get_or_create_program_id_param(0);
-    let col_coord = if rows > 1 || cols > 1 {
+    let output_rank = match ctx.types.get(&output) {
+        Some(TileIrType::Buffer { rank }) => *rank,
+        _ => 1,
+    };
+    let row_coord = if output_rank <= 1 {
+        ctx.emit(TileIrOp::ConstI64(0), TileIrType::I64)
+    } else {
+        ctx.get_or_create_program_id_param(0)
+    };
+    let col_coord = if output_rank <= 1 {
+        ctx.get_or_create_program_id_param(0)
+    } else if rows > 1 || cols > 1 {
         ctx.get_or_create_program_id_param(1)
     } else {
         ctx.emit(TileIrOp::ConstI64(0), TileIrType::I64)
@@ -785,6 +803,7 @@ fn lower_atomic_add(target: &str, index: &Expr, value: &Expr, ctx: &mut LowerCtx
         .get(target)
         .copied()
         .unwrap_or_else(|| ctx.emit(TileIrOp::ConstI64(0), TileIrType::I64));
+    let _ = ctx.get_or_create_shape_desc_param(output);
     let accumulated = lower_expr(value, ctx);
     let coords = match index {
         Expr::Shape(_) => extract_runtime_coords(index, ctx),

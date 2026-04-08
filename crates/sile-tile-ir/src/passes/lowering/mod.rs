@@ -109,8 +109,9 @@ fn run_llvm_ir_lowering_pipeline_inner(
                                 abi,
                             })
                         }
-                        TileIrParamKind::SileProgramId { .. }
-                        | TileIrParamKind::SileShapeDim { .. } => None,
+                        TileIrParamKind::LaunchIndex { .. } | TileIrParamKind::ShapeDesc { .. } => {
+                            None
+                        }
                     })
                     .collect::<Vec<_>>();
                 let (shapes_id, _) = ctx.fresh_value("arg");
@@ -196,7 +197,7 @@ fn build_prologue_block(
         ctx.operands
             .insert(param.value, llvm_ir::Operand::Value(result_id));
         match &param.kind {
-            TileIrParamKind::SileProgramId { dim } => {
+            TileIrParamKind::LaunchIndex { dim } => {
                 insts.push(llvm_ir::Inst {
                     result: Some(result_id),
                     result_name: Some(param.name.clone()),
@@ -208,7 +209,7 @@ fn build_prologue_block(
                     metadata: Vec::new(),
                 });
             }
-            TileIrParamKind::SileShapeDim { source, dim } => {
+            TileIrParamKind::ShapeDesc { source } => {
                 let source_operand = ctx
                     .operands
                     .get(source)
@@ -226,28 +227,58 @@ fn build_prologue_block(
                     .shapes_param
                     .clone()
                     .expect("shape param prologue requires explicit __sile_shapes parameter");
-                let (ptr_id, ptr_name) = ctx.fresh_value("v");
                 insts.push(llvm_ir::Inst {
-                    result: Some(ptr_id),
-                    result_name: Some(ptr_name),
+                    result: Some(result_id),
+                    result_name: Some(param.name.clone()),
                     ty: llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, llvm_ir::Type::I64),
                     op: llvm_ir::InstOp::Gep {
                         base: shapes_operand,
                         indices: vec![llvm_ir::Operand::Const(llvm_ir::Constant::Int(
-                            (shape_offset + dim) as i64,
+                            shape_offset as i64,
                         ))],
                     },
                     metadata: Vec::new(),
                 });
-                insts.push(llvm_ir::Inst {
-                    result: Some(result_id),
-                    result_name: Some(param.name.clone()),
-                    ty: llvm_ir::Type::I64,
-                    op: llvm_ir::InstOp::Load {
-                        ptr: llvm_ir::Operand::Value(ptr_id),
-                    },
-                    metadata: Vec::new(),
-                });
+                ctx.buffer_shape_descs.insert(source_id, result_id);
+                let rank = match param.ty {
+                    crate::TileIrType::ShapeDesc { rank } => rank,
+                    _ => 0,
+                };
+                for dim in 0..rank {
+                    let gep_id = {
+                        let (id, name) = ctx.fresh_value("v");
+                        insts.push(llvm_ir::Inst {
+                            result: Some(id),
+                            result_name: Some(name),
+                            ty: llvm_ir::Type::ptr(
+                                llvm_ir::AddressSpace::Constant,
+                                llvm_ir::Type::I64,
+                            ),
+                            op: llvm_ir::InstOp::Gep {
+                                base: llvm_ir::Operand::Value(result_id),
+                                indices: vec![llvm_ir::Operand::Const(llvm_ir::Constant::Int(
+                                    dim as i64,
+                                ))],
+                            },
+                            metadata: Vec::new(),
+                        });
+                        id
+                    };
+                    let dim_value = {
+                        let (id, name) = ctx.fresh_value("v");
+                        insts.push(llvm_ir::Inst {
+                            result: Some(id),
+                            result_name: Some(name),
+                            ty: llvm_ir::Type::I64,
+                            op: llvm_ir::InstOp::Load {
+                                ptr: llvm_ir::Operand::Value(gep_id),
+                            },
+                            metadata: Vec::new(),
+                        });
+                        llvm_ir::Operand::Value(id)
+                    };
+                    ctx.shape_dim_cache.insert((result_id, dim), dim_value);
+                }
             }
             TileIrParamKind::Buffer => {}
         }

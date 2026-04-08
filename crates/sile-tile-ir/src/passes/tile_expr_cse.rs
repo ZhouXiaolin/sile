@@ -90,6 +90,8 @@ fn expr_key(op: &TileIrOp) -> Option<String> {
         TileIrOp::Broadcast { value, rows, cols } => {
             Some(format!("broadcast:{}:{rows}:{cols}", value.0))
         }
+        TileIrOp::Map { .. } => None,
+        TileIrOp::ShapeDim { shape, dim } => Some(format!("shape_dim:{}:{dim}", shape.0)),
         TileIrOp::Extract {
             tile,
             row_coord,
@@ -268,6 +270,11 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             rows,
             cols,
         },
+        TileIrOp::Map { expr, rows, cols } => TileIrOp::Map {
+            expr: rewrite_map_expr(expr, replacements),
+            rows,
+            cols,
+        },
         TileIrOp::Extract {
             tile,
             row_coord,
@@ -289,6 +296,67 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
         },
         TileIrOp::ConstI64(v) => TileIrOp::ConstI64(v),
         TileIrOp::ConstF64(v) => TileIrOp::ConstF64(v),
+        TileIrOp::ShapeDim { shape, dim } => TileIrOp::ShapeDim {
+            shape: rewrite(shape),
+            dim,
+        },
+    }
+}
+
+fn rewrite_map_expr(
+    expr: crate::TileMapExpr,
+    replacements: &HashMap<ValueId, ValueId>,
+) -> crate::TileMapExpr {
+    let rewrite = |value: ValueId| resolve_replacement(value, replacements);
+    match expr {
+        crate::TileMapExpr::Value(value) => crate::TileMapExpr::Value(rewrite(value)),
+        crate::TileMapExpr::LoadPtrTko {
+            buf,
+            row_coord,
+            col_coord,
+            rows,
+            cols,
+            stride_shape_idx,
+        } => crate::TileMapExpr::LoadPtrTko {
+            buf: rewrite(buf),
+            row_coord: rewrite(row_coord),
+            col_coord: rewrite(col_coord),
+            rows,
+            cols,
+            stride_shape_idx,
+        },
+        crate::TileMapExpr::Splat { value } => crate::TileMapExpr::Splat { value },
+        crate::TileMapExpr::Add { lhs, rhs } => crate::TileMapExpr::Add {
+            lhs: Box::new(rewrite_map_expr(*lhs, replacements)),
+            rhs: Box::new(rewrite_map_expr(*rhs, replacements)),
+        },
+        crate::TileMapExpr::Sub { lhs, rhs } => crate::TileMapExpr::Sub {
+            lhs: Box::new(rewrite_map_expr(*lhs, replacements)),
+            rhs: Box::new(rewrite_map_expr(*rhs, replacements)),
+        },
+        crate::TileMapExpr::Mul { lhs, rhs } => crate::TileMapExpr::Mul {
+            lhs: Box::new(rewrite_map_expr(*lhs, replacements)),
+            rhs: Box::new(rewrite_map_expr(*rhs, replacements)),
+        },
+        crate::TileMapExpr::Div { lhs, rhs } => crate::TileMapExpr::Div {
+            lhs: Box::new(rewrite_map_expr(*lhs, replacements)),
+            rhs: Box::new(rewrite_map_expr(*rhs, replacements)),
+        },
+        crate::TileMapExpr::Neg { operand } => crate::TileMapExpr::Neg {
+            operand: Box::new(rewrite_map_expr(*operand, replacements)),
+        },
+        crate::TileMapExpr::Exp { operand } => crate::TileMapExpr::Exp {
+            operand: Box::new(rewrite_map_expr(*operand, replacements)),
+        },
+        crate::TileMapExpr::Broadcast {
+            value,
+            src_rows,
+            src_cols,
+        } => crate::TileMapExpr::Broadcast {
+            value: Box::new(rewrite_map_expr(*value, replacements)),
+            src_rows,
+            src_cols,
+        },
     }
 }
 

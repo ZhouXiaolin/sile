@@ -41,6 +41,8 @@ pub enum TileIrType {
     I64,
     /// f32 scalar
     F32,
+    /// Opaque shape descriptor view
+    ShapeDesc { rank: usize },
     /// Tile of f32 with known shape
     Tile { rows: i64, cols: i64 },
     /// Opaque buffer pointer (kernel parameter)
@@ -54,6 +56,7 @@ impl fmt::Display for TileIrType {
         match self {
             TileIrType::I64 => write!(f, "i64"),
             TileIrType::F32 => write!(f, "f32"),
+            TileIrType::ShapeDesc { rank } => write!(f, "shape_desc<rank={rank}>"),
             TileIrType::Tile { rows, cols } => write!(f, "tile<f32, {rows}x{cols}>"),
             TileIrType::Buffer { rank } => write!(f, "buffer<f32, rank={rank}>"),
             TileIrType::Void => write!(f, "void"),
@@ -67,6 +70,49 @@ impl fmt::Display for TileIrType {
 pub struct TileIrInst {
     pub result: ValueId,
     pub op: TileIrOp,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TileMapExpr {
+    Value(ValueId),
+    LoadPtrTko {
+        buf: ValueId,
+        row_coord: ValueId,
+        col_coord: ValueId,
+        rows: i64,
+        cols: i64,
+        stride_shape_idx: usize,
+    },
+    Splat {
+        value: f64,
+    },
+    Add {
+        lhs: Box<TileMapExpr>,
+        rhs: Box<TileMapExpr>,
+    },
+    Sub {
+        lhs: Box<TileMapExpr>,
+        rhs: Box<TileMapExpr>,
+    },
+    Mul {
+        lhs: Box<TileMapExpr>,
+        rhs: Box<TileMapExpr>,
+    },
+    Div {
+        lhs: Box<TileMapExpr>,
+        rhs: Box<TileMapExpr>,
+    },
+    Neg {
+        operand: Box<TileMapExpr>,
+    },
+    Exp {
+        operand: Box<TileMapExpr>,
+    },
+    Broadcast {
+        value: Box<TileMapExpr>,
+        src_rows: i64,
+        src_cols: i64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -171,6 +217,12 @@ pub enum TileIrOp {
         rows: i64,
         cols: i64,
     },
+    /// Canonical fused pointwise map over a tile domain.
+    Map {
+        expr: TileMapExpr,
+        rows: i64,
+        cols: i64,
+    },
     /// `cuda_tile.extract`
     Extract {
         tile: ValueId,
@@ -195,6 +247,8 @@ pub enum TileIrOp {
     ConstI64(i64),
     /// Float constant
     ConstF64(f64),
+    /// Query one dimension from a shape descriptor view
+    ShapeDim { shape: ValueId, dim: usize },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -281,8 +335,8 @@ pub struct TileIrParam {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TileIrParamKind {
     Buffer,
-    SileProgramId { dim: i64 },
-    SileShapeDim { source: ValueId, dim: usize },
+    LaunchIndex { dim: i64 },
+    ShapeDesc { source: ValueId },
 }
 
 #[derive(Clone, Debug)]
@@ -342,6 +396,7 @@ impl TileIrFunction {
             TileIrOp::MmaF { a, b, acc, .. } => vec![*a, *b, *acc],
             TileIrOp::ReduceSum { value, .. } | TileIrOp::ReduceMax { value, .. } => vec![*value],
             TileIrOp::Broadcast { value, .. } => vec![*value],
+            TileIrOp::Map { expr, .. } => tile_map_expr_uses(expr),
             TileIrOp::Extract {
                 tile,
                 row_coord,
@@ -350,6 +405,7 @@ impl TileIrFunction {
             TileIrOp::IBinary { lhs, rhs, .. } => vec![*lhs, *rhs],
             TileIrOp::ICmp { lhs, rhs, .. } => vec![*lhs, *rhs],
             TileIrOp::ConstI64(_) | TileIrOp::ConstF64(_) => vec![],
+            TileIrOp::ShapeDim { shape, .. } => vec![*shape],
         }
     }
 
@@ -370,5 +426,39 @@ impl TileIrFunction {
             }
             TileIrTerminator::Return => vec![],
         }
+    }
+}
+
+fn tile_map_expr_uses(expr: &TileMapExpr) -> Vec<ValueId> {
+    let mut uses = Vec::new();
+    collect_tile_map_expr_uses(expr, &mut uses);
+    uses
+}
+
+fn collect_tile_map_expr_uses(expr: &TileMapExpr, uses: &mut Vec<ValueId>) {
+    match expr {
+        TileMapExpr::Value(value) => uses.push(*value),
+        TileMapExpr::LoadPtrTko {
+            buf,
+            row_coord,
+            col_coord,
+            ..
+        } => {
+            uses.push(*buf);
+            uses.push(*row_coord);
+            uses.push(*col_coord);
+        }
+        TileMapExpr::Splat { .. } => {}
+        TileMapExpr::Add { lhs, rhs }
+        | TileMapExpr::Sub { lhs, rhs }
+        | TileMapExpr::Mul { lhs, rhs }
+        | TileMapExpr::Div { lhs, rhs } => {
+            collect_tile_map_expr_uses(lhs, uses);
+            collect_tile_map_expr_uses(rhs, uses);
+        }
+        TileMapExpr::Neg { operand } | TileMapExpr::Exp { operand } => {
+            collect_tile_map_expr_uses(operand, uses);
+        }
+        TileMapExpr::Broadcast { value, .. } => collect_tile_map_expr_uses(value, uses),
     }
 }

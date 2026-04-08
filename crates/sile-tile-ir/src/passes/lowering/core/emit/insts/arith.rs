@@ -8,6 +8,15 @@ pub(crate) fn lower_1d_tile_coord(
     row_coord: llvm_ir::Operand,
     col_coord: llvm_ir::Operand,
 ) -> llvm_ir::Operand {
+    if let llvm_ir::Operand::Const(llvm_ir::Constant::Int(0)) = row_coord {
+        return col_coord;
+    }
+    if let llvm_ir::Operand::Const(llvm_ir::Constant::Int(0)) = col_coord {
+        return row_coord;
+    }
+    if row_coord == col_coord {
+        return row_coord;
+    }
     let non_zero = emit_cmp(
         ctx,
         out,

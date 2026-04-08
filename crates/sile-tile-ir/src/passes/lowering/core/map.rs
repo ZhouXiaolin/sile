@@ -14,6 +14,9 @@ pub(crate) fn llvm_ir_type(ty: &TileIrType) -> llvm_ir::Type {
     match ty {
         TileIrType::I64 => llvm_ir::Type::I64,
         TileIrType::F32 => llvm_ir::Type::F32,
+        TileIrType::ShapeDesc { .. } => {
+            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, llvm_ir::Type::I64)
+        }
         TileIrType::Tile { rows, cols } => tile_ptr_type(*rows, *cols),
         TileIrType::Buffer { .. } => {
             llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, llvm_ir::Type::F32)

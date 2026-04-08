@@ -29,6 +29,38 @@ pub(crate) fn lower_scalar_inst(
             ctx.names
                 .insert(llvm_ir_value(inst.result), format!("v{}", inst.result.0));
         }
+        TileIrOp::ShapeDim { shape, dim } => {
+            let shape_desc = resolve_operand(*shape, ctx);
+            if let llvm_ir::Operand::Value(shape_desc_id) = shape_desc.clone()
+                && let Some(cached) = ctx.shape_dim_cache.get(&(shape_desc_id, *dim)).cloned()
+            {
+                ctx.operands.insert(inst.result, cached);
+                return;
+            }
+            let ptr = emit_gep(
+                ctx,
+                out,
+                shape_desc.clone(),
+                vec![const_i64(*dim as i64)],
+                llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, llvm_ir::Type::I64),
+            );
+            let value = llvm_ir::Operand::Value(llvm_ir_value(inst.result));
+            let llir_id = llvm_ir_value(inst.result);
+            ctx.names.insert(llir_id, format!("v{}", inst.result.0));
+            out.push(llvm_ir::Inst {
+                result: Some(llir_id),
+                result_name: Some(format!("v{}", inst.result.0)),
+                ty: llvm_ir::Type::I64,
+                op: llvm_ir::InstOp::Load { ptr },
+                metadata: Vec::new(),
+            });
+            ctx.operands.insert(inst.result, value.clone());
+            if let llvm_ir::Operand::Value(shape_desc_id) = shape_desc {
+                ctx.shape_dim_cache
+                    .entry((shape_desc_id, *dim))
+                    .or_insert(value);
+            }
+        }
         TileIrOp::IBinary { op, lhs, rhs } => {
             let llir_id = llvm_ir_value(inst.result);
             ctx.names.insert(llir_id, format!("v{}", inst.result.0));
@@ -149,7 +181,8 @@ pub(crate) fn lower_scalar_inst(
         | TileIrOp::MmaF { .. }
         | TileIrOp::ReduceSum { .. }
         | TileIrOp::ReduceMax { .. }
-        | TileIrOp::Broadcast { .. } => {
+        | TileIrOp::Broadcast { .. }
+        | TileIrOp::Map { .. } => {
             unreachable!("tile ops are lowered by dedicated tile lowering paths")
         }
     }

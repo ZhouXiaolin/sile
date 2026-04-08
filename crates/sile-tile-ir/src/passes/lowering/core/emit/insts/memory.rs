@@ -29,22 +29,46 @@ pub(crate) fn emit_shape_dim(
     let llvm_ir::Operand::Value(buf_id) = buf else {
         panic!("shape_dim lowering requires buffer operand to be a value")
     };
+    if let Some(shape_desc_id) = ctx.buffer_shape_descs.get(&buf_id).copied()
+        && let Some(cached) = ctx.shape_dim_cache.get(&(shape_desc_id, dim)).cloned()
+    {
+        return cached;
+    }
     let shape_offset = *ctx
         .shape_offsets
         .get(&buf_id)
         .unwrap_or_else(|| panic!("missing shape offset for buffer value {}", buf_id.0));
-    let shapes_param = ctx
-        .shapes_param
-        .clone()
-        .expect("shape_dim lowering requires explicit __sile_shapes parameter");
+    let shape_desc = if let Some(shape_desc_id) = ctx.buffer_shape_descs.get(&buf_id).copied() {
+        llvm_ir::Operand::Value(shape_desc_id)
+    } else {
+        let shapes_param = ctx
+            .shapes_param
+            .clone()
+            .expect("shape_dim lowering requires explicit __sile_shapes parameter");
+        emit_gep(
+            ctx,
+            out,
+            shapes_param,
+            vec![const_i64(shape_offset as i64)],
+            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, llvm_ir::Type::I64),
+        )
+    };
     let ptr = emit_gep(
         ctx,
         out,
-        shapes_param,
-        vec![const_i64((shape_offset + dim) as i64)],
+        shape_desc,
+        vec![const_i64(dim as i64)],
         llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, llvm_ir::Type::I64),
     );
-    emit_load(ctx, out, ptr, llvm_ir::Type::I64)
+    let loaded = emit_load(ctx, out, ptr, llvm_ir::Type::I64);
+    if let Some(shape_desc_id) = ctx.buffer_shape_descs.get(&buf_id).copied() {
+        ctx.shape_dim_cache
+            .entry((shape_desc_id, dim))
+            .or_insert_with(|| loaded.clone());
+    } else {
+        let _ = shape_offset;
+    }
+    loaded
 }
 
 pub(crate) fn emit_gep(

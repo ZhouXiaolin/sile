@@ -160,6 +160,12 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
         TileIrOp::Broadcast { value, rows, cols } => {
             format!("broadcast {value} {{shape = [{rows}, {cols}]}}")
         }
+        TileIrOp::Map { expr, rows, cols } => {
+            format!(
+                "map {} {{shape = [{rows}, {cols}]}}",
+                format_tile_map_expr(expr)
+            )
+        }
         TileIrOp::Extract {
             tile,
             row_coord,
@@ -175,6 +181,62 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
         }
         TileIrOp::ConstI64(v) => format!("constant <i64: {v}>"),
         TileIrOp::ConstF64(v) => format!("constant <f64: {}>", format_float_literal(*v)),
+        TileIrOp::ShapeDim { shape, dim } => format!("sile.shape_dim {shape} {{dim = {dim}}}"),
+    }
+}
+
+fn format_tile_map_expr(expr: &TileMapExpr) -> String {
+    match expr {
+        TileMapExpr::Value(value) => value.to_string(),
+        TileMapExpr::LoadPtrTko {
+            buf,
+            row_coord,
+            col_coord,
+            rows,
+            cols,
+            stride_shape_idx,
+        } => format!(
+            "load_ptr_tko({buf}, [{row_coord}, {col_coord}], shape=[{rows}, {cols}], stride_dim={stride_shape_idx})"
+        ),
+        TileMapExpr::Splat { value } => format!("constant({})", format_float_literal(*value)),
+        TileMapExpr::Add { lhs, rhs } => {
+            format!(
+                "addf({}, {})",
+                format_tile_map_expr(lhs),
+                format_tile_map_expr(rhs)
+            )
+        }
+        TileMapExpr::Sub { lhs, rhs } => {
+            format!(
+                "subf({}, {})",
+                format_tile_map_expr(lhs),
+                format_tile_map_expr(rhs)
+            )
+        }
+        TileMapExpr::Mul { lhs, rhs } => {
+            format!(
+                "mulf({}, {})",
+                format_tile_map_expr(lhs),
+                format_tile_map_expr(rhs)
+            )
+        }
+        TileMapExpr::Div { lhs, rhs } => {
+            format!(
+                "divf({}, {})",
+                format_tile_map_expr(lhs),
+                format_tile_map_expr(rhs)
+            )
+        }
+        TileMapExpr::Neg { operand } => format!("negf({})", format_tile_map_expr(operand)),
+        TileMapExpr::Exp { operand } => format!("exp({})", format_tile_map_expr(operand)),
+        TileMapExpr::Broadcast {
+            value,
+            src_rows,
+            src_cols,
+        } => format!(
+            "broadcast({}, src_shape=[{src_rows}, {src_cols}])",
+            format_tile_map_expr(value)
+        ),
     }
 }
 
@@ -215,6 +277,7 @@ fn format_tile_ir_type(ty: &TileIrType) -> String {
     match ty {
         TileIrType::I64 => "tile<i64>".into(),
         TileIrType::F32 => "tile<f32>".into(),
+        TileIrType::ShapeDesc { rank } => format!("shape_desc<{rank}>"),
         TileIrType::Tile { rows, cols } => format!("tile<{rows}x{cols}xf32>"),
         TileIrType::Buffer { .. } => "tile<ptr<f32>>".into(),
         TileIrType::Void => "none".into(),
@@ -250,16 +313,16 @@ fn format_param_attrs(param: &TileIrParam) -> String {
                 buffer_rank_attr(&param.ty)
             )
         }
-        TileIrParamKind::SileProgramId { dim } => {
+        TileIrParamKind::LaunchIndex { dim } => {
             format!(
-                "sym_name = \"{}\", kind = \"sile.program_id\", dim = {}",
+                "sym_name = \"{}\", kind = \"launch.index\", dim = {}",
                 param.name, dim
             )
         }
-        TileIrParamKind::SileShapeDim { source, dim } => {
+        TileIrParamKind::ShapeDesc { source } => {
             format!(
-                "sym_name = \"{}\", kind = \"sile.shape_dim\", source = {}, dim = {}",
-                param.name, source, dim
+                "sym_name = \"{}\", kind = \"shape.desc\", source = {}",
+                param.name, source
             )
         }
     }

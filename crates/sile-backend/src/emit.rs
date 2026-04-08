@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sile_core::{Error, Result};
 use sile_llvm_ir as llvm_ir;
@@ -348,8 +348,16 @@ pub fn emit_structured_from<E: StructuredEmitter>(
             continue;
         }
 
-        if matches!(block.terminator, llvm_ir::Terminator::CondBr { .. }) {
+        if is_loop_header(func, &block) {
             current = emit_structured_loop_header(emitter, func, &block, messages)?;
+            if stop_targets.contains(&current) {
+                return Ok(Some(current));
+            }
+            continue;
+        }
+
+        if matches!(block.terminator, llvm_ir::Terminator::CondBr { .. }) {
+            current = emit_structured_if_else(emitter, func, &block, messages)?;
             if stop_targets.contains(&current) {
                 return Ok(Some(current));
             }
@@ -454,6 +462,45 @@ fn emit_structured_loop_header<E: StructuredEmitter>(
     )
 }
 
+fn emit_structured_if_else<E: StructuredEmitter>(
+    emitter: &mut E,
+    func: &llvm_ir::Function,
+    block: &llvm_ir::BasicBlock,
+    messages: StructuredCfgMessages,
+) -> Result<llvm_ir::BlockId> {
+    let llvm_ir::Terminator::CondBr {
+        cond,
+        true_target,
+        true_args,
+        false_target,
+        false_args,
+    } = &block.terminator
+    else {
+        return Err(Error::Compile(messages.unsupported_cond_br.into()));
+    };
+    let join = shared_branch_join(func, *true_target, *false_target)
+        .ok_or_else(|| Error::Compile(messages.unsupported_cond_br.into()))?;
+
+    emitter.emit_block_insts(block)?;
+    emitter.writeln(&format!("if ({}) {{", emitter.format_operand(cond)));
+    emitter.indent_inc();
+    emitter.emit_block_param_assignments(*true_target, true_args);
+    if emit_structured_from(emitter, func, *true_target, &[join], messages)? != Some(join) {
+        return Err(Error::Compile(messages.unsupported_cond_br.into()));
+    }
+    emitter.indent_dec();
+    emitter.writeln("} else {");
+    emitter.indent_inc();
+    emitter.emit_block_param_assignments(*false_target, false_args);
+    if emit_structured_from(emitter, func, *false_target, &[join], messages)? != Some(join) {
+        return Err(Error::Compile(messages.unsupported_cond_br.into()));
+    }
+    emitter.indent_dec();
+    emitter.writeln("}");
+
+    Ok(join)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_structured_loop_header_impl<E: StructuredEmitter>(
     emitter: &mut E,
@@ -495,10 +542,88 @@ fn is_loop_preheader(func: &llvm_ir::Function, block: &llvm_ir::BasicBlock) -> b
     let llvm_ir::Terminator::Br { target: header, .. } = block.terminator else {
         return false;
     };
-    matches!(
-        get_block(func, header).map(|header| &header.terminator),
-        Some(llvm_ir::Terminator::CondBr { .. })
-    )
+    get_block(func, header)
+        .map(|header| is_loop_header(func, header))
+        .unwrap_or(false)
+}
+
+fn is_loop_header(func: &llvm_ir::Function, block: &llvm_ir::BasicBlock) -> bool {
+    let llvm_ir::Terminator::CondBr {
+        true_target,
+        false_target,
+        ..
+    } = block.terminator
+    else {
+        return false;
+    };
+    predecessor_count(func, block.id) > 1
+        && (block_reaches(func, true_target, block.id, &mut HashSet::new())
+            || block_reaches(func, false_target, block.id, &mut HashSet::new()))
+}
+
+fn shared_branch_join(
+    func: &llvm_ir::Function,
+    true_target: llvm_ir::BlockId,
+    false_target: llvm_ir::BlockId,
+) -> Option<llvm_ir::BlockId> {
+    let true_block = get_block(func, true_target)?;
+    let false_block = get_block(func, false_target)?;
+    match (&true_block.terminator, &false_block.terminator) {
+        (
+            llvm_ir::Terminator::Br {
+                target: true_join, ..
+            },
+            llvm_ir::Terminator::Br {
+                target: false_join, ..
+            },
+        ) if true_join == false_join => Some(*true_join),
+        _ => None,
+    }
+}
+
+fn block_reaches(
+    func: &llvm_ir::Function,
+    start: llvm_ir::BlockId,
+    goal: llvm_ir::BlockId,
+    visiting: &mut HashSet<llvm_ir::BlockId>,
+) -> bool {
+    if start == goal {
+        return true;
+    }
+    if !visiting.insert(start) {
+        return false;
+    }
+    let reaches = match get_block(func, start).map(|block| &block.terminator) {
+        Some(llvm_ir::Terminator::Br { target, .. }) => {
+            block_reaches(func, *target, goal, visiting)
+        }
+        Some(llvm_ir::Terminator::CondBr {
+            true_target,
+            false_target,
+            ..
+        }) => {
+            block_reaches(func, *true_target, goal, visiting)
+                || block_reaches(func, *false_target, goal, visiting)
+        }
+        _ => false,
+    };
+    visiting.remove(&start);
+    reaches
+}
+
+fn predecessor_count(func: &llvm_ir::Function, target: llvm_ir::BlockId) -> usize {
+    func.blocks
+        .iter()
+        .map(|block| match &block.terminator {
+            llvm_ir::Terminator::Br { target: succ, .. } => usize::from(*succ == target),
+            llvm_ir::Terminator::CondBr {
+                true_target,
+                false_target,
+                ..
+            } => usize::from(*true_target == target) + usize::from(*false_target == target),
+            llvm_ir::Terminator::Ret { .. } | llvm_ir::Terminator::Switch { .. } => 0,
+        })
+        .sum()
 }
 
 fn build_value_type_map(func: &llvm_ir::Function) -> HashMap<llvm_ir::ValueId, llvm_ir::Type> {

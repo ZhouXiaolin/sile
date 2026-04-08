@@ -123,6 +123,7 @@ fn c_compile_allows_thread_id_intrinsic() {
         compile(&func, CodegenTarget::C).expect("C target should allow thread_id intrinsic");
     match artifact {
         BackendArtifact::CSource(source) => {
+            assert!(source.contains("#include <omp.h>"));
             assert!(source.contains("#define llir_thread_id_0() (0)"));
         }
         other => panic!("expected C source, got {other:?}"),

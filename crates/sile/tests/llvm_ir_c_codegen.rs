@@ -33,6 +33,7 @@ fn dynamic_k_matmul_llir_codegen_emits_structured_c_without_helper_calls() {
     assert!(c.contains("&(b["));
     assert!(c.contains("&(c["));
     assert!(c.contains("float v"));
+    assert_eq!(c.matches("while (true)").count(), 6);
     assert!(!c.contains("sile_shape_dim("));
     assert!(!c.contains("static const int64_t* sile_shapes"));
 }
@@ -56,6 +57,10 @@ fn vec_add_llir_codegen_emits_explicit_c_loops() {
     assert!(c.contains("&(a["));
     assert!(c.contains("&(b["));
     assert!(c.contains("&(c["));
+    assert_eq!(c.matches("while (true)").count(), 1);
+    assert!(!c.contains("__launch_idx1"));
+    assert!(!c.contains(" ? "));
+    assert!(!c.contains("_storage"));
 }
 
 #[test]
