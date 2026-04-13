@@ -325,6 +325,7 @@ pub fn emit_structured_from<E: StructuredEmitter>(
     start: llvm_ir::BlockId,
     stop_targets: &[llvm_ir::BlockId],
     stop_skip_params: Option<(llvm_ir::BlockId, Vec<llvm_ir::ValueId>)>,
+    stop_skip_inst: Option<(llvm_ir::BlockId, llvm_ir::ValueId)>,
     messages: StructuredCfgMessages,
 ) -> Result<Option<llvm_ir::BlockId>> {
     let mut current = start;
@@ -336,7 +337,13 @@ pub fn emit_structured_from<E: StructuredEmitter>(
         if let llvm_ir::Terminator::Br { target, args } = &block.terminator
             && stop_targets.contains(target)
         {
-            emitter.emit_block_insts(&block)?;
+            let skip_inst = stop_skip_inst.as_ref()
+                .and_then(|(bid, vid)| (*bid == current).then_some(*vid));
+            if let Some(skip) = skip_inst {
+                emitter.emit_block_insts_except(&block, Some(skip))?;
+            } else {
+                emitter.emit_block_insts(&block)?;
+            }
             emitter.emit_block_param_assignments_skipping(
                 *target,
                 args,
@@ -496,14 +503,14 @@ fn emit_structured_if_else<E: StructuredEmitter>(
     emitter.writeln(&format!("if ({cond_expr}) {{"));
     emitter.indent_inc();
     emitter.emit_block_param_assignments(*true_target, true_args);
-    if emit_structured_from(emitter, func, *true_target, &[join], None, messages)? != Some(join) {
+    if emit_structured_from(emitter, func, *true_target, &[join], None, None, messages)? != Some(join) {
         return Err(Error::Compile(messages.unsupported_cond_br.into()));
     }
     emitter.indent_dec();
     emitter.writeln("} else {");
     emitter.indent_inc();
     emitter.emit_block_param_assignments(*false_target, false_args);
-    if emit_structured_from(emitter, func, *false_target, &[join], None, messages)? != Some(join) {
+    if emit_structured_from(emitter, func, *false_target, &[join], None, None, messages)? != Some(join) {
         return Err(Error::Compile(messages.unsupported_cond_br.into()));
     }
     emitter.indent_dec();
@@ -562,6 +569,7 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
                     true_target,
                     &[header.id],
                     Some((header.id, vec![for_loop.induction_param])),
+                    for_loop.step_value_id.map(|vid| (header.id, vid)),
                     messages,
                 )?;
                 if backedge != Some(header.id) {
@@ -584,6 +592,7 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
                 func,
                 true_target,
                 &[header.id],
+                None,
                 None,
                 messages,
             )?;
@@ -616,6 +625,7 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
                 true_target,
                 &[header.id],
                 None,
+                None,
                 messages,
             )?;
             if backedge != Some(header.id) {
@@ -634,6 +644,7 @@ struct ForLoopInduction {
     induction_param: llvm_ir::ValueId,
     induction_param_index: usize,
     step: i64,
+    step_value_id: Option<llvm_ir::ValueId>,
 }
 
 fn detect_for_loop_induction(
@@ -659,7 +670,7 @@ fn detect_for_loop_induction(
     }
     let induction_param_index = header.params.iter().position(|param| param.id == *loop_param)?;
     let backedge_candidates = find_loop_backedge_args(func, header.id, true_target);
-    let step = backedge_candidates.into_iter().find_map(|args| {
+    let (step, step_value_id) = backedge_candidates.into_iter().find_map(|args| {
         induction_step_from_backedge_arg(func, *loop_param, args.get(induction_param_index)?)
     })?;
     if step == 0 {
@@ -679,6 +690,7 @@ fn detect_for_loop_induction(
         induction_param: *loop_param,
         induction_param_index,
         step,
+        step_value_id,
     })
 }
 
@@ -705,7 +717,7 @@ fn induction_step_from_backedge_arg(
     func: &llvm_ir::Function,
     loop_param: llvm_ir::ValueId,
     arg: &llvm_ir::Operand,
-) -> Option<i64> {
+) -> Option<(i64, Option<llvm_ir::ValueId>)> {
     let llvm_ir::Operand::Value(step_value_id) = arg else {
         return None;
     };
@@ -713,22 +725,23 @@ fn induction_step_from_backedge_arg(
     let llvm_ir::InstOp::Bin { op, lhs, rhs } = &step_inst.op else {
         return None;
     };
+    let step_val = *step_value_id;
     match (op, lhs, rhs) {
         (
             llvm_ir::BinOp::Add,
             llvm_ir::Operand::Value(id),
             llvm_ir::Operand::Const(llvm_ir::Constant::Int(step)),
-        ) if *id == loop_param => Some(*step),
+        ) if *id == loop_param => Some((*step, Some(step_val))),
         (
             llvm_ir::BinOp::Add,
             llvm_ir::Operand::Const(llvm_ir::Constant::Int(step)),
             llvm_ir::Operand::Value(id),
-        ) if *id == loop_param => Some(*step),
+        ) if *id == loop_param => Some((*step, Some(step_val))),
         (
             llvm_ir::BinOp::Sub,
             llvm_ir::Operand::Value(id),
             llvm_ir::Operand::Const(llvm_ir::Constant::Int(step)),
-        ) if *id == loop_param => Some(-*step),
+        ) if *id == loop_param => Some((-*step, Some(step_val))),
         _ => None,
     }
 }

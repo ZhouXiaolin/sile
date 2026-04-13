@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{BasicBlock, BlockId, Function, Inst, InstOp, Intrinsic, Operand, Terminator, ValueId};
+use crate::{BasicBlock, BlockId, Constant, Function, Inst, InstOp, Intrinsic, Operand, Terminator, ValueId};
 
 /// Canonical LLVM IR rewrites live here.
 ///
@@ -11,6 +11,7 @@ pub fn run(mut func: Function) -> Function {
     sink_pointwise_tile_exprs(&mut func);
     compact_rank2_tile_store_loops(&mut func);
     fold_algebraic_identities(&mut func);
+    fold_constant_comparisons(&mut func);
     eliminate_dead_insts(&mut func);
     func
 }
@@ -119,6 +120,51 @@ fn fold_algebraic_identities(func: &mut Function) {
                 .collect();
             block.terminator = rewrite_terminator_operands(block.terminator.clone(), &replacements);
         }
+    }
+}
+
+/// Fold `Cmp` instructions with two constant operands into `Constant::Bool`.
+fn fold_constant_comparisons(func: &mut Function) {
+    let mut replacements: HashMap<ValueId, Operand> = HashMap::new();
+
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let Some(result) = inst.result else { continue };
+            let InstOp::Cmp { pred, lhs, rhs } = &inst.op else {
+                continue;
+            };
+            let lhs = rewrite_operand(lhs.clone(), &replacements);
+            let rhs = rewrite_operand(rhs.clone(), &replacements);
+            let folded = match (pred, &lhs, &rhs) {
+                (crate::CmpPred::Slt, Operand::Const(Constant::Int(a)), Operand::Const(Constant::Int(b))) => Some(a < b),
+                (crate::CmpPred::Sle, Operand::Const(Constant::Int(a)), Operand::Const(Constant::Int(b))) => Some(a <= b),
+                (crate::CmpPred::Sgt, Operand::Const(Constant::Int(a)), Operand::Const(Constant::Int(b))) => Some(a > b),
+                (crate::CmpPred::Sge, Operand::Const(Constant::Int(a)), Operand::Const(Constant::Int(b))) => Some(a >= b),
+                (crate::CmpPred::Eq, Operand::Const(Constant::Int(a)), Operand::Const(Constant::Int(b))) => Some(a == b),
+                (crate::CmpPred::Ne, Operand::Const(Constant::Int(a)), Operand::Const(Constant::Int(b))) => Some(a != b),
+                (crate::CmpPred::Olt, Operand::Const(Constant::Float(a)), Operand::Const(Constant::Float(b))) => Some(a < b),
+                (crate::CmpPred::Ole, Operand::Const(Constant::Float(a)), Operand::Const(Constant::Float(b))) => Some(a <= b),
+                (crate::CmpPred::Ogt, Operand::Const(Constant::Float(a)), Operand::Const(Constant::Float(b))) => Some(a > b),
+                (crate::CmpPred::Oge, Operand::Const(Constant::Float(a)), Operand::Const(Constant::Float(b))) => Some(a >= b),
+                _ => None,
+            };
+            if let Some(val) = folded {
+                replacements.insert(result, Operand::Const(Constant::Bool(val)));
+            }
+        }
+    }
+
+    if replacements.is_empty() {
+        return;
+    }
+
+    for block in &mut func.blocks {
+        block.insts = std::mem::take(&mut block.insts)
+            .into_iter()
+            .map(|inst| rewrite_inst_operands(inst, &replacements))
+            .filter(|inst| inst.result.map_or(true, |r| !replacements.contains_key(&r)))
+            .collect();
+        block.terminator = rewrite_terminator_operands(block.terminator.clone(), &replacements);
     }
 }
 

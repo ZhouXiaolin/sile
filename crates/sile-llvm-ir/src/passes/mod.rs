@@ -1,3 +1,4 @@
+pub mod alloca_simplify;
 pub mod canonicalize;
 pub mod cse;
 pub mod dce;
@@ -21,6 +22,7 @@ pub enum LlvmIrPassKind {
     Licm,
     Cse,
     Dce,
+    AllocaSimplify,
     VerifyOutput,
 }
 
@@ -39,6 +41,7 @@ pub const RECOMMENDED_PIPELINE: &[LlvmIrPassKind] = &[
     LlvmIrPassKind::Licm,
     LlvmIrPassKind::Cse,
     LlvmIrPassKind::Dce,
+    LlvmIrPassKind::AllocaSimplify,
     LlvmIrPassKind::VerifyOutput,
 ];
 
@@ -60,6 +63,7 @@ pub fn run_pipeline(mut func: Function, pipeline: &[LlvmIrPassKind]) -> Result<F
             LlvmIrPassKind::Licm => licm::run(func),
             LlvmIrPassKind::Cse => cse::run(func),
             LlvmIrPassKind::Dce => dce::run(func),
+            LlvmIrPassKind::AllocaSimplify => alloca_simplify::run(func),
         };
     }
     Ok(func)
