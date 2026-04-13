@@ -269,6 +269,7 @@ impl<'a> CCodegen<'a> {
             start,
             stop_targets,
             None,
+            None,
             StructuredCfgMessages {
                 preheader_must_branch: "structured C loop preheader must end with a branch",
                 missing_loop_header: "missing LLVM IR C loop header",

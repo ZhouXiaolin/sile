@@ -92,6 +92,7 @@ impl<'a> MetalCodegen<'a> {
             start,
             stop_targets,
             None,
+            None,
             StructuredCfgMessages {
                 preheader_must_branch: "structured loop preheader must end with a branch",
                 missing_loop_header: "missing LLVM IR structured loop header",

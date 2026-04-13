@@ -455,10 +455,8 @@ impl PointwiseLoweringPlan {
                 } => (*value, true, *axis, *in_rows, *in_cols),
                 _ => continue,
             };
-            if use_counts.get(&value).copied().unwrap_or(0) != 1 {
-                continue;
-            }
-            // Try Load-Reduce fusion first
+            // Try Load-Reduce fusion first (safe even with multiple consumers
+            // since the fused version reads directly from global memory).
             if let Some(TileIrOp::LoadPtrTko {
                 buf,
                 row_coord,
@@ -468,7 +466,6 @@ impl PointwiseLoweringPlan {
                 stride_shape_idx,
             }) = defs.get(&value)
             {
-                skipped_values.insert(value);
                 load_reduce_fusions.insert(
                     inst.result,
                     LoadReduceFusion {
@@ -484,11 +481,21 @@ impl PointwiseLoweringPlan {
                         in_cols,
                     },
                 );
+                // Only skip the load value if it has a single consumer —
+                // otherwise the load must still be emitted for other users.
+                if use_counts.get(&value).copied().unwrap_or(0) == 1 {
+                    skipped_values.insert(value);
+                }
                 continue;
             }
-            // Try Map-Reduce fusion
+            // Try Map-Reduce fusion.  When the map has a single consumer we
+            // can skip the standalone map emission entirely.  With multiple
+            // consumers the map is still emitted, but the fused reduce avoids
+            // reading from the intermediate alloca.
             if let Some(TileIrOp::Map { expr, rows, cols }) = defs.get(&value) {
-                skipped_values.insert(value);
+                if use_counts.get(&value).copied().unwrap_or(0) == 1 {
+                    skipped_values.insert(value);
+                }
                 map_reduce_fusions.insert(
                     inst.result,
                     MapReduceFusion {
