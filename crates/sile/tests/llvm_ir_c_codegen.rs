@@ -97,6 +97,20 @@ fn softmax_llir_codegen_emits_explicit_reduce_and_broadcast_loops() {
     assert!(!c.contains("llir_reduce_add("));
     assert!(!c.contains("llir_reduce_max("));
     assert!(!c.contains("tile_splat_f32("));
+
+    // Verify alloca count for softmax — the fusion optimizations should keep this low.
+    // Currently: tile_x(2x8), tile_x_max(2x1), num(2x8), denom(2x1), div_result(2x8) = 5
+    // TODO: reduce to ≤ 3 with multi-use fusion
+    let alloca_count = llir_func
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i.op, sile_llvm_ir::InstOp::Alloca { .. }))
+        .count();
+    assert!(
+        alloca_count <= 5,
+        "softmax alloca count should be ≤ 5, got {alloca_count}"
+    );
 }
 
 fn build_dynamic_k_matmul_kernel() -> Kernel {
