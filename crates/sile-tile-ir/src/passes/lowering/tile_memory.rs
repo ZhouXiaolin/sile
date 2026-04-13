@@ -8,7 +8,7 @@ use crate::passes::lowering::core::{
 };
 
 #[derive(Clone)]
-enum BufferIndexBase {
+pub(crate) enum BufferIndexBase {
     Linear {
         tile_base: llvm_ir::Operand,
         tile_cols: i64,
@@ -161,7 +161,7 @@ pub(crate) fn lower_tile_store_inst(
     );
 }
 
-fn build_buffer_index_base(
+pub(crate) fn build_buffer_index_base(
     ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
     out: &mut Vec<llvm_ir::Inst>,
     buf: llvm_ir::Operand,
@@ -227,7 +227,7 @@ fn build_buffer_index_base(
     }
 }
 
-fn emit_buffer_element_ptr(
+pub(crate) fn emit_buffer_element_ptr(
     ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
     out: &mut Vec<llvm_ir::Inst>,
     buf: llvm_ir::Operand,
