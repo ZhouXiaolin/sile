@@ -8,8 +8,8 @@ use super::block_scalar::lower_scalar_inst;
 use super::block_terminator::lower_terminator;
 use super::core::{BlockLowerer, LowerLlvmIrCtx, llvm_ir_block, llvm_ir_type, llvm_ir_value};
 use super::tile_compute::{
-    FusedAccInit, FusedTileLoad, lower_fused_tile_mma_inst, lower_tile_mma_inst,
-    lower_tile_reduce_inst,
+    FusedAccInit, FusedTileLoad, LoadReduceFusion, lower_fused_load_reduce_inst,
+    lower_fused_tile_mma_inst, lower_tile_mma_inst, lower_tile_reduce_inst,
 };
 use super::tile_expr::{
     PointwiseTileDefs, build_pointwise_tile_defs, lower_pointwise_rank1_store_inst,
@@ -50,6 +50,10 @@ pub(crate) fn lower_block(
     let pointwise_plan = PointwiseLoweringPlan::build(block, tile_ir);
 
     for inst in &block.insts {
+        if let Some(fusion) = pointwise_plan.load_reduce_fusions.get(&inst.result) {
+            lower_fused_load_reduce_inst(inst.result, fusion, &mut builder);
+            continue;
+        }
         if let Some(expr) = pointwise_plan.store_maps.get(&inst.result) {
             let TileIrOp::StorePtrTko {
                 buf,
@@ -244,6 +248,7 @@ struct PointwiseLoweringPlan {
     store_maps: HashMap<ValueId, TileMapExpr>,
     store_fusions: HashMap<ValueId, PointwiseTileDefs>,
     expr_fusions: HashMap<ValueId, PointwiseTileDefs>,
+    load_reduce_fusions: HashMap<ValueId, LoadReduceFusion>,
     uninitialized_splats: HashSet<ValueId>,
     skipped_values: HashSet<ValueId>,
 }
@@ -277,6 +282,7 @@ impl PointwiseLoweringPlan {
         let mut store_maps = HashMap::new();
         let mut store_fusions = HashMap::new();
         let mut expr_fusions = HashMap::new();
+        let mut load_reduce_fusions = HashMap::new();
 
         for inst in &block.insts {
             let TileIrOp::MmaF {
@@ -423,11 +429,63 @@ impl PointwiseLoweringPlan {
             expr_fusions.insert(inst.result, pending_tiles);
         }
 
+        for inst in &block.insts {
+            if skipped_values.contains(&inst.result) {
+                continue;
+            }
+            let (value, is_max, axis, in_rows, in_cols) = match &inst.op {
+                TileIrOp::ReduceSum {
+                    value,
+                    axis,
+                    in_rows,
+                    in_cols,
+                } => (*value, false, *axis, *in_rows, *in_cols),
+                TileIrOp::ReduceMax {
+                    value,
+                    axis,
+                    in_rows,
+                    in_cols,
+                } => (*value, true, *axis, *in_rows, *in_cols),
+                _ => continue,
+            };
+            if use_counts.get(&value).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            let Some(TileIrOp::LoadPtrTko {
+                buf,
+                row_coord,
+                col_coord,
+                rows,
+                cols,
+                stride_shape_idx,
+            }) = defs.get(&value)
+            else {
+                continue;
+            };
+            skipped_values.insert(value);
+            load_reduce_fusions.insert(
+                inst.result,
+                LoadReduceFusion {
+                    buf: *buf,
+                    row_coord: *row_coord,
+                    col_coord: *col_coord,
+                    src_rows: *rows,
+                    src_cols: *cols,
+                    stride_shape_idx: *stride_shape_idx,
+                    is_max,
+                    axis,
+                    in_rows,
+                    in_cols,
+                },
+            );
+        }
+
         Self {
             mma_fusions,
             store_maps,
             store_fusions,
             expr_fusions,
+            load_reduce_fusions,
             uninitialized_splats,
             skipped_values,
         }
