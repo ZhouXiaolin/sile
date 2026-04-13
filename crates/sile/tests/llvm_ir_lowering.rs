@@ -23,10 +23,11 @@ fn dynamic_k_matmul_lowers_to_llvm_like_llvm_ir_with_explicit_memory_ops() {
     assert!(printed.contains("; sile.param %b [rank=2, shape_offset=2, elem=f32]"));
     assert!(printed.contains("; sile.param %c [rank=2, shape_offset=4, elem=f32]"));
     assert!(printed.contains("; sile.param %__sile_shapes [elem=i64]"));
-    assert!(printed.contains("bb1:"));
+    assert!(printed.contains("bb0:"));
+    assert!(printed.contains("matmul_row_header_"));
+    assert!(printed.contains("matmul_k_header_"));
     assert!(printed.contains("; args("));
     assert!(printed.contains("br i1"));
-    assert!(printed.contains("ptr addrspace(5)"));
     assert!(
         printed.contains("%__shape_a = getelementptr i64, ptr addrspace(4) %__sile_shapes, i64 0")
     );
@@ -38,11 +39,13 @@ fn dynamic_k_matmul_lowers_to_llvm_like_llvm_ir_with_explicit_memory_ops() {
     );
     assert!(printed.contains("getelementptr i64, ptr addrspace(4) %__shape_a, i64 1"));
     assert!(printed.contains("load i64, ptr addrspace(4)"));
-    assert!(printed.contains("alloca [2 x [2 x f32]], addrspace(5)"));
+    assert!(!printed.contains("alloca [2 x [2 x f32]], addrspace(5)"));
+    assert!(!printed.contains("ptr addrspace(5)"));
     assert!(printed.contains("getelementptr f32, ptr addrspace(1) %a,"));
     assert!(printed.contains("getelementptr f32, ptr addrspace(1) %b,"));
     assert!(printed.contains("getelementptr f32, ptr addrspace(1) %c,"));
     assert!(!printed.contains("tile_fill_"));
+    assert!(!printed.contains("icmp eq"));
     assert!(printed.contains("load f32, ptr"));
     assert!(printed.contains("store f32"));
     assert!(!printed.contains("store f64"));

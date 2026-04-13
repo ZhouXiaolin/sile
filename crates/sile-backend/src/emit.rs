@@ -61,28 +61,6 @@ pub fn format_operand(
     }
 }
 
-pub fn block_param_assignments(
-    func: &llvm_ir::Function,
-    value_names: &HashMap<llvm_ir::ValueId, String>,
-    target: llvm_ir::BlockId,
-    args: &[llvm_ir::Operand],
-) -> Vec<(String, String)> {
-    let Some(block) = func.blocks.iter().find(|block| block.id == target) else {
-        return Vec::new();
-    };
-    block
-        .params
-        .iter()
-        .zip(args.iter())
-        .map(|(param, arg)| {
-            (
-                value_name(value_names, param.id),
-                format_operand(value_names, arg),
-            )
-        })
-        .collect()
-}
-
 pub fn array_dims(ty: &llvm_ir::Type) -> Vec<usize> {
     let mut dims = Vec::new();
     let mut current = ty;
@@ -287,7 +265,16 @@ pub fn infer_tile_plan(func: &llvm_ir::Function) -> Option<TilePlan> {
             let Some((rows, cols)) =
                 infer_tile_dims_from_scalar_store(*value_id, &inst_by_result, &value_types)
             else {
-                continue;
+                let Some((rows, cols)) =
+                    infer_tile_dims_from_direct_loop_store(func, block, &inst_by_result)
+                else {
+                    continue;
+                };
+                return Some(TilePlan {
+                    output_param,
+                    rows,
+                    cols,
+                });
             };
             return Some(TilePlan {
                 output_param,
@@ -302,7 +289,20 @@ pub fn infer_tile_plan(func: &llvm_ir::Function) -> Option<TilePlan> {
 
 pub trait StructuredEmitter {
     fn emit_block_insts(&mut self, block: &llvm_ir::BasicBlock) -> Result<()>;
-    fn emit_block_param_assignments(&mut self, target: llvm_ir::BlockId, args: &[llvm_ir::Operand]);
+    fn emit_block_insts_except(
+        &mut self,
+        block: &llvm_ir::BasicBlock,
+        skip_result: Option<llvm_ir::ValueId>,
+    ) -> Result<()>;
+    fn emit_block_param_assignments_skipping(
+        &mut self,
+        target: llvm_ir::BlockId,
+        args: &[llvm_ir::Operand],
+        skip_params: &[llvm_ir::ValueId],
+    );
+    fn emit_block_param_assignments(&mut self, target: llvm_ir::BlockId, args: &[llvm_ir::Operand]) {
+        self.emit_block_param_assignments_skipping(target, args, &[]);
+    }
     fn format_operand(&self, operand: &llvm_ir::Operand) -> String;
     fn writeln(&mut self, line: &str);
     fn indent_inc(&mut self);
@@ -324,6 +324,7 @@ pub fn emit_structured_from<E: StructuredEmitter>(
     func: &llvm_ir::Function,
     start: llvm_ir::BlockId,
     stop_targets: &[llvm_ir::BlockId],
+    stop_skip_params: Option<(llvm_ir::BlockId, Vec<llvm_ir::ValueId>)>,
     messages: StructuredCfgMessages,
 ) -> Result<Option<llvm_ir::BlockId>> {
     let mut current = start;
@@ -336,7 +337,11 @@ pub fn emit_structured_from<E: StructuredEmitter>(
             && stop_targets.contains(target)
         {
             emitter.emit_block_insts(&block)?;
-            emitter.emit_block_param_assignments(*target, args);
+            emitter.emit_block_param_assignments_skipping(
+                *target,
+                args,
+                skip_param_ids_for_target(stop_skip_params.as_ref(), *target),
+            );
             return Ok(Some(*target));
         }
 
@@ -367,7 +372,11 @@ pub fn emit_structured_from<E: StructuredEmitter>(
         emitter.emit_block_insts(&block)?;
         match &block.terminator {
             llvm_ir::Terminator::Br { target, args } => {
-                emitter.emit_block_param_assignments(*target, args);
+                emitter.emit_block_param_assignments_skipping(
+                    *target,
+                    args,
+                    skip_param_ids_for_target(stop_skip_params.as_ref(), *target),
+                );
                 if stop_targets.contains(target) {
                     return Ok(Some(*target));
                 }
@@ -419,11 +428,11 @@ fn emit_structured_loop_preheader<E: StructuredEmitter>(
     };
 
     emitter.emit_block_insts(preheader)?;
-    emitter.emit_block_param_assignments(*header_id, header_args);
     emit_structured_loop_header_impl(
         emitter,
         func,
         &header,
+        Some(header_args),
         cond,
         *true_target,
         true_args,
@@ -453,6 +462,7 @@ fn emit_structured_loop_header<E: StructuredEmitter>(
         emitter,
         func,
         header,
+        None,
         cond,
         *true_target,
         true_args,
@@ -481,18 +491,19 @@ fn emit_structured_if_else<E: StructuredEmitter>(
     let join = shared_branch_join(func, *true_target, *false_target)
         .ok_or_else(|| Error::Compile(messages.unsupported_cond_br.into()))?;
 
-    emitter.emit_block_insts(block)?;
-    emitter.writeln(&format!("if ({}) {{", emitter.format_operand(cond)));
+    let (cond_expr, skip_result) = branch_condition_expr(func, block, cond, false);
+    emitter.emit_block_insts_except(block, skip_result)?;
+    emitter.writeln(&format!("if ({cond_expr}) {{"));
     emitter.indent_inc();
     emitter.emit_block_param_assignments(*true_target, true_args);
-    if emit_structured_from(emitter, func, *true_target, &[join], messages)? != Some(join) {
+    if emit_structured_from(emitter, func, *true_target, &[join], None, messages)? != Some(join) {
         return Err(Error::Compile(messages.unsupported_cond_br.into()));
     }
     emitter.indent_dec();
     emitter.writeln("} else {");
     emitter.indent_inc();
     emitter.emit_block_param_assignments(*false_target, false_args);
-    if emit_structured_from(emitter, func, *false_target, &[join], messages)? != Some(join) {
+    if emit_structured_from(emitter, func, *false_target, &[join], None, messages)? != Some(join) {
         return Err(Error::Compile(messages.unsupported_cond_br.into()));
     }
     emitter.indent_dec();
@@ -506,6 +517,7 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
     emitter: &mut E,
     func: &llvm_ir::Function,
     header: &llvm_ir::BasicBlock,
+    incoming_header_args: Option<&[llvm_ir::Operand]>,
     cond: &llvm_ir::Operand,
     true_target: llvm_ir::BlockId,
     true_args: &[llvm_ir::Operand],
@@ -513,29 +525,241 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
     false_args: &[llvm_ir::Operand],
     messages: StructuredCfgMessages,
 ) -> Result<llvm_ir::BlockId> {
-    emitter.writeln("while (true) {");
-    emitter.indent_inc();
-    emitter.emit_block_insts(header)?;
-    emitter.writeln(&format!("if (!({})) {{", emitter.format_operand(cond)));
-    emitter.indent_inc();
-    emitter.emit_block_param_assignments(false_target, false_args);
-    emitter.writeln("break;");
-    emitter.indent_dec();
-    emitter.writeln("}");
+    let optimized_loop = branch_condition_expr(func, header, cond, true);
+    match optimized_loop {
+        (cond_expr, skip_result @ Some(_))
+            if header_only_contains_skipped_cmp(header, skip_result) =>
+        {
+            if let Some(for_loop) =
+                detect_for_loop_induction(func, header, cond, true_target, true_args)
+            {
+                let induction_name =
+                    emitter.format_operand(&llvm_ir::Operand::Value(for_loop.induction_param));
+                if let Some(args) = incoming_header_args {
+                    emitter.emit_block_param_assignments_skipping(
+                        header.id,
+                        args,
+                        &[for_loop.induction_param],
+                    );
+                }
+                let init_expr = incoming_header_args
+                    .and_then(|args| args.get(for_loop.induction_param_index))
+                    .map(|arg| format!("{induction_name} = {}", emitter.format_operand(arg)))
+                    .unwrap_or_default();
+                let step_expr = induction_step_expr(&induction_name, for_loop.step);
+                emitter.writeln(&format!(
+                    "for ({}; {}; {}) {{",
+                    init_expr, cond_expr, step_expr
+                ));
+                emitter.indent_inc();
+                emitter.emit_block_param_assignments(true_target, true_args);
+                let backedge = emit_structured_from(
+                    emitter,
+                    func,
+                    true_target,
+                    &[header.id],
+                    Some((header.id, vec![for_loop.induction_param])),
+                    messages,
+                )?;
+                if backedge != Some(header.id) {
+                    return Err(Error::Compile(messages.loop_backedge_mismatch.into()));
+                }
+                emitter.indent_dec();
+                emitter.writeln("}");
+                emitter.emit_block_param_assignments(false_target, false_args);
+                return Ok(false_target);
+            }
 
-    emitter.emit_block_param_assignments(true_target, true_args);
-    let backedge = emit_structured_from(emitter, func, true_target, &[header.id], messages)?;
-    if backedge != Some(header.id) {
-        return Err(Error::Compile(messages.loop_backedge_mismatch.into()));
+            if let Some(args) = incoming_header_args {
+                emitter.emit_block_param_assignments(header.id, args);
+            }
+            emitter.writeln(&format!("while ({cond_expr}) {{"));
+            emitter.indent_inc();
+            emitter.emit_block_param_assignments(true_target, true_args);
+            let backedge = emit_structured_from(
+                emitter,
+                func,
+                true_target,
+                &[header.id],
+                None,
+                messages,
+            )?;
+            if backedge != Some(header.id) {
+                return Err(Error::Compile(messages.loop_backedge_mismatch.into()));
+            }
+            emitter.indent_dec();
+            emitter.writeln("}");
+            emitter.emit_block_param_assignments(false_target, false_args);
+            Ok(false_target)
+        }
+        _ => {
+            if let Some(args) = incoming_header_args {
+                emitter.emit_block_param_assignments(header.id, args);
+            }
+            emitter.writeln("while (true) {");
+            emitter.indent_inc();
+            emitter.emit_block_insts(header)?;
+            emitter.writeln(&format!("if (!({})) {{", emitter.format_operand(cond)));
+            emitter.indent_inc();
+            emitter.emit_block_param_assignments(false_target, false_args);
+            emitter.writeln("break;");
+            emitter.indent_dec();
+            emitter.writeln("}");
+
+            emitter.emit_block_param_assignments(true_target, true_args);
+            let backedge = emit_structured_from(
+                emitter,
+                func,
+                true_target,
+                &[header.id],
+                None,
+                messages,
+            )?;
+            if backedge != Some(header.id) {
+                return Err(Error::Compile(messages.loop_backedge_mismatch.into()));
+            }
+            emitter.indent_dec();
+            emitter.writeln("}");
+
+            Ok(false_target)
+        }
     }
-    emitter.indent_dec();
-    emitter.writeln("}");
+}
 
-    Ok(false_target)
+#[derive(Clone, Copy)]
+struct ForLoopInduction {
+    induction_param: llvm_ir::ValueId,
+    induction_param_index: usize,
+    step: i64,
+}
+
+fn detect_for_loop_induction(
+    func: &llvm_ir::Function,
+    header: &llvm_ir::BasicBlock,
+    cond: &llvm_ir::Operand,
+    true_target: llvm_ir::BlockId,
+    _true_args: &[llvm_ir::Operand],
+) -> Option<ForLoopInduction> {
+    let cond_id = operand_value_id(cond)?;
+    let cmp_inst = get_inst_by_result(func, cond_id)?;
+    let llvm_ir::InstOp::Cmp { pred, lhs, rhs } = &cmp_inst.op else {
+        return None;
+    };
+    let llvm_ir::Operand::Value(loop_param) = lhs else {
+        return None;
+    };
+    if !matches!(
+        pred,
+        llvm_ir::CmpPred::Slt | llvm_ir::CmpPred::Sle | llvm_ir::CmpPred::Sgt | llvm_ir::CmpPred::Sge
+    ) {
+        return None;
+    }
+    let induction_param_index = header.params.iter().position(|param| param.id == *loop_param)?;
+    let backedge_candidates = find_loop_backedge_args(func, header.id, true_target);
+    let step = backedge_candidates.into_iter().find_map(|args| {
+        induction_step_from_backedge_arg(func, *loop_param, args.get(induction_param_index)?)
+    })?;
+    if step == 0 {
+        return None;
+    }
+    if !matches!(
+        (step > 0, pred),
+        (true, llvm_ir::CmpPred::Slt | llvm_ir::CmpPred::Sle)
+            | (false, llvm_ir::CmpPred::Sgt | llvm_ir::CmpPred::Sge)
+    ) {
+        return None;
+    }
+    if !matches!(rhs, llvm_ir::Operand::Const(_) | llvm_ir::Operand::Value(_)) {
+        return None;
+    }
+    Some(ForLoopInduction {
+        induction_param: *loop_param,
+        induction_param_index,
+        step,
+    })
+}
+
+fn find_loop_backedge_args(
+    func: &llvm_ir::Function,
+    header_id: llvm_ir::BlockId,
+    true_target: llvm_ir::BlockId,
+) -> Vec<Vec<llvm_ir::Operand>> {
+    func.blocks
+        .iter()
+        .filter_map(|block| match &block.terminator {
+            llvm_ir::Terminator::Br { target, args }
+                if *target == header_id
+                    && block_reaches(func, true_target, block.id, &mut HashSet::new()) =>
+            {
+                Some(args.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+}
+
+fn induction_step_from_backedge_arg(
+    func: &llvm_ir::Function,
+    loop_param: llvm_ir::ValueId,
+    arg: &llvm_ir::Operand,
+) -> Option<i64> {
+    let llvm_ir::Operand::Value(step_value_id) = arg else {
+        return None;
+    };
+    let step_inst = get_inst_by_result(func, *step_value_id)?;
+    let llvm_ir::InstOp::Bin { op, lhs, rhs } = &step_inst.op else {
+        return None;
+    };
+    match (op, lhs, rhs) {
+        (
+            llvm_ir::BinOp::Add,
+            llvm_ir::Operand::Value(id),
+            llvm_ir::Operand::Const(llvm_ir::Constant::Int(step)),
+        ) if *id == loop_param => Some(*step),
+        (
+            llvm_ir::BinOp::Add,
+            llvm_ir::Operand::Const(llvm_ir::Constant::Int(step)),
+            llvm_ir::Operand::Value(id),
+        ) if *id == loop_param => Some(*step),
+        (
+            llvm_ir::BinOp::Sub,
+            llvm_ir::Operand::Value(id),
+            llvm_ir::Operand::Const(llvm_ir::Constant::Int(step)),
+        ) if *id == loop_param => Some(-*step),
+        _ => None,
+    }
+}
+
+fn induction_step_expr(name: &str, step: i64) -> String {
+    match step {
+        1 => format!("++{name}"),
+        -1 => format!("--{name}"),
+        value if value > 0 => format!("{name} += {value}"),
+        value => format!("{name} -= {}", -value),
+    }
+}
+
+fn skip_param_ids_for_target<'a>(
+    skip: Option<&'a (llvm_ir::BlockId, Vec<llvm_ir::ValueId>)>,
+    target: llvm_ir::BlockId,
+) -> &'a [llvm_ir::ValueId] {
+    if let Some((skip_target, ids)) = skip
+        && *skip_target == target
+    {
+        return ids;
+    }
+    &[]
 }
 
 fn get_block(func: &llvm_ir::Function, id: llvm_ir::BlockId) -> Option<&llvm_ir::BasicBlock> {
     func.blocks.iter().find(|block| block.id == id)
+}
+
+fn get_inst_by_result(func: &llvm_ir::Function, id: llvm_ir::ValueId) -> Option<&llvm_ir::Inst> {
+    func.blocks
+        .iter()
+        .flat_map(|block| block.insts.iter())
+        .find(|inst| inst.result == Some(id))
 }
 
 fn is_loop_preheader(func: &llvm_ir::Function, block: &llvm_ir::BasicBlock) -> bool {
@@ -611,6 +835,63 @@ fn block_reaches(
     reaches
 }
 
+fn branch_condition_expr(
+    func: &llvm_ir::Function,
+    block: &llvm_ir::BasicBlock,
+    cond: &llvm_ir::Operand,
+    require_header_only: bool,
+) -> (String, Option<llvm_ir::ValueId>) {
+    let Some(cond_id) = operand_value_id(cond) else {
+        return (format_operand_with_function(func, cond), None);
+    };
+    let Some(inst) = get_inst_by_result(func, cond_id) else {
+        return (format_operand_with_function(func, cond), None);
+    };
+    if !matches!(inst.op, llvm_ir::InstOp::Cmp { .. }) {
+        return (format_operand_with_function(func, cond), None);
+    }
+    if require_header_only && !header_only_contains_skipped_cmp(block, Some(cond_id)) {
+        return (format_operand_with_function(func, cond), None);
+    }
+    match &inst.op {
+        llvm_ir::InstOp::Cmp { pred, lhs, rhs } => (
+            format!(
+                "{} {} {}",
+                format_operand_with_function(func, lhs),
+                cmp_pred_symbol(*pred),
+                format_operand_with_function(func, rhs)
+            ),
+            Some(cond_id),
+        ),
+        _ => (format_operand_with_function(func, cond), None),
+    }
+}
+
+fn header_only_contains_skipped_cmp(
+    block: &llvm_ir::BasicBlock,
+    skip_result: Option<llvm_ir::ValueId>,
+) -> bool {
+    let Some(skip_result) = skip_result else {
+        return false;
+    };
+    block
+        .insts
+        .iter()
+        .all(|inst| inst.result == Some(skip_result))
+}
+
+fn operand_value_id(operand: &llvm_ir::Operand) -> Option<llvm_ir::ValueId> {
+    match operand {
+        llvm_ir::Operand::Value(id) => Some(*id),
+        llvm_ir::Operand::Const(_) => None,
+    }
+}
+
+fn format_operand_with_function(func: &llvm_ir::Function, operand: &llvm_ir::Operand) -> String {
+    let value_names = build_value_names(func);
+    format_operand(&value_names, operand)
+}
+
 fn predecessor_count(func: &llvm_ir::Function, target: llvm_ir::BlockId) -> usize {
     func.blocks
         .iter()
@@ -666,6 +947,94 @@ fn infer_tile_dims_from_scalar_store(
     };
     let tile_ty = value_types.get(tile_id)?;
     tile_shape_from_type(tile_ty)
+}
+
+fn infer_tile_dims_from_direct_loop_store(
+    func: &llvm_ir::Function,
+    store_block: &llvm_ir::BasicBlock,
+    inst_by_result: &HashMap<llvm_ir::ValueId, &llvm_ir::Inst>,
+) -> Option<(usize, usize)> {
+    let llvm_ir::Terminator::Br {
+        target: col_header_id,
+        args: store_args,
+    } = &store_block.terminator
+    else {
+        return None;
+    };
+    if store_args.len() < 2 {
+        return None;
+    }
+    let row_value = &store_args[0];
+    let col_next_value = &store_args[1];
+
+    let col_header = get_block(func, *col_header_id)?;
+    if col_header.params.len() < 2 {
+        return None;
+    }
+    let row_param = col_header.params[0].id;
+    let col_param = col_header.params[1].id;
+    let cols = infer_loop_bound_from_header(col_header, col_header.params[1].id, inst_by_result)?;
+    let llvm_ir::Terminator::CondBr {
+        false_target: row_latch_id,
+        ..
+    } = &col_header.terminator
+    else {
+        return None;
+    };
+    let row_latch = get_block(func, *row_latch_id)?;
+    let llvm_ir::Terminator::Br {
+        target: row_header_id,
+        ..
+    } = &row_latch.terminator
+    else {
+        return None;
+    };
+    let row_header = get_block(func, *row_header_id)?;
+    if row_header.params.is_empty() {
+        return None;
+    }
+    let rows = infer_loop_bound_from_header(row_header, row_header.params[0].id, inst_by_result)?;
+
+    if !block_reaches(func, *col_header_id, store_block.id, &mut HashSet::new())
+        || !block_reaches(func, *row_header_id, *row_latch_id, &mut HashSet::new())
+        || row_value == &llvm_ir::Operand::Value(row_param)
+        || col_next_value == &llvm_ir::Operand::Value(col_param)
+    {
+        return None;
+    }
+
+    Some((rows, cols))
+}
+
+fn infer_loop_bound_from_header(
+    header: &llvm_ir::BasicBlock,
+    loop_param: llvm_ir::ValueId,
+    inst_by_result: &HashMap<llvm_ir::ValueId, &llvm_ir::Inst>,
+) -> Option<usize> {
+    let llvm_ir::Terminator::CondBr {
+        cond: llvm_ir::Operand::Value(cond_id),
+        ..
+    } = &header.terminator
+    else {
+        return None;
+    };
+    let cmp_inst = inst_by_result.get(cond_id)?;
+    let llvm_ir::InstOp::Cmp { pred, lhs, rhs } = &cmp_inst.op else {
+        return None;
+    };
+    match (pred, lhs, rhs) {
+        (
+            llvm_ir::CmpPred::Slt,
+            llvm_ir::Operand::Value(value_id),
+            llvm_ir::Operand::Const(llvm_ir::Constant::Int(bound)),
+        ) if *value_id == loop_param && *bound >= 0 => Some(*bound as usize),
+        (
+            llvm_ir::CmpPred::Sle,
+            llvm_ir::Operand::Value(value_id),
+            llvm_ir::Operand::Const(llvm_ir::Constant::Int(bound)),
+        ) if *value_id == loop_param && *bound >= 0 => Some((*bound as usize) + 1),
+        _ => None,
+    }
 }
 
 fn tile_shape_from_type(ty: &llvm_ir::Type) -> Option<(usize, usize)> {

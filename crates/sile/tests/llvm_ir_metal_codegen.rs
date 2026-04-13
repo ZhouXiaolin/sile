@@ -13,19 +13,19 @@ fn dynamic_k_matmul_llir_codegen_emits_structured_metal_from_llvm_like_ir() {
     let tile_ir = compiler::lower_to_tile_ir(&typed);
     let tile_ir = compiler::dce::run(tile_ir);
     let llir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
+    let llir_func =
+        compiler::run_llvm_ir_pipeline(llir_func, compiler::ACTIVE_LLVM_IR_PIPELINE).unwrap();
     let metal = llvmir_metal::generate(&llir_func).unwrap();
 
     assert!(metal.contains("kernel void sile_kernel_matmul("));
     assert!(metal.contains("constant int64_t* __sile_shapes [[buffer(3)]]"));
-    assert!(metal.contains("while (true)"));
-    assert!(metal.contains("break;"));
+    assert!(metal.contains("for ("));
     assert!(!metal.contains("goto "));
     assert!(metal.contains("gid.x"));
     assert!(metal.contains("gid.x /"));
     assert!(metal.contains("gid.x %"));
-    assert!(metal.contains("float v15_storage[2][2];"));
     assert!(metal.contains("__shape_a[1]"));
-    assert!(metal.contains("while (true)"));
+    assert!(!metal.contains("while ("));
     assert!(metal.contains("*(v"));
     assert!(metal.contains("&(a["));
     assert!(metal.contains("&(b["));
@@ -35,6 +35,7 @@ fn dynamic_k_matmul_llir_codegen_emits_structured_metal_from_llvm_like_ir() {
     assert!(!metal.contains("tile_load_2d_f32("));
     assert!(!metal.contains("tile_store_2d_f32("));
     assert!(!metal.contains("const device int64_t* shapes"));
+    assert!(!metal.contains("_storage"));
 }
 
 #[test]
@@ -45,10 +46,13 @@ fn vec_add_llir_codegen_emits_structured_metal_from_llvm_like_ir() {
     let tile_ir = compiler::lower_to_tile_ir(&typed);
     let tile_ir = compiler::dce::run(tile_ir);
     let llir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
+    let llir_func =
+        compiler::run_llvm_ir_pipeline(llir_func, compiler::ACTIVE_LLVM_IR_PIPELINE).unwrap();
     let metal = llvmir_metal::generate(&llir_func).unwrap();
 
     assert!(metal.contains("kernel void sile_kernel_vec_add("));
-    assert!(metal.contains("while (true)"));
+    assert!(metal.contains("for ("));
+    assert!(!metal.contains("while ("));
     assert!(metal.contains(" + "));
     assert!(metal.contains("&(a["));
     assert!(metal.contains("&(b["));
@@ -67,11 +71,14 @@ fn softmax_llir_codegen_lowers_reduce_and_broadcast_into_llvm_like_metal() {
     let tile_ir = compiler::lower_to_tile_ir(&typed);
     let tile_ir = compiler::dce::run(tile_ir);
     let llir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
+    let llir_func =
+        compiler::run_llvm_ir_pipeline(llir_func, compiler::ACTIVE_LLVM_IR_PIPELINE).unwrap();
     let metal = llvmir_metal::generate(&llir_func).unwrap();
 
     assert!(metal.contains("kernel void sile_kernel_softmax("));
     assert!(metal.contains("metal::exp("));
-    assert!(metal.contains("while (true)"));
+    assert!(metal.contains("for ("));
+    assert!(!metal.contains("while ("));
     assert!(metal.contains(" ? "));
     assert!(metal.contains("&(x["));
     assert!(metal.contains("&(y["));

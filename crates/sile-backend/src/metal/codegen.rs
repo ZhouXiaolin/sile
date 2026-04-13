@@ -2,8 +2,7 @@ use std::collections::HashMap;
 
 use crate::emit::{
     self, StructuredCfgMessages, StructuredEmitter, TextCodegen, TilePlan, array_dims,
-    block_param_assignments, build_value_names, format_operand as format_llir_operand,
-    infer_tile_plan, value_name as llir_value_name,
+    build_value_names, infer_tile_plan, value_name as llir_value_name,
 };
 use sile_llvm_ir as llvm_ir;
 
@@ -63,7 +62,20 @@ impl<'a> MetalCodegen<'a> {
     }
 
     fn emit_block_insts(&mut self, block: &llvm_ir::BasicBlock) -> sile_core::Result<()> {
+        self.emit_block_insts_except(block, None)
+    }
+
+    fn emit_block_insts_except(
+        &mut self,
+        block: &llvm_ir::BasicBlock,
+        skip_result: Option<llvm_ir::ValueId>,
+    ) -> sile_core::Result<()> {
         for inst in &block.insts {
+            if let Some(skip_result) = skip_result
+                && inst.result == Some(skip_result)
+            {
+                continue;
+            }
             self.emit_inst(inst)?;
         }
         Ok(())
@@ -79,6 +91,7 @@ impl<'a> MetalCodegen<'a> {
             self.func,
             start,
             stop_targets,
+            None,
             StructuredCfgMessages {
                 preheader_must_branch: "structured loop preheader must end with a branch",
                 missing_loop_header: "missing LLVM IR structured loop header",
@@ -199,13 +212,21 @@ impl<'a> MetalCodegen<'a> {
         }
     }
 
-    fn emit_block_param_assignments(
+    fn emit_block_param_assignments_skipping(
         &mut self,
         target: llvm_ir::BlockId,
         args: &[llvm_ir::Operand],
+        skip_params: &[llvm_ir::ValueId],
     ) {
-        for (name, arg) in block_param_assignments(self.func, &self.value_names, target, args) {
-            self.writeln(&format!("{name} = {arg};"));
+        let Some(block) = self.func.blocks.iter().find(|block| block.id == target) else {
+            return;
+        };
+        for (param, arg) in block.params.iter().zip(args.iter()) {
+            if skip_params.contains(&param.id) {
+                continue;
+            }
+            let name = self.value_name(param.id);
+            self.writeln(&format!("{name} = {};", self.format_operand(arg)));
         }
     }
 
@@ -272,7 +293,7 @@ impl<'a> MetalCodegen<'a> {
     }
 
     fn format_operand(&self, operand: &llvm_ir::Operand) -> String {
-        format_llir_operand(&self.value_names, operand)
+        emit::format_operand(&self.value_names, operand)
     }
 
     fn writeln(&mut self, line: &str) {
@@ -304,12 +325,21 @@ impl StructuredEmitter for MetalCodegen<'_> {
         MetalCodegen::emit_block_insts(self, block)
     }
 
-    fn emit_block_param_assignments(
+    fn emit_block_insts_except(
+        &mut self,
+        block: &llvm_ir::BasicBlock,
+        skip_result: Option<llvm_ir::ValueId>,
+    ) -> sile_core::Result<()> {
+        MetalCodegen::emit_block_insts_except(self, block, skip_result)
+    }
+
+    fn emit_block_param_assignments_skipping(
         &mut self,
         target: llvm_ir::BlockId,
         args: &[llvm_ir::Operand],
+        skip_params: &[llvm_ir::ValueId],
     ) {
-        MetalCodegen::emit_block_param_assignments(self, target, args);
+        MetalCodegen::emit_block_param_assignments_skipping(self, target, args, skip_params);
     }
 
     fn format_operand(&self, operand: &llvm_ir::Operand) -> String {

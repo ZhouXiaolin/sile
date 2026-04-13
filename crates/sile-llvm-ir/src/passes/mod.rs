@@ -2,7 +2,9 @@ pub mod canonicalize;
 pub mod cse;
 pub mod dce;
 pub mod licm;
+pub mod loop_induction_canonicalize;
 pub mod loop_simplify;
+pub mod phi_alias;
 pub mod simplify_cfg;
 pub mod verify;
 
@@ -14,6 +16,8 @@ pub enum LlvmIrPassKind {
     Canonicalize,
     SimplifyCfg,
     LoopSimplify,
+    PhiAlias,
+    LoopInductionCanonicalize,
     Licm,
     Cse,
     Dce,
@@ -30,6 +34,8 @@ pub const RECOMMENDED_PIPELINE: &[LlvmIrPassKind] = &[
     LlvmIrPassKind::Canonicalize,
     LlvmIrPassKind::SimplifyCfg,
     LlvmIrPassKind::LoopSimplify,
+    LlvmIrPassKind::PhiAlias,
+    LlvmIrPassKind::LoopInductionCanonicalize,
     LlvmIrPassKind::Licm,
     LlvmIrPassKind::Cse,
     LlvmIrPassKind::Dce,
@@ -49,6 +55,8 @@ pub fn run_pipeline(mut func: Function, pipeline: &[LlvmIrPassKind]) -> Result<F
             LlvmIrPassKind::Canonicalize => canonicalize::run(func),
             LlvmIrPassKind::SimplifyCfg => simplify_cfg::run(func),
             LlvmIrPassKind::LoopSimplify => loop_simplify::run(func),
+            LlvmIrPassKind::PhiAlias => phi_alias::run(func),
+            LlvmIrPassKind::LoopInductionCanonicalize => loop_induction_canonicalize::run(func),
             LlvmIrPassKind::Licm => licm::run(func),
             LlvmIrPassKind::Cse => cse::run(func),
             LlvmIrPassKind::Dce => dce::run(func),

@@ -13,15 +13,16 @@ fn dynamic_k_matmul_llir_codegen_emits_structured_c_without_helper_calls() {
     let tile_ir = compiler::lower_to_tile_ir(&typed);
     let tile_ir = compiler::dce::run(tile_ir);
     let llir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
+    let llir_func =
+        compiler::run_llvm_ir_pipeline(llir_func, compiler::ACTIVE_LLVM_IR_PIPELINE).unwrap();
     let c = llvmir_c::generate(&llir_func).unwrap();
 
     assert!(c.contains("void sile_llvm_ir_matmul("));
     assert!(c.contains("int64_t* __sile_shapes"));
     assert!(c.contains("sile_llvm_ir_matmul(a, b, c, shapes);"));
-    assert!(c.contains("while (true)"));
-    assert!(c.contains("break;"));
+    assert!(c.contains("for ("));
     assert!(!c.contains("goto "));
-    assert!(c.contains("if (!("));
+    assert!(!c.contains("while (true)"));
     assert_eq!(c.matches("tile_fill_2d_f32(").count(), 0);
     assert_eq!(c.matches("tile_load_2d_f32(").count(), 0);
     assert_eq!(c.matches("tile_mma_accumulate_2d_f32(").count(), 0);
@@ -33,9 +34,12 @@ fn dynamic_k_matmul_llir_codegen_emits_structured_c_without_helper_calls() {
     assert!(c.contains("&(b["));
     assert!(c.contains("&(c["));
     assert!(c.contains("float v"));
-    assert_eq!(c.matches("while (true)").count(), 6);
+    assert!(!c.contains("while ("));
+    assert!(c.matches("for (").count() >= 3);
     assert!(!c.contains("sile_shape_dim("));
     assert!(!c.contains("static const int64_t* sile_shapes"));
+    assert!(!c.contains("_storage"));
+    assert!(!c.contains("if (v"));
 }
 
 #[test]
@@ -46,10 +50,12 @@ fn vec_add_llir_codegen_emits_explicit_c_loops() {
     let tile_ir = compiler::lower_to_tile_ir(&typed);
     let tile_ir = compiler::dce::run(tile_ir);
     let llir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
+    let llir_func =
+        compiler::run_llvm_ir_pipeline(llir_func, compiler::ACTIVE_LLVM_IR_PIPELINE).unwrap();
     let c = llvmir_c::generate(&llir_func).unwrap();
 
     assert!(c.contains("void sile_llvm_ir_vec_add("));
-    assert!(c.contains("while (true)"));
+    assert!(c.contains("for ("));
     assert_eq!(c.matches("tile_load_2d_f32(").count(), 0);
     assert_eq!(c.matches("tile_add_2d_f32(").count(), 0);
     assert_eq!(c.matches("tile_store_2d_f32(").count(), 0);
@@ -57,7 +63,7 @@ fn vec_add_llir_codegen_emits_explicit_c_loops() {
     assert!(c.contains("&(a["));
     assert!(c.contains("&(b["));
     assert!(c.contains("&(c["));
-    assert_eq!(c.matches("while (true)").count(), 1);
+    assert!(!c.contains("while ("));
     assert!(!c.contains("__launch_idx1"));
     assert!(!c.contains(" ? "));
     assert!(!c.contains("_storage"));
@@ -71,6 +77,8 @@ fn softmax_llir_codegen_emits_explicit_reduce_and_broadcast_loops() {
     let tile_ir = compiler::lower_to_tile_ir(&typed);
     let tile_ir = compiler::dce::run(tile_ir);
     let llir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
+    let llir_func =
+        compiler::run_llvm_ir_pipeline(llir_func, compiler::ACTIVE_LLVM_IR_PIPELINE).unwrap();
     let c = llvmir_c::generate(&llir_func).unwrap();
 
     assert!(c.contains("void sile_llvm_ir_softmax("));
@@ -84,7 +92,8 @@ fn softmax_llir_codegen_emits_explicit_reduce_and_broadcast_loops() {
     assert_eq!(c.matches("tile_store_2d_f32(").count(), 0);
     assert!(c.contains("expf("));
     assert!(c.contains(" ? "));
-    assert!(c.contains("while (true)"));
+    assert!(c.contains("for ("));
+    assert!(!c.contains("while ("));
     assert!(!c.contains("llir_reduce_add("));
     assert!(!c.contains("llir_reduce_max("));
     assert!(!c.contains("tile_splat_f32("));
