@@ -8,8 +8,9 @@ use super::block_scalar::lower_scalar_inst;
 use super::block_terminator::lower_terminator;
 use super::core::{BlockLowerer, LowerLlvmIrCtx, llvm_ir_block, llvm_ir_type, llvm_ir_value};
 use super::tile_compute::{
-    FusedAccInit, FusedTileLoad, LoadReduceFusion, lower_fused_load_reduce_inst,
-    lower_fused_tile_mma_inst, lower_tile_mma_inst, lower_tile_reduce_inst,
+    FusedAccInit, FusedTileLoad, LoadReduceFusion, MapReduceFusion, lower_fused_load_reduce_inst,
+    lower_fused_map_reduce_inst, lower_fused_tile_mma_inst, lower_tile_mma_inst,
+    lower_tile_reduce_inst,
 };
 use super::tile_expr::{
     PointwiseTileDefs, build_pointwise_tile_defs, lower_pointwise_rank1_store_inst,
@@ -52,6 +53,10 @@ pub(crate) fn lower_block(
     for inst in &block.insts {
         if let Some(fusion) = pointwise_plan.load_reduce_fusions.get(&inst.result) {
             lower_fused_load_reduce_inst(inst.result, fusion, &mut builder);
+            continue;
+        }
+        if let Some(fusion) = pointwise_plan.map_reduce_fusions.get(&inst.result) {
+            lower_fused_map_reduce_inst(inst.result, fusion, &mut builder);
             continue;
         }
         if let Some(expr) = pointwise_plan.store_maps.get(&inst.result) {
@@ -249,6 +254,7 @@ struct PointwiseLoweringPlan {
     store_fusions: HashMap<ValueId, PointwiseTileDefs>,
     expr_fusions: HashMap<ValueId, PointwiseTileDefs>,
     load_reduce_fusions: HashMap<ValueId, LoadReduceFusion>,
+    map_reduce_fusions: HashMap<ValueId, MapReduceFusion>,
     uninitialized_splats: HashSet<ValueId>,
     skipped_values: HashSet<ValueId>,
 }
@@ -283,6 +289,7 @@ impl PointwiseLoweringPlan {
         let mut store_fusions = HashMap::new();
         let mut expr_fusions = HashMap::new();
         let mut load_reduce_fusions = HashMap::new();
+        let mut map_reduce_fusions = HashMap::new();
 
         for inst in &block.insts {
             let TileIrOp::MmaF {
@@ -451,7 +458,8 @@ impl PointwiseLoweringPlan {
             if use_counts.get(&value).copied().unwrap_or(0) != 1 {
                 continue;
             }
-            let Some(TileIrOp::LoadPtrTko {
+            // Try Load-Reduce fusion first
+            if let Some(TileIrOp::LoadPtrTko {
                 buf,
                 row_coord,
                 col_coord,
@@ -459,25 +467,41 @@ impl PointwiseLoweringPlan {
                 cols,
                 stride_shape_idx,
             }) = defs.get(&value)
-            else {
+            {
+                skipped_values.insert(value);
+                load_reduce_fusions.insert(
+                    inst.result,
+                    LoadReduceFusion {
+                        buf: *buf,
+                        row_coord: *row_coord,
+                        col_coord: *col_coord,
+                        src_rows: *rows,
+                        src_cols: *cols,
+                        stride_shape_idx: *stride_shape_idx,
+                        is_max,
+                        axis,
+                        in_rows,
+                        in_cols,
+                    },
+                );
                 continue;
-            };
-            skipped_values.insert(value);
-            load_reduce_fusions.insert(
-                inst.result,
-                LoadReduceFusion {
-                    buf: *buf,
-                    row_coord: *row_coord,
-                    col_coord: *col_coord,
-                    src_rows: *rows,
-                    src_cols: *cols,
-                    stride_shape_idx: *stride_shape_idx,
-                    is_max,
-                    axis,
-                    in_rows,
-                    in_cols,
-                },
-            );
+            }
+            // Try Map-Reduce fusion
+            if let Some(TileIrOp::Map { expr, rows, cols }) = defs.get(&value) {
+                skipped_values.insert(value);
+                map_reduce_fusions.insert(
+                    inst.result,
+                    MapReduceFusion {
+                        expr: expr.clone(),
+                        src_rows: *rows,
+                        src_cols: *cols,
+                        is_max,
+                        axis,
+                        in_rows,
+                        in_cols,
+                    },
+                );
+            }
         }
 
         Self {
@@ -486,6 +510,7 @@ impl PointwiseLoweringPlan {
             store_fusions,
             expr_fusions,
             load_reduce_fusions,
+            map_reduce_fusions,
             uninitialized_splats,
             skipped_values,
         }

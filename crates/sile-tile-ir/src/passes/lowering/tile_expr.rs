@@ -11,7 +11,7 @@ use crate::passes::lowering::core::{
 use crate::{TileIrFunction, TileIrOp, TileMapExpr, ValueId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum CoordOperandKey {
+pub(crate) enum CoordOperandKey {
     Value(llvm_ir::ValueId),
     ConstI64(i64),
 }
@@ -580,7 +580,7 @@ fn collect_fused_load_bases(
     }
 }
 
-fn collect_map_load_bases(
+pub(crate) fn collect_map_load_bases(
     expr: &TileMapExpr,
     ctx: &mut LowerLlvmIrCtx,
     tile_ir: &TileIrFunction,
@@ -633,7 +633,7 @@ fn collect_map_load_bases(
     }
 }
 
-fn eval_map_expr_scalar(
+pub(crate) fn eval_map_expr_scalar(
     expr: &TileMapExpr,
     row: llvm_ir::Operand,
     col: llvm_ir::Operand,
