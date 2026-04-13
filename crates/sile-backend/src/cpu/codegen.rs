@@ -386,12 +386,45 @@ impl StructuredEmitter for CCodegen<'_> {
     }
 }
 
+fn emit_tile_count_logic(
+    out: &mut String,
+    abi: &llvm_ir::ParamAbi,
+    tile_rows: usize,
+    tile_cols: usize,
+) {
+    if abi.rank == 1 {
+        out.push_str(&format!(
+            "  int64_t sile_total_tiles = shapes[{}];\n",
+            abi.shape_offset
+        ));
+    } else {
+        out.push_str(&format!(
+            "  int64_t sile_tiles_n = shapes[{}] / {};\n",
+            abi.shape_offset + 1,
+            tile_cols
+        ));
+        out.push_str(&format!(
+            "  int64_t sile_total_tiles = (shapes[{}] / {}) * sile_tiles_n;\n",
+            abi.shape_offset,
+            tile_rows
+        ));
+    }
+}
+
 fn generate_wrapper(func: &llvm_ir::Function) -> sile_core::Result<String> {
     let mut out = String::new();
     let tile_plan = infer_tile_plan(func);
     let output_rank = tile_plan
         .and_then(|plan| func.params.get(plan.output_param))
-        .and_then(|param| param.abi.as_ref().map(|abi| abi.rank));
+        .and_then(|param| param.abi.as_ref().map(|abi| abi.rank))
+        .or_else(|| {
+            // Fallback: find output buffer param by ABI metadata directly
+            func.params
+                .iter()
+                .filter(|param| !is_shapes_param(param))
+                .last()
+                .and_then(|param| param.abi.as_ref().map(|abi| abi.rank))
+        });
 
     out.push_str(&format!("void sile_kernel_{}(\n", func.name));
     out.push_str("    void** buffers,\n");
@@ -423,21 +456,31 @@ fn generate_wrapper(func: &llvm_ir::Function) -> sile_core::Result<String> {
                 "LLVM IR CPU wrapper requires output parameter ABI metadata".into(),
             )
         })?;
+        emit_tile_count_logic(&mut out, abi, plan.rows, plan.cols);
+    } else if let Some(output_param) = func
+        .params
+        .iter()
+        .filter(|param| !is_shapes_param(param))
+        .last()
+        .filter(|param| param.abi.is_some())
+    {
+        let abi = output_param.abi.as_ref().unwrap();
+        // Use default tile dims when plan is not inferred
         if abi.rank == 1 {
+            // For 1D, use the first buffer param's shape dimension
+            let first_buf = func
+                .params
+                .iter()
+                .filter(|param| !is_shapes_param(param))
+                .next()
+                .and_then(|p| p.abi.as_ref())
+                .unwrap_or(abi);
             out.push_str(&format!(
-                "  int64_t sile_total_tiles = shapes[{}] / {};\n",
-                abi.shape_offset, plan.cols
+                "  int64_t sile_total_tiles = shapes[{}];\n",
+                first_buf.shape_offset
             ));
         } else {
-            out.push_str(&format!(
-                "  int64_t sile_tiles_n = shapes[{}] / {};\n",
-                abi.shape_offset + 1,
-                plan.cols
-            ));
-            out.push_str(&format!(
-                "  int64_t sile_total_tiles = (shapes[{}] / {}) * sile_tiles_n;\n",
-                abi.shape_offset, plan.rows
-            ));
+            emit_tile_count_logic(&mut out, abi, 32, 16);
         }
     } else {
         let first_extent = func
