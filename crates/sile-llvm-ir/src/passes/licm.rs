@@ -60,6 +60,12 @@ fn find_structured_loops(func: &Function) -> Vec<StructuredLoop> {
                 return None;
             };
 
+            // Reject backedges: if the candidate preheader is reachable from
+            // the loop body it is inside the loop, not before it.
+            if block_reaches_target(func, *true_target, block.id, &mut HashSet::new()) {
+                return None;
+            }
+
             let mut blocks = vec![*header];
             let mut seen = HashSet::from([*header, block.id]); // exclude preheader from body
             let mut stack = vec![*true_target];
@@ -261,6 +267,34 @@ fn successors(terminator: &Terminator) -> Vec<BlockId> {
         }
         Terminator::Ret { .. } => Vec::new(),
     }
+}
+
+fn block_reaches_target(
+    func: &Function,
+    start: BlockId,
+    goal: BlockId,
+    visiting: &mut HashSet<BlockId>,
+) -> bool {
+    if start == goal {
+        return true;
+    }
+    if !visiting.insert(start) {
+        return false;
+    }
+    let reaches = get_block(func, start)
+        .map(|block| successors(&block.terminator))
+        .map(|succs| {
+            succs
+                .into_iter()
+                .any(|succ| block_reaches_target(func, succ, goal, visiting))
+        })
+        .unwrap_or(false);
+    visiting.remove(&start);
+    reaches
+}
+
+fn get_block(func: &Function, id: BlockId) -> Option<&BasicBlock> {
+    func.blocks.iter().find(|block| block.id == id)
 }
 
 fn block_map(func: &Function) -> HashMap<BlockId, &BasicBlock> {
