@@ -383,7 +383,7 @@ impl PointwiseLoweringPlan {
             else {
                 continue;
             };
-            if *rows != 1 || buffer_rank_of(*buf, tile_ir) != 1 {
+            if buffer_rank_of(*buf, tile_ir) != 1 {
                 continue;
             }
             if let Some(TileIrOp::Map { expr, .. }) = defs.get(value) {
