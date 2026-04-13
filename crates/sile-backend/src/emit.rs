@@ -547,6 +547,9 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
                     .map(|arg| format!("{induction_name} = {}", emitter.format_operand(arg)))
                     .unwrap_or_default();
                 let step_expr = induction_step_expr(&induction_name, for_loop.step);
+                if !init_expr.is_empty() && is_simple_loop_body(func, true_target, header.id) {
+                    emitter.writeln("#pragma omp simd");
+                }
                 emitter.writeln(&format!(
                     "for ({}; {}; {}) {{",
                     init_expr, cond_expr, step_expr
@@ -736,6 +739,40 @@ fn induction_step_expr(name: &str, step: i64) -> String {
         -1 => format!("--{name}"),
         value if value > 0 => format!("{name} += {value}"),
         value => format!("{name} -= {}", -value),
+    }
+}
+
+fn is_simple_loop_body(
+    func: &llvm_ir::Function,
+    body_start: llvm_ir::BlockId,
+    header_id: llvm_ir::BlockId,
+) -> bool {
+    let mut current = body_start;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current) {
+            return false;
+        }
+        let Some(block) = get_block(func, current) else {
+            return false;
+        };
+        for inst in &block.insts {
+            if matches!(
+                &inst.op,
+                llvm_ir::InstOp::Call { .. }
+                    | llvm_ir::InstOp::Intrinsic {
+                        intrinsic: llvm_ir::Intrinsic::Exp,
+                        ..
+                    }
+            ) {
+                return false;
+            }
+        }
+        match &block.terminator {
+            llvm_ir::Terminator::Br { target, .. } if *target == header_id => return true,
+            llvm_ir::Terminator::Br { target, .. } => current = *target,
+            _ => return false,
+        }
     }
 }
 
