@@ -10,6 +10,7 @@ use crate::{BasicBlock, BlockId, Function, Inst, InstOp, Intrinsic, Operand, Ter
 pub fn run(mut func: Function) -> Function {
     sink_pointwise_tile_exprs(&mut func);
     compact_rank2_tile_store_loops(&mut func);
+    fold_algebraic_identities(&mut func);
     eliminate_dead_insts(&mut func);
     func
 }
@@ -42,6 +43,81 @@ fn sink_pointwise_tile_exprs(func: &mut Function) {
 
         if !changed {
             break;
+        }
+    }
+}
+
+fn fold_algebraic_identities(func: &mut Function) {
+    use crate::BinOp::*;
+    use crate::Constant::*;
+
+    loop {
+        let mut replacements: HashMap<ValueId, Operand> = HashMap::new();
+
+        for block in &func.blocks {
+            for inst in &block.insts {
+                let Some(result) = inst.result else { continue };
+                // Skip if this result was already replaced by an earlier rule
+                if replacements.contains_key(&result) {
+                    continue;
+                }
+                let InstOp::Bin { op, lhs, rhs } = &inst.op else {
+                    continue;
+                };
+                // Rewrite operands through prior replacements
+                let lhs = rewrite_operand(lhs.clone(), &replacements);
+                let rhs = rewrite_operand(rhs.clone(), &replacements);
+
+                let folded = match (op, &lhs, &rhs) {
+                    // Integer: 0 * X → 0, X * 0 → 0
+                    (Mul, Operand::Const(Int(0)), _) => Some(Operand::Const(Int(0))),
+                    (Mul, _, Operand::Const(Int(0))) => Some(Operand::Const(Int(0))),
+                    // Integer: X * 1 → X, 1 * X → X
+                    (Mul, _, Operand::Const(Int(1))) => Some(lhs.clone()),
+                    (Mul, Operand::Const(Int(1)), _) => Some(rhs.clone()),
+                    // Integer: 0 + X → X, X + 0 → X
+                    (Add, Operand::Const(Int(0)), _) => Some(rhs.clone()),
+                    (Add, _, Operand::Const(Int(0))) => Some(lhs.clone()),
+                    // Integer: X - 0 → X
+                    (Sub, _, Operand::Const(Int(0))) => Some(lhs.clone()),
+                    // Integer: 0 / X → 0
+                    (Div, Operand::Const(Int(0)), _) => Some(Operand::Const(Int(0))),
+                    // Float: 0.0 * X → 0.0, 0.0 + X → X, X - 0.0 → X
+                    //        X * 1.0 → X, 1.0 * X → X
+                    (Mul, Operand::Const(Float(f)), _) if *f == 0.0 => {
+                        Some(Operand::Const(Float(0.0)))
+                    }
+                    (Mul, _, Operand::Const(Float(f))) if *f == 0.0 => {
+                        Some(Operand::Const(Float(0.0)))
+                    }
+                    (Mul, _, Operand::Const(Float(f))) if *f == 1.0 => Some(lhs.clone()),
+                    (Mul, Operand::Const(Float(f)), _) if *f == 1.0 => Some(rhs.clone()),
+                    (Add, Operand::Const(Float(f)), _) if *f == 0.0 => Some(rhs.clone()),
+                    (Add, _, Operand::Const(Float(f))) if *f == 0.0 => Some(lhs.clone()),
+                    (Sub, _, Operand::Const(Float(f))) if *f == 0.0 => Some(lhs.clone()),
+                    _ => None,
+                };
+
+                if let Some(simplified) = folded {
+                    replacements.insert(result, simplified);
+                }
+            }
+        }
+
+        if replacements.is_empty() {
+            break;
+        }
+
+        // Rewrite all uses of folded values and remove the folded Bin instructions
+        for block in &mut func.blocks {
+            block.insts = std::mem::take(&mut block.insts)
+                .into_iter()
+                .map(|inst| rewrite_inst_operands(inst, &replacements))
+                .filter(|inst| {
+                    inst.result.map_or(true, |r| !replacements.contains_key(&r))
+                })
+                .collect();
+            block.terminator = rewrite_terminator_operands(block.terminator.clone(), &replacements);
         }
     }
 }
@@ -1932,6 +2008,101 @@ mod tests {
                 args: vec![arg],
             },
             metadata: Vec::new(),
+        }
+    }
+
+    fn float(val: f64) -> Operand {
+        Operand::Const(Constant::Float(val))
+    }
+
+    #[test]
+    fn folds_algebraic_identities() {
+        // Each Bin result is stored to global param(2,"dst") so it can't be
+        // eliminated as dead code. After folding the stores should remain but
+        // the Bin instructions should be gone (replaced by the identity operand).
+        let func = Function {
+            name: "fold_test".into(),
+            params: vec![param(1, "x"), param(2, "dst")],
+            blocks: vec![block(
+                0,
+                "entry",
+                vec![],
+                vec![
+                    // 0 * X → 0
+                    bin(10, BinOp::Mul, int(0), value(1), Type::I64),
+                    store(2, value(10)),
+                    // X * 0 → 0
+                    bin(11, BinOp::Mul, value(1), int(0), Type::I64),
+                    store(2, value(11)),
+                    // X * 1 → X
+                    bin(12, BinOp::Mul, value(1), int(1), Type::I64),
+                    store(2, value(12)),
+                    // 1 * X → X
+                    bin(13, BinOp::Mul, int(1), value(1), Type::I64),
+                    store(2, value(13)),
+                    // 0 + X → X
+                    bin(14, BinOp::Add, int(0), value(1), Type::I64),
+                    store(2, value(14)),
+                    // X + 0 → X
+                    bin(15, BinOp::Add, value(1), int(0), Type::I64),
+                    store(2, value(15)),
+                    // X - 0 → X
+                    bin(16, BinOp::Sub, value(1), int(0), Type::I64),
+                    store(2, value(16)),
+                    // 0 / X → 0
+                    bin(17, BinOp::Div, int(0), value(1), Type::I64),
+                    store(2, value(17)),
+                    // 0.0 + X → X (float)
+                    bin(20, BinOp::Add, float(0.0), value(1), Type::F32),
+                    store(2, value(20)),
+                    // X - 0.0 → X (float)
+                    bin(21, BinOp::Sub, value(1), float(0.0), Type::F32),
+                    store(2, value(21)),
+                    // 0.0 * X → 0.0 (float)
+                    bin(22, BinOp::Mul, float(0.0), value(1), Type::F32),
+                    store(2, value(22)),
+                    // X * 1.0 → X (float)
+                    bin(23, BinOp::Mul, value(1), float(1.0), Type::F32),
+                    store(2, value(23)),
+                    // 1.0 * X → X (float)
+                    bin(24, BinOp::Mul, float(1.0), value(1), Type::F32),
+                    store(2, value(24)),
+                ],
+                Terminator::Ret { value: None },
+            )],
+            entry: BlockId(0),
+            metadata: Vec::new(),
+        };
+
+        let canonical = run(func);
+        let entry = canonical.blocks.iter().find(|b| b.name == "entry").unwrap();
+        // No Bin instructions should remain — all folded into their identity operand
+        let remaining_bins: Vec<_> = entry
+            .insts
+            .iter()
+            .filter(|i| matches!(i.op, InstOp::Bin { .. }))
+            .collect();
+        assert!(
+            remaining_bins.is_empty(),
+            "expected no Bin instructions after folding, but found: {:?}",
+            remaining_bins
+        );
+        // All stores should still be present
+        let store_count = entry
+            .insts
+            .iter()
+            .filter(|i| matches!(i.op, InstOp::Store { .. }))
+            .count();
+        assert_eq!(store_count, 13);
+        // Stores should use simplified operands (x or constants), not Bin results
+        for inst in &entry.insts {
+            if let InstOp::Store { value, .. } = &inst.op {
+                assert!(
+                    !matches!(value, Operand::Value(id) if (10..=17).contains(&id.0) || (20..=24).contains(&id.0)),
+                    "store still uses un-folded Bin result {:?}",
+                    value
+                );
+            }
         }
     }
 }
