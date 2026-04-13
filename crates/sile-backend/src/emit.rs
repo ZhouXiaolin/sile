@@ -991,26 +991,24 @@ fn infer_tile_dims_from_direct_loop_store(
     store_block: &llvm_ir::BasicBlock,
     inst_by_result: &HashMap<llvm_ir::ValueId, &llvm_ir::Inst>,
 ) -> Option<(usize, usize)> {
-    let llvm_ir::Terminator::Br {
-        target: col_header_id,
-        args: store_args,
-    } = &store_block.terminator
-    else {
-        return None;
+    // Find col_header: the block the store branches to
+    let col_header_id = match &store_block.terminator {
+        llvm_ir::Terminator::Br { target, .. } => *target,
+        _ => return None,
     };
-    if store_args.len() < 2 {
-        return None;
-    }
-    let row_value = &store_args[0];
-    let col_next_value = &store_args[1];
 
-    let col_header = get_block(func, *col_header_id)?;
-    if col_header.params.len() < 2 {
+    let col_header = get_block(func, col_header_id)?;
+    
+    // Infer cols from col_header's loop bound (first param if exists)
+    let cols = if col_header.params.is_empty() {
         return None;
-    }
-    let row_param = col_header.params[0].id;
-    let col_param = col_header.params[1].id;
-    let cols = infer_loop_bound_from_header(col_header, col_header.params[1].id, inst_by_result)?;
+    } else {
+        // After phi_alias, col_header may have only 1 param (column loop)
+        let col_loop_param = col_header.params.last()?.id;
+        infer_loop_bound_from_header(col_header, col_loop_param, inst_by_result)?
+    };
+
+    // Find row_header via col_header's false branch -> row_latch -> row_header
     let llvm_ir::Terminator::CondBr {
         false_target: row_latch_id,
         ..
@@ -1032,10 +1030,8 @@ fn infer_tile_dims_from_direct_loop_store(
     }
     let rows = infer_loop_bound_from_header(row_header, row_header.params[0].id, inst_by_result)?;
 
-    if !block_reaches(func, *col_header_id, store_block.id, &mut HashSet::new())
+    if !block_reaches(func, col_header_id, store_block.id, &mut HashSet::new())
         || !block_reaches(func, *row_header_id, *row_latch_id, &mut HashSet::new())
-        || row_value == &llvm_ir::Operand::Value(row_param)
-        || col_next_value == &llvm_ir::Operand::Value(col_param)
     {
         return None;
     }
