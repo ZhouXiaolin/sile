@@ -1,6 +1,7 @@
 mod block;
 mod block_scalar;
 mod block_terminator;
+mod canonical_matmul;
 mod core;
 mod tile_compute;
 mod tile_expr;
@@ -11,6 +12,7 @@ use sile_hir::typeck::TypedKernel;
 use sile_llvm_ir as llvm_ir;
 
 use self::block::lower_block;
+use self::canonical_matmul::lower_canonical_matmul;
 use self::core::{LowerLlvmIrCtx, llvm_ir_block, llvm_ir_type, llvm_ir_value};
 use crate::{TileIrFunction, TileIrParamKind};
 
@@ -136,13 +138,17 @@ fn run_llvm_ir_lowering_pipeline_inner(
                 if let Some(prologue) = build_prologue_block(state.tile_ir, ctx) {
                     blocks.push(prologue);
                 }
-                blocks.extend(
-                    state
-                        .tile_ir
-                        .blocks
-                        .iter()
-                        .flat_map(|block| lower_block(block, state.tile_ir, ctx)),
-                );
+                if let Some(matmul_blocks) = lower_canonical_matmul(state.tile_ir, ctx) {
+                    blocks.extend(matmul_blocks);
+                } else {
+                    blocks.extend(
+                        state
+                            .tile_ir
+                            .blocks
+                            .iter()
+                            .flat_map(|block| lower_block(block, state.tile_ir, ctx)),
+                    );
+                }
                 state.blocks = Some(blocks);
             }
             LlvmIrLoweringPassKind::FinalizeFunction => {

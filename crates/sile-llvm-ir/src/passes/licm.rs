@@ -61,7 +61,7 @@ fn find_structured_loops(func: &Function) -> Vec<StructuredLoop> {
             };
 
             let mut blocks = vec![*header];
-            let mut seen = HashSet::from([*header]);
+            let mut seen = HashSet::from([*header, block.id]); // exclude preheader from body
             let mut stack = vec![*true_target];
             while let Some(current) = stack.pop() {
                 if current == *header || current == *false_target || !seen.insert(current) {

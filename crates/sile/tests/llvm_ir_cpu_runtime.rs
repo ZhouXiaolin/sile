@@ -15,6 +15,8 @@ fn cpu_backend_executes_vec_add_through_llir() {
     let tile_ir = compiler::lower_to_tile_ir(&typed);
     let tile_ir = compiler::dce::run(tile_ir);
     let llir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
+    let llir_func =
+        compiler::run_llvm_ir_pipeline(llir_func, compiler::ACTIVE_LLVM_IR_PIPELINE).unwrap();
 
     let a = Tensor::from_vec(vec![1.0; 16], [16], &device).unwrap();
     let b = Tensor::from_vec(vec![2.0; 16], [16], &device).unwrap();
@@ -45,6 +47,8 @@ fn cpu_backend_executes_dynamic_k_matmul_through_llir() {
     let tile_ir = compiler::lower_to_tile_ir(&typed);
     let tile_ir = compiler::dce::run(tile_ir);
     let llir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
+    let llir_func =
+        compiler::run_llvm_ir_pipeline(llir_func, compiler::ACTIVE_LLVM_IR_PIPELINE).unwrap();
 
     let a = Tensor::from_vec(
         vec![
