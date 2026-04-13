@@ -114,12 +114,14 @@ impl<'a> CCodegen<'a> {
                 }
             }
             for inst in &block.insts {
-                if let Some(id) = inst.result
-                    && self.alloca_results.contains(&id)
-                    && self.declared_values.insert(id)
-                {
-                    self.emit_decl(id, &inst.ty);
-                    emitted_any = true;
+                if let Some(id) = inst.result {
+                    // Declare all computed values at the top to avoid
+                    // use-before-declaration issues when structured CFG
+                    // emission reorders blocks
+                    if self.declared_values.insert(id) {
+                        self.emit_decl(id, &inst.ty);
+                        emitted_any = true;
+                    }
                 }
             }
         }
