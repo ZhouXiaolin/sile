@@ -2,9 +2,31 @@ use sile_llvm_ir as llvm_ir;
 
 use crate::ValueId;
 use crate::passes::lowering::core::{
-    BlockLowerer, alloc_tile_result, const_i64, emit_bin, emit_cmp, emit_gep, emit_select,
-    emit_store, load_tile_scalar_dynamic, lower_nested_tile_loop, resolve_operand,
+    BlockLowerer, LowerLlvmIrCtx, alloc_tile_result, const_i64, emit_bin, emit_cmp, emit_gep,
+    emit_select, emit_store, load_tile_scalar_dynamic, lower_nested_tile_loop, resolve_operand,
 };
+
+pub(crate) fn reduce_combine(
+    ctx: &mut LowerLlvmIrCtx,
+    out: &mut Vec<llvm_ir::Inst>,
+    acc: llvm_ir::Operand,
+    next: llvm_ir::Operand,
+    is_max: bool,
+) -> llvm_ir::Operand {
+    if is_max {
+        let is_gt = emit_cmp(
+            ctx,
+            out,
+            llvm_ir::CmpPred::Ogt,
+            next.clone(),
+            acc.clone(),
+            llvm_ir::Type::I1,
+        );
+        emit_select(ctx, out, is_gt, next, acc, llvm_ir::Type::F32)
+    } else {
+        emit_bin(ctx, out, llvm_ir::BinOp::Add, acc, next, llvm_ir::Type::F32)
+    }
+}
 
 pub(crate) fn lower_tile_reduce_inst(
     result: ValueId,
@@ -55,19 +77,7 @@ pub(crate) fn lower_tile_reduce_inst(
                         col.clone()
                     },
                 );
-                acc = if is_max {
-                    let is_gt = emit_cmp(
-                        ctx,
-                        out,
-                        llvm_ir::CmpPred::Ogt,
-                        next.clone(),
-                        acc.clone(),
-                        llvm_ir::Type::I1,
-                    );
-                    emit_select(ctx, out, is_gt, next, acc, llvm_ir::Type::F32)
-                } else {
-                    emit_bin(ctx, out, llvm_ir::BinOp::Add, acc, next, llvm_ir::Type::F32)
-                };
+                acc = reduce_combine(ctx, out, acc, next, is_max);
             }
 
             let dst_ptr = emit_gep(
