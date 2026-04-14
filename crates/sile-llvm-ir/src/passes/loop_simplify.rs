@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{BasicBlock, BlockId, BlockParam, Constant, Function, Metadata, Operand, Terminator, ValueId};
+use crate::{
+    BasicBlock, BlockId, BlockParam, Constant, Function, Metadata, Operand, Terminator, ValueId,
+};
 
 /// Conservative loop-oriented canonicalization.
 ///
@@ -110,9 +112,7 @@ fn successors(terminator: &Terminator) -> Vec<BlockId> {
             false_target,
             ..
         } => vec![*true_target, *false_target],
-        Terminator::Switch {
-            default, cases, ..
-        } => {
+        Terminator::Switch { default, cases, .. } => {
             let mut s = vec![*default];
             s.extend(cases.iter().map(|(_, b)| *b));
             s
@@ -127,8 +127,7 @@ fn successors(terminator: &Terminator) -> Vec<BlockId> {
 fn insert_preheaders(func: &mut Function) {
     // Build predecessor map
     let mut predecessors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-    let block_map: HashMap<BlockId, &BasicBlock> =
-        func.blocks.iter().map(|b| (b.id, b)).collect();
+    let block_map: HashMap<BlockId, &BasicBlock> = func.blocks.iter().map(|b| (b.id, b)).collect();
     for block in &func.blocks {
         for succ in successors(&block.terminator) {
             predecessors.entry(succ).or_default().push(block.id);
@@ -270,8 +269,7 @@ fn block_reaches(
     if !visited.insert(from) {
         return false;
     }
-    let block_map: HashMap<BlockId, &BasicBlock> =
-        func.blocks.iter().map(|b| (b.id, b)).collect();
+    let block_map: HashMap<BlockId, &BasicBlock> = func.blocks.iter().map(|b| (b.id, b)).collect();
     let Some(block) = block_map.get(&from) else {
         return false;
     };

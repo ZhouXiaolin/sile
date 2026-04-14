@@ -326,6 +326,11 @@ fn rewrite_map_expr(
             stride_shape_idx,
         },
         crate::TileMapExpr::Splat { value } => crate::TileMapExpr::Splat { value },
+        crate::TileMapExpr::Cmp { op, lhs, rhs } => crate::TileMapExpr::Cmp {
+            op,
+            lhs: Box::new(rewrite_map_expr(*lhs, replacements)),
+            rhs: Box::new(rewrite_map_expr(*rhs, replacements)),
+        },
         crate::TileMapExpr::Add { lhs, rhs } => crate::TileMapExpr::Add {
             lhs: Box::new(rewrite_map_expr(*lhs, replacements)),
             rhs: Box::new(rewrite_map_expr(*rhs, replacements)),
@@ -347,6 +352,15 @@ fn rewrite_map_expr(
         },
         crate::TileMapExpr::Exp { operand } => crate::TileMapExpr::Exp {
             operand: Box::new(rewrite_map_expr(*operand, replacements)),
+        },
+        crate::TileMapExpr::Select {
+            cond,
+            on_true,
+            on_false,
+        } => crate::TileMapExpr::Select {
+            cond: Box::new(rewrite_map_expr(*cond, replacements)),
+            on_true: Box::new(rewrite_map_expr(*on_true, replacements)),
+            on_false: Box::new(rewrite_map_expr(*on_false, replacements)),
         },
         crate::TileMapExpr::Broadcast {
             value,

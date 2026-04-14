@@ -99,6 +99,23 @@ fn softmax_lowers_to_llvm_like_llvm_ir() {
     assert!(!printed.contains("intrinsic exp("));
 }
 
+#[test]
+fn relu_max_tile_lowers_to_fcmp_and_select() {
+    let kernel = build_relu_kernel();
+    let typed = typeck::check_kernel(&kernel).unwrap();
+
+    let tile_ir = compiler::lower_to_tile_ir(&typed);
+    let tile_ir = compiler::dce::run(tile_ir);
+    let llvm_ir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
+    let printed = llvmir::format_llvm_ir(&llvm_ir_func);
+
+    assert!(printed.contains("define void @relu("));
+    assert!(printed.contains("fcmp oge"));
+    assert!(printed.contains("select i1 "));
+    assert!(printed.contains("store f32"));
+    assert!(!printed.contains("call @tile_"));
+}
+
 fn build_dynamic_k_matmul_kernel() -> Kernel {
     Kernel::new(
         "matmul",
@@ -416,6 +433,50 @@ fn build_softmax_kernel() -> Kernel {
                 value: Expr::Builtin {
                     op: BuiltinOp::Div,
                     args: vec![Expr::Var("num".into()), Expr::Var("denom_bcast".into())],
+                },
+            },
+        ],
+    )
+}
+
+fn build_relu_kernel() -> Kernel {
+    Kernel::new(
+        "relu",
+        vec![("D".into(), 8)],
+        vec![Param::new(
+            "x",
+            ParamKind::Output,
+            Type::tensor(ElemType::F32, ShapeExpr::tuple([ShapeExpr::symbol("D")])),
+        )],
+        vec![
+            Stmt::Let {
+                name: "zero".into(),
+                ty: None,
+                expr: Expr::Builtin {
+                    op: BuiltinOp::Constant,
+                    args: vec![
+                        Expr::ScalarF32(0.0),
+                        Expr::Shape(ShapeExpr::tuple([ShapeExpr::symbol("D")])),
+                    ],
+                },
+            },
+            Stmt::Let {
+                name: "data".into(),
+                ty: None,
+                expr: Expr::Builtin {
+                    op: BuiltinOp::LoadTile,
+                    args: vec![
+                        Expr::Var("x".into()),
+                        Expr::Shape(ShapeExpr::tuple([ShapeExpr::symbol("D")])),
+                        Expr::Shape(ShapeExpr::tuple([ShapeExpr::constant(0)])),
+                    ],
+                },
+            },
+            Stmt::Store {
+                target: "x".into(),
+                value: Expr::Builtin {
+                    op: BuiltinOp::Max,
+                    args: vec![Expr::Var("zero".into()), Expr::Var("data".into())],
                 },
             },
         ],

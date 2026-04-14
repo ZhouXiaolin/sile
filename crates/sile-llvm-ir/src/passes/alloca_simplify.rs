@@ -95,9 +95,7 @@ pub fn run(mut func: Function) -> Function {
                 op: remap_inst_op(inst.op.clone(), &replacements),
                 ..inst
             })
-            .filter(|inst| {
-                inst.result.map_or(true, |r| !replacements.contains_key(&r))
-            })
+            .filter(|inst| inst.result.map_or(true, |r| !replacements.contains_key(&r)))
             .collect();
 
         block.terminator = remap_terminator(block.terminator.clone(), &replacements);
@@ -111,7 +109,9 @@ fn uses_value(op: &InstOp, id: ValueId) -> bool {
         InstOp::Alloca { .. } => false,
         InstOp::Gep { base, indices } => {
             matches!(base, Operand::Value(v) if *v == id)
-                || indices.iter().any(|o| matches!(o, Operand::Value(v) if *v == id))
+                || indices
+                    .iter()
+                    .any(|o| matches!(o, Operand::Value(v) if *v == id))
         }
         InstOp::Load { ptr } => matches!(ptr, Operand::Value(v) if *v == id),
         InstOp::Store { ptr, value } => {
@@ -136,25 +136,40 @@ fn uses_value(op: &InstOp, id: ValueId) -> bool {
                 || matches!(rhs, Operand::Value(v) if *v == id)
         }
         InstOp::Cast { value, .. } => matches!(value, Operand::Value(v) if *v == id),
-        InstOp::Select { cond, on_true, on_false } => {
+        InstOp::Select {
+            cond,
+            on_true,
+            on_false,
+        } => {
             matches!(cond, Operand::Value(v) if *v == id)
                 || matches!(on_true, Operand::Value(v) if *v == id)
                 || matches!(on_false, Operand::Value(v) if *v == id)
         }
-        InstOp::Call { args, .. } | InstOp::Intrinsic { args, .. } => {
-            args.iter().any(|o| matches!(o, Operand::Value(v) if *v == id))
-        }
+        InstOp::Call { args, .. } | InstOp::Intrinsic { args, .. } => args
+            .iter()
+            .any(|o| matches!(o, Operand::Value(v) if *v == id)),
     }
 }
 
 fn remap_inst_op(op: InstOp, replacements: &HashMap<ValueId, Operand>) -> InstOp {
     match op {
-        InstOp::Alloca { alloc_ty, addr_space } => InstOp::Alloca { alloc_ty, addr_space },
+        InstOp::Alloca {
+            alloc_ty,
+            addr_space,
+        } => InstOp::Alloca {
+            alloc_ty,
+            addr_space,
+        },
         InstOp::Gep { base, indices } => InstOp::Gep {
             base: remap(base, replacements),
-            indices: indices.into_iter().map(|o| remap(o, replacements)).collect(),
+            indices: indices
+                .into_iter()
+                .map(|o| remap(o, replacements))
+                .collect(),
         },
-        InstOp::Load { ptr } => InstOp::Load { ptr: remap(ptr, replacements) },
+        InstOp::Load { ptr } => InstOp::Load {
+            ptr: remap(ptr, replacements),
+        },
         InstOp::Store { ptr, value } => InstOp::Store {
             ptr: remap(ptr, replacements),
             value: remap(value, replacements),
@@ -183,7 +198,11 @@ fn remap_inst_op(op: InstOp, replacements: &HashMap<ValueId, Operand>) -> InstOp
             value: remap(value, replacements),
             to,
         },
-        InstOp::Select { cond, on_true, on_false } => InstOp::Select {
+        InstOp::Select {
+            cond,
+            on_true,
+            on_false,
+        } => InstOp::Select {
             cond: remap(cond, replacements),
             on_true: remap(on_true, replacements),
             on_false: remap(on_false, replacements),
@@ -209,14 +228,30 @@ fn remap_terminator(
             target,
             args: args.into_iter().map(|o| remap(o, replacements)).collect(),
         },
-        Terminator::CondBr { cond, true_target, true_args, false_target, false_args } => Terminator::CondBr {
+        Terminator::CondBr {
+            cond,
+            true_target,
+            true_args,
+            false_target,
+            false_args,
+        } => Terminator::CondBr {
             cond: remap(cond, replacements),
             true_target,
-            true_args: true_args.into_iter().map(|o| remap(o, replacements)).collect(),
+            true_args: true_args
+                .into_iter()
+                .map(|o| remap(o, replacements))
+                .collect(),
             false_target,
-            false_args: false_args.into_iter().map(|o| remap(o, replacements)).collect(),
+            false_args: false_args
+                .into_iter()
+                .map(|o| remap(o, replacements))
+                .collect(),
         },
-        Terminator::Switch { value, default, cases } => Terminator::Switch {
+        Terminator::Switch {
+            value,
+            default,
+            cases,
+        } => Terminator::Switch {
             value: remap(value, replacements),
             default,
             cases,

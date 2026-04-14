@@ -66,6 +66,10 @@ pub fn reduce_sum(tile: Tile<f32>, _axis: i64) -> Tile<f32> {
     Tile::new(vec![tile.shape[0]])
 }
 
+pub fn max_tile(lhs: Tile<f32>, _rhs: Tile<f32>) -> Tile<f32> {
+    Tile::new(lhs.shape)
+}
+
 pub fn exp(tile: Tile<f32>) -> Tile<f32> {
     tile.exp()
 }

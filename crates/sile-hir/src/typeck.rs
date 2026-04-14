@@ -96,7 +96,7 @@ fn infer_builtin(op: BuiltinOp, _args: &[Expr]) -> Result<Type, TypeError> {
             ElemType::F32,
             ShapeExpr::tuple([ShapeExpr::symbol("BM")]),
         )),
-        BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Div | BuiltinOp::Exp => {
+        BuiltinOp::Max | BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Div | BuiltinOp::Exp => {
             Ok(Type::tile(ElemType::F32, ShapeExpr::symbol("S")))
         }
         BuiltinOp::Reshape | BuiltinOp::Broadcast => {

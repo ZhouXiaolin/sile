@@ -86,6 +86,11 @@ pub enum TileMapExpr {
     Splat {
         value: f64,
     },
+    Cmp {
+        op: CmpOp,
+        lhs: Box<TileMapExpr>,
+        rhs: Box<TileMapExpr>,
+    },
     Add {
         lhs: Box<TileMapExpr>,
         rhs: Box<TileMapExpr>,
@@ -107,6 +112,11 @@ pub enum TileMapExpr {
     },
     Exp {
         operand: Box<TileMapExpr>,
+    },
+    Select {
+        cond: Box<TileMapExpr>,
+        on_true: Box<TileMapExpr>,
+        on_false: Box<TileMapExpr>,
     },
     Broadcast {
         value: Box<TileMapExpr>,
@@ -449,7 +459,8 @@ fn collect_tile_map_expr_uses(expr: &TileMapExpr, uses: &mut Vec<ValueId>) {
             uses.push(*col_coord);
         }
         TileMapExpr::Splat { .. } => {}
-        TileMapExpr::Add { lhs, rhs }
+        TileMapExpr::Cmp { lhs, rhs, .. }
+        | TileMapExpr::Add { lhs, rhs }
         | TileMapExpr::Sub { lhs, rhs }
         | TileMapExpr::Mul { lhs, rhs }
         | TileMapExpr::Div { lhs, rhs } => {
@@ -458,6 +469,15 @@ fn collect_tile_map_expr_uses(expr: &TileMapExpr, uses: &mut Vec<ValueId>) {
         }
         TileMapExpr::Neg { operand } | TileMapExpr::Exp { operand } => {
             collect_tile_map_expr_uses(operand, uses);
+        }
+        TileMapExpr::Select {
+            cond,
+            on_true,
+            on_false,
+        } => {
+            collect_tile_map_expr_uses(cond, uses);
+            collect_tile_map_expr_uses(on_true, uses);
+            collect_tile_map_expr_uses(on_false, uses);
         }
         TileMapExpr::Broadcast { value, .. } => collect_tile_map_expr_uses(value, uses),
     }

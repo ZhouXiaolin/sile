@@ -4,11 +4,11 @@ use sile_llvm_ir as llvm_ir;
 
 use crate::passes::lowering::core::{
     BlockLowerer, LowerLlvmIrCtx, alloc_tile_result, buffer_rank_of, const_f32, const_i64,
-    emit_bin, emit_gep, emit_intrinsic, emit_load, emit_shape_dim, emit_store,
-    load_tile_scalar_dynamic, lower_1d_tile_coord, lower_bin_op, lower_nested_tile_loop,
-    resolve_operand, tile_dims_of,
+    emit_bin, emit_cmp, emit_gep, emit_intrinsic, emit_load, emit_select, emit_shape_dim,
+    emit_store, load_tile_scalar_dynamic, lower_1d_tile_coord, lower_bin_op,
+    lower_nested_tile_loop, resolve_operand, tile_dims_of,
 };
-use crate::{TileIrFunction, TileIrOp, TileMapExpr, ValueId};
+use crate::{CmpOp, TileIrFunction, TileIrOp, TileMapExpr, ValueId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CoordOperandKey {
@@ -617,7 +617,8 @@ pub(crate) fn collect_map_load_bases(
                 bases.insert(tile_key, tile_base);
             }
         }
-        TileMapExpr::Add { lhs, rhs }
+        TileMapExpr::Cmp { lhs, rhs, .. }
+        | TileMapExpr::Add { lhs, rhs }
         | TileMapExpr::Sub { lhs, rhs }
         | TileMapExpr::Mul { lhs, rhs }
         | TileMapExpr::Div { lhs, rhs } => {
@@ -626,6 +627,15 @@ pub(crate) fn collect_map_load_bases(
         }
         TileMapExpr::Neg { operand } | TileMapExpr::Exp { operand } => {
             collect_map_load_bases(operand, ctx, tile_ir, out, bases, coord_bases);
+        }
+        TileMapExpr::Select {
+            cond,
+            on_true,
+            on_false,
+        } => {
+            collect_map_load_bases(cond, ctx, tile_ir, out, bases, coord_bases);
+            collect_map_load_bases(on_true, ctx, tile_ir, out, bases, coord_bases);
+            collect_map_load_bases(on_false, ctx, tile_ir, out, bases, coord_bases);
         }
         TileMapExpr::Broadcast { value, .. } => {
             collect_map_load_bases(value, ctx, tile_ir, out, bases, coord_bases);
@@ -668,6 +678,26 @@ pub(crate) fn eval_map_expr_scalar(
             out,
         ),
         TileMapExpr::Splat { value } => const_f32(*value),
+        TileMapExpr::Cmp { op, lhs, rhs } => {
+            let lhs = eval_map_expr_scalar(
+                lhs,
+                row.clone(),
+                col.clone(),
+                ctx,
+                tile_ir,
+                fused_load_bases,
+                out,
+            );
+            let rhs = eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out);
+            emit_cmp(
+                ctx,
+                out,
+                lower_float_cmp_pred(*op),
+                lhs,
+                rhs,
+                llvm_ir::Type::I1,
+            )
+        }
         TileMapExpr::Add { lhs, rhs } => {
             let lhs = eval_map_expr_scalar(
                 lhs,
@@ -742,6 +772,33 @@ pub(crate) fn eval_map_expr_scalar(
                 vec![operand],
                 llvm_ir::Type::F32,
             )
+        }
+        TileMapExpr::Select {
+            cond,
+            on_true,
+            on_false,
+        } => {
+            let cond = eval_map_expr_scalar(
+                cond,
+                row.clone(),
+                col.clone(),
+                ctx,
+                tile_ir,
+                fused_load_bases,
+                out,
+            );
+            let on_true = eval_map_expr_scalar(
+                on_true,
+                row.clone(),
+                col.clone(),
+                ctx,
+                tile_ir,
+                fused_load_bases,
+                out,
+            );
+            let on_false =
+                eval_map_expr_scalar(on_false, row, col, ctx, tile_ir, fused_load_bases, out);
+            emit_select(ctx, out, cond, on_true, on_false, llvm_ir::Type::F32)
         }
         TileMapExpr::Broadcast {
             value,
@@ -880,6 +937,17 @@ fn emit_map_load_scalar(
         llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, llvm_ir::Type::F32),
     );
     emit_load(ctx, out, src_ptr, llvm_ir::Type::F32)
+}
+
+fn lower_float_cmp_pred(op: CmpOp) -> llvm_ir::CmpPred {
+    match op {
+        CmpOp::Lt => llvm_ir::CmpPred::Olt,
+        CmpOp::Le => llvm_ir::CmpPred::Ole,
+        CmpOp::Gt => llvm_ir::CmpPred::Ogt,
+        CmpOp::Ge => llvm_ir::CmpPred::Oge,
+        CmpOp::Eq => llvm_ir::CmpPred::Eq,
+        CmpOp::Ne => llvm_ir::CmpPred::Ne,
+    }
 }
 
 fn get_or_create_1d_tile_base(

@@ -199,6 +199,13 @@ fn format_tile_map_expr(expr: &TileMapExpr) -> String {
             "load_ptr_tko({buf}, [{row_coord}, {col_coord}], shape=[{rows}, {cols}], stride_dim={stride_shape_idx})"
         ),
         TileMapExpr::Splat { value } => format!("constant({})", format_float_literal(*value)),
+        TileMapExpr::Cmp { op, lhs, rhs } => {
+            format!(
+                "cmpf(\"{op}\", {}, {})",
+                format_tile_map_expr(lhs),
+                format_tile_map_expr(rhs)
+            )
+        }
         TileMapExpr::Add { lhs, rhs } => {
             format!(
                 "addf({}, {})",
@@ -229,6 +236,16 @@ fn format_tile_map_expr(expr: &TileMapExpr) -> String {
         }
         TileMapExpr::Neg { operand } => format!("negf({})", format_tile_map_expr(operand)),
         TileMapExpr::Exp { operand } => format!("exp({})", format_tile_map_expr(operand)),
+        TileMapExpr::Select {
+            cond,
+            on_true,
+            on_false,
+        } => format!(
+            "select({}, {}, {})",
+            format_tile_map_expr(cond),
+            format_tile_map_expr(on_true),
+            format_tile_map_expr(on_false)
+        ),
         TileMapExpr::Broadcast {
             value,
             src_rows,

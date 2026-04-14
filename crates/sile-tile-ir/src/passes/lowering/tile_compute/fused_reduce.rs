@@ -5,13 +5,15 @@ use sile_llvm_ir as llvm_ir;
 use crate::TileMapExpr;
 use crate::ValueId;
 use crate::passes::lowering::core::{
-    BlockLowerer, alloc_tile_result, buffer_rank_of, const_f32, const_i64, emit_bin,
-    emit_cmp, emit_gep, emit_load, emit_store, lower_nested_tile_loop,
-    lower_reduce_extent_loop, lower_reduce_extent_loop_step, resolve_operand, REDUCE_UNROLL_THRESHOLD,
+    BlockLowerer, REDUCE_UNROLL_THRESHOLD, alloc_tile_result, buffer_rank_of, const_f32, const_i64,
+    emit_bin, emit_cmp, emit_gep, emit_load, emit_store, lower_nested_tile_loop,
+    lower_reduce_extent_loop, lower_reduce_extent_loop_step, resolve_operand,
 };
 use crate::passes::lowering::tile_compute::reduce::reduce_combine;
 use crate::passes::lowering::tile_expr::{collect_map_load_bases, eval_map_expr_scalar};
-use crate::passes::lowering::tile_memory::{BufferIndexBase, build_buffer_index_base, emit_buffer_element_ptr, emit_buffer_linear_index};
+use crate::passes::lowering::tile_memory::{
+    BufferIndexBase, build_buffer_index_base, emit_buffer_element_ptr, emit_buffer_linear_index,
+};
 
 pub(crate) struct LoadReduceFusion {
     pub(crate) buf: ValueId,
@@ -65,74 +67,98 @@ pub(crate) fn lower_fused_load_reduce_inst(
 
     if reduce_extent <= REDUCE_UNROLL_THRESHOLD {
         // Small extent: fully unroll (original behavior)
-        lower_nested_tile_loop(
-            builder,
-            prefix.as_str(),
-            out_rows,
-            out_cols,
-            {
-                let buf_operand = buf_operand.clone();
-                let index_base = index_base.clone();
-                let dst_tile = dst_tile.clone();
-                let axis = fusion.axis;
-                let is_max = fusion.is_max;
+        lower_nested_tile_loop(builder, prefix.as_str(), out_rows, out_cols, {
+            let buf_operand = buf_operand.clone();
+            let index_base = index_base.clone();
+            let dst_tile = dst_tile.clone();
+            let axis = fusion.axis;
+            let is_max = fusion.is_max;
 
-                move |ctx, _, out, row, col| {
-                    // Use vectorized path for sum-reduce along axis=1
-                    // (contiguous memory), when extent >= 4.
-                    let use_vec = !is_max && axis == 1 && reduce_extent >= 4;
+            move |ctx, _, out, row, col| {
+                // Use vectorized path for sum-reduce along axis=1
+                // (contiguous memory), when extent >= 4.
+                let use_vec = !is_max && axis == 1 && reduce_extent >= 4;
 
-                    let acc = if use_vec {
-                        let vec_chunks = (reduce_extent / 4) as usize;
-                        let base_offset = emit_buffer_linear_index(
-                            ctx, out, &index_base, row.clone(), const_i64(0),
-                        );
-                        let mut a = emit_vec_sum_reduce(
-                            ctx, out, buf_operand.clone(), base_offset.clone(), vec_chunks,
-                        );
-                        // Scalar remainder
-                        for idx in (vec_chunks * 4)..reduce_extent as usize {
-                            let r_offset = emit_bin(
-                                ctx, out, llvm_ir::BinOp::Add,
-                                base_offset.clone(), const_i64(idx as i64),
-                                llvm_ir::Type::I64,
-                            );
-                            let ptr = emit_gep(
-                                ctx, out, buf_operand.clone(), vec![r_offset],
-                                llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, llvm_ir::Type::F32),
-                            );
-                            let next = emit_load(ctx, out, ptr, llvm_ir::Type::F32);
-                            a = emit_bin(ctx, out, llvm_ir::BinOp::Add, a, next, llvm_ir::Type::F32);
-                        }
-                        a
-                    } else {
-                        let first_r = if axis == 1 { row.clone() } else { const_i64(0) };
-                        let first_c = if axis == 1 { const_i64(0) } else { col.clone() };
-                        let first_ptr = emit_buffer_element_ptr(
-                            ctx, out, buf_operand.clone(), index_base.clone(), first_r, first_c,
-                        );
-                        let mut a = emit_load(ctx, out, first_ptr, llvm_ir::Type::F32);
-
-                        for idx in 1..reduce_extent {
-                            let next_r = if axis == 1 { row.clone() } else { const_i64(idx) };
-                            let next_c = if axis == 1 { const_i64(idx) } else { col.clone() };
-                            let next_ptr = emit_buffer_element_ptr(
-                                ctx, out, buf_operand.clone(), index_base.clone(), next_r, next_c,
-                            );
-                            let next = emit_load(ctx, out, next_ptr, llvm_ir::Type::F32);
-                            a = reduce_combine(ctx, out, a, next, is_max);
-                        }
-                        a
-                    };
-
-                    let dst_ptr = emit_gep(
-                        ctx, out, dst_tile.clone(), vec![row, col],
-                        llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::F32),
+                let acc = if use_vec {
+                    let vec_chunks = (reduce_extent / 4) as usize;
+                    let base_offset =
+                        emit_buffer_linear_index(ctx, out, &index_base, row.clone(), const_i64(0));
+                    let mut a = emit_vec_sum_reduce(
+                        ctx,
+                        out,
+                        buf_operand.clone(),
+                        base_offset.clone(),
+                        vec_chunks,
                     );
-                    emit_store(out, dst_ptr, acc);
-                }
-            },
-        );
+                    // Scalar remainder
+                    for idx in (vec_chunks * 4)..reduce_extent as usize {
+                        let r_offset = emit_bin(
+                            ctx,
+                            out,
+                            llvm_ir::BinOp::Add,
+                            base_offset.clone(),
+                            const_i64(idx as i64),
+                            llvm_ir::Type::I64,
+                        );
+                        let ptr = emit_gep(
+                            ctx,
+                            out,
+                            buf_operand.clone(),
+                            vec![r_offset],
+                            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, llvm_ir::Type::F32),
+                        );
+                        let next = emit_load(ctx, out, ptr, llvm_ir::Type::F32);
+                        a = emit_bin(ctx, out, llvm_ir::BinOp::Add, a, next, llvm_ir::Type::F32);
+                    }
+                    a
+                } else {
+                    let first_r = if axis == 1 { row.clone() } else { const_i64(0) };
+                    let first_c = if axis == 1 { const_i64(0) } else { col.clone() };
+                    let first_ptr = emit_buffer_element_ptr(
+                        ctx,
+                        out,
+                        buf_operand.clone(),
+                        index_base.clone(),
+                        first_r,
+                        first_c,
+                    );
+                    let mut a = emit_load(ctx, out, first_ptr, llvm_ir::Type::F32);
+
+                    for idx in 1..reduce_extent {
+                        let next_r = if axis == 1 {
+                            row.clone()
+                        } else {
+                            const_i64(idx)
+                        };
+                        let next_c = if axis == 1 {
+                            const_i64(idx)
+                        } else {
+                            col.clone()
+                        };
+                        let next_ptr = emit_buffer_element_ptr(
+                            ctx,
+                            out,
+                            buf_operand.clone(),
+                            index_base.clone(),
+                            next_r,
+                            next_c,
+                        );
+                        let next = emit_load(ctx, out, next_ptr, llvm_ir::Type::F32);
+                        a = reduce_combine(ctx, out, a, next, is_max);
+                    }
+                    a
+                };
+
+                let dst_ptr = emit_gep(
+                    ctx,
+                    out,
+                    dst_tile.clone(),
+                    vec![row, col],
+                    llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::F32),
+                );
+                emit_store(out, dst_ptr, acc);
+            }
+        });
     } else {
         // Large extent: LLVMIR loop
         lower_fused_load_reduce_loop(
@@ -175,7 +201,14 @@ pub(crate) fn lower_fused_map_reduce_inst(
     let fused_load_bases = builder.with_current_insts(|ctx, tile_ir, out| {
         let mut bases = HashMap::new();
         let mut coord_bases = HashMap::new();
-        collect_map_load_bases(&fusion.expr, ctx, tile_ir, out, &mut bases, &mut coord_bases);
+        collect_map_load_bases(
+            &fusion.expr,
+            ctx,
+            tile_ir,
+            out,
+            &mut bases,
+            &mut coord_bases,
+        );
         bases
     });
 
@@ -188,42 +221,59 @@ pub(crate) fn lower_fused_map_reduce_inst(
 
     if reduce_extent <= REDUCE_UNROLL_THRESHOLD {
         // Small extent: fully unroll (original behavior)
-        lower_nested_tile_loop(
-            builder,
-            prefix.as_str(),
-            out_rows,
-            out_cols,
-            {
-                let expr = fusion.expr.clone();
-                let dst_tile = dst_tile.clone();
-                let axis = fusion.axis;
-                let is_max = fusion.is_max;
-                let fused_load_bases = fused_load_bases.clone();
+        lower_nested_tile_loop(builder, prefix.as_str(), out_rows, out_cols, {
+            let expr = fusion.expr.clone();
+            let dst_tile = dst_tile.clone();
+            let axis = fusion.axis;
+            let is_max = fusion.is_max;
+            let fused_load_bases = fused_load_bases.clone();
 
-                move |ctx, tile_ir, out, row, col| {
-                    let first_r = if axis == 1 { row.clone() } else { const_i64(0) };
-                    let first_c = if axis == 1 { const_i64(0) } else { col.clone() };
-                    let mut acc = eval_map_expr_scalar(
-                        &expr, first_r, first_c, ctx, tile_ir, &fused_load_bases, out,
+            move |ctx, tile_ir, out, row, col| {
+                let first_r = if axis == 1 { row.clone() } else { const_i64(0) };
+                let first_c = if axis == 1 { const_i64(0) } else { col.clone() };
+                let mut acc = eval_map_expr_scalar(
+                    &expr,
+                    first_r,
+                    first_c,
+                    ctx,
+                    tile_ir,
+                    &fused_load_bases,
+                    out,
+                );
+
+                for idx in 1..reduce_extent {
+                    let next_r = if axis == 1 {
+                        row.clone()
+                    } else {
+                        const_i64(idx)
+                    };
+                    let next_c = if axis == 1 {
+                        const_i64(idx)
+                    } else {
+                        col.clone()
+                    };
+                    let next = eval_map_expr_scalar(
+                        &expr,
+                        next_r,
+                        next_c,
+                        ctx,
+                        tile_ir,
+                        &fused_load_bases,
+                        out,
                     );
-
-                    for idx in 1..reduce_extent {
-                        let next_r = if axis == 1 { row.clone() } else { const_i64(idx) };
-                        let next_c = if axis == 1 { const_i64(idx) } else { col.clone() };
-                        let next = eval_map_expr_scalar(
-                            &expr, next_r, next_c, ctx, tile_ir, &fused_load_bases, out,
-                        );
-                        acc = reduce_combine(ctx, out, acc, next, is_max);
-                    }
-
-                    let dst_ptr = emit_gep(
-                        ctx, out, dst_tile.clone(), vec![row, col],
-                        llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::F32),
-                    );
-                    emit_store(out, dst_ptr, acc);
+                    acc = reduce_combine(ctx, out, acc, next, is_max);
                 }
-            },
-        );
+
+                let dst_ptr = emit_gep(
+                    ctx,
+                    out,
+                    dst_tile.clone(),
+                    vec![row, col],
+                    llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::F32),
+                );
+                emit_store(out, dst_ptr, acc);
+            }
+        });
     } else {
         // Large extent: LLVMIR loop
         lower_fused_map_reduce_loop(
@@ -256,18 +306,40 @@ fn lower_fused_load_reduce_loop(
 ) {
     if out_rows == 1 {
         lower_single_col_fused_load_reduce_loop(
-            builder, prefix, out_cols, reduce_extent, axis, is_max,
-            buf_operand, index_base, dst_tile,
+            builder,
+            prefix,
+            out_cols,
+            reduce_extent,
+            axis,
+            is_max,
+            buf_operand,
+            index_base,
+            dst_tile,
         );
     } else if out_cols == 1 {
         lower_single_row_fused_load_reduce_loop(
-            builder, prefix, out_rows, reduce_extent, axis, is_max,
-            buf_operand, index_base, dst_tile,
+            builder,
+            prefix,
+            out_rows,
+            reduce_extent,
+            axis,
+            is_max,
+            buf_operand,
+            index_base,
+            dst_tile,
         );
     } else {
         lower_full_2d_fused_load_reduce_loop(
-            builder, prefix, out_rows, out_cols, reduce_extent, axis, is_max,
-            buf_operand, index_base, dst_tile,
+            builder,
+            prefix,
+            out_rows,
+            out_cols,
+            reduce_extent,
+            axis,
+            is_max,
+            buf_operand,
+            index_base,
+            dst_tile,
         );
     }
 }
@@ -301,7 +373,14 @@ fn lower_single_col_fused_load_reduce_loop(
     builder.switch_to(header);
     let col = llvm_ir::Operand::Value(header_params[0].id);
     let header_term = builder.with_current_insts(|ctx, _, out| {
-        let cond = emit_cmp(ctx, out, llvm_ir::CmpPred::Slt, col.clone(), const_i64(cols), llvm_ir::Type::I1);
+        let cond = emit_cmp(
+            ctx,
+            out,
+            llvm_ir::CmpPred::Slt,
+            col.clone(),
+            const_i64(cols),
+            llvm_ir::Type::I1,
+        );
         llvm_ir::Terminator::CondBr {
             cond,
             true_target: body_block,
@@ -319,15 +398,24 @@ fn lower_single_col_fused_load_reduce_loop(
 
     let reduce_prefix = format!("{prefix}_reduce");
     let final_acc = if let Some(acc) = emit_vec_reduce_loop(
-        builder, &reduce_prefix, reduce_extent, axis, is_max,
-        &buf_operand, &index_base, row.clone(),
+        builder,
+        &reduce_prefix,
+        reduce_extent,
+        axis,
+        is_max,
+        &buf_operand,
+        &index_base,
+        row.clone(),
     ) {
         acc
     } else {
         // Scalar fallback
         let init_acc = builder.with_current_insts(|ctx, _, out| {
             let ptr = emit_buffer_element_ptr(
-                ctx, out, buf_operand.clone(), index_base.clone(),
+                ctx,
+                out,
+                buf_operand.clone(),
+                index_base.clone(),
                 if axis == 1 { row.clone() } else { const_i64(0) },
                 if axis == 1 { const_i64(0) } else { col.clone() },
             );
@@ -342,8 +430,15 @@ fn lower_single_col_fused_load_reduce_loop(
             init_acc,
             |ctx, _, out, reduce_idx, acc| {
                 let ptr = emit_buffer_element_ptr(
-                    ctx, out, buf_operand.clone(), index_base.clone(),
-                    if axis == 1 { row.clone() } else { reduce_idx.clone() },
+                    ctx,
+                    out,
+                    buf_operand.clone(),
+                    index_base.clone(),
+                    if axis == 1 {
+                        row.clone()
+                    } else {
+                        reduce_idx.clone()
+                    },
                     if axis == 1 { reduce_idx } else { col.clone() },
                 );
                 let next = emit_load(ctx, out, ptr, llvm_ir::Type::F32);
@@ -354,12 +449,25 @@ fn lower_single_col_fused_load_reduce_loop(
 
     let latch_term = builder.with_current_insts(|ctx, _, out| {
         let dst_ptr = emit_gep(
-            ctx, out, dst_tile.clone(), vec![row, col],
+            ctx,
+            out,
+            dst_tile.clone(),
+            vec![row, col],
             llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::F32),
         );
         emit_store(out, dst_ptr, final_acc);
-        let next_col = emit_bin(ctx, out, llvm_ir::BinOp::Add, body_col, const_i64(1), llvm_ir::Type::I64);
-        llvm_ir::Terminator::Br { target: header, args: vec![next_col] }
+        let next_col = emit_bin(
+            ctx,
+            out,
+            llvm_ir::BinOp::Add,
+            body_col,
+            const_i64(1),
+            llvm_ir::Type::I64,
+        );
+        llvm_ir::Terminator::Br {
+            target: header,
+            args: vec![next_col],
+        }
     });
     builder.set_current_terminator(latch_term);
     builder.switch_to(continue_block);
@@ -394,7 +502,14 @@ fn lower_single_row_fused_load_reduce_loop(
     builder.switch_to(header);
     let row = llvm_ir::Operand::Value(header_params[0].id);
     let header_term = builder.with_current_insts(|ctx, _, out| {
-        let cond = emit_cmp(ctx, out, llvm_ir::CmpPred::Slt, row.clone(), const_i64(rows), llvm_ir::Type::I1);
+        let cond = emit_cmp(
+            ctx,
+            out,
+            llvm_ir::CmpPred::Slt,
+            row.clone(),
+            const_i64(rows),
+            llvm_ir::Type::I1,
+        );
         llvm_ir::Terminator::CondBr {
             cond,
             true_target: body_block,
@@ -412,15 +527,24 @@ fn lower_single_row_fused_load_reduce_loop(
 
     let reduce_prefix = format!("{prefix}_reduce");
     let final_acc = if let Some(acc) = emit_vec_reduce_loop(
-        builder, &reduce_prefix, reduce_extent, axis, is_max,
-        &buf_operand, &index_base, row.clone(),
+        builder,
+        &reduce_prefix,
+        reduce_extent,
+        axis,
+        is_max,
+        &buf_operand,
+        &index_base,
+        row.clone(),
     ) {
         acc
     } else {
         // Scalar fallback
         let init_acc = builder.with_current_insts(|ctx, _, out| {
             let ptr = emit_buffer_element_ptr(
-                ctx, out, buf_operand.clone(), index_base.clone(),
+                ctx,
+                out,
+                buf_operand.clone(),
+                index_base.clone(),
                 if axis == 1 { row.clone() } else { const_i64(0) },
                 if axis == 1 { const_i64(0) } else { col.clone() },
             );
@@ -435,8 +559,15 @@ fn lower_single_row_fused_load_reduce_loop(
             init_acc,
             |ctx, _, out, reduce_idx, acc| {
                 let ptr = emit_buffer_element_ptr(
-                    ctx, out, buf_operand.clone(), index_base.clone(),
-                    if axis == 1 { row.clone() } else { reduce_idx.clone() },
+                    ctx,
+                    out,
+                    buf_operand.clone(),
+                    index_base.clone(),
+                    if axis == 1 {
+                        row.clone()
+                    } else {
+                        reduce_idx.clone()
+                    },
                     if axis == 1 { reduce_idx } else { col.clone() },
                 );
                 let next = emit_load(ctx, out, ptr, llvm_ir::Type::F32);
@@ -447,12 +578,25 @@ fn lower_single_row_fused_load_reduce_loop(
 
     let latch_term = builder.with_current_insts(|ctx, _, out| {
         let dst_ptr = emit_gep(
-            ctx, out, dst_tile.clone(), vec![row, col],
+            ctx,
+            out,
+            dst_tile.clone(),
+            vec![row, col],
             llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::F32),
         );
         emit_store(out, dst_ptr, final_acc);
-        let next_row = emit_bin(ctx, out, llvm_ir::BinOp::Add, body_row, const_i64(1), llvm_ir::Type::I64);
-        llvm_ir::Terminator::Br { target: header, args: vec![next_row] }
+        let next_row = emit_bin(
+            ctx,
+            out,
+            llvm_ir::BinOp::Add,
+            body_row,
+            const_i64(1),
+            llvm_ir::Type::I64,
+        );
+        llvm_ir::Terminator::Br {
+            target: header,
+            args: vec![next_row],
+        }
     });
     builder.set_current_terminator(latch_term);
     builder.switch_to(continue_block);
@@ -476,11 +620,17 @@ fn lower_full_2d_fused_load_reduce_loop(
     );
     let (col_header, col_params) = builder.create_block(
         &format!("{prefix}_col_header"),
-        vec![("loop_row", llvm_ir::Type::I64), ("loop_col", llvm_ir::Type::I64)],
+        vec![
+            ("loop_row", llvm_ir::Type::I64),
+            ("loop_col", llvm_ir::Type::I64),
+        ],
     );
     let (body_block, body_params) = builder.create_block(
         &format!("{prefix}_body"),
-        vec![("loop_row", llvm_ir::Type::I64), ("loop_col", llvm_ir::Type::I64)],
+        vec![
+            ("loop_row", llvm_ir::Type::I64),
+            ("loop_col", llvm_ir::Type::I64),
+        ],
     );
     let (row_latch, row_latch_params) = builder.create_block(
         &format!("{prefix}_row_latch"),
@@ -497,7 +647,14 @@ fn lower_full_2d_fused_load_reduce_loop(
     builder.switch_to(row_header);
     let row = llvm_ir::Operand::Value(row_params[0].id);
     let row_term = builder.with_current_insts(|ctx, _, out| {
-        let cond = emit_cmp(ctx, out, llvm_ir::CmpPred::Slt, row.clone(), const_i64(rows), llvm_ir::Type::I1);
+        let cond = emit_cmp(
+            ctx,
+            out,
+            llvm_ir::CmpPred::Slt,
+            row.clone(),
+            const_i64(rows),
+            llvm_ir::Type::I1,
+        );
         llvm_ir::Terminator::CondBr {
             cond,
             true_target: col_header,
@@ -513,7 +670,14 @@ fn lower_full_2d_fused_load_reduce_loop(
     let col_row = llvm_ir::Operand::Value(col_params[0].id);
     let col = llvm_ir::Operand::Value(col_params[1].id);
     let col_term = builder.with_current_insts(|ctx, _, out| {
-        let cond = emit_cmp(ctx, out, llvm_ir::CmpPred::Slt, col.clone(), const_i64(cols), llvm_ir::Type::I1);
+        let cond = emit_cmp(
+            ctx,
+            out,
+            llvm_ir::CmpPred::Slt,
+            col.clone(),
+            const_i64(cols),
+            llvm_ir::Type::I1,
+        );
         llvm_ir::Terminator::CondBr {
             cond,
             true_target: body_block,
@@ -531,18 +695,38 @@ fn lower_full_2d_fused_load_reduce_loop(
 
     let reduce_prefix = format!("{prefix}_reduce");
     let final_acc = if let Some(acc) = emit_vec_reduce_loop(
-        builder, &reduce_prefix, reduce_extent, axis, is_max,
-        &buf_operand, &index_base,
-        if axis == 1 { body_row.clone() } else { const_i64(0) },
+        builder,
+        &reduce_prefix,
+        reduce_extent,
+        axis,
+        is_max,
+        &buf_operand,
+        &index_base,
+        if axis == 1 {
+            body_row.clone()
+        } else {
+            const_i64(0)
+        },
     ) {
         acc
     } else {
         // Scalar fallback
         let init_acc = builder.with_current_insts(|ctx, _, out| {
             let ptr = emit_buffer_element_ptr(
-                ctx, out, buf_operand.clone(), index_base.clone(),
-                if axis == 1 { body_row.clone() } else { const_i64(0) },
-                if axis == 1 { const_i64(0) } else { body_col.clone() },
+                ctx,
+                out,
+                buf_operand.clone(),
+                index_base.clone(),
+                if axis == 1 {
+                    body_row.clone()
+                } else {
+                    const_i64(0)
+                },
+                if axis == 1 {
+                    const_i64(0)
+                } else {
+                    body_col.clone()
+                },
             );
             emit_load(ctx, out, ptr, llvm_ir::Type::F32)
         });
@@ -555,9 +739,20 @@ fn lower_full_2d_fused_load_reduce_loop(
             init_acc,
             |ctx, _, out, reduce_idx, acc| {
                 let ptr = emit_buffer_element_ptr(
-                    ctx, out, buf_operand.clone(), index_base.clone(),
-                    if axis == 1 { body_row.clone() } else { reduce_idx.clone() },
-                    if axis == 1 { reduce_idx } else { body_col.clone() },
+                    ctx,
+                    out,
+                    buf_operand.clone(),
+                    index_base.clone(),
+                    if axis == 1 {
+                        body_row.clone()
+                    } else {
+                        reduce_idx.clone()
+                    },
+                    if axis == 1 {
+                        reduce_idx
+                    } else {
+                        body_col.clone()
+                    },
                 );
                 let next = emit_load(ctx, out, ptr, llvm_ir::Type::F32);
                 reduce_combine(ctx, out, acc, next, is_max)
@@ -567,12 +762,25 @@ fn lower_full_2d_fused_load_reduce_loop(
 
     let body_term = builder.with_current_insts(|ctx, _, out| {
         let dst_ptr = emit_gep(
-            ctx, out, dst_tile.clone(), vec![body_row.clone(), body_col.clone()],
+            ctx,
+            out,
+            dst_tile.clone(),
+            vec![body_row.clone(), body_col.clone()],
             llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::F32),
         );
         emit_store(out, dst_ptr, final_acc);
-        let next_col = emit_bin(ctx, out, llvm_ir::BinOp::Add, body_col, const_i64(1), llvm_ir::Type::I64);
-        llvm_ir::Terminator::Br { target: col_header, args: vec![body_row, next_col] }
+        let next_col = emit_bin(
+            ctx,
+            out,
+            llvm_ir::BinOp::Add,
+            body_col,
+            const_i64(1),
+            llvm_ir::Type::I64,
+        );
+        llvm_ir::Terminator::Br {
+            target: col_header,
+            args: vec![body_row, next_col],
+        }
     });
     builder.set_current_terminator(body_term);
 
@@ -580,8 +788,18 @@ fn lower_full_2d_fused_load_reduce_loop(
     builder.switch_to(row_latch);
     let latch_row = llvm_ir::Operand::Value(row_latch_params[0].id);
     let row_latch_term = builder.with_current_insts(|ctx, _, out| {
-        let next_row = emit_bin(ctx, out, llvm_ir::BinOp::Add, latch_row, const_i64(1), llvm_ir::Type::I64);
-        llvm_ir::Terminator::Br { target: row_header, args: vec![next_row] }
+        let next_row = emit_bin(
+            ctx,
+            out,
+            llvm_ir::BinOp::Add,
+            latch_row,
+            const_i64(1),
+            llvm_ir::Type::I64,
+        );
+        llvm_ir::Terminator::Br {
+            target: row_header,
+            args: vec![next_row],
+        }
     });
     builder.set_current_terminator(row_latch_term);
     builder.switch_to(continue_block);
@@ -602,18 +820,40 @@ fn lower_fused_map_reduce_loop(
 ) {
     if out_rows == 1 {
         lower_single_col_fused_map_reduce_loop(
-            builder, prefix, out_cols, reduce_extent, axis, is_max,
-            expr, fused_load_bases, dst_tile,
+            builder,
+            prefix,
+            out_cols,
+            reduce_extent,
+            axis,
+            is_max,
+            expr,
+            fused_load_bases,
+            dst_tile,
         );
     } else if out_cols == 1 {
         lower_single_row_fused_map_reduce_loop(
-            builder, prefix, out_rows, reduce_extent, axis, is_max,
-            expr, fused_load_bases, dst_tile,
+            builder,
+            prefix,
+            out_rows,
+            reduce_extent,
+            axis,
+            is_max,
+            expr,
+            fused_load_bases,
+            dst_tile,
         );
     } else {
         lower_full_2d_fused_map_reduce_loop(
-            builder, prefix, out_rows, out_cols, reduce_extent, axis, is_max,
-            expr, fused_load_bases, dst_tile,
+            builder,
+            prefix,
+            out_rows,
+            out_cols,
+            reduce_extent,
+            axis,
+            is_max,
+            expr,
+            fused_load_bases,
+            dst_tile,
         );
     }
 }
@@ -647,7 +887,14 @@ fn lower_single_col_fused_map_reduce_loop(
     builder.switch_to(header);
     let col = llvm_ir::Operand::Value(header_params[0].id);
     let header_term = builder.with_current_insts(|ctx, _, out| {
-        let cond = emit_cmp(ctx, out, llvm_ir::CmpPred::Slt, col.clone(), const_i64(cols), llvm_ir::Type::I1);
+        let cond = emit_cmp(
+            ctx,
+            out,
+            llvm_ir::CmpPred::Slt,
+            col.clone(),
+            const_i64(cols),
+            llvm_ir::Type::I1,
+        );
         llvm_ir::Terminator::CondBr {
             cond,
             true_target: body_block,
@@ -668,7 +915,10 @@ fn lower_single_col_fused_map_reduce_loop(
             expr,
             if axis == 1 { row.clone() } else { const_i64(0) },
             if axis == 1 { const_i64(0) } else { col.clone() },
-            ctx, tile_ir, fused_load_bases, out,
+            ctx,
+            tile_ir,
+            fused_load_bases,
+            out,
         )
     });
 
@@ -682,9 +932,16 @@ fn lower_single_col_fused_map_reduce_loop(
         |ctx, tile_ir, out, reduce_idx, acc| {
             let next = eval_map_expr_scalar(
                 expr,
-                if axis == 1 { row.clone() } else { reduce_idx.clone() },
+                if axis == 1 {
+                    row.clone()
+                } else {
+                    reduce_idx.clone()
+                },
                 if axis == 1 { reduce_idx } else { col.clone() },
-                ctx, tile_ir, fused_load_bases, out,
+                ctx,
+                tile_ir,
+                fused_load_bases,
+                out,
             );
             reduce_combine(ctx, out, acc, next, is_max)
         },
@@ -692,12 +949,25 @@ fn lower_single_col_fused_map_reduce_loop(
 
     let latch_term = builder.with_current_insts(|ctx, _, out| {
         let dst_ptr = emit_gep(
-            ctx, out, dst_tile.clone(), vec![row, col],
+            ctx,
+            out,
+            dst_tile.clone(),
+            vec![row, col],
             llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::F32),
         );
         emit_store(out, dst_ptr, final_acc);
-        let next_col = emit_bin(ctx, out, llvm_ir::BinOp::Add, body_col, const_i64(1), llvm_ir::Type::I64);
-        llvm_ir::Terminator::Br { target: header, args: vec![next_col] }
+        let next_col = emit_bin(
+            ctx,
+            out,
+            llvm_ir::BinOp::Add,
+            body_col,
+            const_i64(1),
+            llvm_ir::Type::I64,
+        );
+        llvm_ir::Terminator::Br {
+            target: header,
+            args: vec![next_col],
+        }
     });
     builder.set_current_terminator(latch_term);
     builder.switch_to(continue_block);
@@ -732,7 +1002,14 @@ fn lower_single_row_fused_map_reduce_loop(
     builder.switch_to(header);
     let row = llvm_ir::Operand::Value(header_params[0].id);
     let header_term = builder.with_current_insts(|ctx, _, out| {
-        let cond = emit_cmp(ctx, out, llvm_ir::CmpPred::Slt, row.clone(), const_i64(rows), llvm_ir::Type::I1);
+        let cond = emit_cmp(
+            ctx,
+            out,
+            llvm_ir::CmpPred::Slt,
+            row.clone(),
+            const_i64(rows),
+            llvm_ir::Type::I1,
+        );
         llvm_ir::Terminator::CondBr {
             cond,
             true_target: body_block,
@@ -753,7 +1030,10 @@ fn lower_single_row_fused_map_reduce_loop(
             expr,
             if axis == 1 { row.clone() } else { const_i64(0) },
             if axis == 1 { const_i64(0) } else { col.clone() },
-            ctx, tile_ir, fused_load_bases, out,
+            ctx,
+            tile_ir,
+            fused_load_bases,
+            out,
         )
     });
 
@@ -767,9 +1047,16 @@ fn lower_single_row_fused_map_reduce_loop(
         |ctx, tile_ir, out, reduce_idx, acc| {
             let next = eval_map_expr_scalar(
                 expr,
-                if axis == 1 { row.clone() } else { reduce_idx.clone() },
+                if axis == 1 {
+                    row.clone()
+                } else {
+                    reduce_idx.clone()
+                },
                 if axis == 1 { reduce_idx } else { col.clone() },
-                ctx, tile_ir, fused_load_bases, out,
+                ctx,
+                tile_ir,
+                fused_load_bases,
+                out,
             );
             reduce_combine(ctx, out, acc, next, is_max)
         },
@@ -777,12 +1064,25 @@ fn lower_single_row_fused_map_reduce_loop(
 
     let latch_term = builder.with_current_insts(|ctx, _, out| {
         let dst_ptr = emit_gep(
-            ctx, out, dst_tile.clone(), vec![row, col],
+            ctx,
+            out,
+            dst_tile.clone(),
+            vec![row, col],
             llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::F32),
         );
         emit_store(out, dst_ptr, final_acc);
-        let next_row = emit_bin(ctx, out, llvm_ir::BinOp::Add, body_row, const_i64(1), llvm_ir::Type::I64);
-        llvm_ir::Terminator::Br { target: header, args: vec![next_row] }
+        let next_row = emit_bin(
+            ctx,
+            out,
+            llvm_ir::BinOp::Add,
+            body_row,
+            const_i64(1),
+            llvm_ir::Type::I64,
+        );
+        llvm_ir::Terminator::Br {
+            target: header,
+            args: vec![next_row],
+        }
     });
     builder.set_current_terminator(latch_term);
     builder.switch_to(continue_block);
@@ -850,13 +1150,23 @@ fn emit_vec_sum_reduce(
     let mut acc = emit_vec_reduce_add(ctx, out, vec0);
     for chunk in 1..vec_count {
         let chunk_offset = emit_bin(
-            ctx, out, llvm_ir::BinOp::Add,
-            base_offset.clone(), const_i64((chunk * 4) as i64),
+            ctx,
+            out,
+            llvm_ir::BinOp::Add,
+            base_offset.clone(),
+            const_i64((chunk * 4) as i64),
             llvm_ir::Type::I64,
         );
         let vec = emit_vec_load4(ctx, out, buf.clone(), chunk_offset);
         let reduced = emit_vec_reduce_add(ctx, out, vec);
-        acc = emit_bin(ctx, out, llvm_ir::BinOp::Add, acc, reduced, llvm_ir::Type::F32);
+        acc = emit_bin(
+            ctx,
+            out,
+            llvm_ir::BinOp::Add,
+            acc,
+            reduced,
+            llvm_ir::Type::F32,
+        );
     }
     acc
 }
@@ -902,12 +1212,18 @@ fn emit_vec_reduce_loop(
         4,
         const_f32(0.0),
         |ctx, _, out, reduce_idx, acc| {
-            let base_offset = emit_buffer_linear_index(
-                ctx, out, index_base, row.clone(), reduce_idx,
-            );
+            let base_offset =
+                emit_buffer_linear_index(ctx, out, index_base, row.clone(), reduce_idx);
             let vec = emit_vec_load4(ctx, out, buf_operand.clone(), base_offset);
             let reduced = emit_vec_reduce_add(ctx, out, vec);
-            emit_bin(ctx, out, llvm_ir::BinOp::Add, acc, reduced, llvm_ir::Type::F32)
+            emit_bin(
+                ctx,
+                out,
+                llvm_ir::BinOp::Add,
+                acc,
+                reduced,
+                llvm_ir::Type::F32,
+            )
         },
     );
 
@@ -922,8 +1238,12 @@ fn emit_vec_reduce_loop(
             vec_acc,
             |ctx, _, out, reduce_idx, acc| {
                 let ptr = emit_buffer_element_ptr(
-                    ctx, out, buf_operand.clone(), index_base.clone(),
-                    row.clone(), reduce_idx,
+                    ctx,
+                    out,
+                    buf_operand.clone(),
+                    index_base.clone(),
+                    row.clone(),
+                    reduce_idx,
                 );
                 let next = emit_load(ctx, out, ptr, llvm_ir::Type::F32);
                 emit_bin(ctx, out, llvm_ir::BinOp::Add, acc, next, llvm_ir::Type::F32)
@@ -953,11 +1273,17 @@ fn lower_full_2d_fused_map_reduce_loop(
     );
     let (col_header, col_params) = builder.create_block(
         &format!("{prefix}_col_header"),
-        vec![("loop_row", llvm_ir::Type::I64), ("loop_col", llvm_ir::Type::I64)],
+        vec![
+            ("loop_row", llvm_ir::Type::I64),
+            ("loop_col", llvm_ir::Type::I64),
+        ],
     );
     let (body_block, body_params) = builder.create_block(
         &format!("{prefix}_body"),
-        vec![("loop_row", llvm_ir::Type::I64), ("loop_col", llvm_ir::Type::I64)],
+        vec![
+            ("loop_row", llvm_ir::Type::I64),
+            ("loop_col", llvm_ir::Type::I64),
+        ],
     );
     let (row_latch, row_latch_params) = builder.create_block(
         &format!("{prefix}_row_latch"),
@@ -974,7 +1300,14 @@ fn lower_full_2d_fused_map_reduce_loop(
     builder.switch_to(row_header);
     let row = llvm_ir::Operand::Value(row_params[0].id);
     let row_term = builder.with_current_insts(|ctx, _, out| {
-        let cond = emit_cmp(ctx, out, llvm_ir::CmpPred::Slt, row.clone(), const_i64(rows), llvm_ir::Type::I1);
+        let cond = emit_cmp(
+            ctx,
+            out,
+            llvm_ir::CmpPred::Slt,
+            row.clone(),
+            const_i64(rows),
+            llvm_ir::Type::I1,
+        );
         llvm_ir::Terminator::CondBr {
             cond,
             true_target: col_header,
@@ -990,7 +1323,14 @@ fn lower_full_2d_fused_map_reduce_loop(
     let col_row = llvm_ir::Operand::Value(col_params[0].id);
     let col = llvm_ir::Operand::Value(col_params[1].id);
     let col_term = builder.with_current_insts(|ctx, _, out| {
-        let cond = emit_cmp(ctx, out, llvm_ir::CmpPred::Slt, col.clone(), const_i64(cols), llvm_ir::Type::I1);
+        let cond = emit_cmp(
+            ctx,
+            out,
+            llvm_ir::CmpPred::Slt,
+            col.clone(),
+            const_i64(cols),
+            llvm_ir::Type::I1,
+        );
         llvm_ir::Terminator::CondBr {
             cond,
             true_target: body_block,
@@ -1009,9 +1349,20 @@ fn lower_full_2d_fused_map_reduce_loop(
     let init_acc = builder.with_current_insts(|ctx, tile_ir, out| {
         eval_map_expr_scalar(
             expr,
-            if axis == 1 { body_row.clone() } else { const_i64(0) },
-            if axis == 1 { const_i64(0) } else { body_col.clone() },
-            ctx, tile_ir, fused_load_bases, out,
+            if axis == 1 {
+                body_row.clone()
+            } else {
+                const_i64(0)
+            },
+            if axis == 1 {
+                const_i64(0)
+            } else {
+                body_col.clone()
+            },
+            ctx,
+            tile_ir,
+            fused_load_bases,
+            out,
         )
     });
 
@@ -1025,9 +1376,20 @@ fn lower_full_2d_fused_map_reduce_loop(
         |ctx, tile_ir, out, reduce_idx, acc| {
             let next = eval_map_expr_scalar(
                 expr,
-                if axis == 1 { body_row.clone() } else { reduce_idx.clone() },
-                if axis == 1 { reduce_idx } else { body_col.clone() },
-                ctx, tile_ir, fused_load_bases, out,
+                if axis == 1 {
+                    body_row.clone()
+                } else {
+                    reduce_idx.clone()
+                },
+                if axis == 1 {
+                    reduce_idx
+                } else {
+                    body_col.clone()
+                },
+                ctx,
+                tile_ir,
+                fused_load_bases,
+                out,
             );
             reduce_combine(ctx, out, acc, next, is_max)
         },
@@ -1035,12 +1397,25 @@ fn lower_full_2d_fused_map_reduce_loop(
 
     let body_term = builder.with_current_insts(|ctx, _, out| {
         let dst_ptr = emit_gep(
-            ctx, out, dst_tile.clone(), vec![body_row.clone(), body_col.clone()],
+            ctx,
+            out,
+            dst_tile.clone(),
+            vec![body_row.clone(), body_col.clone()],
             llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::F32),
         );
         emit_store(out, dst_ptr, final_acc);
-        let next_col = emit_bin(ctx, out, llvm_ir::BinOp::Add, body_col, const_i64(1), llvm_ir::Type::I64);
-        llvm_ir::Terminator::Br { target: col_header, args: vec![body_row, next_col] }
+        let next_col = emit_bin(
+            ctx,
+            out,
+            llvm_ir::BinOp::Add,
+            body_col,
+            const_i64(1),
+            llvm_ir::Type::I64,
+        );
+        llvm_ir::Terminator::Br {
+            target: col_header,
+            args: vec![body_row, next_col],
+        }
     });
     builder.set_current_terminator(body_term);
 
@@ -1048,8 +1423,18 @@ fn lower_full_2d_fused_map_reduce_loop(
     builder.switch_to(row_latch);
     let latch_row = llvm_ir::Operand::Value(row_latch_params[0].id);
     let row_latch_term = builder.with_current_insts(|ctx, _, out| {
-        let next_row = emit_bin(ctx, out, llvm_ir::BinOp::Add, latch_row, const_i64(1), llvm_ir::Type::I64);
-        llvm_ir::Terminator::Br { target: row_header, args: vec![next_row] }
+        let next_row = emit_bin(
+            ctx,
+            out,
+            llvm_ir::BinOp::Add,
+            latch_row,
+            const_i64(1),
+            llvm_ir::Type::I64,
+        );
+        llvm_ir::Terminator::Br {
+            target: row_header,
+            args: vec![next_row],
+        }
     });
     builder.set_current_terminator(row_latch_term);
     builder.switch_to(continue_block);
