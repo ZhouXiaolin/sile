@@ -865,7 +865,7 @@ fn is_removable_inst(op: &InstOp) -> bool {
         | InstOp::Memcpy { .. }
         | InstOp::Call { .. } => false,
         InstOp::Intrinsic {
-            intrinsic: Intrinsic::Barrier { .. },
+            intrinsic: Intrinsic::Barrier { .. } | Intrinsic::VecStore { .. },
             ..
         } => false,
         _ => true,

@@ -151,6 +151,15 @@ pub enum Intrinsic {
     BlockId { dim: u8 },
     Barrier { scope: SyncScope },
     Exp,
+    /// Load `<len x elem_ty>` from contiguous memory starting at `ptr + offset`.
+    /// Args: [ptr, offset]. Result type must be Vector.
+    VecLoad { len: usize },
+    /// Store `<len x elem_ty>` to contiguous memory starting at `ptr + offset`.
+    /// Args: [ptr, offset, value]. value must be Vector.
+    VecStore { len: usize },
+    /// Horizontal reduction: sum all elements of a vector into a scalar.
+    /// Args: [vector]. Result type must be scalar.
+    VecReduceAdd,
 }
 
 #[derive(Clone, Debug, PartialEq)]

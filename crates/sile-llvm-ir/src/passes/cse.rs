@@ -47,6 +47,13 @@ fn process_block(
     let mut new_insts = Vec::with_capacity(old_insts.len());
     for inst in old_insts {
         let rewritten = rewrite_inst(inst, replacements);
+
+        // Invalidate load CSE entries on any store (conservative but correct:
+        // a store may write to any address that a previous load reads from).
+        if matches!(rewritten.op, InstOp::Store { .. }) {
+            expr_to_value.retain(|k, _| !k.starts_with("load:"));
+        }
+
         if rewritten.metadata.is_empty()
             && let Some(key) = expr_key(&rewritten.op)
         {
@@ -237,8 +244,8 @@ fn expr_key(op: &InstOp) -> Option<String> {
             "intrinsic:{intrinsic:?}:[{}]",
             args.iter().map(operand_key).collect::<Vec<_>>().join(",")
         )),
+        InstOp::Load { ptr } => Some(format!("load:{}", operand_key(ptr))),
         InstOp::Alloca { .. }
-        | InstOp::Load { .. }
         | InstOp::Store { .. }
         | InstOp::AtomicAdd { .. }
         | InstOp::Memcpy { .. }
@@ -248,7 +255,10 @@ fn expr_key(op: &InstOp) -> Option<String> {
 }
 
 fn is_pure_intrinsic(intrinsic: &crate::Intrinsic) -> bool {
-    !matches!(intrinsic, crate::Intrinsic::Barrier { .. })
+    !matches!(
+        intrinsic,
+        crate::Intrinsic::Barrier { .. } | crate::Intrinsic::VecStore { .. }
+    )
 }
 
 fn operand_key(operand: &Operand) -> String {

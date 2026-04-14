@@ -568,6 +568,43 @@ fn format_intrinsic(
                 format_operand(arg, names)
             )
         }
+        Intrinsic::VecLoad { len } => {
+            let ptr = &args[0];
+            let offset = &args[1];
+            format!(
+                "call {} @llvm.vec.load.{}({} {}, {} {})",
+                format_type(result_ty),
+                len,
+                format_operand_type(ptr, types),
+                format_operand(ptr, names),
+                format_operand_type(offset, types),
+                format_operand(offset, names)
+            )
+        }
+        Intrinsic::VecStore { len } => {
+            let ptr = &args[0];
+            let offset = &args[1];
+            let value = &args[2];
+            format!(
+                "call void @llvm.vec.store.{}({} {}, {} {}, {} {})",
+                len,
+                format_operand_type(ptr, types),
+                format_operand(ptr, names),
+                format_operand_type(offset, types),
+                format_operand(offset, names),
+                format_operand_type(value, types),
+                format_operand(value, names)
+            )
+        }
+        Intrinsic::VecReduceAdd => {
+            let vector = &args[0];
+            format!(
+                "call {} @llvm.vec.reduce.add({} {})",
+                format_type(result_ty),
+                format_operand_type(vector, types),
+                format_operand(vector, names)
+            )
+        }
     }
 }
 
