@@ -5,14 +5,22 @@ use sile_llvm_ir as llvm_ir;
 use sile_llvm_ir::Function as LlvmIrFunction;
 
 use crate::cpu::codegen::generate as generate_llvm_ir_c_source;
+#[cfg(target_os = "macos")]
 use crate::metal::codegen::generate as generate_llvm_ir_metal_source;
 use crate::{BackendArtifact, CodegenTarget};
 
 pub fn run(llvm_ir: &LlvmIrFunction, target: CodegenTarget) -> Result<BackendArtifact> {
     let artifact = match target {
         CodegenTarget::C => BackendArtifact::CSource(generate_llvm_ir_c_source(llvm_ir)?),
+        #[cfg(target_os = "macos")]
         CodegenTarget::Metal => {
             BackendArtifact::MetalSource(generate_llvm_ir_metal_source(llvm_ir)?)
+        }
+        #[cfg(not(target_os = "macos"))]
+        CodegenTarget::Metal => {
+            return Err(Error::UnsupportedBackend(
+                "Metal backend is only available on macOS".into(),
+            ));
         }
     };
     Ok(artifact)

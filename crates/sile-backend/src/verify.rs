@@ -11,7 +11,10 @@ pub(crate) fn for_target(
     verify_shared_contract(llvm_ir, stage)?;
     match target {
         CodegenTarget::C => Ok(()),
+        #[cfg(target_os = "macos")]
         CodegenTarget::Metal => verify_metal_contract(llvm_ir, stage),
+        #[cfg(not(target_os = "macos"))]
+        CodegenTarget::Metal => Ok(()),
     }
 }
 
@@ -37,6 +40,7 @@ fn verify_shared_contract(llvm_ir: &LlvmIrFunction, stage: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn verify_metal_contract(llvm_ir: &LlvmIrFunction, stage: &str) -> Result<()> {
     for block in &llvm_ir.blocks {
         for inst in &block.insts {

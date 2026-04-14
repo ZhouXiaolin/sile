@@ -5,6 +5,7 @@ mod emit;
 mod verify;
 
 pub mod cpu;
+#[cfg(target_os = "macos")]
 pub mod metal;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

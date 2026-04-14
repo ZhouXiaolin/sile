@@ -16,6 +16,7 @@ fn default_device_is_cpu_when_env_is_missing() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn default_device_uses_requested_backend_name() {
     let _guard = env_lock().lock().unwrap();
     unsafe { std::env::set_var("SILE_DEVICE", "METAL") };

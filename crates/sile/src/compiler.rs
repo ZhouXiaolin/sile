@@ -1,31 +1,31 @@
 use sile_core::{Error, Result};
-use sile_hir::{Kernel, typeck::TypedKernel};
+use sile_hir::{typeck::TypedKernel, Kernel};
 use sile_llvm_ir::Function as LlvmIrFunction;
 
-pub use sile_backend::{BackendArtifact, CodegenTarget, compile as compile_backend};
+pub use sile_backend::{compile as compile_backend, BackendArtifact, CodegenTarget};
 
 pub use sile_hir::{
-    ACTIVE_HIR_PIPELINE as ACTIVE_HIR_TYPECK_PIPELINE, HirPassKind as HirAnalysisPassKind,
-    RECOMMENDED_HIR_PIPELINE as RECOMMENDED_HIR_TYPECK_PIPELINE,
     run_hir_passes as run_hir_analysis_passes, run_hir_pipeline as run_hir_analysis_pipeline,
-    verify_typed_kernel as verify_hir_typed_kernel,
+    verify_typed_kernel as verify_hir_typed_kernel, HirPassKind as HirAnalysisPassKind,
+    ACTIVE_HIR_PIPELINE as ACTIVE_HIR_TYPECK_PIPELINE,
+    RECOMMENDED_HIR_PIPELINE as RECOMMENDED_HIR_TYPECK_PIPELINE,
 };
 
 pub use sile_llvm_ir::{
-    ACTIVE_LLVM_IR_PIPELINE, LlvmIrPassKind, RECOMMENDED_LLVM_IR_PIPELINE, run_llvm_ir_passes,
-    run_llvm_ir_pipeline,
+    run_llvm_ir_passes, run_llvm_ir_pipeline, LlvmIrPassKind, ACTIVE_LLVM_IR_PIPELINE,
+    RECOMMENDED_LLVM_IR_PIPELINE,
 };
 pub use sile_tile_ir::passes::{
-    ACTIVE_PIPELINE as ACTIVE_TILE_IR_PIPELINE,
-    RECOMMENDED_PIPELINE as RECOMMENDED_TILE_IR_PIPELINE, TileIrPassKind,
     run_default_pipeline as run_tile_ir_passes, run_pipeline as run_tile_ir_pipeline,
+    TileIrPassKind, ACTIVE_PIPELINE as ACTIVE_TILE_IR_PIPELINE,
+    RECOMMENDED_PIPELINE as RECOMMENDED_TILE_IR_PIPELINE,
 };
 pub use sile_tile_ir::{
-    ACTIVE_LLVM_IR_LOWERING_PIPELINE, LlvmIrLoweringPassKind as LlvmLoweringPassKind,
-    RECOMMENDED_LLVM_IR_LOWERING_PIPELINE, TileIrFunction, dce, format_tile_ir,
-    lower_tile_ir_to_llvm_ir, lower_to_tile_ir,
+    dce, format_tile_ir, lower_tile_ir_to_llvm_ir, lower_to_tile_ir,
     run_default_llvm_ir_lowering_pipeline as run_default_llvm_lowering_pipeline,
     run_llvm_ir_lowering_pipeline as run_llvm_lowering_pipeline,
+    LlvmIrLoweringPassKind as LlvmLoweringPassKind, TileIrFunction,
+    ACTIVE_LLVM_IR_LOWERING_PIPELINE, RECOMMENDED_LLVM_IR_LOWERING_PIPELINE,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

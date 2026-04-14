@@ -19,15 +19,15 @@ pub mod typeck {
 pub mod tileir {
     pub use sile_tile_ir::ir::*;
     pub use sile_tile_ir::{
-        TileIrBlock, TileIrFunction, TileIrInst, TileIrOp, TileIrParam, TileIrTerminator,
-        TileIrType, format_tile_ir, lower_to_tile_ir,
+        format_tile_ir, lower_to_tile_ir, TileIrBlock, TileIrFunction, TileIrInst, TileIrOp,
+        TileIrParam, TileIrTerminator, TileIrType,
     };
 }
 pub mod llvmir {
     pub use sile_llvm_ir::{
-        AddressSpace, BasicBlock, BinOp, BlockId, BlockParam, CastOp, CmpPred, Constant, Function,
-        Inst, InstOp, Intrinsic, Metadata, Operand, Param, ParamAbi, SyncScope, Terminator, Type,
-        ValueId, format_llvm_ir,
+        format_llvm_ir, AddressSpace, BasicBlock, BinOp, BlockId, BlockParam, CastOp, CmpPred,
+        Constant, Function, Inst, InstOp, Intrinsic, Metadata, Operand, Param, ParamAbi, SyncScope,
+        Terminator, Type, ValueId,
     };
 }
 pub mod compiler;
@@ -35,6 +35,7 @@ pub mod codegen {
     pub mod llvmir_c {
         pub use sile_backend::cpu::codegen::*;
     }
+    #[cfg(target_os = "macos")]
     pub mod llvmir_metal {
         pub use sile_backend::metal::codegen::*;
     }

@@ -80,16 +80,7 @@ impl CpuBackend {
                 "-o",
             ]);
         } else {
-            cmd.args([
-                "-shared",
-                "-fPIC",
-                "-O2",
-                "-Xpreprocessor",
-                "-fopenmp",
-                "-lomp",
-                "-lm",
-                "-o",
-            ]);
+            cmd.args(["-shared", "-fPIC", "-O2", "-fopenmp", "-lm", "-o"]);
         }
 
         let output = cmd.arg(&so_path).arg(&c_path).output()?;
@@ -135,6 +126,8 @@ impl CpuBackend {
                 shapes.as_ptr(),
                 shapes.len() as i64,
             );
+
+            std::mem::forget(library);
         }
 
         Ok(())

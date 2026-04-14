@@ -1,10 +1,12 @@
-use sile_backend::{BackendArtifact, cpu::CpuBackend, metal::MetalBackend};
+#[cfg(target_os = "macos")]
+use sile_backend::metal::MetalBackend;
+use sile_backend::{cpu::CpuBackend, BackendArtifact};
 use sile_core::{Device, KernelArg, LaunchConfig, Result, Stream};
 use sile_hir::Kernel;
 use sile_llvm_ir::format_llvm_ir;
 use sile_tile_ir::format_tile_ir;
 
-use crate::compiler::{CodegenTarget, compile_backend, compile_kernel_to_llvm_ir};
+use crate::compiler::{compile_backend, compile_kernel_to_llvm_ir, CodegenTarget};
 
 const PRINT_TILE_IR_ENV: &str = "SILE_PRINT_TILEIR";
 const PRINT_LLVM_IR_ENV: &str = "SILE_PRINT_LLVMIR";
@@ -56,6 +58,7 @@ impl<'a> KernelLauncher<'a> {
                 let backend = CpuBackend::new();
                 backend.execute_llir(&llvm_ir_func, &self.args, &launch, stream)
             }
+            #[cfg(target_os = "macos")]
             Device::Metal(_) => {
                 maybe_print_backend_source(&llvm_ir_func, CodegenTarget::Metal)?;
                 let backend = MetalBackend::new()?;
