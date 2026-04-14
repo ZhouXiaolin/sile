@@ -67,6 +67,18 @@ impl<'a> CCodegen<'a> {
         self.out.push_str("#define llir_thread_id_2() (0)\n");
         self.out.push_str("#define llir_barrier() ((void)0)\n");
         self.out.push('\n');
+
+        // Vector load/reduce helpers (used by vectorized reduce loop)
+        self.out.push_str("typedef struct { float v[4]; } llir_float4;\n");
+        self.out.push_str("static inline llir_float4 llir_vec_load_4(const float* ptr, int64_t offset) {\n");
+        self.out.push_str("    llir_float4 r;\n");
+        self.out.push_str("    r.v[0] = ptr[offset]; r.v[1] = ptr[offset+1]; r.v[2] = ptr[offset+2]; r.v[3] = ptr[offset+3];\n");
+        self.out.push_str("    return r;\n");
+        self.out.push_str("}\n");
+        self.out.push_str("static inline float llir_vec_reduce_add(llir_float4 v) {\n");
+        self.out.push_str("    return v.v[0] + v.v[1] + v.v[2] + v.v[3];\n");
+        self.out.push_str("}\n");
+        self.out.push('\n');
     }
 
     fn emit_signature(&mut self) {
@@ -659,7 +671,7 @@ fn c_type(ty: &llvm_ir::Type) -> String {
         llvm_ir::Type::F32 => "float".to_string(),
         llvm_ir::Type::F64 => "double".to_string(),
         llvm_ir::Type::Ptr { pointee, .. } => format!("{}*", c_type(pointee)),
-        llvm_ir::Type::Vector { len, elem } => format!("{} /* vec{} */", c_type(elem), len),
+        llvm_ir::Type::Vector { len: _, elem: _ } => "llir_float4".to_string(),
         llvm_ir::Type::Array { len, elem } => format!("{}[{}]", c_type(elem), len),
     }
 }
@@ -678,6 +690,9 @@ fn intrinsic_name(intrinsic: &llvm_ir::Intrinsic) -> String {
         llvm_ir::Intrinsic::BlockId { dim } => format!("llir_block_id_{}", dim),
         llvm_ir::Intrinsic::Barrier { .. } => "llir_barrier".to_string(),
         llvm_ir::Intrinsic::Exp => "expf".to_string(),
+        llvm_ir::Intrinsic::VecLoad { len } => format!("llir_vec_load_{}", len),
+        llvm_ir::Intrinsic::VecStore { len } => format!("llir_vec_store_{}", len),
+        llvm_ir::Intrinsic::VecReduceAdd => "llir_vec_reduce_add".to_string(),
     }
 }
 

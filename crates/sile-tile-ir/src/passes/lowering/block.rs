@@ -488,26 +488,28 @@ impl PointwiseLoweringPlan {
                 }
                 continue;
             }
-            // Try Map-Reduce fusion.  When the map has a single consumer we
-            // can skip the standalone map emission entirely.  With multiple
-            // consumers the map is still emitted, but the fused reduce avoids
-            // reading from the intermediate alloca.
+            // Try Map-Reduce fusion.  Only when the map has a single consumer
+            // can we skip the standalone map emission and fuse the reduce.
+            // When use_count > 1, the map is emitted standalone (alloca) and
+            // the reduce falls back to lower_tile_reduce_inst which reads from
+            // that alloca, avoiding duplicate computation.
             if let Some(TileIrOp::Map { expr, rows, cols }) = defs.get(&value) {
-                if use_counts.get(&value).copied().unwrap_or(0) == 1 {
+                let map_use_count = use_counts.get(&value).copied().unwrap_or(0);
+                if map_use_count == 1 {
                     skipped_values.insert(value);
+                    map_reduce_fusions.insert(
+                        inst.result,
+                        MapReduceFusion {
+                            expr: expr.clone(),
+                            src_rows: *rows,
+                            src_cols: *cols,
+                            is_max,
+                            axis,
+                            in_rows,
+                            in_cols,
+                        },
+                    );
                 }
-                map_reduce_fusions.insert(
-                    inst.result,
-                    MapReduceFusion {
-                        expr: expr.clone(),
-                        src_rows: *rows,
-                        src_cols: *cols,
-                        is_max,
-                        axis,
-                        in_rows,
-                        in_cols,
-                    },
-                );
             }
         }
 

@@ -236,7 +236,10 @@ fn is_constant_pointer(operand: &Operand, value_types: &HashMap<ValueId, Type>) 
 }
 
 fn is_pure_intrinsic(intrinsic: &Intrinsic) -> bool {
-    !matches!(intrinsic, Intrinsic::Barrier { .. })
+    !matches!(
+        intrinsic,
+        Intrinsic::Barrier { .. } | Intrinsic::VecStore { .. }
+    )
 }
 
 fn loop_defined_values(func: &Function, loop_block_set: &HashSet<BlockId>) -> HashSet<ValueId> {

@@ -77,7 +77,10 @@ fn is_side_effecting(op: &InstOp) -> bool {
         | InstOp::Memcpy { .. }
         | InstOp::Call { .. } => true,
         InstOp::Intrinsic { intrinsic, .. } => {
-            matches!(intrinsic, crate::Intrinsic::Barrier { .. })
+            matches!(
+                intrinsic,
+                crate::Intrinsic::Barrier { .. } | crate::Intrinsic::VecStore { .. }
+            )
         }
         _ => false,
     }

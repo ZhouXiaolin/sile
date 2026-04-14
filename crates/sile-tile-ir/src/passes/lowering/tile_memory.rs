@@ -227,15 +227,16 @@ pub(crate) fn build_buffer_index_base(
     }
 }
 
-pub(crate) fn emit_buffer_element_ptr(
+/// Compute the flat element index (`tile_origin + row * stride + col` or
+/// `tile_base + row * tile_cols + col`) without performing the GEP.
+pub(crate) fn emit_buffer_linear_index(
     ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
     out: &mut Vec<llvm_ir::Inst>,
-    buf: llvm_ir::Operand,
-    index_base: BufferIndexBase,
+    index_base: &BufferIndexBase,
     tile_row: llvm_ir::Operand,
     tile_col: llvm_ir::Operand,
 ) -> llvm_ir::Operand {
-    let linear_index = match index_base {
+    match index_base {
         BufferIndexBase::Linear {
             tile_base,
             tile_cols,
@@ -245,7 +246,7 @@ pub(crate) fn emit_buffer_element_ptr(
                 out,
                 llvm_ir::BinOp::Mul,
                 tile_row,
-                const_i64(tile_cols),
+                const_i64(*tile_cols),
                 llvm_ir::Type::I64,
             );
             let element_offset = emit_bin(
@@ -260,7 +261,7 @@ pub(crate) fn emit_buffer_element_ptr(
                 ctx,
                 out,
                 llvm_ir::BinOp::Add,
-                tile_base,
+                tile_base.clone(),
                 element_offset,
                 llvm_ir::Type::I64,
             )
@@ -274,14 +275,14 @@ pub(crate) fn emit_buffer_element_ptr(
                 out,
                 llvm_ir::BinOp::Mul,
                 tile_row,
-                stride,
+                stride.clone(),
                 llvm_ir::Type::I64,
             );
             let with_row = emit_bin(
                 ctx,
                 out,
                 llvm_ir::BinOp::Add,
-                tile_origin,
+                tile_origin.clone(),
                 row_offset,
                 llvm_ir::Type::I64,
             );
@@ -294,7 +295,18 @@ pub(crate) fn emit_buffer_element_ptr(
                 llvm_ir::Type::I64,
             )
         }
-    };
+    }
+}
+
+pub(crate) fn emit_buffer_element_ptr(
+    ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
+    out: &mut Vec<llvm_ir::Inst>,
+    buf: llvm_ir::Operand,
+    index_base: BufferIndexBase,
+    tile_row: llvm_ir::Operand,
+    tile_col: llvm_ir::Operand,
+) -> llvm_ir::Operand {
+    let linear_index = emit_buffer_linear_index(ctx, out, &index_base, tile_row, tile_col);
 
     emit_gep(
         ctx,

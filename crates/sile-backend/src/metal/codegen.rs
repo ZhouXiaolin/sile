@@ -210,6 +210,63 @@ impl<'a> MetalCodegen<'a> {
                 ));
                 Ok(())
             }
+            llvm_ir::Intrinsic::VecLoad { len } => {
+                let Some(id) = result else {
+                    return Err(sile_core::Error::Compile(
+                        "vec_load intrinsic must produce a result".into(),
+                    ));
+                };
+                let [ptr, offset] = args else {
+                    return Err(sile_core::Error::Compile(
+                        "vec_load intrinsic expects [ptr, offset] arguments".into(),
+                    ));
+                };
+                self.writeln(&format!(
+                    "{} = *((device float{}*)({} + {}));",
+                    self.value_name(id),
+                    len,
+                    self.format_operand(ptr),
+                    self.format_operand(offset)
+                ));
+                Ok(())
+            }
+            llvm_ir::Intrinsic::VecStore { len } => {
+                let [ptr, offset, value] = args else {
+                    return Err(sile_core::Error::Compile(
+                        "vec_store intrinsic expects [ptr, offset, value] arguments".into(),
+                    ));
+                };
+                self.writeln(&format!(
+                    "*((device float{}*)({} + {})) = {};",
+                    len,
+                    self.format_operand(ptr),
+                    self.format_operand(offset),
+                    self.format_operand(value)
+                ));
+                Ok(())
+            }
+            llvm_ir::Intrinsic::VecReduceAdd => {
+                let Some(id) = result else {
+                    return Err(sile_core::Error::Compile(
+                        "vec_reduce_add intrinsic must produce a result".into(),
+                    ));
+                };
+                let [vector] = args else {
+                    return Err(sile_core::Error::Compile(
+                        "vec_reduce_add intrinsic expects one argument".into(),
+                    ));
+                };
+                let v = self.format_operand(vector);
+                self.writeln(&format!(
+                    "{} = {}[0] + {}[1] + {}[2] + {}[3];",
+                    self.value_name(id),
+                    v,
+                    v,
+                    v,
+                    v,
+                ));
+                Ok(())
+            }
         }
     }
 
@@ -386,6 +443,9 @@ fn metal_var_decl(ty: &llvm_ir::Type, name: &str) -> String {
             addr_space,
             pointee,
         } => metal_ptr_zero_decl(addr_space, pointee, name),
+        llvm_ir::Type::Vector { len, elem: _ } => {
+            format!("float{} {} = {{0}}", len, name)
+        }
         other => format!("{} {}", metal_type(other), name),
     }
 }
