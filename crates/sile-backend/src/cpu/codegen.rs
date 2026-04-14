@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::emit::{
-    self, StructuredCfgMessages, StructuredEmitter, TextCodegen, array_dims,
-    build_value_names, infer_tile_plan, value_name as llir_value_name,
+    self, StructuredCfgMessages, StructuredEmitter, TextCodegen, array_dims, build_value_names,
+    infer_tile_plan, value_name as llir_value_name,
 };
 use sile_llvm_ir as llvm_ir;
 
@@ -69,14 +69,19 @@ impl<'a> CCodegen<'a> {
         self.out.push('\n');
 
         // Vector load/reduce helpers (used by vectorized reduce loop)
-        self.out.push_str("typedef struct { float v[4]; } llir_float4;\n");
-        self.out.push_str("static inline llir_float4 llir_vec_load_4(const float* ptr, int64_t offset) {\n");
+        self.out
+            .push_str("typedef struct { float v[4]; } llir_float4;\n");
+        self.out.push_str(
+            "static inline llir_float4 llir_vec_load_4(const float* ptr, int64_t offset) {\n",
+        );
         self.out.push_str("    llir_float4 r;\n");
         self.out.push_str("    r.v[0] = ptr[offset]; r.v[1] = ptr[offset+1]; r.v[2] = ptr[offset+2]; r.v[3] = ptr[offset+3];\n");
         self.out.push_str("    return r;\n");
         self.out.push_str("}\n");
-        self.out.push_str("static inline float llir_vec_reduce_add(llir_float4 v) {\n");
-        self.out.push_str("    return v.v[0] + v.v[1] + v.v[2] + v.v[3];\n");
+        self.out
+            .push_str("static inline float llir_vec_reduce_add(llir_float4 v) {\n");
+        self.out
+            .push_str("    return v.v[0] + v.v[1] + v.v[2] + v.v[3];\n");
         self.out.push_str("}\n");
         self.out.push('\n');
     }
@@ -420,8 +425,7 @@ fn emit_tile_count_logic(
         ));
         out.push_str(&format!(
             "  int64_t sile_total_tiles = (shapes[{}] / {}) * sile_tiles_n;\n",
-            abi.shape_offset,
-            tile_rows
+            abi.shape_offset, tile_rows
         ));
     }
 }

@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{BasicBlock, BlockId, Constant, Function, Inst, InstOp, Intrinsic, Operand, Terminator, ValueId};
+use crate::{
+    BasicBlock, BlockId, Constant, Function, Inst, InstOp, Intrinsic, Operand, Terminator, ValueId,
+};
 
 /// Canonical LLVM IR rewrites live here.
 ///
@@ -114,9 +116,7 @@ fn fold_algebraic_identities(func: &mut Function) {
             block.insts = std::mem::take(&mut block.insts)
                 .into_iter()
                 .map(|inst| rewrite_inst_operands(inst, &replacements))
-                .filter(|inst| {
-                    inst.result.map_or(true, |r| !replacements.contains_key(&r))
-                })
+                .filter(|inst| inst.result.map_or(true, |r| !replacements.contains_key(&r)))
                 .collect();
             block.terminator = rewrite_terminator_operands(block.terminator.clone(), &replacements);
         }
@@ -136,16 +136,56 @@ fn fold_constant_comparisons(func: &mut Function) {
             let lhs = rewrite_operand(lhs.clone(), &replacements);
             let rhs = rewrite_operand(rhs.clone(), &replacements);
             let folded = match (pred, &lhs, &rhs) {
-                (crate::CmpPred::Slt, Operand::Const(Constant::Int(a)), Operand::Const(Constant::Int(b))) => Some(a < b),
-                (crate::CmpPred::Sle, Operand::Const(Constant::Int(a)), Operand::Const(Constant::Int(b))) => Some(a <= b),
-                (crate::CmpPred::Sgt, Operand::Const(Constant::Int(a)), Operand::Const(Constant::Int(b))) => Some(a > b),
-                (crate::CmpPred::Sge, Operand::Const(Constant::Int(a)), Operand::Const(Constant::Int(b))) => Some(a >= b),
-                (crate::CmpPred::Eq, Operand::Const(Constant::Int(a)), Operand::Const(Constant::Int(b))) => Some(a == b),
-                (crate::CmpPred::Ne, Operand::Const(Constant::Int(a)), Operand::Const(Constant::Int(b))) => Some(a != b),
-                (crate::CmpPred::Olt, Operand::Const(Constant::Float(a)), Operand::Const(Constant::Float(b))) => Some(a < b),
-                (crate::CmpPred::Ole, Operand::Const(Constant::Float(a)), Operand::Const(Constant::Float(b))) => Some(a <= b),
-                (crate::CmpPred::Ogt, Operand::Const(Constant::Float(a)), Operand::Const(Constant::Float(b))) => Some(a > b),
-                (crate::CmpPred::Oge, Operand::Const(Constant::Float(a)), Operand::Const(Constant::Float(b))) => Some(a >= b),
+                (
+                    crate::CmpPred::Slt,
+                    Operand::Const(Constant::Int(a)),
+                    Operand::Const(Constant::Int(b)),
+                ) => Some(a < b),
+                (
+                    crate::CmpPred::Sle,
+                    Operand::Const(Constant::Int(a)),
+                    Operand::Const(Constant::Int(b)),
+                ) => Some(a <= b),
+                (
+                    crate::CmpPred::Sgt,
+                    Operand::Const(Constant::Int(a)),
+                    Operand::Const(Constant::Int(b)),
+                ) => Some(a > b),
+                (
+                    crate::CmpPred::Sge,
+                    Operand::Const(Constant::Int(a)),
+                    Operand::Const(Constant::Int(b)),
+                ) => Some(a >= b),
+                (
+                    crate::CmpPred::Eq,
+                    Operand::Const(Constant::Int(a)),
+                    Operand::Const(Constant::Int(b)),
+                ) => Some(a == b),
+                (
+                    crate::CmpPred::Ne,
+                    Operand::Const(Constant::Int(a)),
+                    Operand::Const(Constant::Int(b)),
+                ) => Some(a != b),
+                (
+                    crate::CmpPred::Olt,
+                    Operand::Const(Constant::Float(a)),
+                    Operand::Const(Constant::Float(b)),
+                ) => Some(a < b),
+                (
+                    crate::CmpPred::Ole,
+                    Operand::Const(Constant::Float(a)),
+                    Operand::Const(Constant::Float(b)),
+                ) => Some(a <= b),
+                (
+                    crate::CmpPred::Ogt,
+                    Operand::Const(Constant::Float(a)),
+                    Operand::Const(Constant::Float(b)),
+                ) => Some(a > b),
+                (
+                    crate::CmpPred::Oge,
+                    Operand::Const(Constant::Float(a)),
+                    Operand::Const(Constant::Float(b)),
+                ) => Some(a >= b),
                 _ => None,
             };
             if let Some(val) = folded {

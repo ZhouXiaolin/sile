@@ -616,6 +616,29 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 },
             )
         }
+        BuiltinOp::Max => {
+            let lhs = lower_expr(&args[0], ctx);
+            let rhs = lower_expr(&args[1], ctx);
+            let (rows, cols) = tile_shape_of(lhs, ctx)
+                .or_else(|| tile_shape_of(rhs, ctx))
+                .unwrap_or((1, 1));
+            ctx.emit(
+                TileIrOp::Map {
+                    expr: TileMapExpr::Select {
+                        cond: Box::new(TileMapExpr::Cmp {
+                            op: CmpOp::Ge,
+                            lhs: Box::new(TileMapExpr::Value(lhs)),
+                            rhs: Box::new(TileMapExpr::Value(rhs)),
+                        }),
+                        on_true: Box::new(TileMapExpr::Value(lhs)),
+                        on_false: Box::new(TileMapExpr::Value(rhs)),
+                    },
+                    rows,
+                    cols,
+                },
+                TileIrType::Tile { rows, cols },
+            )
+        }
         BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Mul | BuiltinOp::Div => {
             let lhs = lower_expr(&args[0], ctx);
             let rhs = lower_expr(&args[1], ctx);

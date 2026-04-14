@@ -2,9 +2,9 @@ use sile_llvm_ir as llvm_ir;
 
 use crate::ValueId;
 use crate::passes::lowering::core::{
-    BlockLowerer, LowerLlvmIrCtx, alloc_tile_result, const_i64, emit_bin, emit_cmp, emit_gep,
-    emit_select, emit_store, load_tile_scalar_dynamic, lower_nested_tile_loop,
-    lower_reduce_extent_loop, resolve_operand, REDUCE_UNROLL_THRESHOLD,
+    BlockLowerer, LowerLlvmIrCtx, REDUCE_UNROLL_THRESHOLD, alloc_tile_result, const_i64, emit_bin,
+    emit_cmp, emit_gep, emit_select, emit_store, load_tile_scalar_dynamic, lower_nested_tile_loop,
+    lower_reduce_extent_loop, resolve_operand,
 };
 
 pub(crate) fn reduce_combine(
@@ -191,7 +191,14 @@ fn lower_single_col_reduce_loop(
     builder.switch_to(header);
     let col = llvm_ir::Operand::Value(header_params[0].id);
     let header_term = builder.with_current_insts(|ctx, _, out| {
-        let cond = emit_cmp(ctx, out, llvm_ir::CmpPred::Slt, col.clone(), const_i64(cols), llvm_ir::Type::I1);
+        let cond = emit_cmp(
+            ctx,
+            out,
+            llvm_ir::CmpPred::Slt,
+            col.clone(),
+            const_i64(cols),
+            llvm_ir::Type::I1,
+        );
         llvm_ir::Terminator::CondBr {
             cond,
             true_target: body_block,
@@ -231,7 +238,11 @@ fn lower_single_col_reduce_loop(
                 ctx,
                 out,
                 src_tile.clone(),
-                if axis == 1 { row.clone() } else { reduce_idx.clone() },
+                if axis == 1 {
+                    row.clone()
+                } else {
+                    reduce_idx.clone()
+                },
                 if axis == 1 { reduce_idx } else { col.clone() },
             );
             reduce_combine(ctx, out, acc, next, is_max)
@@ -248,7 +259,14 @@ fn lower_single_col_reduce_loop(
             llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::F32),
         );
         emit_store(out, dst_ptr, final_acc);
-        let next_col = emit_bin(ctx, out, llvm_ir::BinOp::Add, body_col, const_i64(1), llvm_ir::Type::I64);
+        let next_col = emit_bin(
+            ctx,
+            out,
+            llvm_ir::BinOp::Add,
+            body_col,
+            const_i64(1),
+            llvm_ir::Type::I64,
+        );
         llvm_ir::Terminator::Br {
             target: header,
             args: vec![next_col],
@@ -287,7 +305,14 @@ fn lower_single_row_reduce_loop(
     builder.switch_to(header);
     let row = llvm_ir::Operand::Value(header_params[0].id);
     let header_term = builder.with_current_insts(|ctx, _, out| {
-        let cond = emit_cmp(ctx, out, llvm_ir::CmpPred::Slt, row.clone(), const_i64(rows), llvm_ir::Type::I1);
+        let cond = emit_cmp(
+            ctx,
+            out,
+            llvm_ir::CmpPred::Slt,
+            row.clone(),
+            const_i64(rows),
+            llvm_ir::Type::I1,
+        );
         llvm_ir::Terminator::CondBr {
             cond,
             true_target: body_block,
@@ -327,7 +352,11 @@ fn lower_single_row_reduce_loop(
                 ctx,
                 out,
                 src_tile.clone(),
-                if axis == 1 { row.clone() } else { reduce_idx.clone() },
+                if axis == 1 {
+                    row.clone()
+                } else {
+                    reduce_idx.clone()
+                },
                 if axis == 1 { reduce_idx } else { col.clone() },
             );
             reduce_combine(ctx, out, acc, next, is_max)
@@ -344,7 +373,14 @@ fn lower_single_row_reduce_loop(
             llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::F32),
         );
         emit_store(out, dst_ptr, final_acc);
-        let next_row = emit_bin(ctx, out, llvm_ir::BinOp::Add, body_row, const_i64(1), llvm_ir::Type::I64);
+        let next_row = emit_bin(
+            ctx,
+            out,
+            llvm_ir::BinOp::Add,
+            body_row,
+            const_i64(1),
+            llvm_ir::Type::I64,
+        );
         llvm_ir::Terminator::Br {
             target: header,
             args: vec![next_row],
@@ -399,7 +435,14 @@ fn lower_full_2d_reduce_loop(
     builder.switch_to(row_header);
     let row = llvm_ir::Operand::Value(row_params[0].id);
     let row_term = builder.with_current_insts(|ctx, _, out| {
-        let cond = emit_cmp(ctx, out, llvm_ir::CmpPred::Slt, row.clone(), const_i64(rows), llvm_ir::Type::I1);
+        let cond = emit_cmp(
+            ctx,
+            out,
+            llvm_ir::CmpPred::Slt,
+            row.clone(),
+            const_i64(rows),
+            llvm_ir::Type::I1,
+        );
         llvm_ir::Terminator::CondBr {
             cond,
             true_target: col_header,
@@ -415,7 +458,14 @@ fn lower_full_2d_reduce_loop(
     let col_row = llvm_ir::Operand::Value(col_params[0].id);
     let col = llvm_ir::Operand::Value(col_params[1].id);
     let col_term = builder.with_current_insts(|ctx, _, out| {
-        let cond = emit_cmp(ctx, out, llvm_ir::CmpPred::Slt, col.clone(), const_i64(cols), llvm_ir::Type::I1);
+        let cond = emit_cmp(
+            ctx,
+            out,
+            llvm_ir::CmpPred::Slt,
+            col.clone(),
+            const_i64(cols),
+            llvm_ir::Type::I1,
+        );
         llvm_ir::Terminator::CondBr {
             cond,
             true_target: body_block,
@@ -436,8 +486,16 @@ fn lower_full_2d_reduce_loop(
             ctx,
             out,
             src_tile.clone(),
-            if axis == 1 { body_row.clone() } else { const_i64(0) },
-            if axis == 1 { const_i64(0) } else { body_col.clone() },
+            if axis == 1 {
+                body_row.clone()
+            } else {
+                const_i64(0)
+            },
+            if axis == 1 {
+                const_i64(0)
+            } else {
+                body_col.clone()
+            },
         )
     });
 
@@ -453,8 +511,16 @@ fn lower_full_2d_reduce_loop(
                 ctx,
                 out,
                 src_tile.clone(),
-                if axis == 1 { body_row.clone() } else { reduce_idx.clone() },
-                if axis == 1 { reduce_idx } else { body_col.clone() },
+                if axis == 1 {
+                    body_row.clone()
+                } else {
+                    reduce_idx.clone()
+                },
+                if axis == 1 {
+                    reduce_idx
+                } else {
+                    body_col.clone()
+                },
             );
             reduce_combine(ctx, out, acc, next, is_max)
         },
@@ -469,7 +535,14 @@ fn lower_full_2d_reduce_loop(
             llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::F32),
         );
         emit_store(out, dst_ptr, final_acc);
-        let next_col = emit_bin(ctx, out, llvm_ir::BinOp::Add, body_col, const_i64(1), llvm_ir::Type::I64);
+        let next_col = emit_bin(
+            ctx,
+            out,
+            llvm_ir::BinOp::Add,
+            body_col,
+            const_i64(1),
+            llvm_ir::Type::I64,
+        );
         llvm_ir::Terminator::Br {
             target: col_header,
             args: vec![body_row.clone(), next_col],
@@ -481,7 +554,14 @@ fn lower_full_2d_reduce_loop(
     builder.switch_to(row_latch);
     let latch_row = llvm_ir::Operand::Value(row_latch_params[0].id);
     let row_latch_term = builder.with_current_insts(|ctx, _, out| {
-        let next_row = emit_bin(ctx, out, llvm_ir::BinOp::Add, latch_row.clone(), const_i64(1), llvm_ir::Type::I64);
+        let next_row = emit_bin(
+            ctx,
+            out,
+            llvm_ir::BinOp::Add,
+            latch_row.clone(),
+            const_i64(1),
+            llvm_ir::Type::I64,
+        );
         llvm_ir::Terminator::Br {
             target: row_header,
             args: vec![next_row],

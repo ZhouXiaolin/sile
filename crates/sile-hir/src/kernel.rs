@@ -12,6 +12,7 @@ pub enum BuiltinOp {
     LoadTile,
     LoadTileLike2D,
     Store,
+    Max,
     Add,
     Sub,
     Mul,

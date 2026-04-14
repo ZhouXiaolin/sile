@@ -9,7 +9,9 @@ mod single_axis;
 use grid::lower_full_2d_loop;
 use single_axis::{lower_single_col_loop, lower_single_row_loop};
 
-pub(crate) use single_axis::{lower_reduce_extent_loop, lower_reduce_extent_loop_step, REDUCE_UNROLL_THRESHOLD};
+pub(crate) use single_axis::{
+    REDUCE_UNROLL_THRESHOLD, lower_reduce_extent_loop, lower_reduce_extent_loop_step,
+};
 
 pub(crate) fn lower_nested_tile_loop(
     builder: &mut BlockLowerer<'_>,

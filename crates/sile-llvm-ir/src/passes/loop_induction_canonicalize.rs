@@ -36,7 +36,10 @@ pub fn run(mut func: Function) -> Function {
         let Operand::Value(loop_param) = lhs else {
             continue;
         };
-        let Some(induction_index) = header.params.iter().position(|param| param.id == *loop_param)
+        let Some(induction_index) = header
+            .params
+            .iter()
+            .position(|param| param.id == *loop_param)
         else {
             continue;
         };
@@ -45,12 +48,12 @@ pub fn run(mut func: Function) -> Function {
             Terminator::CondBr { true_args, .. } => true_args,
             _ => unreachable!(),
         };
-        let aliases =
-            collect_loop_aliases(&func, header.id, *true_target, true_args, *loop_param);
+        let aliases = collect_loop_aliases(&func, header.id, *true_target, true_args, *loop_param);
         let backedges = find_loop_backedge_blocks(&func, header.id, *true_target);
 
         for backedge in backedges {
-            let Some(arg) = header_arg_from_predecessor(&func, backedge, header.id, induction_index)
+            let Some(arg) =
+                header_arg_from_predecessor(&func, backedge, header.id, induction_index)
             else {
                 continue;
             };
@@ -68,9 +71,19 @@ pub fn run(mut func: Function) -> Function {
             let uses_alias = lhs_alias.is_some() || rhs_alias.is_some();
             let is_step = matches!(
                 (op, lhs, rhs),
-                (BinOp::Add, Operand::Value(_), Operand::Const(Constant::Int(_)))
-                    | (BinOp::Add, Operand::Const(Constant::Int(_)), Operand::Value(_))
-                    | (BinOp::Sub, Operand::Value(_), Operand::Const(Constant::Int(_)))
+                (
+                    BinOp::Add,
+                    Operand::Value(_),
+                    Operand::Const(Constant::Int(_))
+                ) | (
+                    BinOp::Add,
+                    Operand::Const(Constant::Int(_)),
+                    Operand::Value(_)
+                ) | (
+                    BinOp::Sub,
+                    Operand::Value(_),
+                    Operand::Const(Constant::Int(_))
+                )
             );
             if !uses_alias || !is_step {
                 continue;
@@ -202,7 +215,11 @@ fn propagate_aliases(
     changed
 }
 
-fn find_loop_backedge_blocks(func: &Function, header_id: BlockId, true_target: BlockId) -> Vec<BlockId> {
+fn find_loop_backedge_blocks(
+    func: &Function,
+    header_id: BlockId,
+    true_target: BlockId,
+) -> Vec<BlockId> {
     func.blocks
         .iter()
         .filter_map(|block| match &block.terminator {

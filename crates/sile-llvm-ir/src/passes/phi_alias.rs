@@ -115,7 +115,10 @@ fn is_safe_alias_source(func: &Function, pred: BlockId, target: BlockId, value: 
     if pred == target {
         return false;
     }
-    pred_block.insts.iter().any(|inst| inst.result == Some(value))
+    pred_block
+        .insts
+        .iter()
+        .any(|inst| inst.result == Some(value))
 }
 
 fn rewrite_function_operands(func: &mut Function, replacements: &HashMap<ValueId, ValueId>) {
@@ -392,9 +395,17 @@ mod tests {
         };
 
         let out = super::run(func);
-        let body = out.blocks.iter().find(|block| block.id == BlockId(2)).unwrap();
+        let body = out
+            .blocks
+            .iter()
+            .find(|block| block.id == BlockId(2))
+            .unwrap();
         assert!(body.params.is_empty());
-        let header = out.blocks.iter().find(|block| block.id == BlockId(1)).unwrap();
+        let header = out
+            .blocks
+            .iter()
+            .find(|block| block.id == BlockId(1))
+            .unwrap();
         let Terminator::CondBr { true_args, .. } = &header.terminator else {
             panic!("expected condbr");
         };

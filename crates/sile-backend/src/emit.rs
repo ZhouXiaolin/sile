@@ -300,7 +300,11 @@ pub trait StructuredEmitter {
         args: &[llvm_ir::Operand],
         skip_params: &[llvm_ir::ValueId],
     );
-    fn emit_block_param_assignments(&mut self, target: llvm_ir::BlockId, args: &[llvm_ir::Operand]) {
+    fn emit_block_param_assignments(
+        &mut self,
+        target: llvm_ir::BlockId,
+        args: &[llvm_ir::Operand],
+    ) {
         self.emit_block_param_assignments_skipping(target, args, &[]);
     }
     fn format_operand(&self, operand: &llvm_ir::Operand) -> String;
@@ -337,7 +341,8 @@ pub fn emit_structured_from<E: StructuredEmitter>(
         if let llvm_ir::Terminator::Br { target, args } = &block.terminator
             && stop_targets.contains(target)
         {
-            let skip_inst = stop_skip_inst.as_ref()
+            let skip_inst = stop_skip_inst
+                .as_ref()
                 .and_then(|(bid, vid)| (*bid == current).then_some(*vid));
             if let Some(skip) = skip_inst {
                 emitter.emit_block_insts_except(&block, Some(skip))?;
@@ -503,14 +508,18 @@ fn emit_structured_if_else<E: StructuredEmitter>(
     emitter.writeln(&format!("if ({cond_expr}) {{"));
     emitter.indent_inc();
     emitter.emit_block_param_assignments(*true_target, true_args);
-    if emit_structured_from(emitter, func, *true_target, &[join], None, None, messages)? != Some(join) {
+    if emit_structured_from(emitter, func, *true_target, &[join], None, None, messages)?
+        != Some(join)
+    {
         return Err(Error::Compile(messages.unsupported_cond_br.into()));
     }
     emitter.indent_dec();
     emitter.writeln("} else {");
     emitter.indent_inc();
     emitter.emit_block_param_assignments(*false_target, false_args);
-    if emit_structured_from(emitter, func, *false_target, &[join], None, None, messages)? != Some(join) {
+    if emit_structured_from(emitter, func, *false_target, &[join], None, None, messages)?
+        != Some(join)
+    {
         return Err(Error::Compile(messages.unsupported_cond_br.into()));
     }
     emitter.indent_dec();
@@ -664,11 +673,17 @@ fn detect_for_loop_induction(
     };
     if !matches!(
         pred,
-        llvm_ir::CmpPred::Slt | llvm_ir::CmpPred::Sle | llvm_ir::CmpPred::Sgt | llvm_ir::CmpPred::Sge
+        llvm_ir::CmpPred::Slt
+            | llvm_ir::CmpPred::Sle
+            | llvm_ir::CmpPred::Sgt
+            | llvm_ir::CmpPred::Sge
     ) {
         return None;
     }
-    let induction_param_index = header.params.iter().position(|param| param.id == *loop_param)?;
+    let induction_param_index = header
+        .params
+        .iter()
+        .position(|param| param.id == *loop_param)?;
     let backedge_candidates = find_loop_backedge_args(func, header.id, true_target);
     let (step, step_value_id) = backedge_candidates.into_iter().find_map(|args| {
         induction_step_from_backedge_arg(func, *loop_param, args.get(induction_param_index)?)
@@ -1011,7 +1026,7 @@ fn infer_tile_dims_from_direct_loop_store(
     };
 
     let col_header = get_block(func, col_header_id)?;
-    
+
     // Infer cols from col_header's loop bound (first param if exists)
     let cols = if col_header.params.is_empty() {
         return None;

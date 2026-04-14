@@ -183,8 +183,9 @@ fn lower_expr(expr: &KernelExpr, const_params: &[syn::Ident]) -> proc_macro2::To
                         }
                     }
                 }
-                "reduce_max" | "reduce_sum" | "exp" => {
+                "max_tile" | "reduce_max" | "reduce_sum" | "exp" => {
                     let op = match func_name.as_str() {
+                        "max_tile" => quote! { ::sile::hir::BuiltinOp::Max },
                         "reduce_max" => quote! { ::sile::hir::BuiltinOp::ReduceMax },
                         "reduce_sum" => quote! { ::sile::hir::BuiltinOp::ReduceSum },
                         "exp" => quote! { ::sile::hir::BuiltinOp::Exp },
