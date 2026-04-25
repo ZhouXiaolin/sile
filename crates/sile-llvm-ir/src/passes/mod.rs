@@ -2,9 +2,11 @@ pub mod alloca_simplify;
 pub mod canonicalize;
 pub mod cse;
 pub mod dce;
+pub mod inline_preheader_constants;
 pub mod licm;
 pub mod loop_induction_canonicalize;
 pub mod loop_simplify;
+pub mod loop_unroll;
 pub mod phi_alias;
 pub mod simplify_cfg;
 pub mod verify;
@@ -18,11 +20,13 @@ pub enum LlvmIrPassKind {
     SimplifyCfg,
     LoopSimplify,
     PhiAlias,
+    InlinePreheaderConstants,
     LoopInductionCanonicalize,
     Licm,
     Cse,
     Dce,
     AllocaSimplify,
+    LoopUnroll,
     VerifyOutput,
 }
 
@@ -37,11 +41,13 @@ pub const RECOMMENDED_PIPELINE: &[LlvmIrPassKind] = &[
     LlvmIrPassKind::SimplifyCfg,
     LlvmIrPassKind::LoopSimplify,
     LlvmIrPassKind::PhiAlias,
+    LlvmIrPassKind::InlinePreheaderConstants,
     LlvmIrPassKind::LoopInductionCanonicalize,
     LlvmIrPassKind::Licm,
     LlvmIrPassKind::Cse,
     LlvmIrPassKind::Dce,
     LlvmIrPassKind::AllocaSimplify,
+    LlvmIrPassKind::LoopUnroll,
     LlvmIrPassKind::VerifyOutput,
 ];
 
@@ -59,11 +65,15 @@ pub fn run_pipeline(mut func: Function, pipeline: &[LlvmIrPassKind]) -> Result<F
             LlvmIrPassKind::SimplifyCfg => simplify_cfg::run(func),
             LlvmIrPassKind::LoopSimplify => loop_simplify::run(func),
             LlvmIrPassKind::PhiAlias => phi_alias::run(func),
+            LlvmIrPassKind::InlinePreheaderConstants => {
+                inline_preheader_constants::run(func)
+            }
             LlvmIrPassKind::LoopInductionCanonicalize => loop_induction_canonicalize::run(func),
             LlvmIrPassKind::Licm => licm::run(func),
             LlvmIrPassKind::Cse => cse::run(func),
             LlvmIrPassKind::Dce => dce::run(func),
             LlvmIrPassKind::AllocaSimplify => alloca_simplify::run(func),
+            LlvmIrPassKind::LoopUnroll => loop_unroll::run(func),
         };
     }
     Ok(func)
