@@ -14,6 +14,7 @@ const SHAPES_PARAM_NAME: &str = "__sile_shapes";
 /// knew when it emitted `store_ptr_tko`.
 struct OutputBuffer<'a> {
     param: &'a llvm_ir::Param,
+    rows: usize,
     cols: usize,
 }
 
@@ -27,9 +28,10 @@ fn find_output_buffer(func: &llvm_ir::Function) -> Option<OutputBuffer<'_>> {
         })
         .and_then(|param| {
             let abi = param.abi.as_ref()?;
-            let (_rows, cols) = abi.tile?;
+            let (rows, cols) = abi.tile?;
             Some(OutputBuffer {
                 param,
+                rows,
                 cols,
             })
         })
@@ -220,6 +222,16 @@ impl<'a> MetalCodegen<'a> {
             llvm_ir::Intrinsic::ThreadId { .. } => Err(sile_core::Error::Compile(
                 "thread_id intrinsic is not yet supported in LLVM IR Metal codegen".into(),
             )),
+            llvm_ir::Intrinsic::GridDim { dim } => {
+                let Some(id) = result else {
+                    return Err(sile_core::Error::Compile(
+                        "grid_dim intrinsic must produce a result".into(),
+                    ));
+                };
+                let extent = self.grid_dim_expr(*dim)?;
+                self.writeln(&format!("{} = {};", self.value_name(id), extent));
+                Ok(())
+            }
             llvm_ir::Intrinsic::Barrier { .. } => Err(sile_core::Error::Compile(
                 "barrier intrinsic is not yet supported in LLVM IR Metal codegen".into(),
             )),
@@ -317,6 +329,36 @@ impl<'a> MetalCodegen<'a> {
             let name = self.value_name(param.id);
             self.writeln(&format!("{name} = {};", self.format_operand(arg)));
         }
+    }
+
+    /// Extent of grid axis `dim`, from the output buffer's tile shape.
+    ///
+    /// Metal dispatches one thread per tile, so axis 0 spans every tile in the
+    /// output and axes 1 and 2 are always one tile deep.
+    fn grid_dim_expr(&self, dim: u8) -> sile_core::Result<String> {
+        if dim != 0 {
+            return Ok("1".to_string());
+        }
+        let Some(output) = self.output.as_ref() else {
+            // No output ABI: one thread per grid slot.
+            return Ok("(int64_t)gid.x".to_string());
+        };
+        let Some(abi) = output.param.abi.as_ref() else {
+            return Err(sile_core::Error::Compile(
+                "missing output ABI for Metal grid_dim".into(),
+            ));
+        };
+        let shapes = self.shapes_param_name()?;
+        if abi.rank <= 1 {
+            return Ok(format!("({shapes}[{}] / {})", abi.shape_offset, output.cols));
+        }
+        Ok(format!(
+            "(({shapes}[{}] / {}) * (({shapes}[{}] / {}))",
+            abi.shape_offset,
+            output.rows,
+            abi.shape_offset + 1,
+            output.cols,
+        ))
     }
 
     fn logical_block_id_expr(&self, dim: u8) -> sile_core::Result<String> {

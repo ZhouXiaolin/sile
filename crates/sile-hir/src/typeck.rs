@@ -87,6 +87,7 @@ fn infer_expr(expr: &Expr, _locals: &BTreeMap<String, Type>) -> Result<Type, Typ
 fn infer_builtin(op: BuiltinOp, _args: &[Expr]) -> Result<Type, TypeError> {
     match op {
         BuiltinOp::ProgramId => Ok(Type::Shape),
+        BuiltinOp::NumPrograms | BuiltinOp::NumTiles => Ok(Type::Shape),
         BuiltinOp::LoadTile => Ok(Type::tile(ElemType::F32, ShapeExpr::symbol("S"))),
         BuiltinOp::LoadTileLike2D => Ok(Type::tile(
             ElemType::F32,

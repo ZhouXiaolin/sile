@@ -78,6 +78,15 @@ impl<'a> CCodegen<'a> {
             .push_str("static _Thread_local int64_t sile_gid_1 = 0;\n");
         self.out
             .push_str("static _Thread_local int64_t sile_gid_2 = 0;\n");
+        // Grid extents only exist on the CPU host side, so the launcher writes
+        // them before each kernel call. On CPU the grid is flattened, so axes 1
+        // and 2 are always one tile deep.
+        self.out
+            .push_str("static _Thread_local int64_t sile_grid_0 = 1;\n");
+        self.out
+            .push_str("static _Thread_local int64_t sile_grid_1 = 1;\n");
+        self.out
+            .push_str("static _Thread_local int64_t sile_grid_2 = 1;\n");
         self.out.push('\n');
 
         self.emit_runtime_helpers();
@@ -90,6 +99,12 @@ impl<'a> CCodegen<'a> {
             .push_str("#define llir_block_id_1() (sile_gid_1)\n");
         self.out
             .push_str("#define llir_block_id_2() (sile_gid_2)\n");
+        self.out
+            .push_str("#define llir_grid_dim_0() (sile_grid_0)\n");
+        self.out
+            .push_str("#define llir_grid_dim_1() (sile_grid_1)\n");
+        self.out
+            .push_str("#define llir_grid_dim_2() (sile_grid_2)\n");
         self.out.push_str("#define llir_thread_id_0() (0)\n");
         self.out.push_str("#define llir_thread_id_1() (0)\n");
         self.out.push_str("#define llir_thread_id_2() (0)\n");
@@ -518,6 +533,13 @@ fn generate_wrapper(func: &llvm_ir::Function) -> sile_core::Result<String> {
     }
     out.push('\n');
 
+    // Publish the tile count so `GridDim(0)` inside the kernel reads the same
+    // bound the pid loop uses. The CPU grid is flattened, so axes 1 and 2 stay
+    // one tile deep.
+    out.push_str("  sile_grid_0 = sile_total_tiles;\n");
+    out.push_str("  sile_grid_1 = 1;\n");
+    out.push_str("  sile_grid_2 = 1;\n");
+
     out.push_str("  #pragma omp parallel for schedule(static)\n");
     out.push_str("  for (int64_t tg = 0; tg < num_threadgroups; ++tg) {\n");
     out.push_str("    int64_t base = tg * threads_per_group;\n");
@@ -696,6 +718,7 @@ fn intrinsic_name(intrinsic: &llvm_ir::Intrinsic) -> String {
     match intrinsic {
         llvm_ir::Intrinsic::ThreadId { dim } => format!("llir_thread_id_{}", dim),
         llvm_ir::Intrinsic::BlockId { dim } => format!("llir_block_id_{}", dim),
+        llvm_ir::Intrinsic::GridDim { dim } => format!("llir_grid_dim_{}", dim),
         llvm_ir::Intrinsic::Barrier { .. } => "llir_barrier".to_string(),
         llvm_ir::Intrinsic::Exp => "expf".to_string(),
         llvm_ir::Intrinsic::VecLoad { len } => format!("llir_vec_load_{}", len),

@@ -199,6 +199,26 @@ fn lower_expr(expr: &KernelExpr, const_params: &[syn::Ident]) -> proc_macro2::To
                         }
                     }
                 }
+                // tile::num_programs(axis) -> NumPrograms(axis)
+                "num_programs" => {
+                    let all_args = args_exprs;
+                    quote! {
+                        ::sile::hir::Expr::Builtin {
+                            op: ::sile::hir::BuiltinOp::NumPrograms,
+                            args: vec![#(#all_args),*],
+                        }
+                    }
+                }
+                // tile::num_tiles(buf, axis) -> NumTiles(buf, axis)
+                "num_tiles" => {
+                    let all_args = args_exprs;
+                    quote! {
+                        ::sile::hir::Expr::Builtin {
+                            op: ::sile::hir::BuiltinOp::NumTiles,
+                            args: vec![#(#all_args),*],
+                        }
+                    }
+                }
                 _ => {
                     quote! { ::sile::hir::Expr::Var(#func_name.to_string()) }
                 }
@@ -318,9 +338,11 @@ fn lower_expr(expr: &KernelExpr, const_params: &[syn::Ident]) -> proc_macro2::To
                     };
                 }
             }
-            // Handle tile::id().N -> ShapeDim(ProgramId, N)
+            // Handle tile::id().N and tile::program_id().N -> ShapeDim(ProgramId, N).
+            // `id()` is the historical spelling; `program_id` matches CuTile Rust.
             if let KernelExpr::Call { func, .. } = target.as_ref() {
-                if func.to_string() == "id" {
+                let func_name = func.to_string();
+                if func_name == "id" || func_name == "program_id" {
                     let dim_idx: i64 = field.parse().unwrap_or(0);
                     return quote! {
                         ::sile::hir::Expr::Builtin {

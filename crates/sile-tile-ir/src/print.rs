@@ -182,6 +182,12 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
         TileIrOp::ConstI64(v) => format!("constant <i64: {v}>"),
         TileIrOp::ConstF64(v) => format!("constant <f64: {}>", format_float_literal(*v)),
         TileIrOp::ShapeDim { shape, dim } => format!("sile.shape_dim {shape} {{dim = {dim}}}"),
+        TileIrOp::GridDim { dim } => format!("sile.grid_dim {{dim = {dim}}}"),
+        TileIrOp::NumTiles {
+            shape,
+            dim,
+            tile_extent,
+        } => format!("sile.num_tiles {shape} {{dim = {dim}, tile_extent = {tile_extent}}}"),
     }
 }
 

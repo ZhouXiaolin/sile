@@ -3,6 +3,29 @@ use std::ops::{Add, Div, Index, Mul, Sub};
 #[derive(Clone, Copy, Debug)]
 pub struct TileId(pub i64, pub i64, pub i64);
 
+/// This tile program's index along grid axis `axis`.
+///
+/// Matches CuTile Rust `program_id(axis)`. Read the axis with `.0` / `.1` /
+/// `.2`, exactly like the `TileId` spelling.
+pub fn program_id(_axis: i64) -> TileId {
+    TileId(0, 0, 0)
+}
+
+/// The launch grid extent along grid axis `axis`.
+///
+/// Matches CuTile Rust `num_programs(axis)`.
+pub fn num_programs(_axis: i64) -> i64 {
+    0
+}
+
+/// Tile count along one axis of a buffer.
+///
+/// Matches CuTile Rust `num_tiles(partition, axis)`.
+pub fn num_tiles<T>(_tensor: &crate::tensor::Tensor<T>, _axis: i64) -> i64 {
+    0
+}
+
+/// Deprecated spelling of [`program_id`].
 pub fn id() -> TileId {
     TileId(0, 0, 0)
 }

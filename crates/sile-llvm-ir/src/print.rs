@@ -557,6 +557,9 @@ fn format_intrinsic(
         Intrinsic::BlockId { dim } => {
             format!("call i32 @llvm.nvvm.ctaid.{}()", format_dim_suffix(*dim))
         }
+        Intrinsic::GridDim { dim } => {
+            format!("call i32 @llvm.nvvm.nctaid.{}()", format_dim_suffix(*dim))
+        }
         Intrinsic::Barrier { .. } => "call void @llvm.nvvm.barrier0()".to_string(),
         Intrinsic::Exp => {
             let arg = args.first().expect("exp intrinsic expects one argument");

@@ -158,6 +158,10 @@ pub enum Intrinsic {
     BlockId {
         dim: u8,
     },
+    /// Launch grid extent along axis `dim`. The CuTile `num_programs(dim)`.
+    GridDim {
+        dim: u8,
+    },
     Barrier {
         scope: SyncScope,
     },

@@ -1,8 +1,8 @@
 use sile_llvm_ir as llvm_ir;
 
 use super::core::{
-    LowerLlvmIrCtx, const_i64, emit_bin, emit_gep, emit_shape_dim, llvm_ir_type, llvm_ir_value,
-    load_tile_scalar_dynamic, lower_bin_op, lower_cmp_pred, resolve_operand,
+    LowerLlvmIrCtx, const_i64, emit_bin, emit_gep, emit_load, emit_shape_dim, llvm_ir_type,
+    llvm_ir_value, load_tile_scalar_dynamic, lower_bin_op, lower_cmp_pred, resolve_operand,
 };
 use crate::ir::*;
 
@@ -30,36 +30,52 @@ pub(crate) fn lower_scalar_inst(
                 .insert(llvm_ir_value(inst.result), format!("v{}", inst.result.0));
         }
         TileIrOp::ShapeDim { shape, dim } => {
-            let shape_desc = resolve_operand(*shape, ctx);
-            if let llvm_ir::Operand::Value(shape_desc_id) = shape_desc.clone()
-                && let Some(cached) = ctx.shape_dim_cache.get(&(shape_desc_id, *dim)).cloned()
-            {
-                ctx.operands.insert(inst.result, cached);
-                return;
-            }
-            let ptr = emit_gep(
-                ctx,
-                out,
-                shape_desc.clone(),
-                vec![const_i64(*dim as i64)],
-                llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, llvm_ir::Type::I64),
-            );
-            let value = llvm_ir::Operand::Value(llvm_ir_value(inst.result));
+            // `shape` is a ShapeDesc value, not a buffer: read its `dim` entry.
+            let loaded = load_shape_desc_dim(*shape, *dim, ctx, out);
+            ctx.operands.insert(inst.result, loaded);
+        }
+        TileIrOp::GridDim { dim } => {
             let llir_id = llvm_ir_value(inst.result);
             ctx.names.insert(llir_id, format!("v{}", inst.result.0));
+            ctx.operands
+                .insert(inst.result, llvm_ir::Operand::Value(llir_id));
             out.push(llvm_ir::Inst {
                 result: Some(llir_id),
                 result_name: Some(format!("v{}", inst.result.0)),
                 ty: llvm_ir::Type::I64,
-                op: llvm_ir::InstOp::Load { ptr },
+                op: llvm_ir::InstOp::Intrinsic {
+                    intrinsic: llvm_ir::Intrinsic::GridDim {
+                        dim: u8::try_from(*dim).unwrap_or(0),
+                    },
+                    args: Vec::new(),
+                },
                 metadata: Vec::new(),
             });
-            ctx.operands.insert(inst.result, value.clone());
-            if let llvm_ir::Operand::Value(shape_desc_id) = shape_desc {
-                ctx.shape_dim_cache
-                    .entry((shape_desc_id, *dim))
-                    .or_insert(value);
-            }
+        }
+        TileIrOp::NumTiles {
+            shape,
+            dim,
+            tile_extent,
+        } => {
+            // num_tiles = shape_extent / tile_extent. The extent is the same
+            // gep+load ShapeDim uses, so reuse that read and divide by the tile
+            // extent the lowering already knows.
+            let extent = load_shape_desc_dim(*shape, *dim, ctx, out);
+            let llir_id = llvm_ir_value(inst.result);
+            ctx.names.insert(llir_id, format!("v{}", inst.result.0));
+            ctx.operands
+                .insert(inst.result, llvm_ir::Operand::Value(llir_id));
+            out.push(llvm_ir::Inst {
+                result: Some(llir_id),
+                result_name: Some(format!("v{}", inst.result.0)),
+                ty: llvm_ir::Type::I64,
+                op: llvm_ir::InstOp::Bin {
+                    op: llvm_ir::BinOp::Div,
+                    lhs: extent,
+                    rhs: const_i64(*tile_extent),
+                },
+                metadata: Vec::new(),
+            });
         }
         TileIrOp::IBinary { op, lhs, rhs } => {
             let llir_id = llvm_ir_value(inst.result);
@@ -186,4 +202,37 @@ pub(crate) fn lower_scalar_inst(
             unreachable!("tile ops are lowered by dedicated tile lowering paths")
         }
     }
+}
+
+/// Read entry `dim` of the shape descriptor behind `shape`.
+///
+/// `shape` is a ShapeDesc value, so it indexes the shapes array directly through
+/// a gep plus a load, and repeats of the same `(descriptor, dim)` pair reuse the
+/// first load.
+fn load_shape_desc_dim(
+    shape: crate::ir::ValueId,
+    dim: usize,
+    ctx: &mut LowerLlvmIrCtx,
+    out: &mut Vec<llvm_ir::Inst>,
+) -> llvm_ir::Operand {
+    let shape_desc = resolve_operand(shape, ctx);
+    if let llvm_ir::Operand::Value(shape_desc_id) = shape_desc.clone()
+        && let Some(cached) = ctx.shape_dim_cache.get(&(shape_desc_id, dim)).cloned()
+    {
+        return cached;
+    }
+    let ptr = emit_gep(
+        ctx,
+        out,
+        shape_desc.clone(),
+        vec![const_i64(dim as i64)],
+        llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, llvm_ir::Type::I64),
+    );
+    let loaded = emit_load(ctx, out, ptr.clone(), llvm_ir::Type::I64);
+    if let llvm_ir::Operand::Value(shape_desc_id) = shape_desc {
+        ctx.shape_dim_cache
+            .entry((shape_desc_id, dim))
+            .or_insert(loaded.clone());
+    }
+    loaded
 }

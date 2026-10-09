@@ -488,6 +488,30 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx<'_>) -> ValueId {
 fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueId {
     match op {
         BuiltinOp::ProgramId => ctx.get_or_create_program_id_param(0),
+        BuiltinOp::NumPrograms => {
+            // num_programs(axis): the launch extent. Taken from the axis index
+            // argument when it is a literal.
+            let dim = args.first().and_then(|arg| try_eval_i64(arg, ctx)).unwrap_or(0);
+            ctx.emit(TileIrOp::GridDim { dim }, TileIrType::I64)
+        }
+        BuiltinOp::NumTiles => {
+            // num_tiles(buffer, axis): tiles along one axis of that buffer.
+            let buffer = lower_expr(&args[0], ctx);
+            let shape = ctx.get_or_create_shape_desc_param(buffer);
+            let dim = args
+                .get(1)
+                .and_then(|arg| try_eval_i64(arg, ctx))
+                .unwrap_or(0) as usize;
+            let tile_extent = load_tile_extent_for_buffer(buffer, ctx);
+            ctx.emit(
+                TileIrOp::NumTiles {
+                    shape,
+                    dim,
+                    tile_extent,
+                },
+                TileIrType::I64,
+            )
+        }
         BuiltinOp::ShapeDim => {
             // ShapeDim(ProgramId, dim) → ProgramId { dim }
             if matches!(
@@ -999,6 +1023,81 @@ fn param_stride_dim(buf: &ValueId, ctx: &LowerCtx<'_>) -> usize {
         }
     }
     1
+}
+
+/// Tile extent this buffer is loaded through, used by `num_tiles`.
+///
+/// `num_tiles(buf, axis)` divides the buffer extent by the tile extent. The tile
+/// extent comes from the buffer's own `load_tile` shape, so the lowering has to
+/// find that load. The kernel body is a single forward pass and `num_tiles` may
+/// appear before the load, so the search is order-independent.
+fn load_tile_extent_for_buffer(buf: ValueId, ctx: &LowerCtx<'_>) -> i64 {
+    let Some(hir_param) = ctx
+        .mir_params
+        .iter()
+        .position(|param| param.value == buf)
+        .map(|index| &ctx.typed.kernel.params[index])
+    else {
+        return 1;
+    };
+    let mut extents = Vec::new();
+    for stmt in &ctx.typed.kernel.body {
+        collect_buffer_tile_extents(stmt, &hir_param.name, ctx, &mut extents);
+    }
+    // One buffer normally uses a single tile extent; take the largest so a tile
+    // count is never inflated by a smaller probe load.
+    extents.into_iter().max().unwrap_or(1)
+}
+
+/// Append the tile extents that `buf_name` is loaded with anywhere in `stmt`.
+fn collect_buffer_tile_extents(
+    stmt: &sile_hir::Stmt,
+    buf_name: &str,
+    ctx: &LowerCtx<'_>,
+    out: &mut Vec<i64>,
+) {
+    match stmt {
+        sile_hir::Stmt::Let { expr, .. } | sile_hir::Stmt::Assign { expr, .. } => {
+            collect_buffer_tile_extents_in_expr(expr, buf_name, ctx, out);
+        }
+        sile_hir::Stmt::ForLoop { body, .. } => {
+            for inner in body {
+                collect_buffer_tile_extents(inner, buf_name, ctx, out);
+            }
+        }
+        sile_hir::Stmt::Store { value, .. } => {
+            collect_buffer_tile_extents_in_expr(value, buf_name, ctx, out);
+        }
+        sile_hir::Stmt::AtomicAdd { index, value, .. } => {
+            collect_buffer_tile_extents_in_expr(index, buf_name, ctx, out);
+            collect_buffer_tile_extents_in_expr(value, buf_name, ctx, out);
+        }
+    }
+}
+
+fn collect_buffer_tile_extents_in_expr(
+    expr: &sile_hir::Expr,
+    buf_name: &str,
+    ctx: &LowerCtx<'_>,
+    out: &mut Vec<i64>,
+) {
+    let sile_hir::Expr::Builtin { op, args } = expr else {
+        return;
+    };
+    if *op == BuiltinOp::LoadTile {
+        let matches_buffer =
+            matches!(args.first(), Some(sile_hir::Expr::Var(name)) if name == buf_name);
+        if matches_buffer {
+            let shape = args.get(1).map(|arg| extract_const_shape(arg, ctx));
+            if let Some(dims) = shape {
+                let (_, cols) = shape_to_2d(&dims);
+                out.push(cols);
+            }
+        }
+    }
+    for arg in args {
+        collect_buffer_tile_extents_in_expr(arg, buf_name, ctx, out);
+    }
 }
 
 fn rank_of_param(param: &sile_hir::Param) -> usize {

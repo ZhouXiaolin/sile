@@ -60,6 +60,12 @@ fn verify_metal_contract(llvm_ir: &LlvmIrFunction, stage: &str) -> Result<()> {
                             block.name
                         )));
                     }
+                    sile_llvm_ir::Intrinsic::GridDim { dim } if *dim > 2 => {
+                        return Err(Error::Compile(format!(
+                            "{stage}: Metal backend only supports grid_dim dimensions 0..=2, got {dim} (block `{}`)",
+                            block.name
+                        )));
+                    }
                     _ => {}
                 },
                 sile_llvm_ir::InstOp::Call { func, .. } => {

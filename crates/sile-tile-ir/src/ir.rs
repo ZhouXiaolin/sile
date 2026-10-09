@@ -259,6 +259,15 @@ pub enum TileIrOp {
     ConstF64(f64),
     /// Query one dimension from a shape descriptor view
     ShapeDim { shape: ValueId, dim: usize },
+    /// Launch grid extent along `dim`. `num_programs(dim)`.
+    GridDim { dim: i64 },
+    /// Tile count along `dim` of the shape behind `shape`.
+    /// `num_tiles(buffer, dim, tile_extent)`.
+    NumTiles {
+        shape: ValueId,
+        dim: usize,
+        tile_extent: i64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -416,6 +425,8 @@ impl TileIrFunction {
             TileIrOp::ICmp { lhs, rhs, .. } => vec![*lhs, *rhs],
             TileIrOp::ConstI64(_) | TileIrOp::ConstF64(_) => vec![],
             TileIrOp::ShapeDim { shape, .. } => vec![*shape],
+            TileIrOp::GridDim { .. } => vec![],
+            TileIrOp::NumTiles { shape, .. } => vec![*shape],
         }
     }
 

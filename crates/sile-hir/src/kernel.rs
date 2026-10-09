@@ -8,7 +8,12 @@ pub enum ParamKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuiltinOp {
+    /// `program_id(axis)`: this tile program's index along grid axis `axis`.
     ProgramId,
+    /// `num_programs(axis)`: the launch grid extent along grid axis `axis`.
+    NumPrograms,
+    /// `num_tiles(buffer, axis)`: tile count along one buffer axis.
+    NumTiles,
     LoadTile,
     LoadTileLike2D,
     Store,

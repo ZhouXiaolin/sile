@@ -92,6 +92,12 @@ fn expr_key(op: &TileIrOp) -> Option<String> {
         }
         TileIrOp::Map { .. } => None,
         TileIrOp::ShapeDim { shape, dim } => Some(format!("shape_dim:{}:{dim}", shape.0)),
+        TileIrOp::GridDim { dim } => Some(format!("grid_dim:{dim}")),
+        TileIrOp::NumTiles {
+            shape,
+            dim,
+            tile_extent,
+        } => Some(format!("num_tiles:{}:{dim}:{tile_extent}", shape.0)),
         TileIrOp::Extract {
             tile,
             row_coord,
@@ -299,6 +305,16 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
         TileIrOp::ShapeDim { shape, dim } => TileIrOp::ShapeDim {
             shape: rewrite(shape),
             dim,
+        },
+        TileIrOp::GridDim { dim } => TileIrOp::GridDim { dim },
+        TileIrOp::NumTiles {
+            shape,
+            dim,
+            tile_extent,
+        } => TileIrOp::NumTiles {
+            shape: rewrite(shape),
+            dim,
+            tile_extent,
         },
     }
 }
