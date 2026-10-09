@@ -6,7 +6,6 @@ pub mod inline_preheader_constants;
 pub mod licm;
 pub mod loop_induction_canonicalize;
 pub mod loop_simplify;
-pub mod loop_unroll;
 pub mod phi_alias;
 pub mod simplify_cfg;
 pub mod verify;
@@ -26,7 +25,6 @@ pub enum LlvmIrPassKind {
     Cse,
     Dce,
     AllocaSimplify,
-    LoopUnroll,
     VerifyOutput,
 }
 
@@ -47,7 +45,6 @@ pub const RECOMMENDED_PIPELINE: &[LlvmIrPassKind] = &[
     LlvmIrPassKind::Cse,
     LlvmIrPassKind::Dce,
     LlvmIrPassKind::AllocaSimplify,
-    LlvmIrPassKind::LoopUnroll,
     LlvmIrPassKind::VerifyOutput,
 ];
 
@@ -73,7 +70,6 @@ pub fn run_pipeline(mut func: Function, pipeline: &[LlvmIrPassKind]) -> Result<F
             LlvmIrPassKind::Cse => cse::run(func),
             LlvmIrPassKind::Dce => dce::run(func),
             LlvmIrPassKind::AllocaSimplify => alloca_simplify::run(func),
-            LlvmIrPassKind::LoopUnroll => loop_unroll::run(func),
         };
     }
     Ok(func)

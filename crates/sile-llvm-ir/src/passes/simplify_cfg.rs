@@ -34,6 +34,7 @@ pub fn run(mut func: Function) -> Function {
     func
 }
 
+/// A block that only forwards to its successor and has a single predecessor.
 fn collect_reachable_blocks(func: &Function) -> HashSet<BlockId> {
     let mut reachable = HashSet::new();
     let mut queue = VecDeque::new();

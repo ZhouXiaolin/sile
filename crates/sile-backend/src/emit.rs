@@ -18,18 +18,35 @@ pub fn run(llvm_ir: &LlvmIrFunction, target: CodegenTarget) -> Result<BackendArt
     Ok(artifact)
 }
 
+/// Sanitize a name into a valid C/C++/MSL identifier.
+///
+/// Passes synthesize names that contain characters the target languages
+/// reject (for example `v25.c0` or `loop_col22.u`, produced by loop
+/// unrolling). Only `[A-Za-z0-9_]` survives; a leading digit is prefixed.
+/// An empty result falls back to a numeric name so it stays usable.
+fn sanitize_identifier(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    if out.is_empty() || out.as_bytes()[0].is_ascii_digit() {
+        out.insert(0, 'v');
+    }
+    out
+}
+
 pub fn build_value_names(func: &llvm_ir::Function) -> HashMap<llvm_ir::ValueId, String> {
     let mut names = HashMap::new();
     for param in &func.params {
-        names.insert(param.id, param.name.clone());
+        names.insert(param.id, sanitize_identifier(&param.name));
     }
     for block in &func.blocks {
         for param in &block.params {
-            names.insert(param.id, param.name.clone());
+            names.insert(param.id, sanitize_identifier(&param.name));
         }
         for inst in &block.insts {
             if let (Some(id), Some(name)) = (inst.result, inst.result_name.as_ref()) {
-                names.insert(id, name.clone());
+                names.insert(id, sanitize_identifier(name));
             }
         }
     }
