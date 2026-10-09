@@ -377,10 +377,7 @@ impl PointwiseLoweringPlan {
         }
 
         for inst in &block.insts {
-            let TileIrOp::StorePtrTko {
-                buf, value, rows, ..
-            } = &inst.op
-            else {
+            let TileIrOp::StorePtrTko { buf, value, .. } = &inst.op else {
                 continue;
             };
             if buffer_rank_of(*buf, tile_ir) != 1 {

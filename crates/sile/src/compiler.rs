@@ -18,11 +18,12 @@ pub use sile_llvm_ir::{
 pub use sile_tile_ir::passes::{
     ACTIVE_PIPELINE as ACTIVE_TILE_IR_PIPELINE,
     RECOMMENDED_PIPELINE as RECOMMENDED_TILE_IR_PIPELINE, TileIrPassKind,
-    run_default_pipeline as run_tile_ir_passes, run_pipeline as run_tile_ir_pipeline,
+    run_default_pipeline as run_tile_ir_passes, run_default_pipeline as run_default_tile_ir_pipeline,
+    run_pipeline as run_tile_ir_pipeline,
 };
 pub use sile_tile_ir::{
     ACTIVE_LLVM_IR_LOWERING_PIPELINE, LlvmIrLoweringPassKind as LlvmLoweringPassKind,
-    RECOMMENDED_LLVM_IR_LOWERING_PIPELINE, TileIrFunction, dce, format_tile_ir,
+    RECOMMENDED_LLVM_IR_LOWERING_PIPELINE, TileIrFunction, format_tile_ir,
     lower_tile_ir_to_llvm_ir, lower_to_tile_ir,
     run_default_llvm_ir_lowering_pipeline as run_default_llvm_lowering_pipeline,
     run_llvm_ir_lowering_pipeline as run_llvm_lowering_pipeline,

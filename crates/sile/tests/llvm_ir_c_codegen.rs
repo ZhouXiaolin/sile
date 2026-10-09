@@ -11,7 +11,7 @@ fn dynamic_k_matmul_llir_codegen_emits_structured_c_without_helper_calls() {
     let typed = typeck::check_kernel(&kernel).unwrap();
 
     let tile_ir = compiler::lower_to_tile_ir(&typed);
-    let tile_ir = compiler::dce::run(tile_ir);
+    let tile_ir = compiler::run_default_tile_ir_pipeline(tile_ir).unwrap();
     let llir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
     let llir_func =
         compiler::run_llvm_ir_pipeline(llir_func, compiler::ACTIVE_LLVM_IR_PIPELINE).unwrap();
@@ -48,7 +48,7 @@ fn vec_add_llir_codegen_emits_explicit_c_loops() {
     let typed = typeck::check_kernel(&kernel).unwrap();
 
     let tile_ir = compiler::lower_to_tile_ir(&typed);
-    let tile_ir = compiler::dce::run(tile_ir);
+    let tile_ir = compiler::run_default_tile_ir_pipeline(tile_ir).unwrap();
     let llir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
     let llir_func =
         compiler::run_llvm_ir_pipeline(llir_func, compiler::ACTIVE_LLVM_IR_PIPELINE).unwrap();
@@ -75,7 +75,7 @@ fn softmax_llir_codegen_emits_explicit_reduce_and_broadcast_loops() {
     let typed = typeck::check_kernel(&kernel).unwrap();
 
     let tile_ir = compiler::lower_to_tile_ir(&typed);
-    let tile_ir = compiler::dce::run(tile_ir);
+    let tile_ir = compiler::run_default_tile_ir_pipeline(tile_ir).unwrap();
     let llir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
     let llir_func =
         compiler::run_llvm_ir_pipeline(llir_func, compiler::ACTIVE_LLVM_IR_PIPELINE).unwrap();

@@ -13,7 +13,7 @@ fn cpu_backend_executes_vec_add_through_llir() {
     let kernel = build_vec_add_kernel();
     let typed = typeck::check_kernel(&kernel).unwrap();
     let tile_ir = compiler::lower_to_tile_ir(&typed);
-    let tile_ir = compiler::dce::run(tile_ir);
+    let tile_ir = compiler::run_default_tile_ir_pipeline(tile_ir).unwrap();
     let llir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
     let llir_func =
         compiler::run_llvm_ir_pipeline(llir_func, compiler::ACTIVE_LLVM_IR_PIPELINE).unwrap();
@@ -45,7 +45,7 @@ fn cpu_backend_executes_dynamic_k_matmul_through_llir() {
     let kernel = build_dynamic_k_matmul_kernel();
     let typed = typeck::check_kernel(&kernel).unwrap();
     let tile_ir = compiler::lower_to_tile_ir(&typed);
-    let tile_ir = compiler::dce::run(tile_ir);
+    let tile_ir = compiler::run_default_tile_ir_pipeline(tile_ir).unwrap();
     let llir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
     let llir_func =
         compiler::run_llvm_ir_pipeline(llir_func, compiler::ACTIVE_LLVM_IR_PIPELINE).unwrap();
@@ -110,7 +110,7 @@ fn cpu_backend_executes_relu_max_tile_through_llir() {
     let kernel = build_relu_kernel();
     let typed = typeck::check_kernel(&kernel).unwrap();
     let tile_ir = compiler::lower_to_tile_ir(&typed);
-    let tile_ir = compiler::dce::run(tile_ir);
+    let tile_ir = compiler::run_default_tile_ir_pipeline(tile_ir).unwrap();
     let llir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
     let llir_func =
         compiler::run_llvm_ir_pipeline(llir_func, compiler::ACTIVE_LLVM_IR_PIPELINE).unwrap();

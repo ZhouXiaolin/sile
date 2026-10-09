@@ -1,7 +1,5 @@
-pub mod canonicalize_shape;
-pub mod canonicalize_tile_ops;
-pub mod dce;
 pub mod lowering;
+pub mod dce;
 pub mod pointwise_fusion;
 pub mod tile_expr_cse;
 pub mod verify;
@@ -16,8 +14,6 @@ pub use lowering::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TileIrPassKind {
     VerifyInput,
-    CanonicalizeShape,
-    CanonicalizeTileOps,
     PointwiseFusion,
     TileExprCse,
     Dce,
@@ -26,12 +22,14 @@ pub enum TileIrPassKind {
 
 /// Planned Tile IR pipeline.
 ///
-/// Tile IR keeps tile/broadcast/reduce/mma semantics, so passes here should stay
+/// A pass belongs here only while it changes the IR of at least one real kernel.
+/// `crates/sile/tests/tile_ir_pass_ablation.rs` measures that on the printed IR,
+/// so a pass that turns into a no-op fails the suite and gets removed.
+///
+/// Tile IR keeps tile/broadcast/reduce/mma semantics, so passes here stay
 /// semantic and shape-aware rather than reason about low-level CFG details.
 pub const RECOMMENDED_PIPELINE: &[TileIrPassKind] = &[
     TileIrPassKind::VerifyInput,
-    TileIrPassKind::CanonicalizeShape,
-    TileIrPassKind::CanonicalizeTileOps,
     TileIrPassKind::PointwiseFusion,
     TileIrPassKind::TileExprCse,
     TileIrPassKind::Dce,
@@ -51,8 +49,6 @@ pub fn run_pipeline(
                 verify::verify_function(&func)?;
                 func
             }
-            TileIrPassKind::CanonicalizeShape => canonicalize_shape::run(func),
-            TileIrPassKind::CanonicalizeTileOps => canonicalize_tile_ops::run(func),
             TileIrPassKind::PointwiseFusion => pointwise_fusion::run(func),
             TileIrPassKind::TileExprCse => tile_expr_cse::run(func),
             TileIrPassKind::Dce => dce::run(func),

@@ -10,7 +10,7 @@ fn dynamic_k_matmul_lowers_to_llvm_like_llvm_ir_with_explicit_memory_ops() {
     let typed = typeck::check_kernel(&kernel).unwrap();
 
     let tile_ir = compiler::lower_to_tile_ir(&typed);
-    let tile_ir = compiler::dce::run(tile_ir);
+    let tile_ir = compiler::run_default_tile_ir_pipeline(tile_ir).unwrap();
     let llvm_ir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
     let printed = llvmir::format_llvm_ir(&llvm_ir_func);
 
@@ -60,7 +60,7 @@ fn vec_add_lowers_to_llvm_like_llvm_ir() {
     let typed = typeck::check_kernel(&kernel).unwrap();
 
     let tile_ir = compiler::lower_to_tile_ir(&typed);
-    let tile_ir = compiler::dce::run(tile_ir);
+    let tile_ir = compiler::run_default_tile_ir_pipeline(tile_ir).unwrap();
     let llvm_ir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
     let printed = llvmir::format_llvm_ir(&llvm_ir_func);
 
@@ -83,7 +83,7 @@ fn softmax_lowers_to_llvm_like_llvm_ir() {
     let typed = typeck::check_kernel(&kernel).unwrap();
 
     let tile_ir = compiler::lower_to_tile_ir(&typed);
-    let tile_ir = compiler::dce::run(tile_ir);
+    let tile_ir = compiler::run_default_tile_ir_pipeline(tile_ir).unwrap();
     let llvm_ir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
     let printed = llvmir::format_llvm_ir(&llvm_ir_func);
 
@@ -105,7 +105,7 @@ fn relu_max_tile_lowers_to_fcmp_and_select() {
     let typed = typeck::check_kernel(&kernel).unwrap();
 
     let tile_ir = compiler::lower_to_tile_ir(&typed);
-    let tile_ir = compiler::dce::run(tile_ir);
+    let tile_ir = compiler::run_default_tile_ir_pipeline(tile_ir).unwrap();
     let llvm_ir_func = compiler::lower_tile_ir_to_llvm_ir(&tile_ir, &typed);
     let printed = llvmir::format_llvm_ir(&llvm_ir_func);
 

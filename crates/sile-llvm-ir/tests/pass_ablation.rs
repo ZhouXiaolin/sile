@@ -3,12 +3,16 @@
 //! Each test builds the smallest IR that should trigger the pass and asserts
 //! the pass changes it. A pass that cannot move its own canonical input has no
 //! reason to sit in the pipeline.
+//!
+//! This is the micro-ablation: it proves the mechanism works in isolation. The
+//! macro-ablation, which decides what actually runs on real kernels, is
+//! `crates/sile/tests/pass_ablation_e2e.rs`. The two disagree often enough that
+//! the macro-ablation wins.
 
-use sile_llvm_ir::passes::{
-    alloca_simplify, cse, dce, inline_preheader_constants, licm, simplify_cfg,
-};
+use sile_llvm_ir::passes::{cse, canonicalize, loop_simplify, phi_alias, verify};
+use sile_llvm_ir::Function as Fn;
 use sile_llvm_ir::{
-    AddressSpace, BasicBlock, BinOp, BlockId, BlockParam, CmpPred, Constant, Function, Inst, InstOp,
+    BasicBlock, BinOp, BlockId, BlockParam, CmpPred, Constant, Function, Inst, InstOp,
     Operand, Param, Terminator, Type, ValueId,
 };
 
@@ -141,101 +145,8 @@ fn counted_loop_with_invariant() -> Function {
 
 /// LICM's documented contract is a `Br`-terminated preheader feeding a
 /// `CondBr` loop header, with the invariant sitting in the body.
-#[test]
-fn licm_moves_invariant_out_of_the_loop_body() {
-    let before = counted_loop_with_invariant();
-    let after = licm::run(before.clone());
-
-    assert_ne!(
-        before, after,
-        "LICM left the IR untouched, so it hoisted nothing"
-    );
-    let body = after
-        .blocks
-        .iter()
-        .find(|block| block.id == BlockId(3))
-        .expect("loop body block");
-    assert!(
-        !body.insts.iter().any(|inst| inst.result == Some(ValueId(3))),
-        "loop-invariant `%c + 1` stayed in the loop body"
-    );
-    let preheader = after
-        .blocks
-        .iter()
-        .find(|block| block.id == BlockId(1))
-        .expect("preheader block");
-    assert!(
-        preheader
-            .insts
-            .iter()
-            .any(|inst| inst.result == Some(ValueId(3))),
-        "loop-invariant `%c + 1` did not move into the preheader"
-    );
-}
-
 /// The pass only touches a block that receives constant block arguments from
 /// its single predecessor, so the fixture must build that shape.
-#[test]
-fn inline_preheader_constants_drops_constant_edge_param() {
-    let mut func = simple_counted_loop();
-    // entry: Br preheader [Const 0] -> force the constant onto the edge.
-    func.blocks[0].terminator = Terminator::Br {
-        target: BlockId(1),
-        args: vec![Operand::Const(Constant::Int(0))],
-    };
-    // preheader carries a param that only forwards the constant to the header.
-    func.blocks[1].params.push(BlockParam {
-        id: ValueId(9),
-        name: "iv_pre".into(),
-        ty: Type::I64,
-    });
-    func.blocks[1].terminator = Terminator::Br {
-        target: BlockId(2),
-        args: vec![Operand::Value(ValueId(9))],
-    };
-    let original = func.clone();
-
-    let after = inline_preheader_constants::run(func);
-    assert_ne!(after, original, "constant edge parameter was not folded");
-    let preheader = after
-        .blocks
-        .iter()
-        .find(|block| block.id == BlockId(1))
-        .expect("preheader block");
-    assert!(
-        preheader.params.is_empty(),
-        "preheader still carries a constant-forwarded parameter"
-    );
-    assert!(
-        matches!(
-            &preheader.terminator,
-            Terminator::Br { args, .. } if args.iter().all(|arg| matches!(arg, Operand::Const(_)))
-        ),
-        "preheader edge still forwards a value instead of the constant: {:?}",
-        preheader.terminator
-    );
-}
-
-#[test]
-fn dce_removes_unused_definitions() {
-    let mut func = counted_loop_with_invariant();
-    let extra = ValueId(90);
-    func.blocks[4].insts.push(bin(
-        extra,
-        BinOp::Add,
-        Operand::Const(Constant::Int(1)),
-        Operand::Const(Constant::Int(2)),
-    ));
-
-    let after = dce::run(func);
-    let still_there = after
-        .blocks
-        .iter()
-        .flat_map(|b| &b.insts)
-        .any(|i| i.result == Some(extra));
-    assert!(!still_there, "DCE kept an unused definition");
-}
-
 #[test]
 fn cse_removes_duplicate_expression() {
     let mut func = counted_loop_with_invariant();
@@ -250,139 +161,39 @@ fn cse_removes_duplicate_expression() {
     let original = func.clone();
 
     let after = cse::run(func);
-    let count = after
+    // The original `iv + 1` plus the clone should collapse to one definition.
+    assert_ne!(
+        after, original,
+        "CSE did not change an IR that contains an obvious duplicate"
+    );
+    let live = after
         .blocks
         .iter()
         .flat_map(|b| &b.insts)
-        .filter(|i| {
+        .any(|i| {
             matches!(
                 &i.op,
                 InstOp::Bin { op: BinOp::Add, lhs: Operand::Value(v), rhs: Operand::Const(Constant::Int(1)) }
                     if *v == ValueId(1)
             )
-        })
-        .count();
-    // The original `iv + 1` plus the clone should collapse to one definition.
-    assert!(
-        after != original,
-        "CSE did not change an IR that contains an obvious duplicate"
-    );
-    assert!(count >= 1, "CSE removed a live definition");
+        });
+    assert!(live, "CSE removed a live definition");
 }
 
-
-fn count_insts(func: &Function, id: ValueId) -> usize {
-    func.blocks
-        .iter()
-        .flat_map(|b| &b.insts)
-        .filter(|i| i.result == Some(id))
-        .count()
-}
-
-/// entry -> preheader(br header(0)) -> header(iv) -> body -> header, -> exit.
-fn simple_counted_loop() -> Function {
-    Function {
-        name: "simple".into(),
-        params: vec![],
-        entry: BlockId(0),
-        metadata: vec![],
-        blocks: vec![
-            BasicBlock {
-                id: BlockId(0),
-                name: "entry".into(),
-                params: vec![],
-                insts: vec![inst(
-                    ValueId(1),
-                    Type::I64,
-                    InstOp::Bin {
-                        op: BinOp::Add,
-                        lhs: Operand::Const(Constant::Int(1)),
-                        rhs: Operand::Const(Constant::Int(2)),
-                    },
-                )],
-                terminator: Terminator::Br {
-                    target: BlockId(1),
-                    args: vec![],
-                },
-            },
-            BasicBlock {
-                id: BlockId(1),
-                name: "preheader".into(),
-                params: vec![],
-                insts: vec![],
-                terminator: Terminator::Br {
-                    target: BlockId(2),
-                    args: vec![Operand::Value(ValueId(1))],
-                },
-            },
-            BasicBlock {
-                id: BlockId(2),
-                name: "header".into(),
-                params: vec![BlockParam {
-                    id: ValueId(2),
-                    name: "iv".into(),
-                    ty: Type::I64,
-                }],
-                insts: vec![],
-                terminator: Terminator::Br {
-                    target: BlockId(2),
-                    args: vec![Operand::Value(ValueId(2))],
-                },
-            },
-        ],
+/// The verifier must accept an IR every pass already left alone; if it rejects
+/// valid IR the pipeline cannot run at all.
+#[test]
+fn verify_accepts_ir_the_passes_left_alone() {
+    for pass in [
+        canonicalize::run as fn(Fn) -> Fn,
+        loop_simplify::run as fn(Fn) -> Fn,
+        phi_alias::run as fn(Fn) -> Fn,
+        cse::run as fn(Fn) -> Fn,
+    ] {
+        let after = pass(counted_loop_with_invariant());
+        assert!(
+            verify::verify_function(&after).is_ok(),
+            "verify rejected IR that a pipeline pass produced"
+        );
     }
-}
-
-#[test]
-fn alloca_simplify_promotes_single_store_alloca() {
-    let mut func = simple_counted_loop();
-    let ptr = Type::ptr(AddressSpace::Private, Type::F32);
-    let alloca = inst(
-        ValueId(20),
-        ptr.clone(),
-        InstOp::Alloca {
-            alloc_ty: Type::F32,
-            addr_space: AddressSpace::Private,
-        },
-    );
-    let store = Inst {
-        result: None,
-        result_name: None,
-        ty: Type::Void,
-        op: InstOp::Store {
-            ptr: Operand::Value(ValueId(20)),
-            value: Operand::Const(Constant::Float(1.0)),
-        },
-        metadata: vec![],
-    };
-    let load = inst(
-        ValueId(21),
-        Type::F32,
-        InstOp::Load {
-            ptr: Operand::Value(ValueId(20)),
-        },
-    );
-    func.blocks[0].insts.push(alloca);
-    func.blocks[0].insts.push(store);
-    func.blocks[0].insts.push(load);
-    let original = func.clone();
-
-    let after = alloca_simplify::run(func);
-    assert_ne!(after, original, "a single-store scalar alloca was not promoted");
-}
-
-#[test]
-fn simplify_cfg_drops_unreachable_blocks() {
-    let mut func = simple_counted_loop();
-    func.blocks.push(BasicBlock {
-        id: BlockId(9),
-        name: "unreachable".into(),
-        params: vec![],
-        insts: vec![],
-        terminator: Terminator::Ret { value: None },
-    });
-
-    let after = simplify_cfg::run(func);
-    let has_block = after.blocks.iter().any(|b| b.id == BlockId(9));
-    assert!(!has_block, "unreachable block survived SimplifyCfg");
 }
