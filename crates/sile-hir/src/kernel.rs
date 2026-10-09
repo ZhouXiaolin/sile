@@ -84,6 +84,12 @@ pub enum Expr {
     Shape(ShapeExpr),
     ScalarI64(i64),
     ScalarF32(f32),
+    /// A runtime tile index, one scalar per axis: `[pid_m, k]` in CuTile Rust.
+    ///
+    /// Distinct from `Shape` because a shape is compile-time metadata while an
+    /// index is a computed value, and collapsing the two drops any arithmetic
+    /// the index carries.
+    TileIndex(Vec<Expr>),
     Builtin { op: BuiltinOp, args: Vec<Expr> },
 }
 
@@ -125,6 +131,7 @@ impl Expr {
             Self::Shape(_) => "shape",
             Self::ScalarI64(_) => "scalar",
             Self::ScalarF32(_) => "scalar_f32",
+            Self::TileIndex(_) => "tile_index",
         }
     }
 }

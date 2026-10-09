@@ -481,6 +481,12 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx<'_>) -> ValueId {
         Expr::ScalarI64(v) => ctx.emit(TileIrOp::ConstI64(*v), TileIrType::I64),
         Expr::ScalarF32(v) => ctx.emit(TileIrOp::ConstF64(*v as f64), TileIrType::F32),
         Expr::Shape(_) => ctx.emit(TileIrOp::ConstI64(0), TileIrType::I64),
+        // An index tuple's value is its first axis. Callers needing every axis
+        // use `extract_runtime_coords`, which reads the inner list directly.
+        Expr::TileIndex(elems) => elems
+            .first()
+            .map(|elem| lower_expr(elem, ctx))
+            .unwrap_or_else(|| ctx.emit(TileIrOp::ConstI64(0), TileIrType::I64)),
         Expr::Builtin { op, args } => lower_builtin(*op, args, ctx),
     }
 }
@@ -941,6 +947,11 @@ fn resolve_shape_dim(dim: &ShapeExpr, ctx: &LowerCtx<'_>) -> i64 {
 
 fn extract_runtime_coords(expr: &Expr, ctx: &mut LowerCtx<'_>) -> Vec<ValueId> {
     match expr {
+        // A tile index is a list of runtime scalars, so each element is lowered
+        // as a value. Matching only `Shape` here would silently drop any
+        // arithmetic the index carries, and the load would fall back to the raw
+        // program id.
+        Expr::TileIndex(elems) => elems.iter().map(|elem| lower_expr(elem, ctx)).collect(),
         Expr::Shape(ShapeExpr::Tuple(dims)) => dims
             .iter()
             .map(|dim| resolve_runtime_dim(dim, ctx))

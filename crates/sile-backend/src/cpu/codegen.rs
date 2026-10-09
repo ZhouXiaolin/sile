@@ -456,9 +456,12 @@ fn emit_tile_count_logic(
     tile_cols: usize,
 ) {
     if abi.rank == 1 {
+        // The extent is in elements, and one program owns `tile_cols` of them,
+        // or `num_programs` reports the element count instead of the tile count.
         out.push_str(&format!(
-            "  int64_t sile_total_tiles = shapes[{}];\n",
-            abi.shape_offset
+            "  int64_t sile_total_tiles = shapes[{}] / {};\n",
+            abi.shape_offset,
+            tile_cols.max(1)
         ));
     } else {
         out.push_str(&format!(

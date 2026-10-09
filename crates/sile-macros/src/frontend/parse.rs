@@ -405,6 +405,10 @@ fn extract_shape_expr(expr: &syn::Expr) -> Option<Vec<KernelShapeDim>> {
     }
 }
 
+pub(crate) fn parse_expr_pub(expr: &syn::Expr) -> syn::Result<KernelExpr> {
+    parse_expr(expr)
+}
+
 fn parse_expr(expr: &syn::Expr) -> syn::Result<KernelExpr> {
     match expr {
         syn::Expr::MethodCall(call) => {

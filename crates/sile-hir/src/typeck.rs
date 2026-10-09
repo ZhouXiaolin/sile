@@ -81,6 +81,10 @@ fn infer_expr(expr: &Expr, _locals: &BTreeMap<String, Type>) -> Result<Type, Typ
         Expr::Shape(_) => Ok(Type::Shape),
         Expr::ScalarI64(_) => Ok(Type::Scalar(ElemType::F32)),
         Expr::ScalarF32(_) => Ok(Type::Scalar(ElemType::F32)),
+        // A tile index types as Shape because the tile-lowering path reads it
+        // through the same shape-shaped expression as the historical spelling.
+        // Narrowing this is a separate change; see `Expr::TileIndex`.
+        Expr::TileIndex(_) => Ok(Type::Shape),
     }
 }
 

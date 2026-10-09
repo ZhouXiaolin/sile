@@ -1,7 +1,33 @@
 use std::ops::{Add, Div, Index, Mul, Sub};
 
-#[derive(Clone, Copy, Debug)]
+/// A tile program's index, or a grid extent, as (x, y, z).
+///
+/// Tuple indexing reads one axis. Scalar arithmetic applies to every axis,
+/// which is what CuTile Rust gets from `program_id(axis) -> i32`: an index can
+/// be computed, not only read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct TileId(pub i64, pub i64, pub i64);
+
+impl std::ops::Add<i64> for TileId {
+    type Output = Self;
+    fn add(self, rhs: i64) -> Self {
+        Self(self.0 + rhs, self.1 + rhs, self.2 + rhs)
+    }
+}
+
+impl std::ops::Sub<i64> for TileId {
+    type Output = Self;
+    fn sub(self, rhs: i64) -> Self {
+        Self(self.0 - rhs, self.1 - rhs, self.2 - rhs)
+    }
+}
+
+impl std::ops::Mul<i64> for TileId {
+    type Output = Self;
+    fn mul(self, rhs: i64) -> Self {
+        Self(self.0 * rhs, self.1 * rhs, self.2 * rhs)
+    }
+}
 
 /// This tile program's index along grid axis `axis`.
 ///

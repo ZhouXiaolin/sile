@@ -199,6 +199,19 @@ fn lower_expr(expr: &KernelExpr, const_params: &[syn::Ident]) -> proc_macro2::To
                         }
                     }
                 }
+                // tile::program_id(axis) -> ProgramId(axis). Without this
+                // branch the call degrades to a plain variable, and any
+                // arithmetic wrapped around it, such as `program_id(0) + 1`,
+                // disappears before it reaches the HIR.
+                "program_id" => {
+                    let all_args = args_exprs;
+                    quote! {
+                        ::sile::hir::Expr::Builtin {
+                            op: ::sile::hir::BuiltinOp::ProgramId,
+                            args: vec![#(#all_args),*],
+                        }
+                    }
+                }
                 // tile::num_programs(axis) -> NumPrograms(axis)
                 "num_programs" => {
                     let all_args = args_exprs;
@@ -296,29 +309,37 @@ fn lower_expr(expr: &KernelExpr, const_params: &[syn::Ident]) -> proc_macro2::To
             }
         }
         KernelExpr::Array(arr) => {
-            let elems: Vec<_> = arr
-                .elems
-                .iter()
-                .map(|elem| {
-                    if let syn::Expr::Path(path) = elem {
-                        if let Some(ident) = path.path.get_ident() {
-                            let name = ident.to_string();
-                            return quote! { ::sile::hir::ShapeExpr::symbol(#name) };
-                        }
-                    }
-                    if let syn::Expr::Lit(lit) = elem {
-                        if let syn::Lit::Int(lit_int) = &lit.lit {
-                            let val: i64 = lit_int.base10_parse().unwrap_or(-1);
-                            return quote! { ::sile::hir::ShapeExpr::constant(#val) };
-                        }
-                    }
-                    quote! { ::sile::hir::ShapeExpr::dynamic() }
-                })
-                .collect();
-            quote! {
-                ::sile::hir::Expr::Shape(
-                    ::sile::hir::ShapeExpr::tuple(vec![#(#elems),*])
-                )
+            // An array literal is overloaded. In shape position it is a shape:
+            // `load_tile([TILE], [pid])`. In index position it is a list of
+            // runtime scalars, as CuTile Rust writes `part.load([pid_m, k])`.
+            // Only a plain identifier or an integer literal is a shape
+            // dimension. Anything else must survive as an expression, or the
+            // arithmetic behind it is dropped and the tile reads the wrong data.
+            let mut shape_elems = Vec::new();
+            let mut index_elems = Vec::new();
+            let mut pure_shape = true;
+            for elem in &arr.elems {
+                if let Some(dim) = shape_literal_dim(elem) {
+                    shape_elems.push(quote! { ::sile::hir::ShapeExpr::constant(#dim) });
+                } else if let Some(name) = shape_literal_symbol(elem) {
+                    shape_elems.push(quote! { ::sile::hir::ShapeExpr::symbol(#name) });
+                } else {
+                    pure_shape = false;
+                    let parsed = super::parse::parse_expr_pub(elem);
+                    index_elems.push(match parsed {
+                        Ok(kernel_expr) => lower_expr(&kernel_expr, const_params),
+                        Err(_) => quote! { ::sile::hir::Expr::ScalarI64(0) },
+                    });
+                }
+            }
+            if pure_shape {
+                quote! {
+                    ::sile::hir::Expr::Shape(
+                        ::sile::hir::ShapeExpr::tuple(vec![#(#shape_elems),*])
+                    )
+                }
+            } else {
+                quote! { ::sile::hir::Expr::TileIndex(vec![#(#index_elems),*]) }
             }
         }
         KernelExpr::FieldAccess { target, field } => {
@@ -411,5 +432,31 @@ fn lower_expr(expr: &KernelExpr, const_params: &[syn::Ident]) -> proc_macro2::To
                 }
             }
         }
+    }
+}
+
+/// A plain integer in an array literal, or `-1` for a dynamic dimension.
+fn shape_literal_dim(elem: &syn::Expr) -> Option<i64> {
+    match elem {
+        syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(v), .. }) => {
+            Some(v.base10_parse().unwrap_or(-1))
+        }
+        syn::Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Neg(_),
+            expr,
+            ..
+        }) => shape_literal_dim(expr).map(|v| -v),
+        _ => None,
+    }
+}
+
+/// A bare identifier, which is a shape symbol only when the array holds nothing
+/// but shape dimensions.
+fn shape_literal_symbol(elem: &syn::Expr) -> Option<String> {
+    match elem {
+        syn::Expr::Path(path) if path.path.segments.len() == 1 => {
+            path.path.get_ident().map(|ident| ident.to_string())
+        }
+        _ => None,
     }
 }
