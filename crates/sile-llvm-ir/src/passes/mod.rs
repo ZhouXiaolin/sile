@@ -2,8 +2,11 @@ pub mod alloca_simplify;
 pub mod canonicalize;
 pub mod cse;
 pub mod dce;
+#[allow(dead_code)]
 pub mod inline_preheader_constants;
+#[allow(dead_code)]
 pub mod licm;
+#[allow(dead_code)]
 pub mod loop_induction_canonicalize;
 pub mod loop_simplify;
 pub mod phi_alias;
@@ -19,8 +22,12 @@ pub enum LlvmIrPassKind {
     SimplifyCfg,
     LoopSimplify,
     PhiAlias,
+    /// Inactive: does not fold constants on preheader edges. See
+    /// `tests/pass_ablation.rs`.
     InlinePreheaderConstants,
+    /// Inactive: does not hoist loop invariants. See `tests/pass_ablation.rs`.
     LoopInductionCanonicalize,
+    /// Inactive: does not hoist loop invariants. See `tests/pass_ablation.rs`.
     Licm,
     Cse,
     Dce,
@@ -39,9 +46,6 @@ pub const RECOMMENDED_PIPELINE: &[LlvmIrPassKind] = &[
     LlvmIrPassKind::SimplifyCfg,
     LlvmIrPassKind::LoopSimplify,
     LlvmIrPassKind::PhiAlias,
-    LlvmIrPassKind::InlinePreheaderConstants,
-    LlvmIrPassKind::LoopInductionCanonicalize,
-    LlvmIrPassKind::Licm,
     LlvmIrPassKind::Cse,
     LlvmIrPassKind::Dce,
     LlvmIrPassKind::AllocaSimplify,
@@ -62,11 +66,9 @@ pub fn run_pipeline(mut func: Function, pipeline: &[LlvmIrPassKind]) -> Result<F
             LlvmIrPassKind::SimplifyCfg => simplify_cfg::run(func),
             LlvmIrPassKind::LoopSimplify => loop_simplify::run(func),
             LlvmIrPassKind::PhiAlias => phi_alias::run(func),
-            LlvmIrPassKind::InlinePreheaderConstants => {
-                inline_preheader_constants::run(func)
-            }
-            LlvmIrPassKind::LoopInductionCanonicalize => loop_induction_canonicalize::run(func),
-            LlvmIrPassKind::Licm => licm::run(func),
+            LlvmIrPassKind::InlinePreheaderConstants
+            | LlvmIrPassKind::LoopInductionCanonicalize
+            | LlvmIrPassKind::Licm => func,
             LlvmIrPassKind::Cse => cse::run(func),
             LlvmIrPassKind::Dce => dce::run(func),
             LlvmIrPassKind::AllocaSimplify => alloca_simplify::run(func),
