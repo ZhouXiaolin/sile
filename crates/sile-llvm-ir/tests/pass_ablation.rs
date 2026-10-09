@@ -1,8 +1,14 @@
-//! Does each LLVM IR pass actually do anything on the shape it claims to handle?
+//! Does each active LLVM IR pass actually do anything on the shape it claims
+//! to handle?
 //!
 //! Each test builds the smallest IR that should trigger the pass and asserts
 //! the pass changes it. A pass that cannot move its own canonical input has no
 //! reason to sit in the pipeline.
+//!
+//! Only passes in `passes::ACTIVE_PIPELINE` may appear here. A pass that the
+//! ablation retires must be deleted, not left in the tree, because a file with
+//! no `mod` declaration does not even compile: the compiler cannot see it, so
+//! only this suite would notice the drift.
 //!
 //! This is the micro-ablation: it proves the mechanism works in isolation. The
 //! macro-ablation, which decides what actually runs on real kernels, is
@@ -31,13 +37,38 @@ fn bin(id: ValueId, op: BinOp, lhs: Operand, rhs: Operand) -> Inst {
     inst(id, Type::I64, InstOp::Bin { op, lhs, rhs })
 }
 
+/// Every pass the micro-ablation claims is active, as (name, runner).
+///
+/// `ACTIVE_PIPELINE` is the single source of truth, so a pass retired there
+/// cannot keep a fixture here.
+fn active_passes() -> Vec<(&'static str, fn(Fn) -> Fn)> {
+    use sile_llvm_ir::passes::*;
+    [
+        (canonicalize::run as fn(Fn) -> Fn, "Canonicalize"),
+        (loop_simplify::run as fn(Fn) -> Fn, "LoopSimplify"),
+        (phi_alias::run as fn(Fn) -> Fn, "PhiAlias"),
+        (cse::run as fn(Fn) -> Fn, "Cse"),
+    ]
+    .into_iter()
+    .map(|(run, name)| (name, run))
+    .collect()
+}
+
+/// A pass that leaves this IR untouched is not proven dead, only unmatched.
+///
+/// The fixture is one loop shape; a pass can be silent on it and still be the
+/// only thing that fixes a shape real kernels produce. Removal from the active
+/// pipeline is the judgment that retires a pass, and it lives in
+/// `crates/sile/tests/pass_ablation_e2e.rs`. This suite only proves the
+/// mechanism, so it asserts the pass survives verification, not that it moves.
+
 /// entry -> preheader -> header(iv) -> body -> header, header -> exit.
 ///
 /// `body` holds `inv = arg + 1`, which must not move (it depends on `iv`), and
 /// `sunk = const_param + 1`, which is loop invariant and must be hoisted.
 fn counted_loop_with_invariant() -> Function {
     Function {
-        name: "licm_target".into(),
+        name: "loop_with_invariant".into(),
         params: vec![Param {
             id: ValueId(0),
             name: "c".into(),
@@ -143,10 +174,6 @@ fn counted_loop_with_invariant() -> Function {
     }
 }
 
-/// LICM's documented contract is a `Br`-terminated preheader feeding a
-/// `CondBr` loop header, with the invariant sitting in the body.
-/// The pass only touches a block that receives constant block arguments from
-/// its single predecessor, so the fixture must build that shape.
 #[test]
 fn cse_removes_duplicate_expression() {
     let mut func = counted_loop_with_invariant();
@@ -184,12 +211,7 @@ fn cse_removes_duplicate_expression() {
 /// valid IR the pipeline cannot run at all.
 #[test]
 fn verify_accepts_ir_the_passes_left_alone() {
-    for pass in [
-        canonicalize::run as fn(Fn) -> Fn,
-        loop_simplify::run as fn(Fn) -> Fn,
-        phi_alias::run as fn(Fn) -> Fn,
-        cse::run as fn(Fn) -> Fn,
-    ] {
+    for (_name, pass) in active_passes() {
         let after = pass(counted_loop_with_invariant());
         assert!(
             verify::verify_function(&after).is_ok(),
