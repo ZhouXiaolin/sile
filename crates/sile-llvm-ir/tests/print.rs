@@ -19,6 +19,7 @@ fn prints_dynamic_k_matmul_like_cfg() {
                 abi: Some(ParamAbi {
                     rank: 2,
                     shape_offset: 0,
+                    tile: None,
                 }),
             },
             Param {
@@ -28,6 +29,7 @@ fn prints_dynamic_k_matmul_like_cfg() {
                 abi: Some(ParamAbi {
                     rank: 2,
                     shape_offset: 2,
+                    tile: None,
                 }),
             },
             Param {
@@ -37,6 +39,7 @@ fn prints_dynamic_k_matmul_like_cfg() {
                 abi: Some(ParamAbi {
                     rank: 2,
                     shape_offset: 4,
+                    tile: None,
                 }),
             },
             Param {

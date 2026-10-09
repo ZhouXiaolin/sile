@@ -88,6 +88,11 @@ pub enum Metadata {
 pub struct ParamAbi {
     pub rank: usize,
     pub shape_offset: usize,
+    /// Tile dimensions this parameter is stored through, when known.
+    ///
+    /// Populated by the Tile IR lowering from the `store_ptr_tko` shape, so
+    /// backends read the tile plan instead of inferring it from the CFG.
+    pub tile: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

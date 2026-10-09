@@ -1,12 +1,43 @@
 use std::collections::HashMap;
 
 use crate::emit::{
-    self, StructuredCfgMessages, StructuredEmitter, TextCodegen, TilePlan, array_dims,
-    build_value_names, infer_tile_plan, value_name as llir_value_name,
+    self, StructuredCfgMessages, StructuredEmitter, TextCodegen, array_dims, build_value_names,
+    value_name as llir_value_name,
 };
 use sile_llvm_ir as llvm_ir;
 
 const SHAPES_PARAM_NAME: &str = "__sile_shapes";
+
+/// The output buffer of a kernel, with the tile it is stored through.
+///
+/// The tile shape comes from `ParamAbi::tile`, which Tile IR lowering already
+/// knew when it emitted `store_ptr_tko`.
+struct OutputBuffer<'a> {
+    param: &'a llvm_ir::Param,
+    cols: usize,
+}
+
+/// Last non-shape parameter carrying tile ABI metadata.
+fn find_output_buffer(func: &llvm_ir::Function) -> Option<OutputBuffer<'_>> {
+    func.params
+        .iter()
+        .rev()
+        .find(|param| {
+            !is_shapes_param(param) && param.abi.as_ref().is_some_and(|abi| abi.tile.is_some())
+        })
+        .and_then(|param| {
+            let abi = param.abi.as_ref()?;
+            let (_rows, cols) = abi.tile?;
+            Some(OutputBuffer {
+                param,
+                cols,
+            })
+        })
+}
+
+fn is_shapes_param(param: &llvm_ir::Param) -> bool {
+    param.name == SHAPES_PARAM_NAME
+}
 
 pub fn generate(func: &llvm_ir::Function) -> sile_core::Result<String> {
     emit::generate_text(MetalCodegen::new(func))
@@ -14,7 +45,7 @@ pub fn generate(func: &llvm_ir::Function) -> sile_core::Result<String> {
 
 struct MetalCodegen<'a> {
     func: &'a llvm_ir::Function,
-    tile_plan: Option<TilePlan>,
+    output: Option<OutputBuffer<'a>>,
     value_names: HashMap<llvm_ir::ValueId, String>,
     indent: usize,
     out: String,
@@ -24,7 +55,7 @@ impl<'a> MetalCodegen<'a> {
     fn new(func: &'a llvm_ir::Function) -> Self {
         Self {
             func,
-            tile_plan: infer_tile_plan(func),
+            output: find_output_buffer(func),
             value_names: build_value_names(func),
             indent: 0,
             out: String::new(),
@@ -289,7 +320,7 @@ impl<'a> MetalCodegen<'a> {
     }
 
     fn logical_block_id_expr(&self, dim: u8) -> sile_core::Result<String> {
-        let Some(plan) = self.tile_plan else {
+        let Some(output) = self.output.as_ref() else {
             return Ok(match dim {
                 0 => "(int64_t)gid.x".into(),
                 1 => "(int64_t)gid.y".into(),
@@ -301,10 +332,12 @@ impl<'a> MetalCodegen<'a> {
                 }
             });
         };
-        let output_param = self.func.params.get(plan.output_param).ok_or_else(|| {
-            sile_core::Error::Compile("missing output parameter for Metal tile plan".into())
-        })?;
-        let output_rank = output_param.abi.as_ref().map(|abi| abi.rank).unwrap_or(1);
+        let Some(abi) = output.param.abi.as_ref() else {
+            return Err(sile_core::Error::Compile(
+                "missing output ABI for Metal codegen".into(),
+            ));
+        };
+        let output_rank = abi.rank;
         if output_rank <= 1 {
             return Ok(match dim {
                 0 => "(int64_t)gid.x".into(),
@@ -316,11 +349,8 @@ impl<'a> MetalCodegen<'a> {
                 }
             });
         }
-        let abi = output_param.abi.as_ref().ok_or_else(|| {
-            sile_core::Error::Compile("missing output ABI for Metal tile plan".into())
-        })?;
         let shapes = self.shapes_param_name()?;
-        let tiles_n = format!("({shapes}[{}] / {})", abi.shape_offset + 1, plan.cols);
+        let tiles_n = format!("({shapes}[{}] / {})", abi.shape_offset + 1, output.cols);
         Ok(match dim {
             0 => format!("((int64_t)gid.x / {tiles_n})"),
             1 => format!("((int64_t)gid.x % {tiles_n})"),

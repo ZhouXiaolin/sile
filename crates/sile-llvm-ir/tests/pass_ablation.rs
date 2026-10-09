@@ -12,6 +12,7 @@ use sile_llvm_ir::{
     Operand, Param, Terminator, Type, ValueId,
 };
 
+
 fn inst(result: ValueId, ty: Type, op: InstOp) -> Inst {
     Inst {
         result: Some(result),
@@ -138,14 +139,80 @@ fn counted_loop_with_invariant() -> Function {
     }
 }
 
+/// LICM's documented contract is a `Br`-terminated preheader feeding a
+/// `CondBr` loop header, with the invariant sitting in the body.
 #[test]
-fn licm_hoists_loop_invariant_computation() {
+fn licm_moves_invariant_out_of_the_loop_body() {
     let before = counted_loop_with_invariant();
     let after = licm::run(before.clone());
 
-    assert_eq!(
+    assert_ne!(
         before, after,
-        "LICM left a loop-invariant `%c + 1` inside the loop body"
+        "LICM left the IR untouched, so it hoisted nothing"
+    );
+    let body = after
+        .blocks
+        .iter()
+        .find(|block| block.id == BlockId(3))
+        .expect("loop body block");
+    assert!(
+        !body.insts.iter().any(|inst| inst.result == Some(ValueId(3))),
+        "loop-invariant `%c + 1` stayed in the loop body"
+    );
+    let preheader = after
+        .blocks
+        .iter()
+        .find(|block| block.id == BlockId(1))
+        .expect("preheader block");
+    assert!(
+        preheader
+            .insts
+            .iter()
+            .any(|inst| inst.result == Some(ValueId(3))),
+        "loop-invariant `%c + 1` did not move into the preheader"
+    );
+}
+
+/// The pass only touches a block that receives constant block arguments from
+/// its single predecessor, so the fixture must build that shape.
+#[test]
+fn inline_preheader_constants_drops_constant_edge_param() {
+    let mut func = simple_counted_loop();
+    // entry: Br preheader [Const 0] -> force the constant onto the edge.
+    func.blocks[0].terminator = Terminator::Br {
+        target: BlockId(1),
+        args: vec![Operand::Const(Constant::Int(0))],
+    };
+    // preheader carries a param that only forwards the constant to the header.
+    func.blocks[1].params.push(BlockParam {
+        id: ValueId(9),
+        name: "iv_pre".into(),
+        ty: Type::I64,
+    });
+    func.blocks[1].terminator = Terminator::Br {
+        target: BlockId(2),
+        args: vec![Operand::Value(ValueId(9))],
+    };
+    let original = func.clone();
+
+    let after = inline_preheader_constants::run(func);
+    assert_ne!(after, original, "constant edge parameter was not folded");
+    let preheader = after
+        .blocks
+        .iter()
+        .find(|block| block.id == BlockId(1))
+        .expect("preheader block");
+    assert!(
+        preheader.params.is_empty(),
+        "preheader still carries a constant-forwarded parameter"
+    );
+    assert!(
+        matches!(
+            &preheader.terminator,
+            Terminator::Br { args, .. } if args.iter().all(|arg| matches!(arg, Operand::Const(_)))
+        ),
+        "preheader edge still forwards a value instead of the constant: {:?}",
+        preheader.terminator
     );
 }
 
@@ -264,29 +331,6 @@ fn simple_counted_loop() -> Function {
             },
         ],
     }
-}
-
-#[test]
-fn inline_preheader_constants_folds_constant_edge_args() {
-    let mut func = simple_counted_loop();
-    // header passes a non-constant that the preheader computed as a constant.
-    func.blocks[1].insts.push(inst(
-        ValueId(9),
-        Type::I64,
-        InstOp::Bin {
-            op: BinOp::Add,
-            lhs: Operand::Const(Constant::Int(2)),
-            rhs: Operand::Const(Constant::Int(3)),
-        },
-    ));
-    func.blocks[1].terminator = Terminator::Br {
-        target: BlockId(2),
-        args: vec![Operand::Value(ValueId(9))],
-    };
-    let original = func.clone();
-
-    let after = inline_preheader_constants::run(func);
-    assert_ne!(after, original, "a constant expression on a preheader edge was not folded");
 }
 
 #[test]

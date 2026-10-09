@@ -11,10 +11,12 @@ use sile_hir::Type as HirType;
 use sile_hir::typeck::TypedKernel;
 use sile_llvm_ir as llvm_ir;
 
+use std::collections::HashMap;
+
 use self::block::lower_block;
 use self::canonical_matmul::lower_canonical_matmul;
 use self::core::{LowerLlvmIrCtx, llvm_ir_block, llvm_ir_type, llvm_ir_value};
-use crate::{TileIrFunction, TileIrParamKind};
+use crate::{TileIrFunction, TileIrOp, TileIrParamKind, ValueId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LlvmIrLoweringPassKind {
@@ -152,7 +154,7 @@ fn run_llvm_ir_lowering_pipeline_inner(
                 state.blocks = Some(blocks);
             }
             LlvmIrLoweringPassKind::FinalizeFunction => {
-                let params = state.params.take().ok_or_else(|| {
+                let mut params = state.params.take().ok_or_else(|| {
                     "FinalizeFunction requires LowerParams earlier in Tile IR->LLVM IR pipeline"
                         .to_string()
                 })?;
@@ -160,6 +162,7 @@ fn run_llvm_ir_lowering_pipeline_inner(
                     "FinalizeFunction requires LowerBlocks earlier in Tile IR->LLVM IR pipeline"
                         .to_string()
                 })?;
+                attach_tile_abi(&mut params, state.tile_ir);
                 state.output = Some(llvm_ir::Function {
                     name: state.tile_ir.name.clone(),
                     params,
@@ -302,6 +305,50 @@ fn build_prologue_block(
     })
 }
 
+/// Record each output buffer's tile dimensions in its LLVM IR parameter ABI.
+///
+/// The Tile IR `store_ptr_tko` operation already carries the tile shape, so the
+/// lowering is the only stage that knows it directly. Publishing it on the
+/// parameter ABI keeps backends from having to guess the tiling from the CFG,
+/// which is both fragile and duplicated across targets.
+fn attach_tile_abi(params: &mut [llvm_ir::Param], tile_ir: &TileIrFunction) {
+    // buffer ValueId -> (rows, cols) from the first store through that buffer.
+    let mut tile_by_buffer: HashMap<ValueId, (i64, i64)> = HashMap::new();
+    for block in &tile_ir.blocks {
+        for inst in &block.insts {
+            if let TileIrOp::StorePtrTko {
+                buf, rows, cols, ..
+            } = &inst.op
+            {
+                tile_by_buffer.entry(*buf).or_insert((*rows, *cols));
+            }
+        }
+    }
+    if tile_by_buffer.is_empty() {
+        return;
+    }
+
+    for param in params.iter_mut() {
+        let Some(abi) = param.abi.as_mut() else {
+            continue;
+        };
+        // Match the LLVM IR param back to its Tile IR buffer by value id.
+        let Some(tile) = tile_ir
+            .params
+            .iter()
+            .filter(|p| matches!(p.kind, TileIrParamKind::Buffer))
+            .find(|p| llvm_ir_value(p.value) == param.id)
+            .and_then(|p| tile_by_buffer.get(&p.value))
+        else {
+            continue;
+        };
+        abi.tile = Some((
+            usize::try_from(tile.0).unwrap_or(0),
+            usize::try_from(tile.1).unwrap_or(0),
+        ));
+    }
+}
+
 fn lower_param_abis(typed: &TypedKernel) -> Vec<Option<llvm_ir::ParamAbi>> {
     let mut next_shape_offset = 0usize;
     typed
@@ -313,6 +360,7 @@ fn lower_param_abis(typed: &TypedKernel) -> Vec<Option<llvm_ir::ParamAbi>> {
                 let abi = llvm_ir::ParamAbi {
                     rank: shape.rank(),
                     shape_offset: next_shape_offset,
+                    tile: None,
                 };
                 next_shape_offset += abi.rank;
                 Some(abi)

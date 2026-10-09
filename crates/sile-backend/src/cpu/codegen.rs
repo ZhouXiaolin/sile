@@ -2,11 +2,39 @@ use std::collections::{HashMap, HashSet};
 
 use crate::emit::{
     self, StructuredCfgMessages, StructuredEmitter, TextCodegen, array_dims, build_value_names,
-    infer_tile_plan, value_name as llir_value_name,
+    value_name as llir_value_name,
 };
 use sile_llvm_ir as llvm_ir;
 
 const SHAPES_PARAM_NAME: &str = "__sile_shapes";
+
+/// The output buffer of a kernel, plus the tile it is stored through.
+///
+/// Tile shape comes from `ParamAbi::tile`, which Tile IR lowering already knew.
+struct OutputBuffer<'a> {
+    param: &'a llvm_ir::Param,
+    rows: usize,
+    cols: usize,
+}
+
+/// Last non-shape parameter carrying tile ABI metadata.
+fn find_output_buffer(func: &llvm_ir::Function) -> Option<OutputBuffer<'_>> {
+    func.params
+        .iter()
+        .rev()
+        .find(|param| {
+            !is_shapes_param(param) && param.abi.as_ref().is_some_and(|abi| abi.tile.is_some())
+        })
+        .and_then(|param| {
+            let abi = param.abi.as_ref()?;
+            let (rows, cols) = abi.tile?;
+            Some(OutputBuffer {
+                param,
+                rows,
+                cols,
+            })
+        })
+}
 
 pub fn generate(func: &llvm_ir::Function) -> sile_core::Result<String> {
     let mut code = emit::generate_text(CCodegen::new(func))?;
@@ -432,12 +460,12 @@ fn emit_tile_count_logic(
 
 fn generate_wrapper(func: &llvm_ir::Function) -> sile_core::Result<String> {
     let mut out = String::new();
-    let tile_plan = infer_tile_plan(func);
-    let output_rank = tile_plan
-        .and_then(|plan| func.params.get(plan.output_param))
-        .and_then(|param| param.abi.as_ref().map(|abi| abi.rank))
+    let output = find_output_buffer(func);
+    let output_rank = output
+        .as_ref()
+        .and_then(|out| out.param.abi.as_ref().map(|abi| abi.rank))
         .or_else(|| {
-            // Fallback: find output buffer param by ABI metadata directly
+            // No tile ABI: fall back to rank only, so the wrapper still compiles.
             func.params
                 .iter()
                 .filter(|param| !is_shapes_param(param))
@@ -468,40 +496,16 @@ fn generate_wrapper(func: &llvm_ir::Function) -> sile_core::Result<String> {
     out.push_str("  (void)num_shapes;\n");
     out.push('\n');
 
-    if let Some(plan) = tile_plan {
-        let output_param = &func.params[plan.output_param];
-        let abi = output_param.abi.as_ref().ok_or_else(|| {
+    if let Some(output) = &output {
+        let abi = output.param.abi.as_ref().ok_or_else(|| {
             sile_core::Error::Compile(
                 "LLVM IR CPU wrapper requires output parameter ABI metadata".into(),
             )
         })?;
-        emit_tile_count_logic(&mut out, abi, plan.rows, plan.cols);
-    } else if let Some(output_param) = func
-        .params
-        .iter()
-        .filter(|param| !is_shapes_param(param))
-        .last()
-        .filter(|param| param.abi.is_some())
-    {
-        let abi = output_param.abi.as_ref().unwrap();
-        // Use default tile dims when plan is not inferred
-        if abi.rank == 1 {
-            // For 1D, use the first buffer param's shape dimension
-            let first_buf = func
-                .params
-                .iter()
-                .filter(|param| !is_shapes_param(param))
-                .next()
-                .and_then(|p| p.abi.as_ref())
-                .unwrap_or(abi);
-            out.push_str(&format!(
-                "  int64_t sile_total_tiles = shapes[{}];\n",
-                first_buf.shape_offset
-            ));
-        } else {
-            emit_tile_count_logic(&mut out, abi, 32, 16);
-        }
+        emit_tile_count_logic(&mut out, abi, output.rows, output.cols);
     } else {
+        // No tile ABI at all: cover the buffer with one thread per tile-sized
+        // slice, taken from the first buffer's leading extent.
         let first_extent = func
             .params
             .first()
