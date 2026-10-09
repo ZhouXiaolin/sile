@@ -1,9 +1,4 @@
-use std::collections::HashMap;
-
-use crate::emit::{
-    self, StructuredCfgMessages, StructuredEmitter, TextCodegen, array_dims, build_value_names,
-    value_name as llir_value_name,
-};
+use crate::emit::{self, StructuredCfgMessages, TargetDialect, array_dims};
 use sile_llvm_ir as llvm_ir;
 
 const SHAPES_PARAM_NAME: &str = "__sile_shapes";
@@ -42,299 +37,45 @@ fn is_shapes_param(param: &llvm_ir::Param) -> bool {
 }
 
 pub fn generate(func: &llvm_ir::Function) -> sile_core::Result<String> {
-    emit::generate_text(MetalCodegen::new(func))
+    let dialect = MetalDialect::new(func)?;
+    emit::generate_text(emit::TargetEmitter::new(func, dialect))
 }
 
-struct MetalCodegen<'a> {
+/// The MSL dialect: one spelling table, plus the tile arithmetic that MSL reads
+/// from buffer shapes.
+///
+/// `grid_dim` and `block_id` divide the flat thread index into tiles, which is
+/// what the tile ABI promises the target can reconstruct.
+struct MetalDialect<'a> {
     func: &'a llvm_ir::Function,
     output: Option<OutputBuffer<'a>>,
-    value_names: HashMap<llvm_ir::ValueId, String>,
-    indent: usize,
-    out: String,
 }
 
-impl<'a> MetalCodegen<'a> {
-    fn new(func: &'a llvm_ir::Function) -> Self {
-        Self {
+impl<'a> MetalDialect<'a> {
+    fn new(func: &'a llvm_ir::Function) -> sile_core::Result<Self> {
+        Ok(Self {
             func,
             output: find_output_buffer(func),
-            value_names: build_value_names(func),
-            indent: 0,
-            out: String::new(),
-        }
+        })
     }
 
-    fn emit_prelude(&mut self) {
-        self.out.push_str("#include <metal_stdlib>\n");
-        self.out.push_str("using namespace metal;\n\n");
+    fn shapes_param_name(&self) -> sile_core::Result<&str> {
+        self.func
+            .params
+            .iter()
+            .find(|param| param.name == SHAPES_PARAM_NAME)
+            .map(|param| param.name.as_str())
+            .ok_or_else(|| {
+                sile_core::Error::Compile(
+                    "Metal backend requires explicit __sile_shapes parameter in LLVM IR".into(),
+                )
+            })
     }
 
-    fn emit_signature(&mut self) {
-        self.out
-            .push_str(&format!("kernel void sile_kernel_{}(\n", self.func.name));
-        for (idx, param) in self.func.params.iter().enumerate() {
-            self.out.push_str(&format!(
-                "    {} [[buffer({})]],\n",
-                metal_param_decl(param),
-                idx,
-            ));
-        }
-        self.out
-            .push_str("    uint3 gid [[thread_position_in_grid]]) {\n");
-        self.indent = 1;
-    }
-
-    fn emit_body(&mut self) -> sile_core::Result<()> {
-        self.emit_value_decls();
-        self.writeln("");
-        self.emit_structured_from(self.func.entry, &[])?;
-
-        self.indent = 0;
-        self.out.push_str("}\n");
-        Ok(())
-    }
-
-    fn emit_block_insts(&mut self, block: &llvm_ir::BasicBlock) -> sile_core::Result<()> {
-        self.emit_block_insts_except(block, None)
-    }
-
-    fn emit_block_insts_except(
-        &mut self,
-        block: &llvm_ir::BasicBlock,
-        skip_result: Option<llvm_ir::ValueId>,
-    ) -> sile_core::Result<()> {
-        for inst in &block.insts {
-            if let Some(skip_result) = skip_result
-                && inst.result == Some(skip_result)
-            {
-                continue;
-            }
-            self.emit_inst(inst)?;
-        }
-        Ok(())
-    }
-
-    fn emit_structured_from(
-        &mut self,
-        start: llvm_ir::BlockId,
-        stop_targets: &[llvm_ir::BlockId],
-    ) -> sile_core::Result<Option<llvm_ir::BlockId>> {
-        emit::emit_structured_from(
-            self,
-            self.func,
-            start,
-            stop_targets,
-            None,
-            None,
-            StructuredCfgMessages {
-                preheader_must_branch: "structured loop preheader must end with a branch",
-                missing_loop_header: "missing LLVM IR structured loop header",
-                header_must_cond_br: "structured loop header must end with a conditional branch",
-                loop_backedge_mismatch: "structured loop body did not produce the expected backedge",
-                unsupported_cond_br: "LLVM IR Metal codegen only supports structured conditional branches",
-                unsupported_switch: "LLVM IR Metal codegen does not yet support switch terminators",
-            },
-        )
-    }
-
-    fn emit_value_decls(&mut self) {
-        let func = self.func;
-        let _ = emit::emit_value_decls(func, |id, ty| self.emit_decl(id, ty));
-    }
-
-    fn emit_decl(&mut self, id: llvm_ir::ValueId, ty: &llvm_ir::Type) {
-        let name = self.value_name(id);
-        match ty {
-            llvm_ir::Type::Ptr {
-                addr_space: llvm_ir::AddressSpace::Private,
-                pointee,
-            } => {
-                let storage_name = format!("{}_storage", name);
-                self.writeln(&format!("{};", metal_storage_decl(pointee, &storage_name)));
-                self.writeln(&metal_private_ptr_bind_decl(pointee, &name, &storage_name));
-            }
-            _ => self.writeln(&format!("{};", metal_var_decl(ty, &name))),
-        }
-    }
-
-    fn emit_inst(&mut self, inst: &llvm_ir::Inst) -> sile_core::Result<()> {
-        if let Some(line) = emit::lower_common_inst_line(
-            inst,
-            |id| self.value_name(id),
-            |op| self.format_operand(op),
-        ) {
-            self.writeln(&line);
-            return Ok(());
-        }
-
-        match &inst.op {
-            llvm_ir::InstOp::Alloca { .. } => Ok(()),
-            llvm_ir::InstOp::Memcpy { dst, src, size } => {
-                self.writeln(&format!(
-                    "for (int64_t copy_i = 0; copy_i < {}; ++copy_i) {{",
-                    self.format_operand(size)
-                ));
-                self.indent += 1;
-                self.writeln(&format!(
-                    "{}[copy_i] = {}[copy_i];",
-                    self.format_operand(dst),
-                    self.format_operand(src)
-                ));
-                self.indent -= 1;
-                self.writeln("}");
-                Ok(())
-            }
-            llvm_ir::InstOp::AtomicAdd { ptr, value } => {
-                self.writeln(&format!(
-                    "atomic_fetch_add_explicit((device atomic_float*)({}), {}, memory_order_relaxed);",
-                    self.format_operand(ptr),
-                    self.format_operand(value)
-                ));
-                Ok(())
-            }
-            llvm_ir::InstOp::Call { func, .. } => Err(sile_core::Error::Compile(format!(
-                "LLVM IR Metal codegen does not support call instructions: {func}"
-            ))),
-            llvm_ir::InstOp::Intrinsic { intrinsic, args } => {
-                self.emit_intrinsic(inst.result, intrinsic, args)
-            }
-            _ => Ok(()),
-        }
-    }
-
-    fn emit_intrinsic(
-        &mut self,
-        result: Option<llvm_ir::ValueId>,
-        intrinsic: &llvm_ir::Intrinsic,
-        args: &[llvm_ir::Operand],
-    ) -> sile_core::Result<()> {
-        match intrinsic {
-            llvm_ir::Intrinsic::BlockId { dim } => {
-                let Some(id) = result else {
-                    return Err(sile_core::Error::Compile(
-                        "block_id intrinsic must produce a result".into(),
-                    ));
-                };
-                let axis = self.logical_block_id_expr(*dim)?;
-                self.writeln(&format!("{} = {};", self.value_name(id), axis));
-                Ok(())
-            }
-            llvm_ir::Intrinsic::ThreadId { .. } => Err(sile_core::Error::Compile(
-                "thread_id intrinsic is not yet supported in LLVM IR Metal codegen".into(),
-            )),
-            llvm_ir::Intrinsic::GridDim { dim } => {
-                let Some(id) = result else {
-                    return Err(sile_core::Error::Compile(
-                        "grid_dim intrinsic must produce a result".into(),
-                    ));
-                };
-                let extent = self.grid_dim_expr(*dim)?;
-                self.writeln(&format!("{} = {};", self.value_name(id), extent));
-                Ok(())
-            }
-            llvm_ir::Intrinsic::Barrier { .. } => Err(sile_core::Error::Compile(
-                "barrier intrinsic is not yet supported in LLVM IR Metal codegen".into(),
-            )),
-            llvm_ir::Intrinsic::Exp => {
-                let Some(id) = result else {
-                    return Err(sile_core::Error::Compile(
-                        "exp intrinsic must produce a result".into(),
-                    ));
-                };
-                let [arg] = args else {
-                    return Err(sile_core::Error::Compile(
-                        "exp intrinsic expects one argument".into(),
-                    ));
-                };
-                self.writeln(&format!(
-                    "{} = metal::exp({});",
-                    self.value_name(id),
-                    self.format_operand(arg)
-                ));
-                Ok(())
-            }
-            llvm_ir::Intrinsic::VecLoad { len } => {
-                let Some(id) = result else {
-                    return Err(sile_core::Error::Compile(
-                        "vec_load intrinsic must produce a result".into(),
-                    ));
-                };
-                let [ptr, offset] = args else {
-                    return Err(sile_core::Error::Compile(
-                        "vec_load intrinsic expects [ptr, offset] arguments".into(),
-                    ));
-                };
-                self.writeln(&format!(
-                    "{} = *((device float{}*)({} + {}));",
-                    self.value_name(id),
-                    len,
-                    self.format_operand(ptr),
-                    self.format_operand(offset)
-                ));
-                Ok(())
-            }
-            llvm_ir::Intrinsic::VecStore { len } => {
-                let [ptr, offset, value] = args else {
-                    return Err(sile_core::Error::Compile(
-                        "vec_store intrinsic expects [ptr, offset, value] arguments".into(),
-                    ));
-                };
-                self.writeln(&format!(
-                    "*((device float{}*)({} + {})) = {};",
-                    len,
-                    self.format_operand(ptr),
-                    self.format_operand(offset),
-                    self.format_operand(value)
-                ));
-                Ok(())
-            }
-            llvm_ir::Intrinsic::VecReduceAdd => {
-                let Some(id) = result else {
-                    return Err(sile_core::Error::Compile(
-                        "vec_reduce_add intrinsic must produce a result".into(),
-                    ));
-                };
-                let [vector] = args else {
-                    return Err(sile_core::Error::Compile(
-                        "vec_reduce_add intrinsic expects one argument".into(),
-                    ));
-                };
-                let v = self.format_operand(vector);
-                self.writeln(&format!(
-                    "{} = {}[0] + {}[1] + {}[2] + {}[3];",
-                    self.value_name(id),
-                    v,
-                    v,
-                    v,
-                    v,
-                ));
-                Ok(())
-            }
-        }
-    }
-
-    fn emit_block_param_assignments_skipping(
-        &mut self,
-        target: llvm_ir::BlockId,
-        args: &[llvm_ir::Operand],
-        skip_params: &[llvm_ir::ValueId],
-    ) {
-        let Some(block) = self.func.blocks.iter().find(|block| block.id == target) else {
-            return;
-        };
-        for (param, arg) in block.params.iter().zip(args.iter()) {
-            if skip_params.contains(&param.id) {
-                continue;
-            }
-            let name = self.value_name(param.id);
-            self.writeln(&format!("{name} = {};", self.format_operand(arg)));
-        }
-    }
-
-    /// Extent of grid axis `dim`, from the output buffer's tile shape.
+    /// Extent of grid axis `dim`, reconstructed from the output buffer's shape.
     ///
     /// Metal dispatches one thread per tile, so axis 0 spans every tile in the
-    /// output and axes 1 and 2 are always one tile deep.
+    /// output, and axes 1 and 2 are always one tile deep.
     fn grid_dim_expr(&self, dim: u8) -> sile_core::Result<String> {
         if dim != 0 {
             return Ok("1".to_string());
@@ -361,28 +102,30 @@ impl<'a> MetalCodegen<'a> {
         ))
     }
 
+    /// Program index along `dim`, read from the flat thread position.
+    ///
+    /// A rank-2 output uses one thread per element tile, so the flat index
+    /// splits into a row and a column count.
     fn logical_block_id_expr(&self, dim: u8) -> sile_core::Result<String> {
-        let Some(output) = self.output.as_ref() else {
-            return Ok(match dim {
+        let index = |dim: u8| -> String {
+            match dim {
                 0 => "(int64_t)gid.x".into(),
                 1 => "(int64_t)gid.y".into(),
                 2 => "(int64_t)gid.z".into(),
-                _ => {
-                    return Err(sile_core::Error::Compile(format!(
-                        "unsupported block_id dimension in Metal codegen: {dim}"
-                    )));
-                }
-            });
+                _ => unreachable!("guarded by the caller"),
+            }
+        };
+        let Some(output) = self.output.as_ref() else {
+            return Ok(index(dim));
         };
         let Some(abi) = output.param.abi.as_ref() else {
             return Err(sile_core::Error::Compile(
                 "missing output ABI for Metal codegen".into(),
             ));
         };
-        let output_rank = abi.rank;
-        if output_rank <= 1 {
+        if abi.rank <= 1 {
             return Ok(match dim {
-                0 => "(int64_t)gid.x".into(),
+                0 => index(0),
                 1 | 2 => "0".into(),
                 _ => {
                     return Err(sile_core::Error::Compile(format!(
@@ -404,105 +147,179 @@ impl<'a> MetalCodegen<'a> {
             }
         })
     }
-
-    fn shapes_param_name(&self) -> sile_core::Result<&str> {
-        self.func
-            .params
-            .iter()
-            .find(|param| param.name == SHAPES_PARAM_NAME)
-            .map(|param| param.name.as_str())
-            .ok_or_else(|| {
-                sile_core::Error::Compile(
-                    "Metal backend requires explicit __sile_shapes parameter in LLVM IR".into(),
-                )
-            })
-    }
-
-    fn value_name(&self, id: llvm_ir::ValueId) -> String {
-        llir_value_name(&self.value_names, id)
-    }
-
-    fn format_operand(&self, operand: &llvm_ir::Operand) -> String {
-        emit::format_operand(&self.value_names, operand)
-    }
-
-    fn writeln(&mut self, line: &str) {
-        self.out
-            .push_str(&format!("{}{}\n", "  ".repeat(self.indent), line));
-    }
 }
 
-impl TextCodegen for MetalCodegen<'_> {
-    fn emit_prelude(&mut self) {
-        MetalCodegen::emit_prelude(self);
+impl TargetDialect for MetalDialect<'_> {
+    fn var_decl(
+        &self,
+        ty: &llvm_ir::Type,
+        name: &str,
+        _is_alloca: bool,
+    ) -> Option<String> {
+        // MSL has no function-local pointer storage, so a private pointer binds
+        // to a `thread` local array. Unlike C, every private pointer behaves the
+        // same way here, whether it came from an `alloca` or a `gep`.
+        match ty {
+            llvm_ir::Type::Ptr {
+                addr_space: llvm_ir::AddressSpace::Private,
+                pointee,
+            } => {
+                let storage_name = format!("{name}_storage");
+                Some(format!(
+                    "{}; {};",
+                    metal_storage_decl(pointee, &storage_name),
+                    metal_private_ptr_bind_decl(pointee, name, &storage_name)
+                ))
+            }
+            _ => Some(format!("{};", metal_var_decl(ty, name))),
+        }
     }
 
-    fn emit_signature(&mut self) {
-        MetalCodegen::emit_signature(self);
+    fn param_decl(&self, ty: &llvm_ir::Type, _name: &str) -> String {
+        metal_type(ty)
     }
 
-    fn emit_body(&mut self) -> sile_core::Result<()> {
-        MetalCodegen::emit_body(self)
+    fn signature(&self, name: &str, params: &[(String, String)]) -> String {
+        let mut out = format!("kernel void sile_kernel_{name}(\n");
+        for (idx, (ty, param_name)) in params.iter().enumerate() {
+            out.push_str(&format!(
+                "    {ty} {param_name} [[buffer({idx})]],\n"
+            ));
+        }
+        out.push_str("    uint3 gid [[thread_position_in_grid]]) {\n");
+        out
     }
 
-    fn finish(self) -> String {
-        self.out
-    }
-}
-
-impl StructuredEmitter for MetalCodegen<'_> {
-    fn emit_block_insts(&mut self, block: &llvm_ir::BasicBlock) -> sile_core::Result<()> {
-        MetalCodegen::emit_block_insts(self, block)
+    fn prelude_lines(&self) -> Vec<String> {
+        vec![
+            "#include <metal_stdlib>".to_string(),
+            "using namespace metal;".to_string(),
+            String::new(),
+        ]
     }
 
-    fn emit_block_insts_except(
-        &mut self,
-        block: &llvm_ir::BasicBlock,
-        skip_result: Option<llvm_ir::ValueId>,
-    ) -> sile_core::Result<()> {
-        MetalCodegen::emit_block_insts_except(self, block, skip_result)
-    }
-
-    fn emit_block_param_assignments_skipping(
-        &mut self,
-        target: llvm_ir::BlockId,
+    fn intrinsic_stmt(
+        &self,
+        result: Option<llvm_ir::ValueId>,
+        value_name: impl Fn(llvm_ir::ValueId) -> String,
+        format_operand: impl Fn(&llvm_ir::Operand) -> String,
+        intrinsic: &llvm_ir::Intrinsic,
         args: &[llvm_ir::Operand],
-        skip_params: &[llvm_ir::ValueId],
-    ) {
-        MetalCodegen::emit_block_param_assignments_skipping(self, target, args, skip_params);
+    ) -> sile_core::Result<Vec<String>> {
+        let result = result.ok_or_else(|| {
+            sile_core::Error::Compile(format!(
+                "{intrinsic:?} in LLVM IR Metal codegen must produce a result"
+            ))
+        })?;
+        let name = || value_name(result);
+        let line = match intrinsic {
+            llvm_ir::Intrinsic::BlockId { dim } => {
+                format!("{} = {};", name(), self.logical_block_id_expr(*dim)?)
+            }
+            llvm_ir::Intrinsic::ThreadId { dim } => format!(
+                "{} = (int64_t)gid.{};",
+                name(),
+                match dim {
+                    0 => "x",
+                    1 => "y",
+                    _ => "z",
+                }
+            ),
+            llvm_ir::Intrinsic::GridDim { dim } => {
+                format!("{} = {};", name(), self.grid_dim_expr(*dim)?)
+            }
+            llvm_ir::Intrinsic::Barrier { .. } => {
+                return Err(sile_core::Error::Compile(
+                    "barrier intrinsic is not yet supported in LLVM IR Metal codegen".into(),
+                ));
+            }
+            llvm_ir::Intrinsic::Exp => {
+                let [arg] = args else {
+                    return Err(sile_core::Error::Compile(
+                        "exp intrinsic expects one argument".into(),
+                    ));
+                };
+                format!("{} = metal::exp({});", name(), format_operand(arg))
+            }
+            llvm_ir::Intrinsic::VecLoad { len } => {
+                let [ptr, offset] = args else {
+                    return Err(sile_core::Error::Compile(
+                        "vec_load intrinsic expects [ptr, offset] arguments".into(),
+                    ));
+                };
+                format!(
+                    "{} = *((device float{}*)({} + {}));",
+                    name(),
+                    len,
+                    format_operand(ptr),
+                    format_operand(offset)
+                )
+            }
+            llvm_ir::Intrinsic::VecStore { len } => {
+                let [ptr, offset, value] = args else {
+                    return Err(sile_core::Error::Compile(
+                        "vec_store intrinsic expects [ptr, offset, value] arguments".into(),
+                    ));
+                };
+                format!(
+                    "*((device float{}*)({} + {})) = {};",
+                    len,
+                    format_operand(ptr),
+                    format_operand(offset),
+                    format_operand(value)
+                )
+            }
+            llvm_ir::Intrinsic::VecReduceAdd => {
+                let [vector] = args else {
+                    return Err(sile_core::Error::Compile(
+                        "vec_reduce_add intrinsic expects one argument".into(),
+                    ));
+                };
+                let v = format_operand(vector);
+                format!("{} = {v}[0] + {v}[1] + {v}[2] + {v}[3];", name())
+            }
+        };
+        Ok(vec![line])
     }
 
-    fn format_operand(&self, operand: &llvm_ir::Operand) -> String {
-        MetalCodegen::format_operand(self, operand)
+    fn extra_inst_stmt(
+        &mut self,
+        inst: &llvm_ir::Inst,
+        _value_name: impl Fn(llvm_ir::ValueId) -> String,
+        format_operand: impl Fn(&llvm_ir::Operand) -> String,
+    ) -> sile_core::Result<Vec<String>> {
+        // MSL has no `memcpy` builtin and no ordinary function calls, so both
+        // become explicit loops or an error.
+        match &inst.op {
+            llvm_ir::InstOp::Memcpy { dst, src, size } => Ok(vec![
+                format!("for (int64_t copy_i = 0; copy_i < {}; ++copy_i) {{", format_operand(size)),
+                format!("{}[copy_i] = {}[copy_i];", format_operand(dst), format_operand(src)),
+                "}".to_string(),
+            ]),
+            llvm_ir::InstOp::AtomicAdd { ptr, value } => Ok(vec![format!(
+                "atomic_fetch_add_explicit((device atomic_float*)({}), {}, memory_order_relaxed);",
+                format_operand(ptr),
+                format_operand(value)
+            )]),
+            llvm_ir::InstOp::Call { func, .. } => Err(sile_core::Error::Compile(format!(
+                "LLVM IR Metal codegen does not support call instructions: {func}"
+            ))),
+            _ => Ok(vec![]),
+        }
     }
 
-    fn writeln(&mut self, line: &str) {
-        MetalCodegen::writeln(self, line);
-    }
-
-    fn indent_inc(&mut self) {
-        self.indent += 1;
-    }
-
-    fn indent_dec(&mut self) {
-        self.indent -= 1;
+    fn messages(&self) -> StructuredCfgMessages {
+        StructuredCfgMessages {
+            preheader_must_branch: "structured Metal loop preheader must end with a branch",
+            missing_loop_header: "missing LLVM IR structured Metal loop header",
+            header_must_cond_br: "structured Metal loop header must end with a conditional branch",
+            loop_backedge_mismatch: "structured Metal loop body did not produce the expected backedge",
+            unsupported_cond_br: "LLVM IR Metal codegen only supports structured conditional branches",
+            unsupported_switch: "LLVM IR Metal codegen does not yet support switch terminators",
+        }
     }
 }
 
-fn metal_param_decl(param: &llvm_ir::Param) -> String {
-    let ty = match &param.ty {
-        llvm_ir::Type::Ptr {
-            addr_space: llvm_ir::AddressSpace::Global,
-            pointee,
-        } => format!("device {}* {}", metal_scalar_type(pointee), param.name),
-        llvm_ir::Type::Ptr {
-            addr_space: llvm_ir::AddressSpace::Constant,
-            pointee,
-        } => format!("constant {}* {}", metal_scalar_type(pointee), param.name),
-        other => format!("{} {}", metal_type(other), param.name),
-    };
-    ty
-}
 
 fn metal_var_decl(ty: &llvm_ir::Type, name: &str) -> String {
     match ty {

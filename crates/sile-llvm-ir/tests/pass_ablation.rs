@@ -15,11 +15,10 @@
 //! `crates/sile/tests/pass_ablation_e2e.rs`. The two disagree often enough that
 //! the macro-ablation wins.
 
-use sile_llvm_ir::passes::{cse, canonicalize, loop_simplify, phi_alias, verify};
-use sile_llvm_ir::Function as Fn;
+use sile_llvm_ir::passes::{active_passes, verify};
 use sile_llvm_ir::{
-    BasicBlock, BinOp, BlockId, BlockParam, CmpPred, Constant, Function, Inst, InstOp,
-    Operand, Param, Terminator, Type, ValueId,
+    BasicBlock, BinOp, BlockId, BlockParam, CmpPred, Constant, Function, Inst, InstOp, Operand,
+    Param, Terminator, Type, ValueId,
 };
 
 
@@ -35,23 +34,6 @@ fn inst(result: ValueId, ty: Type, op: InstOp) -> Inst {
 
 fn bin(id: ValueId, op: BinOp, lhs: Operand, rhs: Operand) -> Inst {
     inst(id, Type::I64, InstOp::Bin { op, lhs, rhs })
-}
-
-/// Every pass the micro-ablation claims is active, as (name, runner).
-///
-/// `ACTIVE_PIPELINE` is the single source of truth, so a pass retired there
-/// cannot keep a fixture here.
-fn active_passes() -> Vec<(&'static str, fn(Fn) -> Fn)> {
-    use sile_llvm_ir::passes::*;
-    [
-        (canonicalize::run as fn(Fn) -> Fn, "Canonicalize"),
-        (loop_simplify::run as fn(Fn) -> Fn, "LoopSimplify"),
-        (phi_alias::run as fn(Fn) -> Fn, "PhiAlias"),
-        (cse::run as fn(Fn) -> Fn, "Cse"),
-    ]
-    .into_iter()
-    .map(|(run, name)| (name, run))
-    .collect()
 }
 
 /// A pass that leaves this IR untouched is not proven dead, only unmatched.
@@ -187,7 +169,11 @@ fn cse_removes_duplicate_expression() {
     func.blocks[3].insts.insert(1, dup);
     let original = func.clone();
 
-    let after = cse::run(func);
+    let (_, run) = active_passes()
+        .into_iter()
+        .find(|(name, _)| *name == "Cse")
+        .expect("Cse is an active pass");
+    let after = run(func);
     // The original `iv + 1` plus the clone should collapse to one definition.
     assert_ne!(
         after, original,

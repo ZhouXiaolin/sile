@@ -201,43 +201,338 @@ pub fn generate_text<E: TextCodegen>(mut emitter: E) -> Result<String> {
     Ok(emitter.finish())
 }
 
-pub fn emit_value_decls<F>(func: &llvm_ir::Function, mut emit_decl: F) -> bool
-where
-    F: FnMut(llvm_ir::ValueId, &llvm_ir::Type),
-{
-    let mut declared = HashMap::new();
 
-    for block in &func.blocks {
-        for param in &block.params {
-            declared.entry(param.id).or_insert(&param.ty);
-        }
-        for inst in &block.insts {
-            if let Some(id) = inst.result {
-                declared.entry(id).or_insert(&inst.ty);
-            }
+
+/// How a target spells one target-language concept.
+///
+/// Every backend is a dialect over one shared traversal, so adding a target
+/// means adding a type name table, an intrinsic spelling and a signature
+/// preamble. The traversal, value naming, block ordering and structured-CFG
+/// emission live in [`TargetEmitter`] and are written once.
+pub trait TargetDialect {
+    /// Declaration text for a value of this type, `None` when the target wants
+    /// no declaration (the value is read from a built-in).
+    /// Declaration text for a value of this type.
+    ///
+    /// `is_alloca` separates an `alloca`, which owns storage the target must
+    /// materialize, from a `gep` of a driver buffer, which borrows storage and
+    /// must stay a plain pointer. The two have the same LLVM IR type, so the
+    /// flag is what tells them apart.
+    fn var_decl(
+        &self,
+        ty: &llvm_ir::Type,
+        name: &str,
+        is_alloca: bool,
+    ) -> Option<String>;
+
+    /// Parameter text for one kernel parameter.
+    fn param_decl(&self, ty: &llvm_ir::Type, name: &str) -> String;
+
+    /// Text of the function head, up to and including the opening brace.
+    ///
+    /// Each entry of `params` is `(declaration, name)`, so the dialect decides
+    /// whether the two are joined by a space, as in C, or an attribute, as in
+    /// MSL.
+    fn signature(&self, name: &str, params: &[(String, String)]) -> String;
+
+    /// Lines emitted before the kernel body, after the declarations.
+    fn prelude_lines(&self) -> Vec<String>;
+
+    /// Assignment of an intrinsic result, or a statement when it has none.
+    fn intrinsic_stmt(
+        &self,
+        result: Option<llvm_ir::ValueId>,
+        value_name: impl Fn(llvm_ir::ValueId) -> String,
+        format_operand: impl Fn(&llvm_ir::Operand) -> String,
+        intrinsic: &llvm_ir::Intrinsic,
+        args: &[llvm_ir::Operand],
+    ) -> sile_core::Result<Vec<String>>;
+
+    /// A statement per target for operations the shared traversal does not know.
+    fn extra_inst_stmt(
+        &mut self,
+        inst: &llvm_ir::Inst,
+        value_name: impl Fn(llvm_ir::ValueId) -> String,
+        format_operand: impl Fn(&llvm_ir::Operand) -> String,
+    ) -> sile_core::Result<Vec<String>>;
+
+    /// Diagnostics that name this target.
+    fn messages(&self) -> StructuredCfgMessages;
+}
+
+/// The shared emitter: one traversal, one value order, many dialects.
+///
+/// [`TextCodegen`] is the public entry point. `C` and `Metal` stop implementing
+/// it directly and hand this struct a dialect instead, which is what keeps the
+/// next target from copying the traversal a third time.
+pub struct TargetEmitter<'a, D: TargetDialect> {
+    pub func: &'a llvm_ir::Function,
+    pub dialect: D,
+    /// Values an `alloca` defines, so a target can tell real storage apart from
+    /// a pointer into a driver buffer.
+    pub allocas: HashSet<llvm_ir::ValueId>,
+    pub value_names: HashMap<llvm_ir::ValueId, String>,
+    pub declared_values: HashSet<llvm_ir::ValueId>,
+    pub indent: usize,
+    out: String,
+}
+
+/// Every value an `alloca` defines, on any block.
+pub fn collect_alloca_results(func: &llvm_ir::Function) -> HashSet<llvm_ir::ValueId> {
+    func.blocks
+        .iter()
+        .flat_map(|block| block.insts.iter())
+        .filter_map(|inst| match inst.op {
+            llvm_ir::InstOp::Alloca { .. } => inst.result,
+            _ => None,
+        })
+        .collect()
+}
+
+impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
+    pub fn new(func: &'a llvm_ir::Function, dialect: D) -> Self {
+        Self {
+            func,
+            dialect,
+            allocas: collect_alloca_results(func),
+            value_names: build_value_names(func),
+            declared_values: HashSet::new(),
+            indent: 0,
+            out: String::new(),
         }
     }
 
-    if declared.is_empty() {
-        return false;
+    fn param_names(&self) -> HashMap<llvm_ir::ValueId, String> {
+        self.func
+            .params
+            .iter()
+            .map(|param| {
+                let name = self
+                    .value_names
+                    .get(&param.id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("v{}", param.id.0));
+                (param.id, name)
+            })
+            .collect()
     }
 
-    for block in &func.blocks {
-        for param in &block.params {
-            if declared.remove(&param.id).is_some() {
-                emit_decl(param.id, &param.ty);
+    fn emit_value_decls_inner(&mut self) {
+        let mut declared = HashMap::new();
+        for block in &self.func.blocks {
+            for param in &block.params {
+                declared.entry(param.id).or_insert(param.ty.clone());
+            }
+            for inst in &block.insts {
+                if let Some(id) = inst.result {
+                    declared.entry(id).or_insert(inst.ty.clone());
+                }
             }
         }
+        if declared.is_empty() {
+            return;
+        }
+        let mut lines = Vec::new();
+        let mut seen: Vec<llvm_ir::ValueId> = Vec::new();
+        for block in &self.func.blocks {
+            for param in &block.params {
+                if declared.contains_key(&param.id) && !seen.contains(&param.id) {
+                    seen.push(param.id);
+                    lines.push((param.id, declared[&param.id].clone()));
+                }
+            }
+            for inst in &block.insts {
+                if let Some(id) = inst.result
+                    && declared.contains_key(&id)
+                    && !seen.contains(&id)
+                {
+                    seen.push(id);
+                    lines.push((id, inst.ty.clone()));
+                }
+            }
+        }
+        for (id, ty) in lines {
+            if self.declared_values.insert(id) {
+                let name = self.value_name(id);
+                let decl = self.dialect.var_decl(&ty, &name, self.allocas.contains(&id));
+                if let Some(decl) = decl {
+                    self.writeln(&decl);
+                }
+            }
+        }
+
+    }
+
+    pub fn value_name(&self, id: llvm_ir::ValueId) -> String {
+        value_name(&self.value_names, id)
+    }
+
+    pub fn format_operand(&self, operand: &llvm_ir::Operand) -> String {
+        format_operand(&self.value_names, operand)
+    }
+
+    pub fn writeln(&mut self, line: &str) {
+        self.out.push_str(&"  ".repeat(self.indent));
+        self.out.push_str(line);
+        self.out.push('\n');
+    }
+
+}
+
+impl<D: TargetDialect> TextCodegen for TargetEmitter<'_, D> {
+    fn emit_prelude(&mut self) {
+        for line in self.dialect.prelude_lines() {
+            self.out.push_str(&line);
+            self.out.push('\n');
+        }
+    }
+
+    fn emit_signature(&mut self) {
+        let names = self.param_names();
+        let params: Vec<(String, String)> = self
+            .func
+            .params
+            .iter()
+            .map(|param| {
+                let ty = self.dialect.param_decl(&param.ty, &names[&param.id]);
+                (ty, names[&param.id].clone())
+            })
+            .collect();
+        let head = self.dialect.signature(&self.func.name, &params);
+        self.out.push_str(&head);
+        self.indent = 1;
+    }
+
+    fn emit_body(&mut self) -> Result<()> {
+        self.emit_value_decls_inner();
+        self.out.push('\n');
+        if self.emit_structured_from(self.func.entry, &[])?.is_some() {
+            return Err(Error::Compile(
+                "structured codegen unexpectedly stopped at a non-terminal block".into(),
+            ));
+        }
+        self.indent = 0;
+        self.out.push_str("}\n");
+        Ok(())
+    }
+
+    fn finish(self) -> String {
+        self.out
+    }
+}
+
+impl<D: TargetDialect> StructuredEmitter for TargetEmitter<'_, D> {
+    fn emit_block_insts(&mut self, block: &llvm_ir::BasicBlock) -> Result<()> {
+        self.emit_block_insts_except(block, None)
+    }
+
+    fn emit_block_insts_except(
+        &mut self,
+        block: &llvm_ir::BasicBlock,
+        skip_result: Option<llvm_ir::ValueId>,
+    ) -> Result<()> {
         for inst in &block.insts {
-            if let Some(id) = inst.result
-                && let Some(ty) = declared.remove(&id)
+            if let Some(skip_result) = skip_result
+                && inst.result == Some(skip_result)
             {
-                emit_decl(id, ty);
+                continue;
             }
+            self.emit_inst(inst)?;
+        }
+        Ok(())
+    }
+
+    fn emit_block_param_assignments_skipping(
+        &mut self,
+        target: llvm_ir::BlockId,
+        args: &[llvm_ir::Operand],
+        skip_params: &[llvm_ir::ValueId],
+    ) {
+        let Some(block) = self.func.blocks.iter().find(|block| block.id == target) else {
+            return;
+        };
+        for (param, arg) in block.params.iter().zip(args.iter()) {
+            if skip_params.contains(&param.id) {
+                continue;
+            }
+            let name = self.value_name(param.id);
+            self.writeln(&format!("{name} = {};", self.format_operand(arg)));
         }
     }
 
-    true
+    fn format_operand(&self, operand: &llvm_ir::Operand) -> String {
+        self.format_operand(operand)
+    }
+
+    fn writeln(&mut self, line: &str) {
+        TargetEmitter::writeln(self, line);
+    }
+
+    fn indent_inc(&mut self) {
+        self.indent += 1;
+    }
+
+    fn indent_dec(&mut self) {
+        self.indent -= 1;
+    }
+}
+
+impl<D: TargetDialect> TargetEmitter<'_, D> {
+    fn emit_structured_from(
+        &mut self,
+        start: llvm_ir::BlockId,
+        stop_targets: &[llvm_ir::BlockId],
+    ) -> Result<Option<llvm_ir::BlockId>> {
+        emit_structured_from(self, self.func, start, stop_targets, None, None, self.dialect.messages())
+    }
+
+
+    /// One instruction: shared lowering first, dialect second.
+    ///
+    /// The shared line covers every operator both targets spell the same way,
+    /// which is most of the instruction set. A dialect only handles what it
+    /// spells differently, so the two emitters cannot drift apart in silence.
+    fn emit_inst(&mut self, inst: &llvm_ir::Inst) -> Result<()> {
+        if let llvm_ir::InstOp::Intrinsic { intrinsic, args } = &inst.op {
+            // The dialect borrows `self` immutably, so the closures it needs
+            // cannot borrow `self` at the same time. Copy the name table.
+            let value_names = self.value_names.clone();
+            let dialect = &self.dialect;
+            let lines = dialect.intrinsic_stmt(
+                inst.result,
+                |id| value_name(&value_names, id),
+                |op| format_operand(&value_names, op),
+                intrinsic,
+                args,
+            )?;
+            for line in lines {
+                self.writeln(&line);
+            }
+            return Ok(());
+        }
+
+        if let Some(line) = lower_common_inst_line(
+            inst,
+            |id| self.value_name(id),
+            |op| self.format_operand(op),
+        ) {
+            self.writeln(&line);
+            return Ok(());
+        }
+
+        // The dialect borrows `self` mutably, so it cannot also borrow the
+        // closures that read `self`. Name the values it needs up front.
+        let value_names = self.value_names.clone();
+        let lines = self.dialect.extra_inst_stmt(
+            inst,
+            |id| value_name(&value_names, id),
+            |op| format_operand(&value_names, op),
+        )?;
+        for line in lines {
+            self.writeln(&line);
+        }
+        Ok(())
+    }
 }
 
 pub trait StructuredEmitter {

@@ -79,6 +79,21 @@ pub const RECOMMENDED_PIPELINE: &[LlvmIrPassKind] = &[
 /// Passes that are active today.
 pub const ACTIVE_PIPELINE: &[LlvmIrPassKind] = RECOMMENDED_PIPELINE;
 
+/// Every active transform, as `(name, runner)`.
+///
+/// The two verify kinds are checks, not transforms, so they are absent. This is
+/// the list the fixture-level ablation reads, which keeps a retired pass from
+/// keeping a fixture.
+pub fn active_passes() -> impl Iterator<Item = (&'static str, fn(Function) -> Function)> {
+    vec![
+        ("Canonicalize", canonicalize::run as fn(Function) -> Function),
+        ("LoopSimplify", loop_simplify::run as fn(Function) -> Function),
+        ("PhiAlias", phi_alias::run as fn(Function) -> Function),
+        ("Cse", cse::run as fn(Function) -> Function),
+    ]
+    .into_iter()
+}
+
 pub fn run_pipeline(mut func: Function, pipeline: &[LlvmIrPassKind]) -> Result<Function, String> {
     for pass in pipeline {
         func = match pass {
