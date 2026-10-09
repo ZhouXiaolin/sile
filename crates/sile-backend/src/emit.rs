@@ -181,26 +181,7 @@ pub const NO_POINTERS: PointerSpelling = PointerSpelling {
     load_deref: false,
 };
 
-pub fn lower_common_inst_line<FValue, FOperand>(
-    inst: &llvm_ir::Inst,
-    value_name: FValue,
-    format_operand: FOperand,
-) -> Option<String>
-where
-    FValue: Fn(llvm_ir::ValueId) -> String,
-    FOperand: Fn(&llvm_ir::Operand) -> String,
-{
-    let mut gep_elements = HashMap::new();
-    lower_common_inst_line_with(
-        inst,
-        value_name,
-        format_operand,
-        POINTER_LANGUAGE,
-        &mut gep_elements,
-    )
-}
-
-/// [`lower_common_inst_line`] with the dialect's pointer spelling.
+/// Lower one instruction with the dialect's pointer spelling.
 ///
 /// `gep_elements` maps a Gep result to `(base, indices)`, which a language
 /// without pointers needs in order to spell the element a load reads or a store
