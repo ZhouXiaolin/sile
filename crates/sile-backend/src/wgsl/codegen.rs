@@ -90,15 +90,38 @@ impl<'a> WgslDialect<'a> {
 
     /// Program index along `dim`.
     ///
-    /// WGSL names the launch index once, as an `@builtin` entry parameter, and
-    /// all three axes are components of that one vector.
+    /// A rank-1 output puts one workgroup item on each tile, so the launch
+    /// index along x is the tile index directly. A rank-2 output is dispatched
+    /// flat, one workgroup item per tile, so the x component carries both axes
+    /// and splits into a row count and a column count exactly as in C and MSL.
     fn block_id_expr(&self, dim: u8) -> String {
-        let axis = match dim {
-            0 => "x",
-            1 => "y",
-            _ => "z",
+        let flat = format!("i64({LAUNCH_INDEX}.x)");
+        let Some(output) = self.output.as_ref() else {
+            return match dim {
+                0 => flat,
+                _ => "0".to_string(),
+            };
         };
-        format!("i64({LAUNCH_INDEX}.{axis})")
+        let Some(abi) = output.param.abi.as_ref() else {
+            return flat;
+        };
+        if abi.rank <= 1 {
+            return match dim {
+                0 => flat,
+                _ => "0".to_string(),
+            };
+        }
+        let tiles_n = format!(
+            "({shapes}[{}] / {})",
+            abi.shape_offset + 1,
+            output.cols.max(1),
+            shapes = self.shapes_name
+        );
+        match dim {
+            0 => format!("({flat} / {tiles_n})"),
+            1 => format!("({flat} % {tiles_n})"),
+            _ => "0".to_string(),
+        }
     }
 
     /// Grid extent along `dim`, reconstructed from the output buffer's shape.

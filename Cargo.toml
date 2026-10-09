@@ -14,4 +14,6 @@ quote = "1"
 syn = { version = "2", features = ["full", "extra-traits", "visit-mut"] }
 tempfile = "3"
 naga = { version = "24", features = ["wgsl-in", "wgsl-out"] }
+wgpu = "24"
+pollster = "0.4"
 thiserror = "2"

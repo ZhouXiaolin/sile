@@ -1,4 +1,6 @@
-use sile_backend::{BackendArtifact, cpu::CpuBackend, metal::MetalBackend};
+use sile_backend::{
+    BackendArtifact, cpu::CpuBackend, metal::MetalBackend, wgsl::runtime::WgpuBackend,
+};
 use sile_core::{Device, KernelArg, LaunchConfig, Result, Stream};
 use sile_hir::Kernel;
 use sile_llvm_ir::format_llvm_ir;
@@ -62,6 +64,11 @@ impl<'a> KernelLauncher<'a> {
                 let param_kinds: Vec<_> =
                     typed.kernel.params.iter().map(|param| param.kind).collect();
                 backend.execute_llir(&llvm_ir_func, &param_kinds, &self.args, &launch, stream)
+            }
+            Device::Wgpu(_) => {
+                maybe_print_backend_source(&llvm_ir_func, CodegenTarget::Wgsl)?;
+                let backend = WgpuBackend::new()?;
+                backend.execute_llir(&llvm_ir_func, &self.args, &launch, stream)
             }
             _ => Err(sile_core::Error::UnsupportedBackend(
                 "backend not implemented",
