@@ -181,34 +181,6 @@ impl emit::TargetDialect for CDialect {
     }
 }
 
-
-fn emit_tile_count_logic(
-    out: &mut String,
-    abi: &llvm_ir::ParamAbi,
-    tile_rows: usize,
-    tile_cols: usize,
-) {
-    if abi.rank == 1 {
-        // The extent is in elements, and one program owns `tile_cols` of them,
-        // or `num_programs` reports the element count instead of the tile count.
-        out.push_str(&format!(
-            "  int64_t sile_total_tiles = shapes[{}] / {};\n",
-            abi.shape_offset,
-            tile_cols.max(1)
-        ));
-    } else {
-        out.push_str(&format!(
-            "  int64_t sile_tiles_n = shapes[{}] / {};\n",
-            abi.shape_offset + 1,
-            tile_cols
-        ));
-        out.push_str(&format!(
-            "  int64_t sile_total_tiles = (shapes[{}] / {}) * sile_tiles_n;\n",
-            abi.shape_offset, tile_rows
-        ));
-    }
-}
-
 fn generate_wrapper(func: &llvm_ir::Function) -> sile_core::Result<String> {
     let mut out = String::new();
     let output = find_output_buffer(func);
@@ -247,27 +219,33 @@ fn generate_wrapper(func: &llvm_ir::Function) -> sile_core::Result<String> {
     out.push_str("  (void)num_shapes;\n");
     out.push('\n');
 
-    if let Some(output) = &output {
-        let abi = output.param.abi.as_ref().ok_or_else(|| {
-            sile_core::Error::Compile(
-                "LLVM IR CPU wrapper requires output parameter ABI metadata".into(),
-            )
-        })?;
-        emit_tile_count_logic(&mut out, abi, output.rows, output.cols);
-    } else {
-        // No tile ABI at all: cover the buffer with one thread per tile-sized
-        // slice, taken from the first buffer's leading extent.
-        let first_extent = func
-            .params
-            .first()
-            .filter(|param| !is_shapes_param(param))
-            .or_else(|| func.params.iter().find(|param| !is_shapes_param(param)))
-            .and_then(|param| param.abi.as_ref())
-            .map(|abi| format!("shapes[{}]", abi.shape_offset))
-            .unwrap_or_else(|| "num_threadgroups * threads_per_group".into());
-        out.push_str(&format!("  int64_t sile_total_tiles = {first_extent};\n"));
-    }
+    // The launch grid is the tile count, which is what the caller dispatched.
+    // Deriving it from a buffer's extent instead is wrong the moment a kernel
+    // does not tile the buffer it reads: `parallel_reduce` launches one program
+    // per 1000-element tile and atomically adds them into a one-element output,
+    // so the output's extent is one and every other tile would be dropped.
+    // Metal and WGSL already honor the grid, so this makes the three agree.
+    out.push_str("  int64_t sile_total_tiles = num_threadgroups;\n");
     out.push('\n');
+
+    // A rank-2 output is dispatched flat, one program per tile, so the single
+    // index splits into a row and a column the same way MSL and WGSL split it.
+    // The split needs the number of tile columns, which is the last shape
+    // extent divided by the tile width the output stores through.
+    if output_rank.unwrap_or(1) > 1
+        && let Some(output) = &output
+    {
+        let cols = output.cols.max(1);
+        let offset = output
+            .param
+            .abi
+            .as_ref()
+            .map(|abi| abi.shape_offset + 1)
+            .unwrap_or(1);
+        out.push_str(&format!(
+            "  int64_t sile_tiles_n = shapes[{offset}] / {cols};\n"
+        ));
+    }
 
     // Publish the tile count so `GridDim(0)` inside the kernel reads the same
     // bound the pid loop uses. The CPU grid is flattened, so axes 1 and 2 stay

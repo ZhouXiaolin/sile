@@ -108,6 +108,11 @@ impl WgpuBackend {
         self.queue
             .write_buffer(&shapes_buffer, 0, as_bytes(&shapes));
 
+        // A float atomic add binds the same storage a second time as an integer
+        // atomic, so the alias bindings come after the kernel buffers and the
+        // shape descriptor and cover the buffers `codegen` names.
+        let aliases = super::codegen::atomic_alias_bindings(func);
+
         // The shape descriptor is the one read-only binding, and the kernel
         // buffers are the read-write ones. `codegen` puts the descriptor last,
         // so its binding number is the count of kernel buffers.
@@ -123,19 +128,27 @@ impl WgpuBackend {
             },
             count: None,
         };
+        let binding_count = args.len() + 1 + aliases.len();
         let layout = self
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("sile bind group layout"),
-                entries: &(0..=args.len()).map(read_write).collect::<Vec<_>>(),
+                entries: &(0..binding_count).map(read_write).collect::<Vec<_>>(),
             });
-        let entries = (0..=args.len())
+        let entries = (0..binding_count)
             .map(|index| wgpu::BindGroupEntry {
                 binding: index as u32,
                 resource: if index == args.len() {
                     shapes_buffer.as_entire_binding()
-                } else {
+                } else if index < args.len() {
                     buffers[index].as_entire_binding()
+                } else {
+                    // The alias of one kernel buffer, bound over the same
+                    // storage. `codegen` numbers these after the descriptor in
+                    // the order it declared the buffers, which is the order of
+                    // `aliases`.
+                    let buffer = aliases[index - args.len() - 1];
+                    buffers[buffer].as_entire_binding()
                 },
             })
             .collect::<Vec<_>>();

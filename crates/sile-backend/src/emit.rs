@@ -15,9 +15,7 @@ pub fn run(llvm_ir: &LlvmIrFunction, target: CodegenTarget) -> Result<BackendArt
         CodegenTarget::Metal => {
             BackendArtifact::MetalSource(generate_llvm_ir_metal_source(llvm_ir)?)
         }
-        CodegenTarget::Wgsl => {
-            BackendArtifact::WgslSource(generate_llvm_ir_wgsl_source(llvm_ir)?)
-        }
+        CodegenTarget::Wgsl => BackendArtifact::WgslSource(generate_llvm_ir_wgsl_source(llvm_ir)?),
     };
     Ok(artifact)
 }
@@ -31,7 +29,13 @@ pub fn run(llvm_ir: &LlvmIrFunction, target: CodegenTarget) -> Result<BackendArt
 fn sanitize_identifier(name: &str) -> String {
     let mut out: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if out.is_empty() || out.as_bytes()[0].is_ascii_digit() {
         out.insert(0, 'v');
@@ -146,15 +150,14 @@ pub fn find_output_buffer(func: &llvm_ir::Function) -> Option<OutputBuffer<'_>> 
     func.params
         .iter()
         .rev()
-        .find(|param| is_shapes_param(param) == false && param.abi.as_ref().is_some_and(|abi| abi.tile.is_some()))
+        .find(|param| {
+            is_shapes_param(param) == false
+                && param.abi.as_ref().is_some_and(|abi| abi.tile.is_some())
+        })
         .and_then(|param| {
             let abi = param.abi.as_ref()?;
             let (rows, cols) = abi.tile?;
-            Some(OutputBuffer {
-                param,
-                rows,
-                cols,
-            })
+            Some(OutputBuffer { param, rows, cols })
         })
 }
 
@@ -193,11 +196,91 @@ pub enum SelectSpelling {
     Function,
 }
 
-fn select_expr(spelling: SelectSpelling, cond: String, on_true: String, on_false: String) -> String {
+fn select_expr(
+    spelling: SelectSpelling,
+    cond: String,
+    on_true: String,
+    on_false: String,
+) -> String {
     match spelling {
         SelectSpelling::Ternary => format!("({cond}) ? ({on_true}) : ({on_false})"),
         SelectSpelling::Function => format!("select({on_false}, {on_true}, {cond})"),
     }
+}
+
+/// Collapse a pointer into the buffer it addresses and every index in its chain.
+///
+/// A Gep's base can be a Gep, and each link offsets the same buffer by a number
+/// of elements, so one chain is one buffer and one summed index.
+pub fn walk_gep_chain<'g>(
+    ptr: &llvm_ir::Operand,
+    gep_elements: &'g HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)>,
+) -> Option<(&'g llvm_ir::Operand, Vec<llvm_ir::Operand>)> {
+    let llvm_ir::Operand::Value(id) = ptr else {
+        return None;
+    };
+    let (base, indices) = gep_elements.get(id)?;
+    let (root, mut prefix) = match walk_gep_chain(base, gep_elements) {
+        Some((root, prefix)) => (root, prefix),
+        None => (base, Vec::new()),
+    };
+    prefix.extend(indices.iter().cloned());
+    Some((root, prefix))
+}
+
+/// Spell the element a pointer names, for a target that has no pointers.
+///
+/// A dialect reaching for the element behind an intrinsic argument gets the
+/// same rule the shared load and store use, instead of a second spelling of it.
+pub fn element_operand(
+    ptr: &llvm_ir::Operand,
+    gep_elements: &HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)>,
+    value_name: &dyn Fn(llvm_ir::ValueId) -> String,
+    format_operand: &dyn Fn(&llvm_ir::Operand) -> String,
+) -> String {
+    match walk_gep_chain(ptr, gep_elements) {
+        Some((root, indices)) => {
+            let terms: Vec<String> = indices.iter().map(|idx| format_operand(idx)).collect();
+            match terms.as_slice() {
+                [] => format!("{}[0]", format_operand(root)),
+                [one] => format!("{}[{one}]", format_operand(root)),
+                many => format!(
+                    "{}[{}]",
+                    format_operand(root),
+                    many.iter()
+                        .map(|term| format!("({term})"))
+                        .collect::<Vec<_>>()
+                        .join(" + ")
+                ),
+            }
+        }
+        None => match ptr {
+            llvm_ir::Operand::Value(id) => format!("{}[0]", value_name(*id)),
+            other => format_operand(other),
+        },
+    }
+}
+
+/// Every Gep in the function, as `(base, indices)`.
+///
+/// A target that has no pointers reads this table to spell the element a load or
+/// a store addresses, and a dialect needs the same table for an intrinsic
+/// argument. Both read the whole function, so both take it from one place
+/// instead of one of them re-deriving it during emission.
+pub fn collect_gep_elements(
+    func: &llvm_ir::Function,
+) -> HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)> {
+    let mut gep_elements = HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if let llvm_ir::InstOp::Gep { base, indices } = &inst.op
+                && let Some(result) = inst.result
+            {
+                gep_elements.insert(result, ((*base).clone(), indices.clone()));
+            }
+        }
+    }
+    gep_elements
 }
 
 /// Lower one instruction with the dialect's pointer spelling.
@@ -226,60 +309,8 @@ where
         gep_elements.insert(result, ((*base).clone(), indices.clone()));
     }
 
-    // A Gep result is the element it points at, spelled where it is consumed.
-    // A Gep's base can itself be a Gep, and every link of that chain offsets
-    // the same buffer by a number of elements, so the whole chain collapses to
-    // one buffer and one summed index: reading a dimension of a tensor's shape
-    // descriptor is a Gep into a Gep, and it addresses exactly one element.
-    fn element_chain<'g>(
-        ptr: &llvm_ir::Operand,
-        gep_elements: &'g HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)>,
-    ) -> Option<(&'g llvm_ir::Operand, Vec<&'g llvm_ir::Operand>)> {
-        let llvm_ir::Operand::Value(id) = ptr else {
-            return None;
-        };
-        let (base, indices) = gep_elements.get(id)?;
-        let (root, mut prefix) = match element_chain(base, gep_elements) {
-            Some((root, prefix)) => (root, prefix),
-            None => (base, Vec::new()),
-        };
-        prefix.extend(indices.iter());
-        Some((root, prefix))
-    }
-
-    fn element(
-        ptr: &llvm_ir::Operand,
-        gep_elements: &HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)>,
-        value_name: &dyn Fn(llvm_ir::ValueId) -> String,
-        format_operand: &dyn Fn(&llvm_ir::Operand) -> String,
-    ) -> String {
-        match element_chain(ptr, gep_elements) {
-            Some((root, indices)) => {
-                let terms: Vec<String> =
-                    indices.iter().map(|idx| format_operand(idx)).collect();
-                match terms.as_slice() {
-                    [] => format!("{}[0]", format_operand(root)),
-                    [one] => format!("{}[{one}]", format_operand(root)),
-                    many => format!(
-                        "{}[{}]",
-                        format_operand(root),
-                        many
-                            .iter()
-                            .map(|term| format!("({term})"))
-                            .collect::<Vec<_>>()
-                            .join(" + ")
-                    ),
-                }
-            }
-            None => match ptr {
-                llvm_ir::Operand::Value(id) => format!("{}[0]", value_name(*id)),
-                other => format_operand(other),
-            },
-        }
-    }
-
     let element = |ptr: &llvm_ir::Operand| -> String {
-        element(ptr, gep_elements, &value_name, &format_operand)
+        element_operand(ptr, gep_elements, &value_name, &format_operand)
     };
 
     match &inst.op {
@@ -368,8 +399,6 @@ pub fn generate_text<E: TextCodegen>(mut emitter: E) -> Result<String> {
     Ok(emitter.finish())
 }
 
-
-
 /// How a target spells one target-language concept.
 ///
 /// Every backend is a dialect over one shared traversal, so adding a target
@@ -385,12 +414,7 @@ pub trait TargetDialect {
     /// materialize, from a `gep` of a driver buffer, which borrows storage and
     /// must stay a plain pointer. The two have the same LLVM IR type, so the
     /// flag is what tells them apart.
-    fn var_decl(
-        &self,
-        ty: &llvm_ir::Type,
-        name: &str,
-        is_alloca: bool,
-    ) -> Option<String>;
+    fn var_decl(&self, ty: &llvm_ir::Type, name: &str, is_alloca: bool) -> Option<String>;
 
     /// Parameter text for one kernel parameter.
     fn param_decl(&self, ty: &llvm_ir::Type, name: &str) -> String;
@@ -461,8 +485,7 @@ pub trait TargetDialect {
     /// result is the element it points at, spelled where it is consumed, so it
     /// has no value and no type of its own to declare.
     fn declares_at_use(&self, inst: &llvm_ir::Inst) -> bool {
-        self.pointers().has_address_of == false
-            && matches!(inst.op, llvm_ir::InstOp::Gep { .. })
+        self.pointers().has_address_of == false && matches!(inst.op, llvm_ir::InstOp::Gep { .. })
             || self.declares_intrinsic_at_use(inst)
     }
 
@@ -515,6 +538,14 @@ pub fn collect_alloca_results(func: &llvm_ir::Function) -> HashSet<llvm_ir::Valu
 
 impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
     pub fn new(func: &'a llvm_ir::Function, dialect: D) -> Self {
+        // A target that has no pointers reads the Gep table from the first
+        // instruction, so the whole function is collected once here rather
+        // than filled as the Geps go by.
+        let gep_elements = if dialect.pointers().has_address_of {
+            HashMap::new()
+        } else {
+            collect_gep_elements(func)
+        };
         let value_names = build_value_names(func)
             .into_iter()
             .map(|(id, name)| {
@@ -534,7 +565,7 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
             allocas: collect_alloca_results(func),
             value_names,
             declared_values: HashSet::new(),
-            gep_elements: HashMap::new(),
+            gep_elements,
             indent: 0,
             out: String::new(),
         }
@@ -594,13 +625,14 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
         for (id, ty) in lines {
             if self.declared_values.insert(id) {
                 let name = self.value_name(id);
-                let decl = self.dialect.var_decl(&ty, &name, self.allocas.contains(&id));
+                let decl = self
+                    .dialect
+                    .var_decl(&ty, &name, self.allocas.contains(&id));
                 if let Some(decl) = decl {
                     self.writeln(&decl);
                 }
             }
         }
-
     }
 
     pub fn value_name(&self, id: llvm_ir::ValueId) -> String {
@@ -616,7 +648,6 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
         self.out.push_str(line);
         self.out.push('\n');
     }
-
 }
 
 impl<D: TargetDialect> TextCodegen for TargetEmitter<'_, D> {
@@ -727,9 +758,16 @@ impl<D: TargetDialect> TargetEmitter<'_, D> {
         start: llvm_ir::BlockId,
         stop_targets: &[llvm_ir::BlockId],
     ) -> Result<Option<llvm_ir::BlockId>> {
-        emit_structured_from(self, self.func, start, stop_targets, None, None, self.dialect.messages())
+        emit_structured_from(
+            self,
+            self.func,
+            start,
+            stop_targets,
+            None,
+            None,
+            self.dialect.messages(),
+        )
     }
-
 
     /// One instruction: shared lowering first, dialect second.
     ///
@@ -1067,11 +1105,8 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
                 let step_expr = induction_step_expr(&induction_name, for_loop.step);
                 // Only C has this directive, and a target without one keeps
                 // the loop as it is.
-                let vectorize = emitter.vectorize_hint(is_simple_loop_body(
-                    func,
-                    true_target,
-                    header.id,
-                ));
+                let vectorize =
+                    emitter.vectorize_hint(is_simple_loop_body(func, true_target, header.id));
                 if let Some(vectorize) = vectorize {
                     emitter.writeln(&vectorize);
                 }
@@ -1481,4 +1516,3 @@ fn predecessor_count(func: &llvm_ir::Function, target: llvm_ir::BlockId) -> usiz
         })
         .sum()
 }
-

@@ -24,6 +24,10 @@ fn main() -> sile::Result<()> {
 
     let result = out.to_vec(&stream)?[0];
     let expected = (LEN * (LEN + 1) / 2) as f32;
+    // Each tile is summed exactly, then added f32-atomically into one
+    // accumulator, so the error grows with the tile count rather than with the
+    // data: 100 tiles lands about 32 units short in f32, which is 6.4e-7
+    // relative. A 1e-5 relative bound is therefore honest and not a shrug.
     let tolerance = expected * 1e-5;
     println!("sum = {}, expected = {}", result, expected);
     assert!((result - expected).abs() < tolerance);

@@ -1,8 +1,12 @@
+use std::collections::HashMap;
+
 use crate::emit::{
-    self, NO_POINTERS, OutputBuffer, StructuredCfgMessages, TargetDialect, find_output_buffer,
+    self, NO_POINTERS, OutputBuffer, StructuredCfgMessages, TargetDialect, element_operand,
+    find_output_buffer,
 };
 use sile_core::Result;
 use sile_llvm_ir as llvm_ir;
+use sile_llvm_ir::{Operand, ValueId};
 
 /// The entry point parameter that carries the launch index.
 ///
@@ -17,6 +21,22 @@ pub fn generate(func: &llvm_ir::Function) -> Result<String> {
     emit::generate_text(emit::TargetEmitter::new(func, dialect))
 }
 
+/// The kernel buffers that carry a float atomic add, in binding order.
+///
+/// WGSL has no atomic add on a float, so each such buffer is bound a second
+/// time as `atomic<i32>` and the add is a compare exchange over the bit
+/// pattern. The runtime has to bind the same storage twice, and this tells it
+/// which buffers, so the codegen and the runtime cannot disagree about the
+/// layout.
+pub fn atomic_alias_bindings(func: &llvm_ir::Function) -> Vec<usize> {
+    let dialect = WgslDialect::new(func).expect("WGSL dialect over a typed function");
+    dialect
+        .atomic_buffer_params()
+        .iter()
+        .map(|param| dialect.binding_index(param))
+        .collect()
+}
+
 /// The WGSL dialect.
 ///
 /// WGSPL takes no pointer parameters: a kernel buffer is an array bound to a
@@ -26,6 +46,18 @@ pub fn generate(func: &llvm_ir::Function) -> Result<String> {
 struct WgslDialect<'a> {
     func: &'a llvm_ir::Function,
     output: Option<OutputBuffer<'a>>,
+    /// Every Gep in the function, as `(base, indices)`.
+    ///
+    /// WGSL has no pointers, so a `vec_load` argument that the shared emitter
+    /// sees as a pointer is an element here. The rule that spells it lives once
+    /// in the shared emitter as `element_operand`, and this table is the input
+    /// it reads.
+    gep_elements: HashMap<ValueId, (Operand, Vec<Operand>)>,
+    /// Number of float atomic sites emitted so far.
+    ///
+    /// Each site names its own compare-exchange locals, and WGSL declares them
+    /// in the function scope, so two sites cannot share a name.
+    atomic_sites: usize,
     /// WGSL spelling of the shape descriptor.
     ///
     /// WGSL reserves a leading double underscore, so the shared
@@ -36,10 +68,117 @@ struct WgslDialect<'a> {
 }
 
 impl<'a> WgslDialect<'a> {
+    /// The element an intrinsic's pointer argument names.
+    ///
+    /// A `gep` result is already an element, so the shared spelling applies.
+    /// A kernel buffer argument is not: it is the whole array, and the index
+    /// that follows addresses into it. `element_operand` appends `[0]` for a
+    /// value with no Gep history, which is right for a `load` of a pointer and
+    /// wrong here, so this drops it.
+    fn buffer_element(
+        &self,
+        ptr: &llvm_ir::Operand,
+        value_name: &dyn Fn(llvm_ir::ValueId) -> String,
+        format_operand: &dyn Fn(&llvm_ir::Operand) -> String,
+    ) -> String {
+        let spelled = element_operand(ptr, &self.gep_elements, value_name, format_operand);
+        match ptr {
+            llvm_ir::Operand::Value(id) if self.gep_elements.contains_key(id) => spelled,
+            _ => format_operand(ptr),
+        }
+    }
+
+    /// First binding number the atomic aliases occupy.
+    ///
+    /// They come after every kernel buffer and the shapes descriptor, so a
+    /// kernel with no atomic add binds nothing new and the numbers a caller
+    /// already passes keep their meaning.
+    fn alias_binding_base(&self) -> usize {
+        self.func.params.len()
+    }
+
+    /// The buffers a float atomic add writes through.
+    ///
+    /// A kernel that adds nothing binds no alias, so the aliases come from the
+    /// instruction stream rather than from the parameter list. The root of the
+    /// Gep chain is the buffer, and a chain is already collected once for the
+    /// whole function.
+    fn atomic_buffer_params(&self) -> Vec<&llvm_ir::Param> {
+        let names: Vec<String> = self
+            .func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .filter_map(|inst| match &inst.op {
+                llvm_ir::InstOp::AtomicAdd { ptr, .. } => self.atomic_buffer_name(ptr),
+                _ => None,
+            })
+            .collect();
+        self.func
+            .params
+            .iter()
+            .filter(|param| names.iter().any(|name| *name == param.name))
+            .collect()
+    }
+
+    /// Name of the buffer an atomic add's pointer root addresses.
+    fn atomic_buffer_name(&self, ptr: &llvm_ir::Operand) -> Option<String> {
+        let (root, _) = emit::walk_gep_chain(ptr, &self.gep_elements)?;
+        match root {
+            llvm_ir::Operand::Value(id) => self
+                .func
+                .params
+                .iter()
+                .find(|param| param.id == *id && !emit::is_shapes_param(param))
+                .map(|param| param.name.clone()),
+            _ => None,
+        }
+    }
+
+    /// Name this atomic compare-exchange site writes its locals under.
+    ///
+    /// WGSL declares the compare-exchange operands in the function scope, so
+    /// two sites in one kernel cannot share a name. A counter is the cheapest
+    /// unique suffix, and it is read in the order the sites are emitted.
+    fn next_atomic_cas_name(&mut self) -> String {
+        self.atomic_sites += 1;
+        format!("sile_atomic_{}", self.atomic_sites)
+    }
+
+    /// The `atomic<i32>` binding and index this atomic add operates on.
+    ///
+    /// WGSL has no atomic add on a float, so the same buffer is bound a second
+    /// time as `atomic<i32>` and the add is a compare exchange over the bit
+    /// pattern. The pointer operand names the buffer and an element index, and
+    /// the alias binding is the same buffer under the integer spelling.
+    fn atomic_target(
+        &self,
+        ptr: &llvm_ir::Operand,
+        value_name: impl Fn(ValueId) -> String,
+        format_operand: impl Fn(&Operand) -> String,
+    ) -> (String, String) {
+        let (root, indices) =
+            emit::walk_gep_chain(ptr, &self.gep_elements).unwrap_or((ptr, Vec::new()));
+        let index = indices
+            .iter()
+            .map(|index| format_operand(index))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        // The alias binding is named after the kernel parameter it covers, so
+        // the CAS and the prelude agree without the value table.
+        let buffer = self.atomic_buffer_name(root).unwrap_or_else(|| match root {
+            llvm_ir::Operand::Value(id) => value_name(*id),
+            other => format_operand(other),
+        });
+        (format!("{buffer}_atomic"), format!("({index})"))
+    }
+
     fn new(func: &'a llvm_ir::Function) -> Result<Self> {
         Ok(Self {
             func,
             output: find_output_buffer(func),
+            gep_elements: emit::collect_gep_elements(func),
+            atomic_sites: 0,
             shapes_name: "sile_shapes".to_string(),
         })
     }
@@ -206,12 +345,7 @@ impl TargetDialect for WgslDialect<'_> {
         self.shapes_name.clone()
     }
 
-    fn var_decl(
-        &self,
-        ty: &llvm_ir::Type,
-        name: &str,
-        _is_alloca: bool,
-    ) -> Option<String> {
+    fn var_decl(&self, ty: &llvm_ir::Type, name: &str, _is_alloca: bool) -> Option<String> {
         Some(format!("var {}: {};", name, wgsl_type(ty)))
     }
 
@@ -260,6 +394,18 @@ impl TargetDialect for WgslDialect<'_> {
                     self.storage_decl(param)
                 ));
             }
+        }
+        // A float atomic add needs the same storage bound once more as an
+        // integer atomic, which is the only spelling WGSL has. One binding per
+        // buffer that carries an atomic add, numbered after the shapes
+        // descriptor so a kernel's bindings stay stable.
+        let mut alias = self.alias_binding_base();
+        for param in &self.atomic_buffer_params() {
+            lines.push(format!(
+                "@group(0) @binding({}) var<storage, read_write> {}_atomic: array<atomic<i32>>;",
+                alias, param.name
+            ));
+            alias += 1;
         }
         lines
     }
@@ -324,13 +470,18 @@ impl TargetDialect for WgslDialect<'_> {
                         "WGSL vec_load expects [ptr, offset]".into(),
                     ));
                 };
-                format!(
-                    "let {} = vec{}<f32>({} + i64(0) + {});",
-                    name(),
-                    len,
-                    format_operand(ptr),
-                    format_operand(offset)
-                )
+                // WGSL cannot cast a storage array to a vector, so each lane
+                // is read as one element and the constructor builds the vector.
+                // The IR keeps the vector type because C and MSL read all four
+                // lanes in one instruction.
+                let element =
+                    self.buffer_element(ptr, &|id| value_name(id), &|op| format_operand(op));
+                let offset = format_operand(offset);
+                let lanes = (0..*len)
+                    .map(|lane| format!("{element}[{offset} + i64({lane})]"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("let {} = vec{len}<f32>({lanes});", name())
             }
             llvm_ir::Intrinsic::VecStore { len } => {
                 let [ptr, offset, value] = args else {
@@ -339,7 +490,12 @@ impl TargetDialect for WgslDialect<'_> {
                     ));
                 };
                 let _ = len;
-                format!("{}[{}] = {};", format_operand(ptr), format_operand(offset), format_operand(value))
+                format!(
+                    "{}[{}] = {};",
+                    self.buffer_element(ptr, &|id| value_name(id), &|op| format_operand(op)),
+                    format_operand(offset),
+                    format_operand(value)
+                )
             }
             llvm_ir::Intrinsic::VecReduceAdd => {
                 let [vector] = args else {
@@ -360,23 +516,50 @@ impl TargetDialect for WgslDialect<'_> {
     fn extra_inst_stmt(
         &mut self,
         inst: &llvm_ir::Inst,
-        _value_name: impl Fn(llvm_ir::ValueId) -> String,
+        value_name: impl Fn(llvm_ir::ValueId) -> String,
         format_operand: impl Fn(&llvm_ir::Operand) -> String,
     ) -> Result<Vec<String>> {
+        // A pointer argument spells the element it addresses, the same way a
+        // load reads it, so the shared spelling is reused rather than repeated.
+        let element = |ptr: &llvm_ir::Operand| {
+            self.buffer_element(ptr, &|id| value_name(id), &|op| format_operand(op))
+        };
         match &inst.op {
             // WGSL has no `memcpy`; a byte copy becomes an element loop.
             llvm_ir::InstOp::Memcpy { dst, src, size } => Ok(vec![
-                format!("for (var copy_i: i64 = 0; copy_i < {}; copy_i++) {{", format_operand(size)),
-                format!("{}[copy_i] = {}[copy_i];", format_operand(dst), format_operand(src)),
+                format!(
+                    "for (var copy_i: i64 = 0; copy_i < {}; copy_i++) {{",
+                    format_operand(size)
+                ),
+                format!("{}[copy_i] = {}[copy_i];", element(dst), element(src)),
                 "}".to_string(),
             ]),
-            // A WGSL atomic add works on integers, not floats, so the float
-            // buffer is read-modify-written under an atomic compare exchange.
-            llvm_ir::InstOp::AtomicAdd { ptr, value } => Ok(vec![format!(
-                "atomicAdd(({}), ({}));",
-                format_operand(ptr),
-                format_operand(value)
-            )]),
+            // WGSL has no atomic add on floats, so the same storage is bound
+            // a second time as `atomic<i32>` and the add is a compare exchange
+            // loop over the bit pattern. One storage buffer, two bindings,
+            // which is the only spelling this target has.
+            llvm_ir::InstOp::AtomicAdd { ptr, value } => {
+                let (buffer, index) = self.atomic_target(ptr, &value_name, &format_operand);
+                let cas = self.next_atomic_cas_name();
+                Ok(vec![
+                    format!("var {cas}_comparand: i32 = 0;"),
+                    format!(
+                        "var {cas}_desired: i32 = bitcast<i32>({});",
+                        format_operand(value)
+                    ),
+                    "loop {".to_string(),
+                    format!(
+                        "let {cas}_exchange = atomicCompareExchangeWeak(&{buffer}[{index}], {cas}_comparand, {cas}_desired);"
+                    ),
+                    format!("if ({cas}_exchange.exchanged) {{ break; }}"),
+                    format!("{cas}_comparand = {cas}_exchange.old_value;"),
+                    format!(
+                        "{cas}_desired = bitcast<i32>(bitcast<f32>({cas}_comparand) + {});",
+                        format_operand(value)
+                    ),
+                    "}".to_string(),
+                ])
+            }
             llvm_ir::InstOp::Call { func, .. } => Err(sile_core::Error::Compile(format!(
                 "LLVM IR WGSL codegen does not support call instructions: {func}"
             ))),
