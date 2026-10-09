@@ -140,11 +140,15 @@ fn three_targets_agree_on_dynamic_k_matmul() {
 
 /// The atomic case, which is the one where the three dialects cannot agree by
 /// construction: WGSL spells the float add as a compare exchange over bit
-/// patterns, and the other two use a native float atomic. The reductions also
-/// happen in a different order on each target, so the comparison allows the f32
-/// accumulation error that order produces.
+/// patterns, and the other two use a native float atomic.
+///
+/// The comparison is exact rather than tolerant, and the data is chosen so it
+/// can be. Every tile sums to 1000 and every partial sum is an integer no
+/// larger than 100000, which f32 represents exactly, so any reduction order
+/// reaches the same bits. That makes the three-way agreement a claim about the
+/// lowering, not a claim that the differences stayed under some bound.
 #[test]
-fn three_targets_agree_on_parallel_reduce_within_f32_order_error() {
+fn three_targets_agree_on_parallel_reduce_exactly() {
     const TILE: i64 = 1000;
     const LEN: i64 = 100_000;
 
@@ -162,14 +166,8 @@ fn three_targets_agree_on_parallel_reduce_within_f32_order_error() {
 
     assert_all_targets_ran(&results);
     let (_, first) = results[0];
+    assert_eq!(first, LEN as f32, "cpu lost or corrupted the atomic sum");
     for (name, value) in &results[1..] {
-        // 100 tiles summed to 1000 each, then reduced in a different order per
-        // target. The differences are f32 accumulation, so the bound is
-        // relative to the exact sum rather than an absolute epsilon.
-        let bound = LEN as f32 * 1e-5;
-        assert!(
-            (value - first).abs() <= bound,
-            "{name} got {value}, cpu got {first}, which is beyond f32 order error"
-        );
+        assert_eq!(*value, first, "{name} disagrees with cpu on the atomic sum");
     }
 }
