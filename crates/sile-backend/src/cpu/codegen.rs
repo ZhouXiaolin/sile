@@ -1,35 +1,7 @@
-use crate::emit::{self, StructuredCfgMessages, array_dims};
+use crate::emit::{self, StructuredCfgMessages, find_output_buffer, array_dims};
 use sile_llvm_ir as llvm_ir;
 
 const SHAPES_PARAM_NAME: &str = "__sile_shapes";
-
-/// The output buffer of a kernel, plus the tile it is stored through.
-///
-/// Tile shape comes from `ParamAbi::tile`, which Tile IR lowering already knew.
-struct OutputBuffer<'a> {
-    param: &'a llvm_ir::Param,
-    rows: usize,
-    cols: usize,
-}
-
-/// Last non-shape parameter carrying tile ABI metadata.
-fn find_output_buffer(func: &llvm_ir::Function) -> Option<OutputBuffer<'_>> {
-    func.params
-        .iter()
-        .rev()
-        .find(|param| {
-            !is_shapes_param(param) && param.abi.as_ref().is_some_and(|abi| abi.tile.is_some())
-        })
-        .and_then(|param| {
-            let abi = param.abi.as_ref()?;
-            let (rows, cols) = abi.tile?;
-            Some(OutputBuffer {
-                param,
-                rows,
-                cols,
-            })
-        })
-}
 
 pub fn generate(func: &llvm_ir::Function) -> sile_core::Result<String> {
     let mut code = emit::generate_text(CTargetEmitter::new(func, CDialect::new()))?;
@@ -136,6 +108,10 @@ impl emit::TargetDialect for CDialect {
         lines.push("}".to_string());
         lines.push(String::new());
         lines
+    }
+
+    fn vectorize_hint(&self, is_simple_body: bool) -> Option<String> {
+        is_simple_body.then(|| "#pragma omp simd".to_string())
     }
 
     fn intrinsic_stmt(

@@ -84,7 +84,9 @@ fn maybe_print_backend_source(
 
     let artifact = compile_backend(llvm_ir_func, target)?;
     match artifact {
-        BackendArtifact::CSource(source) | BackendArtifact::MetalSource(source) => {
+        BackendArtifact::CSource(source)
+        | BackendArtifact::MetalSource(source)
+        | BackendArtifact::WgslSource(source) => {
             eprintln!("{}", source);
         }
     }

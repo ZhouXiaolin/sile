@@ -39,6 +39,9 @@ pub mod codegen {
     pub mod llvmir_metal {
         pub use sile_backend::metal::codegen::*;
     }
+    pub mod llvmir_wgsl {
+        pub use sile_backend::wgsl::codegen::*;
+    }
 }
 pub mod schedule {
     pub fn require_divisible(total: i64, tile: i64) -> sile_core::Result<()> {

@@ -6,6 +6,7 @@ use sile_llvm_ir::Function as LlvmIrFunction;
 
 use crate::cpu::codegen::generate as generate_llvm_ir_c_source;
 use crate::metal::codegen::generate as generate_llvm_ir_metal_source;
+use crate::wgsl::codegen::generate as generate_llvm_ir_wgsl_source;
 use crate::{BackendArtifact, CodegenTarget};
 
 pub fn run(llvm_ir: &LlvmIrFunction, target: CodegenTarget) -> Result<BackendArtifact> {
@@ -13,6 +14,9 @@ pub fn run(llvm_ir: &LlvmIrFunction, target: CodegenTarget) -> Result<BackendArt
         CodegenTarget::C => BackendArtifact::CSource(generate_llvm_ir_c_source(llvm_ir)?),
         CodegenTarget::Metal => {
             BackendArtifact::MetalSource(generate_llvm_ir_metal_source(llvm_ir)?)
+        }
+        CodegenTarget::Wgsl => {
+            BackendArtifact::WgslSource(generate_llvm_ir_wgsl_source(llvm_ir)?)
         }
     };
     Ok(artifact)
@@ -118,6 +122,65 @@ pub fn float_literal(value: f64) -> String {
     }
 }
 
+/// The synthetic shape parameter every backend reads.
+pub const SHAPES_PARAM_NAME: &str = "__sile_shapes";
+
+/// True when the parameter is the shape descriptor, not a kernel buffer.
+pub fn is_shapes_param(param: &llvm_ir::Param) -> bool {
+    param.name == SHAPES_PARAM_NAME
+}
+
+/// The output buffer of a kernel, with the tile it is stored through.
+///
+/// The tile shape comes from `ParamAbi::tile`, which Tile IR lowering already
+/// knew when it emitted `store_ptr_tko`, so no backend re-derives it by scanning
+/// the CFG for the last store.
+pub struct OutputBuffer<'a> {
+    pub param: &'a llvm_ir::Param,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+/// Last non-shape parameter carrying tile ABI metadata.
+pub fn find_output_buffer(func: &llvm_ir::Function) -> Option<OutputBuffer<'_>> {
+    func.params
+        .iter()
+        .rev()
+        .find(|param| is_shapes_param(param) == false && param.abi.as_ref().is_some_and(|abi| abi.tile.is_some()))
+        .and_then(|param| {
+            let abi = param.abi.as_ref()?;
+            let (rows, cols) = abi.tile?;
+            Some(OutputBuffer {
+                param,
+                rows,
+                cols,
+            })
+        })
+}
+
+/// How a target spells address-taking and dereferencing.
+///
+/// C and MSL have pointers, so a load is `*p` and a store is `*p = v`. WGSL has
+/// no pointers, so the same IR has to read and write the element directly, and
+/// the load of a Gep result is folded into its use.
+#[derive(Clone, Copy)]
+pub struct PointerSpelling {
+    /// Whether the target can take an address, so `&base[i]` is an instruction.
+    pub has_address_of: bool,
+    /// Whether a load through a pointer dereferences it.
+    pub load_deref: bool,
+}
+
+pub const POINTER_LANGUAGE: PointerSpelling = PointerSpelling {
+    has_address_of: true,
+    load_deref: true,
+};
+
+pub const NO_POINTERS: PointerSpelling = PointerSpelling {
+    has_address_of: false,
+    load_deref: false,
+};
+
 pub fn lower_common_inst_line<FValue, FOperand>(
     inst: &llvm_ir::Inst,
     value_name: FValue,
@@ -127,6 +190,58 @@ where
     FValue: Fn(llvm_ir::ValueId) -> String,
     FOperand: Fn(&llvm_ir::Operand) -> String,
 {
+    let mut gep_elements = HashMap::new();
+    lower_common_inst_line_with(
+        inst,
+        value_name,
+        format_operand,
+        POINTER_LANGUAGE,
+        &mut gep_elements,
+    )
+}
+
+/// [`lower_common_inst_line`] with the dialect's pointer spelling.
+///
+/// `gep_elements` maps a Gep result to `(base, indices)`, which a language
+/// without pointers needs in order to spell the element a load reads or a store
+/// writes. It is empty for a pointer language, which never consults it.
+pub fn lower_common_inst_line_with<FValue, FOperand>(
+    inst: &llvm_ir::Inst,
+    value_name: FValue,
+    format_operand: FOperand,
+    pointers: PointerSpelling,
+    gep_elements: &mut HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)>,
+) -> Option<String>
+where
+    FValue: Fn(llvm_ir::ValueId) -> String,
+    FOperand: Fn(&llvm_ir::Operand) -> String,
+{
+    // A Gep result names an element, not a value, so record it before anything
+    // asks. Only a pointer-free language needs the table.
+    if !pointers.has_address_of
+        && let Some(result) = inst.result
+        && let llvm_ir::InstOp::Gep { base, indices } = &inst.op
+    {
+        gep_elements.insert(result, ((*base).clone(), indices.clone()));
+    }
+
+    let element = |ptr: &llvm_ir::Operand| -> String {
+        match ptr {
+            llvm_ir::Operand::Value(id) => match gep_elements.get(id) {
+                Some((base, indices)) => {
+                    let suffix = indices
+                        .iter()
+                        .map(|idx| format!("[{}]", format_operand(idx)))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    format!("{}{suffix}", format_operand(base))
+                }
+                None => format!("{}[0]", value_name(*id)),
+            },
+            other => format_operand(other),
+        }
+    };
+
     match &inst.op {
         llvm_ir::InstOp::Bin { op, lhs, rhs } => inst.result.map(|id| {
             format!(
@@ -159,30 +274,39 @@ where
                 format_operand(on_false)
             )
         }),
-        llvm_ir::InstOp::Load { ptr } => inst
-            .result
-            .map(|id| format!("{} = *({});", value_name(id), format_operand(ptr))),
-        llvm_ir::InstOp::Store { ptr, value } => Some(format!(
-            "*({}) = {};",
-            format_operand(ptr),
-            format_operand(value)
-        )),
+        llvm_ir::InstOp::Load { ptr } => inst.result.map(|id| {
+            if pointers.load_deref {
+                format!("{} = *({});", value_name(id), format_operand(ptr))
+            } else {
+                // No pointer to dereference, so the load reads the element.
+                format!("{} = {};", value_name(id), element(ptr))
+            }
+        }),
+        llvm_ir::InstOp::Store { ptr, value } => Some(if pointers.load_deref {
+            format!("*({}) = {};", format_operand(ptr), format_operand(value))
+        } else {
+            format!("{} = {};", element(ptr), format_operand(value))
+        }),
         llvm_ir::InstOp::Cast { value, .. } => inst
             .result
             .map(|id| format!("{} = {};", value_name(id), format_operand(value))),
-        llvm_ir::InstOp::Gep { base, indices } => inst.result.map(|id| {
-            let index_suffix = indices
-                .iter()
-                .map(|idx| format!("[{}]", format_operand(idx)))
-                .collect::<Vec<_>>()
-                .join("");
-            format!(
-                "{} = &({}{});",
-                value_name(id),
-                format_operand(base),
-                index_suffix
-            )
-        }),
+        // A language with addresses materializes the pointer; one without
+        // already recorded the element above and emits nothing.
+        llvm_ir::InstOp::Gep { base, indices } if pointers.has_address_of => {
+            inst.result.map(|id| {
+                let index_suffix = indices
+                    .iter()
+                    .map(|idx| format!("[{}]", format_operand(idx)))
+                    .collect::<Vec<_>>()
+                    .join("");
+                format!(
+                    "{} = &({}{});",
+                    value_name(id),
+                    format_operand(base),
+                    index_suffix
+                )
+            })
+        }
         _ => None,
     }
 }
@@ -256,6 +380,29 @@ pub trait TargetDialect {
         format_operand: impl Fn(&llvm_ir::Operand) -> String,
     ) -> sile_core::Result<Vec<String>>;
 
+    /// How this target spells address-taking and dereferencing.
+    fn pointers(&self) -> PointerSpelling {
+        POINTER_LANGUAGE
+    }
+
+    /// A loop-carried hint the target wants before a simple loop, if any.
+    ///
+    /// `is_simple_body` reports that the loop has no inner control flow, which
+    /// is the only case C asks for. A target with no vectorization pragma keeps
+    /// the default of nothing.
+    fn vectorize_hint(&self, _is_simple_body: bool) -> Option<String> {
+        None
+    }
+
+    /// True when the target writes this result at its use, not at the top.
+    ///
+    /// WGSL writes an intrinsic as `let name = expr;`, so hoisting a declaration
+    /// too would define the same name twice. C and MSL assign to a hoisted
+    /// variable, so they keep the default of declaring everything up front.
+    fn declares_at_use(&self, _inst: &llvm_ir::Inst) -> bool {
+        false
+    }
+
     /// Diagnostics that name this target.
     fn messages(&self) -> StructuredCfgMessages;
 }
@@ -273,6 +420,11 @@ pub struct TargetEmitter<'a, D: TargetDialect> {
     pub allocas: HashSet<llvm_ir::ValueId>,
     pub value_names: HashMap<llvm_ir::ValueId, String>,
     pub declared_values: HashSet<llvm_ir::ValueId>,
+    /// Gep results, which a pointer-free target spells as elements.
+    ///
+    /// Filled by [`lower_common_inst_line_with`], so the emitter must own it and
+    /// pass it on every instruction.
+    pub gep_elements: HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)>,
     pub indent: usize,
     out: String,
 }
@@ -297,6 +449,7 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
             allocas: collect_alloca_results(func),
             value_names: build_value_names(func),
             declared_values: HashSet::new(),
+            gep_elements: HashMap::new(),
             indent: 0,
             out: String::new(),
         }
@@ -324,7 +477,9 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
                 declared.entry(param.id).or_insert(param.ty.clone());
             }
             for inst in &block.insts {
-                if let Some(id) = inst.result {
+                if let Some(id) = inst.result
+                    && !self.dialect.declares_at_use(inst)
+                {
                     declared.entry(id).or_insert(inst.ty.clone());
                 }
             }
@@ -475,6 +630,10 @@ impl<D: TargetDialect> StructuredEmitter for TargetEmitter<'_, D> {
     fn indent_dec(&mut self) {
         self.indent -= 1;
     }
+
+    fn vectorize_hint(&mut self, is_simple_body: bool) -> Option<String> {
+        self.dialect.vectorize_hint(is_simple_body)
+    }
 }
 
 impl<D: TargetDialect> TargetEmitter<'_, D> {
@@ -511,11 +670,20 @@ impl<D: TargetDialect> TargetEmitter<'_, D> {
             return Ok(());
         }
 
-        if let Some(line) = lower_common_inst_line(
-            inst,
-            |id| self.value_name(id),
-            |op| self.format_operand(op),
-        ) {
+        let (line, mut gep_elements) = {
+            let value_names = self.value_names.clone();
+            let pointers = self.dialect.pointers();
+            let line = lower_common_inst_line_with(
+                inst,
+                |id| value_name(&value_names, id),
+                |op| format_operand(&value_names, op),
+                pointers,
+                &mut self.gep_elements,
+            );
+            (line, self.gep_elements.clone())
+        };
+        let _ = &mut gep_elements;
+        if let Some(line) = line {
             self.writeln(&line);
             return Ok(());
         }
@@ -559,6 +727,9 @@ pub trait StructuredEmitter {
     fn writeln(&mut self, line: &str);
     fn indent_inc(&mut self);
     fn indent_dec(&mut self);
+
+    /// A loop-carried hint the target wants before a simple loop, if any.
+    fn vectorize_hint(&mut self, is_simple_body: bool) -> Option<String>;
 }
 
 #[derive(Clone, Copy)]
@@ -811,8 +982,15 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
                     .map(|arg| format!("{induction_name} = {}", emitter.format_operand(arg)))
                     .unwrap_or_default();
                 let step_expr = induction_step_expr(&induction_name, for_loop.step);
-                if !init_expr.is_empty() && is_simple_loop_body(func, true_target, header.id) {
-                    emitter.writeln("#pragma omp simd");
+                // Only C has this directive, and a target without one keeps
+                // the loop as it is.
+                let vectorize = emitter.vectorize_hint(is_simple_loop_body(
+                    func,
+                    true_target,
+                    header.id,
+                ));
+                if let Some(vectorize) = vectorize {
+                    emitter.writeln(&vectorize);
                 }
                 emitter.writeln(&format!(
                     "for ({}; {}; {}) {{",

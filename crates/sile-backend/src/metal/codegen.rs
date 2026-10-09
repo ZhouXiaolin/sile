@@ -1,40 +1,7 @@
-use crate::emit::{self, StructuredCfgMessages, TargetDialect, array_dims};
+use crate::emit::{self, StructuredCfgMessages, TargetDialect, array_dims, find_output_buffer, OutputBuffer};
 use sile_llvm_ir as llvm_ir;
 
 const SHAPES_PARAM_NAME: &str = "__sile_shapes";
-
-/// The output buffer of a kernel, with the tile it is stored through.
-///
-/// The tile shape comes from `ParamAbi::tile`, which Tile IR lowering already
-/// knew when it emitted `store_ptr_tko`.
-struct OutputBuffer<'a> {
-    param: &'a llvm_ir::Param,
-    rows: usize,
-    cols: usize,
-}
-
-/// Last non-shape parameter carrying tile ABI metadata.
-fn find_output_buffer(func: &llvm_ir::Function) -> Option<OutputBuffer<'_>> {
-    func.params
-        .iter()
-        .rev()
-        .find(|param| {
-            !is_shapes_param(param) && param.abi.as_ref().is_some_and(|abi| abi.tile.is_some())
-        })
-        .and_then(|param| {
-            let abi = param.abi.as_ref()?;
-            let (rows, cols) = abi.tile?;
-            Some(OutputBuffer {
-                param,
-                rows,
-                cols,
-            })
-        })
-}
-
-fn is_shapes_param(param: &llvm_ir::Param) -> bool {
-    param.name == SHAPES_PARAM_NAME
-}
 
 pub fn generate(func: &llvm_ir::Function) -> sile_core::Result<String> {
     let dialect = MetalDialect::new(func)?;
@@ -196,6 +163,11 @@ impl TargetDialect for MetalDialect<'_> {
             "using namespace metal;".to_string(),
             String::new(),
         ]
+    }
+
+    fn vectorize_hint(&self, _is_simple_body: bool) -> Option<String> {
+        // MSL lets the driver schedule this loop; a pragma is not available.
+        None
     }
 
     fn intrinsic_stmt(

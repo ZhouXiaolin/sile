@@ -11,7 +11,9 @@ pub(crate) fn for_target(
     verify_shared_contract(llvm_ir, stage)?;
     match target {
         CodegenTarget::C => Ok(()),
-        CodegenTarget::Metal => verify_metal_contract(llvm_ir, stage),
+        CodegenTarget::Metal | CodegenTarget::Wgsl => {
+            verify_gpu_contract(llvm_ir, stage)
+        }
     }
 }
 
@@ -37,32 +39,37 @@ fn verify_shared_contract(llvm_ir: &LlvmIrFunction, stage: &str) -> Result<()> {
     Ok(())
 }
 
-fn verify_metal_contract(llvm_ir: &LlvmIrFunction, stage: &str) -> Result<()> {
+/// What both GPU targets reject, named for both.
+///
+/// WGSL and MSL both reject a call instruction and an unsupported intrinsic
+/// axis, and both spell `thread_id` and `barrier` differently enough that the
+/// shared rejection lives here while each dialect decides what it does support.
+fn verify_gpu_contract(llvm_ir: &LlvmIrFunction, stage: &str) -> Result<()> {
     for block in &llvm_ir.blocks {
         for inst in &block.insts {
             match &inst.op {
                 sile_llvm_ir::InstOp::Intrinsic { intrinsic, .. } => match intrinsic {
                     sile_llvm_ir::Intrinsic::ThreadId { .. } => {
                         return Err(Error::Compile(format!(
-                            "{stage}: Metal backend does not support thread_id intrinsic (block `{}`)",
+                            "{stage}: GPU backend does not support thread_id intrinsic (block `{}`)",
                             block.name
                         )));
                     }
                     sile_llvm_ir::Intrinsic::Barrier { .. } => {
                         return Err(Error::Compile(format!(
-                            "{stage}: Metal backend does not support barrier intrinsic (block `{}`)",
+                            "{stage}: GPU backend does not support barrier intrinsic (block `{}`)",
                             block.name
                         )));
                     }
                     sile_llvm_ir::Intrinsic::BlockId { dim } if *dim > 2 => {
                         return Err(Error::Compile(format!(
-                            "{stage}: Metal backend only supports block_id dimensions 0..=2, got {dim} (block `{}`)",
+                            "{stage}: GPU backend only supports block_id dimensions 0..=2, got {dim} (block `{}`)",
                             block.name
                         )));
                     }
                     sile_llvm_ir::Intrinsic::GridDim { dim } if *dim > 2 => {
                         return Err(Error::Compile(format!(
-                            "{stage}: Metal backend only supports grid_dim dimensions 0..=2, got {dim} (block `{}`)",
+                            "{stage}: GPU backend only supports grid_dim dimensions 0..=2, got {dim} (block `{}`)",
                             block.name
                         )));
                     }
@@ -70,7 +77,7 @@ fn verify_metal_contract(llvm_ir: &LlvmIrFunction, stage: &str) -> Result<()> {
                 },
                 sile_llvm_ir::InstOp::Call { func, .. } => {
                     return Err(Error::Compile(format!(
-                        "{stage}: Metal backend does not support LLVM IR call instructions, got `{func}` (block `{}`)",
+                        "{stage}: GPU backend does not support LLVM IR call instructions, got `{func}` (block `{}`)",
                         block.name
                     )));
                 }
