@@ -83,3 +83,66 @@ fn the_pipeline_still_shrinks_every_kernel() {
         );
     }
 }
+
+/// Removing a pass must change what the three targets emit, not just the IR.
+///
+/// The pipeline exists to feed three emitters, so a pass earns its place by
+/// changing their text. Counting instructions and blocks says nothing about it:
+/// `LoopSimplify` deletes no instruction and in fact adds two blocks to softmax,
+/// yet every target spells softmax differently without it. This is the ablation
+/// that decides, and it is measured here rather than inferred from a count.
+#[test]
+fn every_working_pass_changes_what_every_target_emits() {
+    use sile::compiler::LlvmIrPassKind;
+
+    let lowered = |pass: Option<LlvmIrPassKind>| {
+        fn llir_for(
+            kernel: &sile::hir::Kernel,
+            drop: Option<LlvmIrPassKind>,
+        ) -> sile::llvmir::Function {
+            let typed = typeck::check_kernel(kernel).expect("typecheck");
+            let pipeline: Vec<_> = ACTIVE_LLVM_IR_PIPELINE
+                .iter()
+                .copied()
+                .filter(|kind| Some(*kind) != drop)
+                .collect();
+            run_llvm_ir_pipeline(
+                lower_tile_ir_to_llvm_ir(&lower_to_tile_ir(&typed), &typed),
+                &pipeline,
+            )
+            .expect("pipeline with one pass dropped")
+        }
+        move |kernel: &sile::hir::Kernel| llir_for(kernel, pass)
+    };
+
+    let targets = |func: &sile::llvmir::Function| {
+        [
+            sile::codegen::llvmir_c::generate(func).ok(),
+            sile::codegen::llvmir_metal::generate(func).ok(),
+            sile::codegen::llvmir_wgsl::generate(func).ok(),
+        ]
+    };
+
+    for pass in WORKING {
+        let with = lowered(None);
+        let without = lowered(Some(pass));
+        let mut cost = Vec::new();
+        for kernel in fixtures() {
+            let full = targets(&with(kernel));
+            let trimmed = targets(&without(kernel));
+            let changed: Vec<&str> = ["c", "metal", "wgsl"]
+                .into_iter()
+                .zip(full.iter().zip(trimmed.iter()))
+                .filter(|(_, (full, trimmed))| full != trimmed)
+                .map(|(name, _)| name)
+                .collect();
+            if !changed.is_empty() {
+                cost.push(format!("{} via {}", kernel.name, changed.join("+")));
+            }
+        }
+        assert!(
+            !cost.is_empty(),
+            "{pass:?} changes no target's text: it no longer earns its place"
+        );
+    }
+}
