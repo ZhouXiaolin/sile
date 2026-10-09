@@ -4,6 +4,14 @@ use crate::emit::{
 use sile_core::Result;
 use sile_llvm_ir as llvm_ir;
 
+/// The entry point parameter that carries the launch index.
+///
+/// WGSL has no implicit launch index: a compute entry point declares one
+/// `@builtin(global_invocation_id)` parameter and every axis of the launch grid
+/// is a component of it. `workgroup_size(1)` means one workgroup item owns one
+/// tile, so the invocation id is the tile index.
+const LAUNCH_INDEX: &str = "sile_launch_index";
+
 pub fn generate(func: &llvm_ir::Function) -> Result<String> {
     let dialect = WgslDialect::new(func)?;
     emit::generate_text(emit::TargetEmitter::new(func, dialect))
@@ -18,6 +26,13 @@ pub fn generate(func: &llvm_ir::Function) -> Result<String> {
 struct WgslDialect<'a> {
     func: &'a llvm_ir::Function,
     output: Option<OutputBuffer<'a>>,
+    /// WGSL spelling of the shape descriptor.
+    ///
+    /// WGSL reserves a leading double underscore, so the shared
+    /// `__sile_shapes` name cannot be a WGSL binding. The emitter renames it
+    /// through [`TargetDialect::shapes_name`], and this field carries the same
+    /// name to the binding declarations and to `grid_dim_expr`.
+    shapes_name: String,
 }
 
 impl<'a> WgslDialect<'a> {
@@ -25,6 +40,7 @@ impl<'a> WgslDialect<'a> {
         Ok(Self {
             func,
             output: find_output_buffer(func),
+            shapes_name: "sile_shapes".to_string(),
         })
     }
 
@@ -55,7 +71,7 @@ impl<'a> WgslDialect<'a> {
     /// A read-only buffer is `read`, a mutable one is `read_write`, and the
     /// shape descriptor is read-only.
     fn storage_decl(&self, param: &llvm_ir::Param) -> String {
-        let access = if param.name == emit::SHAPES_PARAM_NAME {
+        let access = if emit::is_shapes_param(param) {
             "read"
         } else {
             "read_write"
@@ -64,20 +80,25 @@ impl<'a> WgslDialect<'a> {
             llvm_ir::Type::Ptr { pointee, .. } => wgsl_type(pointee.as_ref()),
             _ => "f32".to_string(),
         };
-        format!("var<storage, {access}> {}: array<{elem}>;", param.name)
+        let name = if emit::is_shapes_param(param) {
+            self.shapes_name.clone()
+        } else {
+            param.name.clone()
+        };
+        format!("var<storage, {access}> {name}: array<{elem}>;")
     }
 
     /// Program index along `dim`.
     ///
-    /// WGSL exposes only the global invocation id, so all three axes come from
-    /// the one vector.
+    /// WGSL names the launch index once, as an `@builtin` entry parameter, and
+    /// all three axes are components of that one vector.
     fn block_id_expr(&self, dim: u8) -> String {
         let axis = match dim {
             0 => "x",
             1 => "y",
             _ => "z",
         };
-        format!("i64(global_invocation_id.{axis})")
+        format!("i64({LAUNCH_INDEX}.{axis})")
     }
 
     /// Grid extent along `dim`, reconstructed from the output buffer's shape.
@@ -89,7 +110,7 @@ impl<'a> WgslDialect<'a> {
             return Ok("1".to_string());
         }
         let Some(output) = self.output.as_ref() else {
-            return Ok("i64(global_invocation_id.count)".to_string());
+            return Ok(format!("i64({LAUNCH_INDEX}.x)"));
         };
         let abi = output.param.abi.as_ref().ok_or_else(|| {
             sile_core::Error::Compile("missing output ABI for WGSL grid_dim".into())
@@ -99,13 +120,13 @@ impl<'a> WgslDialect<'a> {
             return Ok(format!(
                 "({SHAPES}[{offset}] / {})",
                 output.cols.max(1),
-                SHAPES = emit::SHAPES_PARAM_NAME
+                SHAPES = self.shapes_name
             ));
         }
         Ok(format!(
             "(({SHAPES}[{offset}] / {rows}) * ({SHAPES}[{}] / {cols}))",
             offset + 1,
-            SHAPES = emit::SHAPES_PARAM_NAME,
+            SHAPES = self.shapes_name,
             rows = output.rows.max(1),
             cols = output.cols.max(1)
         ))
@@ -122,19 +143,46 @@ fn wgsl_type(ty: &llvm_ir::Type) -> String {
         llvm_ir::Type::I64 => "i64".to_string(),
         llvm_ir::Type::F32 => "f32".to_string(),
         llvm_ir::Type::F64 => "f64".to_string(),
-        // WGSL arrays are one-dimensional, so a nested array becomes the flat
-        // element type. A private alloca whose type is a nested array is
-        // spelled by `var_decl` through this same path.
-        llvm_ir::Type::Ptr { pointee, .. } => match pointee.as_ref() {
-            llvm_ir::Type::Array { elem, .. } => format!("array<{}>", wgsl_type(elem)),
-            other => wgsl_type(other),
-        },
-        llvm_ir::Type::Array { elem, .. } => format!("array<{}>", wgsl_type(elem)),
+        llvm_ir::Type::Ptr { pointee, .. } => wgsl_type(pointee.as_ref()),
+        // WGSL arrays are one-dimensional: a nested array is the flat element
+        // type with the total element count. A private alloca that holds a
+        // tile is spelled through this same path, and a Gep chain already
+        // summed its indices into one element offset, so the flat storage and
+        // the flat index agree.
+        llvm_ir::Type::Array { .. } => {
+            let base = array_base_type(ty);
+            let count = array_element_count(ty);
+            format!("array<{base}, {count}>")
+        }
         llvm_ir::Type::Vector { elem, len } => format!("vec{}<{}>", len, wgsl_type(elem)),
     }
 }
 
+/// Element type at the bottom of a (possibly nested) array.
+fn array_base_type(ty: &llvm_ir::Type) -> String {
+    let mut current = ty;
+    while let llvm_ir::Type::Array { elem, .. } = current {
+        current = elem;
+    }
+    wgsl_type(current)
+}
+
+/// Total number of elements in a (possibly nested) array.
+fn array_element_count(ty: &llvm_ir::Type) -> usize {
+    let mut count = 1usize;
+    let mut current = ty;
+    while let llvm_ir::Type::Array { len, elem } = current {
+        count *= *len;
+        current = elem;
+    }
+    count
+}
+
 impl TargetDialect for WgslDialect<'_> {
+    fn shapes_name(&self) -> String {
+        self.shapes_name.clone()
+    }
+
     fn var_decl(
         &self,
         ty: &llvm_ir::Type,
@@ -153,13 +201,22 @@ impl TargetDialect for WgslDialect<'_> {
 
     fn signature(&self, name: &str, params: &[(String, String)]) -> String {
         // All buffers arrive as bindings, so the parameter list is empty apart
-        // from the launch index the entry point reads itself.
+        // from the launch index. WGSL names that index in the signature as an
+        // `@builtin`, which is the only way a compute entry point reads it.
+        //
+        // The entry attributes belong here, against the function they decorate.
+        // WGSL attributes attach to the declaration that follows them, so an
+        // entry attribute printed before the buffer bindings decorates those
+        // bindings instead, and the kernel stops being an entry point.
         let _ = params;
-        format!("fn sile_kernel_{name}() {{\n")
+        format!(
+            "@compute @workgroup_size(1)\n\
+             fn sile_kernel_{name}(@builtin(global_invocation_id) {LAUNCH_INDEX}: vec3<u32>) {{\n"
+        )
     }
 
     fn prelude_lines(&self) -> Vec<String> {
-        let mut lines = vec!["@compute @workgroup_size(1)".to_string()];
+        let mut lines = Vec::new();
         // Kernel buffers bind first, then the shapes descriptor, so a kernel's
         // bindings stay stable no matter how many shapes it carries.
         for param in &self.func.params {
@@ -191,9 +248,14 @@ impl TargetDialect for WgslDialect<'_> {
         NO_POINTERS
     }
 
-    fn declares_at_use(&self, inst: &llvm_ir::Inst) -> bool {
-        // A WGSL intrinsic is a `let` binding, so it must not be declared twice.
+    fn declares_intrinsic_at_use(&self, inst: &llvm_ir::Inst) -> bool {
+        // A WGSL intrinsic is a `let` binding, so it must not also be declared.
         matches!(inst.op, llvm_ir::InstOp::Intrinsic { .. })
+    }
+
+    fn select(&self) -> emit::SelectSpelling {
+        // WGSL has no conditional expression; a choice is a call.
+        emit::SelectSpelling::Function
     }
 
     fn vectorize_hint(&self, _is_simple_body: bool) -> Option<String> {

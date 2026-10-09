@@ -181,6 +181,25 @@ pub const NO_POINTERS: PointerSpelling = PointerSpelling {
     load_deref: false,
 };
 
+/// How a target spells a three-way choice.
+///
+/// C and MSL write `cond ? on_true : on_false`. WGSL has no conditional
+/// expression, so it calls `select(on_false, on_true, cond)` instead. The two
+/// argument orders differ, which is why the spelling is a parameter and not a
+/// format string.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SelectSpelling {
+    Ternary,
+    Function,
+}
+
+fn select_expr(spelling: SelectSpelling, cond: String, on_true: String, on_false: String) -> String {
+    match spelling {
+        SelectSpelling::Ternary => format!("({cond}) ? ({on_true}) : ({on_false})"),
+        SelectSpelling::Function => format!("select({on_false}, {on_true}, {cond})"),
+    }
+}
+
 /// Lower one instruction with the dialect's pointer spelling.
 ///
 /// `gep_elements` maps a Gep result to `(base, indices)`, which a language
@@ -191,6 +210,7 @@ pub fn lower_common_inst_line_with<FValue, FOperand>(
     value_name: FValue,
     format_operand: FOperand,
     pointers: PointerSpelling,
+    select: SelectSpelling,
     gep_elements: &mut HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)>,
 ) -> Option<String>
 where
@@ -206,21 +226,60 @@ where
         gep_elements.insert(result, ((*base).clone(), indices.clone()));
     }
 
-    let element = |ptr: &llvm_ir::Operand| -> String {
-        match ptr {
-            llvm_ir::Operand::Value(id) => match gep_elements.get(id) {
-                Some((base, indices)) => {
-                    let suffix = indices
-                        .iter()
-                        .map(|idx| format!("[{}]", format_operand(idx)))
-                        .collect::<Vec<_>>()
-                        .join("");
-                    format!("{}{suffix}", format_operand(base))
+    // A Gep result is the element it points at, spelled where it is consumed.
+    // A Gep's base can itself be a Gep, and every link of that chain offsets
+    // the same buffer by a number of elements, so the whole chain collapses to
+    // one buffer and one summed index: reading a dimension of a tensor's shape
+    // descriptor is a Gep into a Gep, and it addresses exactly one element.
+    fn element_chain<'g>(
+        ptr: &llvm_ir::Operand,
+        gep_elements: &'g HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)>,
+    ) -> Option<(&'g llvm_ir::Operand, Vec<&'g llvm_ir::Operand>)> {
+        let llvm_ir::Operand::Value(id) = ptr else {
+            return None;
+        };
+        let (base, indices) = gep_elements.get(id)?;
+        let (root, mut prefix) = match element_chain(base, gep_elements) {
+            Some((root, prefix)) => (root, prefix),
+            None => (base, Vec::new()),
+        };
+        prefix.extend(indices.iter());
+        Some((root, prefix))
+    }
+
+    fn element(
+        ptr: &llvm_ir::Operand,
+        gep_elements: &HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)>,
+        value_name: &dyn Fn(llvm_ir::ValueId) -> String,
+        format_operand: &dyn Fn(&llvm_ir::Operand) -> String,
+    ) -> String {
+        match element_chain(ptr, gep_elements) {
+            Some((root, indices)) => {
+                let terms: Vec<String> =
+                    indices.iter().map(|idx| format_operand(idx)).collect();
+                match terms.as_slice() {
+                    [] => format!("{}[0]", format_operand(root)),
+                    [one] => format!("{}[{one}]", format_operand(root)),
+                    many => format!(
+                        "{}[{}]",
+                        format_operand(root),
+                        many
+                            .iter()
+                            .map(|term| format!("({term})"))
+                            .collect::<Vec<_>>()
+                            .join(" + ")
+                    ),
                 }
-                None => format!("{}[0]", value_name(*id)),
+            }
+            None => match ptr {
+                llvm_ir::Operand::Value(id) => format!("{}[0]", value_name(*id)),
+                other => format_operand(other),
             },
-            other => format_operand(other),
         }
+    }
+
+    let element = |ptr: &llvm_ir::Operand| -> String {
+        element(ptr, gep_elements, &value_name, &format_operand)
     };
 
     match &inst.op {
@@ -248,11 +307,14 @@ where
             on_false,
         } => inst.result.map(|id| {
             format!(
-                "{} = ({}) ? ({}) : ({});",
+                "{} = {};",
                 value_name(id),
-                format_operand(cond),
-                format_operand(on_true),
-                format_operand(on_false)
+                select_expr(
+                    select,
+                    format_operand(cond),
+                    format_operand(on_true),
+                    format_operand(on_false)
+                )
             )
         }),
         llvm_ir::InstOp::Load { ptr } => inst.result.map(|id| {
@@ -366,6 +428,20 @@ pub trait TargetDialect {
         POINTER_LANGUAGE
     }
 
+    /// How this target spells a three-way choice.
+    fn select(&self) -> SelectSpelling {
+        SelectSpelling::Ternary
+    }
+
+    /// Name this target uses for the shape descriptor.
+    ///
+    /// Every kernel carries one shape descriptor, and it is the only IR name a
+    /// target has an opinion about, so it gets a method instead of making every
+    /// target spell a rename rule over arbitrary strings.
+    fn shapes_name(&self) -> String {
+        SHAPES_PARAM_NAME.to_string()
+    }
+
     /// A loop-carried hint the target wants before a simple loop, if any.
     ///
     /// `is_simple_body` reports that the loop has no inner control flow, which
@@ -380,7 +456,22 @@ pub trait TargetDialect {
     /// WGSL writes an intrinsic as `let name = expr;`, so hoisting a declaration
     /// too would define the same name twice. C and MSL assign to a hoisted
     /// variable, so they keep the default of declaring everything up front.
-    fn declares_at_use(&self, _inst: &llvm_ir::Inst) -> bool {
+    ///
+    /// A target with no pointers also declares nothing for a `gep`: the `gep`
+    /// result is the element it points at, spelled where it is consumed, so it
+    /// has no value and no type of its own to declare.
+    fn declares_at_use(&self, inst: &llvm_ir::Inst) -> bool {
+        self.pointers().has_address_of == false
+            && matches!(inst.op, llvm_ir::InstOp::Gep { .. })
+            || self.declares_intrinsic_at_use(inst)
+    }
+
+    /// True when an intrinsic is a `let`-style binding at its use.
+    ///
+    /// Separate from [`TargetDialect::declares_at_use`] because the `gep` half
+    /// of that answer comes from the pointer language and the intrinsic half is
+    /// a per-target choice, so mixing them makes the default wrong for C.
+    fn declares_intrinsic_at_use(&self, _inst: &llvm_ir::Inst) -> bool {
         false
     }
 
@@ -424,11 +515,24 @@ pub fn collect_alloca_results(func: &llvm_ir::Function) -> HashSet<llvm_ir::Valu
 
 impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
     pub fn new(func: &'a llvm_ir::Function, dialect: D) -> Self {
+        let value_names = build_value_names(func)
+            .into_iter()
+            .map(|(id, name)| {
+                // The shape descriptor is the one IR name a target can reject,
+                // so it is the one name renamed here.
+                let name = if name == SHAPES_PARAM_NAME {
+                    dialect.shapes_name()
+                } else {
+                    name
+                };
+                (id, name)
+            })
+            .collect();
         Self {
             func,
             dialect,
             allocas: collect_alloca_results(func),
-            value_names: build_value_names(func),
+            value_names,
             declared_values: HashSet::new(),
             gep_elements: HashMap::new(),
             indent: 0,
@@ -651,19 +755,17 @@ impl<D: TargetDialect> TargetEmitter<'_, D> {
             return Ok(());
         }
 
-        let (line, mut gep_elements) = {
+        let line = {
             let value_names = self.value_names.clone();
-            let pointers = self.dialect.pointers();
-            let line = lower_common_inst_line_with(
+            lower_common_inst_line_with(
                 inst,
                 |id| value_name(&value_names, id),
                 |op| format_operand(&value_names, op),
-                pointers,
+                self.dialect.pointers(),
+                self.dialect.select(),
                 &mut self.gep_elements,
-            );
-            (line, self.gep_elements.clone())
+            )
         };
-        let _ = &mut gep_elements;
         if let Some(line) = line {
             self.writeln(&line);
             return Ok(());
@@ -1168,13 +1270,14 @@ fn induction_step_from_backedge_arg(
     }
 }
 
+/// Loop step text, as an assignment every target accepts.
+///
+/// C spells this `++i`, and WGSL has no increment operator, so the shared
+/// emitter writes `i = i + step` even for a pointer target: both compile, and
+/// one spelling means the loop increment is not another place the dialects
+/// disagree.
 fn induction_step_expr(name: &str, step: i64) -> String {
-    match step {
-        1 => format!("++{name}"),
-        -1 => format!("--{name}"),
-        value if value > 0 => format!("{name} += {value}"),
-        value => format!("{name} -= {}", -value),
-    }
+    format!("{name} = {name} + {step}")
 }
 
 fn is_simple_loop_body(

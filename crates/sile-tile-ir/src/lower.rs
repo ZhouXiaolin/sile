@@ -109,7 +109,7 @@ impl<'a> LowerCtx<'a> {
             return value;
         }
         let value = self.push_param(
-            format!("__launch_idx{dim}"),
+            format!("launch_idx{dim}"),
             TileIrType::I64,
             TileIrParamKind::LaunchIndex { dim },
         );
@@ -132,7 +132,7 @@ impl<'a> LowerCtx<'a> {
             _ => 1,
         };
         let value = self.push_param(
-            format!("__shape_{}", source_name),
+            format!("shape_{}", source_name),
             TileIrType::ShapeDesc { rank },
             TileIrParamKind::ShapeDesc { source },
         );

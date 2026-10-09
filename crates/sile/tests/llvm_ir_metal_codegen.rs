@@ -24,7 +24,7 @@ fn dynamic_k_matmul_llir_codegen_emits_structured_metal_from_llvm_like_ir() {
     assert!(metal.contains("gid.x"));
     assert!(metal.contains("gid.x /"));
     assert!(metal.contains("gid.x %"));
-    assert!(metal.contains("__shape_a[1]"));
+    assert!(metal.contains("shape_a[1]"));
     assert!(!metal.contains("while ("));
     assert!(metal.contains("*(v"));
     assert!(metal.contains("&(a["));

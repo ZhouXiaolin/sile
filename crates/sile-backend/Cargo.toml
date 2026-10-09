@@ -8,5 +8,6 @@ sile-core = { path = "../sile-core" }
 sile-hir = { path = "../sile-hir" }
 sile-llvm-ir = { path = "../sile-llvm-ir" }
 libloading.workspace = true
+naga.workspace = true
 tempfile.workspace = true
 metal = "0.33.0"

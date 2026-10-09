@@ -29,15 +29,15 @@ fn dynamic_k_matmul_lowers_to_llvm_like_llvm_ir_with_explicit_memory_ops() {
     assert!(printed.contains("; args("));
     assert!(printed.contains("br i1"));
     assert!(
-        printed.contains("%__shape_a = getelementptr i64, ptr addrspace(4) %__sile_shapes, i64 0")
+        printed.contains("%shape_a = getelementptr i64, ptr addrspace(4) %__sile_shapes, i64 0")
     );
     assert!(
-        printed.contains("%__shape_b = getelementptr i64, ptr addrspace(4) %__sile_shapes, i64 2")
+        printed.contains("%shape_b = getelementptr i64, ptr addrspace(4) %__sile_shapes, i64 2")
     );
     assert!(
-        printed.contains("%__shape_c = getelementptr i64, ptr addrspace(4) %__sile_shapes, i64 4")
+        printed.contains("%shape_c = getelementptr i64, ptr addrspace(4) %__sile_shapes, i64 4")
     );
-    assert!(printed.contains("getelementptr i64, ptr addrspace(4) %__shape_a, i64 1"));
+    assert!(printed.contains("getelementptr i64, ptr addrspace(4) %shape_a, i64 1"));
     assert!(printed.contains("load i64, ptr addrspace(4)"));
     assert!(!printed.contains("alloca [2 x [2 x f32]], addrspace(5)"));
     assert!(!printed.contains("ptr addrspace(5)"));
