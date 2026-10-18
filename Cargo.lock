@@ -950,7 +950,6 @@ dependencies = [
  "naga",
  "pollster",
  "sile-core",
- "sile-hir",
  "sile-llvm-ir",
  "tempfile",
  "wgpu",

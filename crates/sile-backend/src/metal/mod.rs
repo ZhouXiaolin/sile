@@ -5,8 +5,6 @@ use metal::{CommandQueue, ComputePipelineState, Device, Library};
 #[cfg(target_os = "macos")]
 use sile_core::{KernelArg, LaunchConfig, Result, Stream};
 #[cfg(target_os = "macos")]
-use sile_hir::ParamKind;
-#[cfg(target_os = "macos")]
 use sile_llvm_ir::Function as LlvmIrFunction;
 
 #[cfg(target_os = "macos")]
@@ -70,7 +68,7 @@ impl MetalBackend {
     pub fn execute_llir(
         &self,
         func: &LlvmIrFunction,
-        param_kinds: &[ParamKind],
+        outputs: &[bool],
         args: &[KernelArg<'_>],
         scalars: &[f32],
         scalars_i64: &[i64],
@@ -82,7 +80,7 @@ impl MetalBackend {
         self.execute_source(
             &func.name,
             &source,
-            param_kinds,
+            outputs,
             args,
             scalars,
             scalars_i64,
@@ -104,7 +102,7 @@ impl MetalBackend {
         &self,
         kernel_name: &str,
         source: &str,
-        param_kinds: &[ParamKind],
+        outputs: &[bool],
         args: &[KernelArg<'_>],
         scalars: &[f32],
         scalars_i64: &[i64],
@@ -190,7 +188,7 @@ impl MetalBackend {
         command_buffer.wait_until_completed();
 
         for (i, arg) in args.iter().enumerate() {
-            let is_output = matches!(param_kinds.get(i), Some(ParamKind::Output));
+            let is_output = outputs.get(i).copied().unwrap_or(false);
             if is_output {
                 self.download_bytes(&mtl_buffers[i], arg.mut_ptr, arg.len_in_bytes());
             }

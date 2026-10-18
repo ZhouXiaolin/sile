@@ -15,5 +15,4 @@ tempfile.workspace = true
 # The Metal backend runs only on macOS. Codegen stays portable, but the runtime
 # binds the Objective-C frameworks, which do not build elsewhere.
 [target.'cfg(target_os = "macos")'.dependencies]
-sile-hir = { path = "../sile-hir" }
 metal = "0.33.0"

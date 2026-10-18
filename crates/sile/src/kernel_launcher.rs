@@ -197,19 +197,19 @@ impl<'a> KernelLauncher<'a> {
                 let typed = _typed;
                 maybe_print_backend_source(llvm_ir_func, CodegenTarget::Metal)?;
                 let backend = MetalBackend::new()?;
-                // `args` holds the buffers only, so the kinds list has to line
-                // up with it: a scalar parameter is not in `args` and would
-                // shift every output that follows it.
-                let param_kinds: Vec<_> = typed
+                // `args` holds the buffers only, so the output flags have to
+                // line up with it: a scalar parameter is not in `args` and
+                // would shift every output that follows it.
+                let outputs: Vec<bool> = typed
                     .kernel
                     .params
                     .iter()
                     .filter(|param| !matches!(param.ty, sile_hir::Type::Scalar(_)))
-                    .map(|param| param.kind)
+                    .map(|param| param.kind == sile_hir::ParamKind::Output)
                     .collect();
                 backend.execute_llir(
                     llvm_ir_func,
-                    &param_kinds,
+                    &outputs,
                     &self.args,
                     &self.scalars,
                     &self.scalars_i64,
