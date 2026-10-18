@@ -144,6 +144,12 @@ pub enum BinOp {
     Rem,
     And,
     Or,
+    Xor,
+    /// The bits of a count moved left: `shl` on integers.
+    Shl,
+    /// The bits of a count moved right: `ashr` on the signed counts this IR
+    /// carries.
+    Shr,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,6 +206,22 @@ pub enum Intrinsic {
     Log2,
     /// Square root of one float. The LLVM spelling is `llvm.sqrt.f32`.
     Sqrt,
+    /// Absolute value of one float.
+    Abs,
+    Sin,
+    Cos,
+    Tan,
+    Sinh,
+    Cosh,
+    Tanh,
+    /// The first integer not below `x`, as a float.
+    Ceil,
+    /// The first integer not above `x`, as a float.
+    Floor,
+    /// `x` raised to `y`, element by element. Two arguments.
+    Pow,
+    /// The angle of the point `(x, y)`. Two arguments, `y` first.
+    Atan2,
     /// Load `<len x elem_ty>` from contiguous memory starting at `ptr + offset`.
     /// Args: [ptr, offset]. Result type must be Vector.
     VecLoad {
@@ -229,6 +251,29 @@ impl Intrinsic {
             Intrinsic::Log => Some("log"),
             Intrinsic::Log2 => Some("log2"),
             Intrinsic::Sqrt => Some("sqrt"),
+            Intrinsic::Abs => Some("fabs"),
+            Intrinsic::Sin => Some("sin"),
+            Intrinsic::Cos => Some("cos"),
+            Intrinsic::Tan => Some("tan"),
+            Intrinsic::Sinh => Some("sinh"),
+            Intrinsic::Cosh => Some("cosh"),
+            Intrinsic::Tanh => Some("tanh"),
+            Intrinsic::Ceil => Some("ceil"),
+            Intrinsic::Floor => Some("floor"),
+            _ => None,
+        }
+    }
+
+    /// The name a two-argument float function has on every target, when this
+    /// intrinsic is one.
+    ///
+    /// The same three-way spelling rule as [`Intrinsic::float_function`]: the
+    /// C library adds an `f`, Metal puts the name behind `metal::`, and WGSL
+    /// uses it as it stands.
+    pub fn binary_float_function(&self) -> Option<&'static str> {
+        match self {
+            Intrinsic::Pow => Some("pow"),
+            Intrinsic::Atan2 => Some("atan2"),
             _ => None,
         }
     }

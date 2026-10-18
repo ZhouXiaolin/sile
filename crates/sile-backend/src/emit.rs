@@ -106,6 +106,9 @@ pub fn bin_op_symbol(op: llvm_ir::BinOp) -> &'static str {
         llvm_ir::BinOp::Rem => "%",
         llvm_ir::BinOp::And => "&",
         llvm_ir::BinOp::Or => "|",
+        llvm_ir::BinOp::Xor => "^",
+        llvm_ir::BinOp::Shl => "<<",
+        llvm_ir::BinOp::Shr => ">>",
     }
 }
 
@@ -1702,6 +1705,7 @@ fn is_simple_loop_body(
                 llvm_ir::InstOp::Call { .. } => true,
                 llvm_ir::InstOp::Intrinsic { intrinsic, .. } => {
                     intrinsic.float_function().is_some()
+                        || intrinsic.binary_float_function().is_some()
                 }
                 _ => false,
             };

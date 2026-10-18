@@ -592,6 +592,9 @@ fn format_bin_op(op: BinOp, ty: &Type) -> &'static str {
         (BinOp::Rem, false) => "srem",
         (BinOp::And, _) => "and",
         (BinOp::Or, _) => "or",
+        (BinOp::Xor, _) => "xor",
+        (BinOp::Shl, _) => "shl",
+        (BinOp::Shr, _) => "ashr",
     }
 }
 
@@ -667,7 +670,20 @@ fn format_intrinsic(
             footer,
         ),
         Intrinsic::Barrier { .. } => "call void @llvm.nvvm.barrier0()".to_string(),
-        Intrinsic::Exp | Intrinsic::Exp2 | Intrinsic::Log | Intrinsic::Log2 | Intrinsic::Sqrt => {
+        Intrinsic::Exp
+        | Intrinsic::Exp2
+        | Intrinsic::Log
+        | Intrinsic::Log2
+        | Intrinsic::Sqrt
+        | Intrinsic::Abs
+        | Intrinsic::Sin
+        | Intrinsic::Cos
+        | Intrinsic::Tan
+        | Intrinsic::Sinh
+        | Intrinsic::Cosh
+        | Intrinsic::Tanh
+        | Intrinsic::Ceil
+        | Intrinsic::Floor => {
             let function = intrinsic
                 .float_function()
                 .expect("a float function has a name");
@@ -679,6 +695,23 @@ fn format_intrinsic(
                 format_exp_suffix(result_ty),
                 format_operand_type(arg, types),
                 format_operand(arg, names)
+            )
+        }
+        Intrinsic::Pow | Intrinsic::Atan2 => {
+            let function = intrinsic
+                .binary_float_function()
+                .expect("a binary float function has a name");
+            let lhs = args.first().expect("a binary float function takes two arguments");
+            let rhs = args.get(1).expect("a binary float function takes two arguments");
+            format!(
+                "call {} @llvm.{}.{}({} {}, {} {})",
+                format_type(result_ty),
+                function,
+                format_exp_suffix(result_ty),
+                format_operand_type(lhs, types),
+                format_operand(lhs, names),
+                format_operand_type(rhs, types),
+                format_operand(rhs, names)
             )
         }
         Intrinsic::VecLoad { len } => format_runtime_call(

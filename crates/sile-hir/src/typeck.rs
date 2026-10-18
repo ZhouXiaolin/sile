@@ -518,6 +518,38 @@ fn infer_builtin(
         // `let s = a.shape();` bind a value that lowering turns into zero.
         // `x.shape()` is a shape expression whose dimensions are the buffer's.
         BuiltinOp::ShapeOf => Ok(Type::Shape(buffer_declared_shape(args, 0, locals))),
+        // `pow` and `atan2` are pointwise float functions. They follow the
+        // arithmetic rule: two tiles of one shape, or scalars, with the wider
+        // operand's shape.
+        BuiltinOp::Pow | BuiltinOp::Atan2 => {
+            if let (Some(Type::Tile { shape: lhs, .. }), Some(Type::Tile { shape: rhs, .. })) =
+                (arg_types.first(), arg_types.get(1))
+                && lhs != rhs
+            {
+                return Err(TypeError::invalid_kernel(format!(
+                    "pointwise operands have different shapes: {lhs} and {rhs}"
+                )));
+            }
+            match (arg_types.first(), arg_types.get(1)) {
+                (Some(Type::Tile { shape, .. }), _) => Ok(Type::tile(ElemType::F32, shape.clone())),
+                (_, Some(Type::Tile { shape, .. })) => Ok(Type::tile(ElemType::F32, shape.clone())),
+                _ => Ok(Type::Scalar(ElemType::F32)),
+            }
+        }
+        // An exclusive or, a shift: operations on counts. A mask has no
+        // exclusive or and a float has no bit pattern this IR names, so a tile
+        // operand is a written mistake rather than an operation.
+        BuiltinOp::Xor | BuiltinOp::Shl | BuiltinOp::Shr => {
+            if arg_types
+                .iter()
+                .any(|ty| matches!(ty, Type::Tile { .. } | Type::Tensor { .. }))
+            {
+                return Err(TypeError::invalid_kernel(format!(
+                    "{op:?} is a count operation; it takes scalars, not tiles"
+                )));
+            }
+            Ok(Type::Scalar(ElemType::F32))
+        }
         // `ceil_div(a, b)` rounds a division of counts up, so its result is a
         // count, not a tile.
         BuiltinOp::ScalarDiv | BuiltinOp::ShapeDim | BuiltinOp::CeilDiv => {
@@ -575,6 +607,9 @@ fn check_arity(op: BuiltinOp, actual: usize) -> Result<(), TypeError> {
         BuiltinOp::Iota => (1, 1),
         BuiltinOp::ScalarDiv => (2, 2),
         BuiltinOp::Index => (2, 2),
+        BuiltinOp::Pow | BuiltinOp::Atan2 | BuiltinOp::Xor | BuiltinOp::Shl | BuiltinOp::Shr => {
+            (2, 2)
+        }
     };
     if (min..=max).contains(&actual) {
         return Ok(());

@@ -265,7 +265,11 @@ fn const_key(constant: &Constant) -> String {
 }
 
 fn canonical_bin_pair(op: BinOp, lhs: String, rhs: String) -> (String, String) {
-    if matches!(op, BinOp::Add | BinOp::Mul | BinOp::And | BinOp::Or) && lhs > rhs {
+    if matches!(
+        op,
+        BinOp::Add | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor
+    ) && lhs > rhs
+    {
         (rhs, lhs)
     } else {
         (lhs, rhs)

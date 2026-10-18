@@ -1125,6 +1125,47 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 ty,
             )
         }
+        // Pow and atan2 are the two binary functions every target spells as a
+        // library call, so they ride the map node the way a unary does.
+        BuiltinOp::Pow | BuiltinOp::Atan2 => {
+            let lhs = lower_expr(&args[0], ctx);
+            let rhs = lower_expr(&args[1], ctx);
+            let shape = tile_shape_of(lhs, ctx).or_else(|| tile_shape_of(rhs, ctx));
+            let (rows, cols) = shape.unwrap_or((1, 1));
+            let expr = if op == BuiltinOp::Pow {
+                TileMapExpr::Pow {
+                    lhs: Box::new(TileMapExpr::Value(lhs)),
+                    rhs: Box::new(TileMapExpr::Value(rhs)),
+                }
+            } else {
+                TileMapExpr::Atan2 {
+                    lhs: Box::new(TileMapExpr::Value(lhs)),
+                    rhs: Box::new(TileMapExpr::Value(rhs)),
+                }
+            };
+            ctx.emit(
+                TileIrOp::Map { expr, rows, cols },
+                pointwise_result_ty(shape, &[lhs, rhs], ctx),
+            )
+        }
+        // An exclusive or and the shifts are count operations. Typeck rejects
+        // tile operands, and a float operand has no bit pattern this IR names,
+        // so both operands are counts by the time lowering sees them.
+        BuiltinOp::Xor | BuiltinOp::Shl | BuiltinOp::Shr => {
+            let lhs = lower_expr(&args[0], ctx);
+            let rhs = lower_expr(&args[1], ctx);
+            assert!(
+                !is_float_operand(lhs, ctx) && !is_float_operand(rhs, ctx),
+                "{op:?} is a count operation; its operands are counts, not floats"
+            );
+            let bin_op = match op {
+                BuiltinOp::Xor => BinOp::Xor,
+                BuiltinOp::Shl => BinOp::Shl,
+                BuiltinOp::Shr => BinOp::Shr,
+                _ => unreachable!("the arm names the operations it reads"),
+            };
+            ctx.emit(TileIrOp::IBinary { op: bin_op, lhs, rhs }, TileIrType::I64)
+        }
         // A comparison yields `0.0`/`1.0` per element, so it is a map too. The
         // select that consumes it reads the same coordinates, which is what
         // makes `select(gt_tile(a, b), a, b)` a pointwise maximum.
@@ -1438,7 +1479,7 @@ fn lower_arith(op: BinOp, lhs: ValueId, rhs: ValueId, ctx: &mut LowerCtx<'_>) ->
         BinOp::Mul => TileIrOp::MulF { lhs, rhs, rows, cols },
         BinOp::Div => TileIrOp::DivF { lhs, rhs, rows, cols },
         BinOp::Rem => unreachable!("a remainder rides the map node"),
-        BinOp::And | BinOp::Or => {
+        BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Shl | BinOp::Shr => {
             unreachable!("a bitwise operation is not a tile operation")
         }
     };

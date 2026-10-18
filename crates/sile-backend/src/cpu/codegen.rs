@@ -469,11 +469,26 @@ fn intrinsic_name(intrinsic: &llvm_ir::Intrinsic) -> String {
         | llvm_ir::Intrinsic::Exp2
         | llvm_ir::Intrinsic::Log
         | llvm_ir::Intrinsic::Log2
-        | llvm_ir::Intrinsic::Sqrt => format!(
+        | llvm_ir::Intrinsic::Sqrt
+        | llvm_ir::Intrinsic::Abs
+        | llvm_ir::Intrinsic::Sin
+        | llvm_ir::Intrinsic::Cos
+        | llvm_ir::Intrinsic::Tan
+        | llvm_ir::Intrinsic::Sinh
+        | llvm_ir::Intrinsic::Cosh
+        | llvm_ir::Intrinsic::Tanh
+        | llvm_ir::Intrinsic::Ceil
+        | llvm_ir::Intrinsic::Floor => format!(
             "{}f",
             intrinsic
                 .float_function()
                 .expect("a float function has a name")
+        ),
+        llvm_ir::Intrinsic::Pow | llvm_ir::Intrinsic::Atan2 => format!(
+            "{}f",
+            intrinsic
+                .binary_float_function()
+                .expect("a binary float function has a name")
         ),
         llvm_ir::Intrinsic::VecLoad { len } => format!("llir_vec_load_{}", len),
         llvm_ir::Intrinsic::VecStore { len } => format!("llir_vec_store_{}", len),

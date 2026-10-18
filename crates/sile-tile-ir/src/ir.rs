@@ -122,6 +122,18 @@ pub enum TileMapExpr {
         op: UnaryOp,
         operand: Box<TileMapExpr>,
     },
+    /// `pow(a, b)`: `a` raised to `b`, element by element. The two-argument
+    /// float functions ride this tree the way the one-argument ones ride
+    /// [`TileMapExpr::Unary`], because both are pointwise.
+    Pow {
+        lhs: Box<TileMapExpr>,
+        rhs: Box<TileMapExpr>,
+    },
+    /// `atan2(y, x)`: the angle of the point `(x, y)`.
+    Atan2 {
+        lhs: Box<TileMapExpr>,
+        rhs: Box<TileMapExpr>,
+    },
     /// The remainder of a division.
     Rem {
         lhs: Box<TileMapExpr>,
@@ -367,6 +379,13 @@ pub enum BinOp {
     /// The bitwise or of two counts. A disjunction of masks is a maximum, so it
     /// uses `Select` instead.
     Or,
+    /// The exclusive or of two counts. There is no mask reading: one of two
+    /// masks being set is their difference, not a value an element type holds.
+    Xor,
+    /// The bits of a count moved left.
+    Shl,
+    /// The bits of a count moved right.
+    Shr,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -389,6 +408,9 @@ impl fmt::Display for BinOp {
             BinOp::Rem => write!(f, "rem"),
             BinOp::And => write!(f, "and"),
             BinOp::Or => write!(f, "or"),
+            BinOp::Xor => write!(f, "xor"),
+            BinOp::Shl => write!(f, "shl"),
+            BinOp::Shr => write!(f, "shr"),
         }
     }
 }
@@ -594,7 +616,9 @@ fn collect_tile_map_expr_uses(expr: &TileMapExpr, uses: &mut Vec<ValueId>) {
         | TileMapExpr::Sub { lhs, rhs }
         | TileMapExpr::Mul { lhs, rhs }
         | TileMapExpr::Div { lhs, rhs }
-        | TileMapExpr::Rem { lhs, rhs } => {
+        | TileMapExpr::Rem { lhs, rhs }
+        | TileMapExpr::Pow { lhs, rhs }
+        | TileMapExpr::Atan2 { lhs, rhs } => {
             collect_tile_map_expr_uses(lhs, uses);
             collect_tile_map_expr_uses(rhs, uses);
         }

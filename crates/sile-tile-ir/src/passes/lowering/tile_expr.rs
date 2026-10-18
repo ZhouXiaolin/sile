@@ -634,7 +634,9 @@ pub(crate) fn collect_map_load_bases(
         | TileMapExpr::Sub { lhs, rhs }
         | TileMapExpr::Mul { lhs, rhs }
         | TileMapExpr::Div { lhs, rhs }
-        | TileMapExpr::Rem { lhs, rhs } => {
+        | TileMapExpr::Rem { lhs, rhs }
+        | TileMapExpr::Pow { lhs, rhs }
+        | TileMapExpr::Atan2 { lhs, rhs } => {
             collect_map_load_bases(lhs, ctx, tile_ir, out, bases, coord_bases);
             collect_map_load_bases(rhs, ctx, tile_ir, out, bases, coord_bases);
         }
@@ -704,13 +706,36 @@ fn eval_unary_scalar(
                 llvm_ir::Type::F32,
             )
         }
-        UnaryOp::Exp | UnaryOp::Exp2 | UnaryOp::Log | UnaryOp::Log2 | UnaryOp::Sqrt => {
+        UnaryOp::Exp
+        | UnaryOp::Exp2
+        | UnaryOp::Log
+        | UnaryOp::Log2
+        | UnaryOp::Sqrt
+        | UnaryOp::Abs
+        | UnaryOp::Sin
+        | UnaryOp::Cos
+        | UnaryOp::Tan
+        | UnaryOp::Sinh
+        | UnaryOp::Cosh
+        | UnaryOp::Tanh
+        | UnaryOp::Ceil
+        | UnaryOp::Floor => {
             let intrinsic = match op {
                 UnaryOp::Exp => llvm_ir::Intrinsic::Exp,
                 UnaryOp::Exp2 => llvm_ir::Intrinsic::Exp2,
                 UnaryOp::Log => llvm_ir::Intrinsic::Log,
                 UnaryOp::Log2 => llvm_ir::Intrinsic::Log2,
-                _ => llvm_ir::Intrinsic::Sqrt,
+                UnaryOp::Sqrt => llvm_ir::Intrinsic::Sqrt,
+                UnaryOp::Abs => llvm_ir::Intrinsic::Abs,
+                UnaryOp::Sin => llvm_ir::Intrinsic::Sin,
+                UnaryOp::Cos => llvm_ir::Intrinsic::Cos,
+                UnaryOp::Tan => llvm_ir::Intrinsic::Tan,
+                UnaryOp::Sinh => llvm_ir::Intrinsic::Sinh,
+                UnaryOp::Cosh => llvm_ir::Intrinsic::Cosh,
+                UnaryOp::Tanh => llvm_ir::Intrinsic::Tanh,
+                UnaryOp::Ceil => llvm_ir::Intrinsic::Ceil,
+                UnaryOp::Floor => llvm_ir::Intrinsic::Floor,
+                _ => unreachable!("Neg and Rsqrt are handled above"),
             };
             emit_intrinsic(ctx, out, intrinsic, vec![operand], llvm_ir::Type::F32)
         }
@@ -849,6 +874,48 @@ pub(crate) fn eval_map_expr_scalar(
             );
             let rhs = eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
             emit_bin(ctx, out, llvm_ir::BinOp::Div, lhs, rhs, scalar_ty(count))
+        }
+        // Pow and atan2 are the two binary functions the targets spell as
+        // library calls, so they lower to intrinsics like a unary does.
+        TileMapExpr::Pow { lhs, rhs } => {
+            let lhs = eval_map_expr_scalar(
+                lhs,
+                row.clone(),
+                col.clone(),
+                ctx,
+                tile_ir,
+                fused_load_bases,
+                out,
+                count,
+            );
+            let rhs = eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
+            emit_intrinsic(
+                ctx,
+                out,
+                llvm_ir::Intrinsic::Pow,
+                vec![lhs, rhs],
+                llvm_ir::Type::F32,
+            )
+        }
+        TileMapExpr::Atan2 { lhs, rhs } => {
+            let lhs = eval_map_expr_scalar(
+                lhs,
+                row.clone(),
+                col.clone(),
+                ctx,
+                tile_ir,
+                fused_load_bases,
+                out,
+                count,
+            );
+            let rhs = eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
+            emit_intrinsic(
+                ctx,
+                out,
+                llvm_ir::Intrinsic::Atan2,
+                vec![lhs, rhs],
+                llvm_ir::Type::F32,
+            )
         }
         TileMapExpr::Unary { op, operand } => {
             let operand =
@@ -1012,10 +1079,12 @@ fn map_expr_is_count(expr: &TileMapExpr, tile_ir: &TileIrFunction) -> bool {
         TileMapExpr::Select {
             on_true, on_false, ..
         } => map_expr_is_count(on_true, tile_ir) && map_expr_is_count(on_false, tile_ir),
-        // A sequence, a splat, a transcendental, a load and a broadcast of one
-        // are all element values.
+        // A sequence, a splat, a transcendental, a binary float function, a
+        // load and a broadcast of one are all element values.
         TileMapExpr::Splat { .. }
         | TileMapExpr::Unary { .. }
+        | TileMapExpr::Pow { .. }
+        | TileMapExpr::Atan2 { .. }
         | TileMapExpr::Iota
         | TileMapExpr::Broadcast { .. }
         | TileMapExpr::Transpose { .. }

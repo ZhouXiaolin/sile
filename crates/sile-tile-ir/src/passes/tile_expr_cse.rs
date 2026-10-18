@@ -407,6 +407,14 @@ fn rewrite_map_expr(
             lhs: Box::new(rewrite_map_expr(*lhs, replacements)),
             rhs: Box::new(rewrite_map_expr(*rhs, replacements)),
         },
+        crate::TileMapExpr::Pow { lhs, rhs } => crate::TileMapExpr::Pow {
+            lhs: Box::new(rewrite_map_expr(*lhs, replacements)),
+            rhs: Box::new(rewrite_map_expr(*rhs, replacements)),
+        },
+        crate::TileMapExpr::Atan2 { lhs, rhs } => crate::TileMapExpr::Atan2 {
+            lhs: Box::new(rewrite_map_expr(*lhs, replacements)),
+            rhs: Box::new(rewrite_map_expr(*rhs, replacements)),
+        },
         crate::TileMapExpr::Transpose { value } => crate::TileMapExpr::Transpose {
             value: Box::new(rewrite_map_expr(*value, replacements)),
         },

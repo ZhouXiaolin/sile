@@ -100,6 +100,20 @@ pub enum BuiltinOp {
     ScalarDiv,
     ShapeDim,
     Index,
+    /// `pow(a, b)`: `a` raised to `b`, element by element. CuTile names it as
+    /// one operation and every target spells one, so it travels as data the
+    /// same way a [`BuiltinOp::Unary`] does.
+    Pow,
+    /// `atan2(y, x)`: the angle of the point `(x, y)`.
+    Atan2,
+    /// `xori(a, b)`: the exclusive or of two counts. A mask has no exclusive
+    /// or — one of two masks being set is their difference, not a value this
+    /// IR carries — so a tile operand is a checker error.
+    Xor,
+    /// `shli(a, b)`: the counts' bits moved left.
+    Shl,
+    /// `shri(a, b)`: the bits moved right, arithmetically for a signed count.
+    Shr,
 }
 
 /// A one-operand float operation.
@@ -123,6 +137,20 @@ pub enum UnaryOp {
     Sqrt,
     /// `rsqrt(x)`: one over the square root.
     Rsqrt,
+    /// `absf(x)`: the absolute value.
+    Abs,
+    /// `sin(x)`, `cos(x)`, `tan(x)`, and their hyperbolic siblings. Each is one
+    /// instruction on every target, which is the bar [`UnaryOp`] holds.
+    Sin,
+    Cos,
+    Tan,
+    Sinh,
+    Cosh,
+    Tanh,
+    /// `ceil(x)`: the first integer not below `x`, as a float.
+    Ceil,
+    /// `floor(x)`: the first integer not above `x`, as a float.
+    Floor,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

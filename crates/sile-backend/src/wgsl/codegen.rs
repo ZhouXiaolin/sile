@@ -505,16 +505,47 @@ impl TargetDialect for WgslDialect<'_> {
             | llvm_ir::Intrinsic::Exp2
             | llvm_ir::Intrinsic::Log
             | llvm_ir::Intrinsic::Log2
-            | llvm_ir::Intrinsic::Sqrt => {
+            | llvm_ir::Intrinsic::Sqrt
+            | llvm_ir::Intrinsic::Abs
+            | llvm_ir::Intrinsic::Sin
+            | llvm_ir::Intrinsic::Cos
+            | llvm_ir::Intrinsic::Tan
+            | llvm_ir::Intrinsic::Sinh
+            | llvm_ir::Intrinsic::Cosh
+            | llvm_ir::Intrinsic::Tanh
+            | llvm_ir::Intrinsic::Ceil
+            | llvm_ir::Intrinsic::Floor => {
                 let [arg] = args else {
                     return Err(sile_core::Error::Compile(
                         "a float function takes one argument".into(),
                     ));
                 };
-                let function = intrinsic
-                    .float_function()
-                    .expect("a float function has a name");
+                // WGSL names the absolute value `abs`; the shared table says
+                // `fabs`, the C and MSL spelling.
+                let function = match intrinsic {
+                    llvm_ir::Intrinsic::Abs => "abs",
+                    _ => intrinsic
+                        .float_function()
+                        .expect("a float function has a name"),
+                };
                 format!("let {} = {}({});", name(), function, format_operand(arg))
+            }
+            llvm_ir::Intrinsic::Pow | llvm_ir::Intrinsic::Atan2 => {
+                let [lhs, rhs] = args else {
+                    return Err(sile_core::Error::Compile(
+                        "a binary float function takes two arguments".into(),
+                    ));
+                };
+                let function = intrinsic
+                    .binary_float_function()
+                    .expect("a binary float function has a name");
+                format!(
+                    "let {} = {}({}, {});",
+                    name(),
+                    function,
+                    format_operand(lhs),
+                    format_operand(rhs)
+                )
             }
             llvm_ir::Intrinsic::VecLoad { len } => {
                 let [ptr, offset] = args else {

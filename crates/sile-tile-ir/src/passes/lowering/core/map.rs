@@ -48,6 +48,9 @@ pub(crate) fn lower_bin_op(op: BinOp) -> llvm_ir::BinOp {
         BinOp::Rem => llvm_ir::BinOp::Rem,
         BinOp::And => llvm_ir::BinOp::And,
         BinOp::Or => llvm_ir::BinOp::Or,
+        BinOp::Xor => llvm_ir::BinOp::Xor,
+        BinOp::Shl => llvm_ir::BinOp::Shl,
+        BinOp::Shr => llvm_ir::BinOp::Shr,
     }
 }
 

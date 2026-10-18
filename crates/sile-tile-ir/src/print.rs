@@ -13,6 +13,15 @@ fn unary_name(op: UnaryOp) -> &'static str {
         UnaryOp::Log2 => "log2",
         UnaryOp::Sqrt => "sqrt",
         UnaryOp::Rsqrt => "rsqrt",
+        UnaryOp::Abs => "absf",
+        UnaryOp::Sin => "sin",
+        UnaryOp::Cos => "cos",
+        UnaryOp::Tan => "tan",
+        UnaryOp::Sinh => "sinh",
+        UnaryOp::Cosh => "cosh",
+        UnaryOp::Tanh => "tanh",
+        UnaryOp::Ceil => "ceil",
+        UnaryOp::Floor => "floor",
     }
 }
 
@@ -300,6 +309,20 @@ fn format_tile_map_expr(expr: &TileMapExpr) -> String {
         TileMapExpr::Unary { op, operand } => {
             format!("{}({})", unary_name(*op), format_tile_map_expr(operand))
         }
+        TileMapExpr::Pow { lhs, rhs } => {
+            format!(
+                "powf({}, {})",
+                format_tile_map_expr(lhs),
+                format_tile_map_expr(rhs)
+            )
+        }
+        TileMapExpr::Atan2 { lhs, rhs } => {
+            format!(
+                "atan2({}, {})",
+                format_tile_map_expr(lhs),
+                format_tile_map_expr(rhs)
+            )
+        }
         TileMapExpr::Select {
             cond,
             on_true,
@@ -379,6 +402,9 @@ fn format_tile_binary_op(op: BinOp, is_float: bool) -> &'static str {
         (BinOp::Rem, false) => "remi",
         (BinOp::And, _) => "and",
         (BinOp::Or, _) => "or",
+        (BinOp::Xor, _) => "xori",
+        (BinOp::Shl, _) => "shli",
+        (BinOp::Shr, _) => "shri",
     }
 }
 
