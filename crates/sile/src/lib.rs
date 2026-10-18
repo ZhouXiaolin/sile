@@ -1,6 +1,6 @@
 pub use sile_core as core;
 pub use sile_hir as hir;
-pub use sile_macros::kernel;
+pub use sile_macros::{kernel, module};
 
 pub use sile_core::{Device, Error, KernelArg, LaunchConfig, Result, Stream};
 pub use sile_hir::{

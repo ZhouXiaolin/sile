@@ -272,14 +272,58 @@ fn rewrite_stmt(stmt: &syn::Stmt) -> syn::Stmt {
 #[proc_macro_attribute]
 pub fn kernel(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(item as syn::ItemFn);
-    let decl = match frontend::parse::parse_kernel(&input) {
-        Ok(value) => value,
-        Err(err) => return err.to_compile_error().into(),
+    expand_kernel_fn(&input)
+        .unwrap_or_else(|err| err.to_compile_error())
+        .into()
+}
+
+/// The entry keys a `#[sile::entry(...)]` accepts. They all name a compiler
+/// behavior of the CUDA front end — diagnostics, proofs, tuning — and none of
+/// them changes the program this front end builds, so each one is accepted by
+/// name and dropped. A key that is not on the list is a typo, and a typo must
+/// fail at compile time rather than pass silently.
+const ENTRY_KEYS: &[&str] = &[
+    "print_ir",
+    "dump_mlir_dir",
+    "unchecked_accesses",
+    "deny_in_kernel_checks",
+    "preconditions",
+    "optimization_hints",
+];
+
+/// Accepts every key on [`ENTRY_KEYS`] and rejects every other one. The value
+/// a key carries is not read: the behaviors they name live in the CUDA
+/// compiler's pass pipeline, and this front end names its own through the
+/// `SILE_PRINT_*` environment variables.
+fn validate_entry_keys(attr: &syn::Attribute) -> syn::Result<()> {
+    let syn::Meta::List(list) = &attr.meta else {
+        return Ok(()); // `#[entry]` with no keys has nothing to check.
     };
-    let kernel_hir = match frontend::lower::lower_kernel_to_hir(&decl) {
-        Ok(value) => value,
-        Err(err) => return err.to_compile_error().into(),
-    };
+    let keys = list.parse_args_with(
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+    )?;
+    for meta in keys {
+        let key = meta
+            .path()
+            .get_ident()
+            .map(syn::Ident::to_string)
+            .unwrap_or_default();
+        if !ENTRY_KEYS.contains(&key.as_str()) {
+            return Err(syn::Error::new_spanned(
+                &meta,
+                format!(
+                    "`{key}` is not an entry attribute; the keys are: {}",
+                    ENTRY_KEYS.join(", ")
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn expand_kernel_fn(input: &syn::ItemFn) -> syn::Result<proc_macro2::TokenStream> {
+    let decl = frontend::parse::parse_kernel(input)?;
+    let kernel_hir = frontend::lower::lower_kernel_to_hir(&decl)?;
     let name = &input.sig.ident;
     let vis = &input.vis;
     let attrs = &input.attrs;
@@ -341,7 +385,8 @@ pub fn kernel(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let params: Vec<FnArg> = input
         .sig
         .inputs
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|mut arg| {
             if let FnArg::Typed(ref mut pt) = arg {
                 pt.ty = Box::new(rewrite_type(&pt.ty));
@@ -398,8 +443,12 @@ pub fn kernel(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // HIR is a compile-time value here, so it is built inline. The expensive
     // part of a launch is the Tile IR -> LLVM IR -> backend pipeline, and that
     // is cached by the launcher, keyed on the HIR it actually received.
+    // The host body is a stub: loops run once, a return hands back nothing.
+    // The warnings that stub would raise are noise the device program does
+    // not have, so the expansion silences exactly those two.
     let expanded = quote::quote! {
         #( #attrs )*
+        #[allow(unused_assignments, unused_variables)]
         #vis fn #name<'kernel, #(#const_generics),*>(#(#params),*) -> ::sile::KernelLauncher<'kernel> {
             // The scalars are read before the body runs, and under names the
             // body cannot shadow. A kernel may rebind a parameter to a value of
@@ -421,5 +470,135 @@ pub fn kernel(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    expanded.into()
+    Ok(expanded)
+}
+
+#[proc_macro_attribute]
+pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(item as syn::ItemMod);
+    expand_module(&input)
+        .unwrap_or_else(|err| err.to_compile_error())
+        .into()
+}
+
+/// Expands a `#[sile::module]`: the entry functions become launchers, exactly
+/// what `#[sile::kernel]` builds, and every device function stays a plain
+/// function whose calls the entries inlined at their call sites.
+fn expand_module(input: &syn::ItemMod) -> syn::Result<proc_macro2::TokenStream> {
+    use std::collections::HashMap;
+
+    let content = input
+        .content
+        .as_ref()
+        .map(|(_, items)| items)
+        .expect("a module macro on a mod with a body");
+    let mut entries: Vec<syn::ItemFn> = Vec::new();
+    let mut devices: HashMap<String, frontend::inline::DeviceFn> = HashMap::new();
+    let mut kept: Vec<syn::Item> = Vec::new();
+    // The attribute the surface spells `#[sile::entry]` reaches this macro
+    // with the crate name as its first segment, so the last segment is what
+    // names it.
+    let is_entry_attr = |attr: &syn::Attribute| {
+        attr.path()
+            .segments
+            .last()
+            .map(|segment| segment.ident == "entry")
+            .unwrap_or(false)
+    };
+    for item in content {
+        match item {
+            syn::Item::Fn(f) => {
+                let entry_attr = f.attrs.iter().find(|attr| is_entry_attr(attr)).cloned();
+                if let Some(attr) = entry_attr {
+                    validate_entry_keys(&attr)?;
+                    let mut f = f.clone();
+                    f.attrs.retain(|attr| !is_entry_attr(attr));
+                    entries.push(f);
+                } else {
+                    let params: Vec<String> = f
+                        .sig
+                        .inputs
+                        .iter()
+                        .filter_map(|arg| match arg {
+                            syn::FnArg::Typed(pt) => match pt.pat.as_ref() {
+                                syn::Pat::Ident(ident) => Some(ident.ident.to_string()),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .collect();
+                    devices.insert(
+                        f.sig.ident.to_string(),
+                        frontend::inline::DeviceFn {
+                            params,
+                            returns: !matches!(&f.sig.output, syn::ReturnType::Default),
+                            body: f.block.stmts.clone(),
+                        },
+                    );
+                    // The device function stays for the host: its signature
+                    // keeps a plain Tile and its body keeps the stub calls,
+                    // the same treatment an entry's body gets.
+                    let mut f = f.clone();
+                    // The calls this function would serve were inlined into
+                    // the entries, so the host copy has no caller: it stays
+                    // for the host build to type-check, and that is dead code
+                    // by design.
+                    f.attrs.push(syn::parse_quote!(#[allow(dead_code)]));
+                    f.sig.inputs = f
+                        .sig
+                        .inputs
+                        .into_iter()
+                        .map(|mut arg| {
+                            if let syn::FnArg::Typed(ref mut pt) = arg {
+                                pt.ty = Box::new(rewrite_type(&pt.ty));
+                            }
+                            arg
+                        })
+                        .collect();
+                    f.block.stmts = f
+                        .block
+                        .stmts
+                        .iter()
+                        .map(rewrite_stmt)
+                        .collect();
+                    kept.push(syn::Item::Fn(f));
+                }
+            }
+            other => kept.push(other.clone()),
+        }
+    }
+
+    let mut names: Vec<String> = devices.keys().cloned().collect();
+    names.sort();
+    let mut expanded_entries = Vec::new();
+    for entry in &entries {
+        let mut stack = Vec::new();
+        let mut fresh = 0usize;
+        let stmts = frontend::inline::inline_device_calls(
+            &entry.block.stmts,
+            &devices,
+            &mut stack,
+            &mut fresh,
+        )?;
+        let flat = syn::ItemFn {
+            attrs: Vec::new(),
+            vis: entry.vis.clone(),
+            sig: entry.sig.clone(),
+            block: Box::new(syn::Block {
+                brace_token: entry.block.brace_token,
+                stmts,
+            }),
+        };
+        expanded_entries.push(expand_kernel_fn(&flat)?);
+    }
+
+    let vis = &input.vis;
+    let mod_token = input.mod_token;
+    let ident = &input.ident;
+    Ok(quote::quote! {
+        #vis #mod_token #ident {
+            #(#kept)*
+            #(#expanded_entries)*
+        }
+    })
 }

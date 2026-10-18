@@ -236,6 +236,21 @@ def main():
     elif op == "rs_scan_2d_axis0":
         (x,) = read_inputs(count, lengths)
         expected = np.cumsum(x.reshape(4, 8), axis=0, dtype="<f4").ravel()
+    elif op == "mod_plain_entry":
+        (x,) = read_inputs(count, lengths)
+        expected = x + np.float32(1.5)
+    elif op == "mod_transitive_entry":
+        (x,) = read_inputs(count, lengths)
+        once = x + np.float32(1.5)
+        expected = once + once
+    elif op == "mod_keyed_entry":
+        (x,) = read_inputs(count, lengths)
+        expected = x + np.float32(1.5) * np.float32(2.0)
+    elif op == "mod_reassign_entry":
+        (x,) = read_inputs(count, lengths)
+        base = np.float32(1.0)
+        # A tile of ones plus itself three times: four ones in f32.
+        expected = np.full(x.shape, np.float32(4.0), dtype="<f4")
     elif op == "rs_cat_cols":
         x, y = read_inputs(count, lengths)
         expected = np.concatenate([x.reshape(4, 8), y.reshape(4, 8)], axis=1).ravel()
