@@ -6,6 +6,7 @@ use sile_llvm_ir::Function as LlvmIrFunction;
 
 use crate::cpu::codegen::generate as generate_llvm_ir_c_source;
 use crate::metal::codegen::generate as generate_llvm_ir_metal_source;
+use crate::ptx::codegen::generate as generate_llvm_ir_ptx_source;
 use crate::wgsl::codegen::generate as generate_llvm_ir_wgsl_source;
 use crate::{BackendArtifact, CodegenTarget};
 
@@ -16,6 +17,7 @@ pub fn run(llvm_ir: &LlvmIrFunction, target: CodegenTarget) -> Result<BackendArt
             BackendArtifact::MetalSource(generate_llvm_ir_metal_source(llvm_ir)?)
         }
         CodegenTarget::Wgsl => BackendArtifact::WgslSource(generate_llvm_ir_wgsl_source(llvm_ir)?),
+        CodegenTarget::Ptx => BackendArtifact::PtxSource(generate_llvm_ir_ptx_source(llvm_ir)?),
     };
     Ok(artifact)
 }
@@ -1479,7 +1481,7 @@ pub fn emit_structured_from<E: StructuredEmitter>(
     start: llvm_ir::BlockId,
     stop_targets: &[llvm_ir::BlockId],
     stop_skip_params: Option<(llvm_ir::BlockId, Vec<llvm_ir::ValueId>)>,
-    stop_skip_inst: Option<(llvm_ir::BlockId, llvm_ir::ValueId)>,
+    stop_skip_inst: Option<llvm_ir::ValueId>,
     messages: StructuredCfgMessages,
 ) -> Result<Option<llvm_ir::BlockId>> {
     let mut current = start;
@@ -1491,9 +1493,17 @@ pub fn emit_structured_from<E: StructuredEmitter>(
         if let llvm_ir::Terminator::Br { target, args } = &block.terminator
             && stop_targets.contains(target)
         {
-            let skip_inst = stop_skip_inst
-                .as_ref()
-                .and_then(|(bid, vid)| (*bid == current).then_some(*vid));
+            // The structured loop writes the induction step in its own `for`
+            // header, so the latch block must not write it a second time. The
+            // step instruction is identified by the value it defines; the block
+            // that carries it is whichever block is being emitted here, which
+            // is the latch and not the loop header the backedge targets.
+            let skip_inst = stop_skip_inst.filter(|skipped| {
+                block
+                    .insts
+                    .iter()
+                    .any(|inst| inst.result == Some(*skipped))
+            });
             if let Some(skip) = skip_inst {
                 emitter.emit_block_insts_except(&block, Some(skip))?;
             } else {
@@ -1756,7 +1766,7 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
                     true_target,
                     &[header.id],
                     Some((header.id, vec![for_loop.induction_param])),
-                    for_loop.step_value_id.map(|vid| (header.id, vid)),
+                    for_loop.step_value_id,
                     messages,
                 )?;
                 if backedge != Some(header.id) {

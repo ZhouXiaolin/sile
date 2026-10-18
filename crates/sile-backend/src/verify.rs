@@ -11,7 +11,9 @@ pub(crate) fn for_target(
     verify_shared_contract(llvm_ir, stage)?;
     match target {
         CodegenTarget::C => Ok(()),
-        CodegenTarget::Metal | CodegenTarget::Wgsl => verify_gpu_contract(llvm_ir, stage),
+        CodegenTarget::Metal | CodegenTarget::Wgsl | CodegenTarget::Ptx => {
+            verify_gpu_contract(llvm_ir, stage)
+        }
     }
 }
 

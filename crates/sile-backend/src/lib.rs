@@ -6,6 +6,7 @@ mod verify;
 
 pub mod cpu;
 pub mod metal;
+pub mod ptx;
 pub mod wgsl;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,6 +14,7 @@ pub enum CodegenTarget {
     C,
     Metal,
     Wgsl,
+    Ptx,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,6 +22,7 @@ pub enum BackendArtifact {
     CSource(String),
     MetalSource(String),
     WgslSource(String),
+    PtxSource(String),
 }
 
 pub fn compile(llvm_ir: &LlvmIrFunction, target: CodegenTarget) -> Result<BackendArtifact> {

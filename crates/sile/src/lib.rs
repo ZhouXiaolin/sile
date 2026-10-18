@@ -135,6 +135,9 @@ pub mod codegen {
     pub mod llvmir_metal {
         pub use sile_backend::metal::codegen::*;
     }
+    pub mod llvmir_ptx {
+        pub use sile_backend::ptx::codegen::*;
+    }
     pub mod llvmir_wgsl {
         pub use sile_backend::wgsl::codegen::*;
     }

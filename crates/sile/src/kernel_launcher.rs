@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use sile_backend::{BackendArtifact, cpu::CpuBackend, wgsl::runtime::WgpuBackend};
+use sile_backend::{BackendArtifact, cpu::CpuBackend, ptx::PtxBackend, wgsl::runtime::WgpuBackend};
 #[cfg(target_os = "macos")]
 use sile_backend::metal::MetalBackend;
 use sile_core::{Device, KernelArg, LaunchConfig, Result, Stream};
@@ -233,9 +233,18 @@ impl<'a> KernelLauncher<'a> {
                     stream,
                 )
             }
-            _ => Err(sile_core::Error::UnsupportedBackend(
-                "backend not implemented",
-            )),
+            Device::Cuda(_) => {
+                maybe_print_backend_source(llvm_ir_func, CodegenTarget::Ptx)?;
+                let backend = PtxBackend::new()?;
+                backend.execute_llir(
+                    llvm_ir_func,
+                    &self.args,
+                    &self.scalars,
+                    &self.scalars_i64,
+                    &launch,
+                    stream,
+                )
+            }
         }
     }
 }
@@ -282,7 +291,8 @@ fn maybe_print_backend_source(
     match artifact {
         BackendArtifact::CSource(source)
         | BackendArtifact::MetalSource(source)
-        | BackendArtifact::WgslSource(source) => {
+        | BackendArtifact::WgslSource(source)
+        | BackendArtifact::PtxSource(source) => {
             eprintln!("{}", source);
         }
     }
