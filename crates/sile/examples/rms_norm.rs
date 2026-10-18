@@ -1,10 +1,10 @@
-//! `rms_norm` written the way cutile-rs writes it.
+//! `rms_norm`, ported from cutile-examples/examples/rms_norm.rs.
 //!
 //! This is the widest single port: it writes a tiled output through
 //! `partition_mut` and an indexed store, reads a one-element tile back as a
 //! scalar, and takes a square root with an explicit rounding mode.
 //!
-//! Two things differ from the original. CuTile passes a host-partitioned output
+//! One thing differs from the original. CuTile passes a host-partitioned output
 //! to each program, so the program's row is already the base of its `out` and
 //! the store names row `0`. Here the whole buffer arrives, so the store names
 //! the row it owns. The `i32` annotations of the original are `i64` here,
@@ -65,7 +65,7 @@ fn main() -> sile::Result<()> {
 
     let (m, n) = (4i64, 8i64);
     const BLOCK_SIZE: i64 = 2;
-    let eps = 1e-6f32;
+    let eps = 1e-8f32;
 
     let x_data: Vec<f32> = (0..m * n).map(|i| (i as f32) * 0.25 - 2.0).collect();
     let w_data: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 0.1).collect();

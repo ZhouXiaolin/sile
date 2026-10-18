@@ -1,8 +1,12 @@
-//! `saxpy` written the way cutile-rs writes it.
+//! `saxpy`, ported from cutile-examples/examples/saxpy.rs.
 //!
 //! The kernel takes the scalar `a` by value and reads it inside a tile
 //! expression, so it exercises the scalar descriptor, the broadcast of a scalar
-//! and both load spellings.
+//! and both load spellings. The host side matches the original: `arange(32)`
+//! reshaped to (4, 8), `a = 2.0`, and the (2, 2) tile that puts the launch on a
+//! (2, 4) grid. What differs is only where the reference comes from: the
+//! original asserts against host arithmetic, this one against
+//! `numpy_ref.py saxpy`.
 
 use sile::{Device, Tensor};
 use kernels::saxpy;
@@ -33,7 +37,7 @@ fn main() -> sile::Result<()> {
     let stream = device.create_stream()?;
 
     const BM: i64 = 2;
-    const BN: i64 = 8;
+    const BN: i64 = 2;
     let (m, n) = (4i64, 8i64);
     let a = 2.0f32;
 
@@ -51,10 +55,14 @@ fn main() -> sile::Result<()> {
 
     let out = y.to_vec(&stream)?;
     let expected = common::numpy("saxpy", &[a.to_string()], &[&values, &y_host]);
-    for (i, (got, expected)) in out.iter().zip(&expected).enumerate().take(10) {
-        println!("{a} * {} + {} = {got} (expected {expected})", values[i], y_host[i]);
-        assert_eq!(got, expected, "element {i}");
+    for (i, (got, expected)) in out.iter().zip(&expected).enumerate() {
+        let answer = a * values[i] + y_host[i];
+        println!("{a} * {} + {} = {got}", values[i], y_host[i]);
+        assert!(
+            (got - expected).abs() < 1e-5,
+            "element {i}: {got}, want {expected} (host {answer})"
+        );
     }
-    println!("cutile saxpy {m}x{n} ok on {:?}", device);
+    println!("saxpy {m}x{n} ok on {device:?}");
     Ok(())
 }

@@ -1,4 +1,4 @@
-//! Flash attention written the way cutile-rs writes it.
+//! Flash attention, ported from cutile-examples/examples/flash_attention.rs.
 //!
 //! This is the widest single port: a rank-4 input addressed through a rank-4
 //! partition, a transposed tile feeding a matrix multiply, a rank-zero tile
@@ -108,7 +108,7 @@ fn main() -> sile::Result<()> {
 
     let (b, h, m, d) = (1i64, 2i64, 8i64, 8i64);
     let hkv = 1i64;
-    let (bm, bn) = (4i64, 4i64);
+    let (bm, _bn) = (4i64, 4i64);
     let qk_scale = 1.0f32 / (d as f32).sqrt();
 
     let sample = |count: i64, salt: f32| -> Vec<f32> {

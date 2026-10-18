@@ -1,7 +1,10 @@
-//! `dropout` written the way cutile-rs writes it.
+//! `dropout`, ported from cutile-examples/examples/dropout.rs.
 //!
 //! The kernel exercises the comparison-and-select pair: `gt_tile` produces a
 //! tile of `0.0`/`1.0` and `select` picks between two tiles element by element.
+//! The original draws `x` from `randn` and `x_keep` from `rand`, both seeded on
+//! the device; this port generates deterministic values on the host instead,
+//! because the python reference must see the exact bytes the kernel reads.
 
 use sile::{Device, Tensor};
 use kernels::dropout;

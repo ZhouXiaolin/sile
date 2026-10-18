@@ -1,4 +1,7 @@
-//! Flash attention with a causal mask, written the way cutile-rs writes it.
+//! Flash attention with a causal mask, ported from
+//! cutile-examples/examples/flash_attention_causal.rs. The original's host
+//! reference is a hand-written CPU fmha; here it is `numpy_ref.py`, and the
+//! plain (no mask) kernel the original also carries runs from this same file.
 //!
 //! This port adds four things to the plain attention example. A branch on a
 //! const generic picks the causal path at compile time. A comparison of two

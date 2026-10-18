@@ -1,7 +1,10 @@
-//! `softmax` written the way cutile-rs writes it.
+//! `softmax`, ported from cutile-examples/examples/softmax.rs.
 //!
-//! The reductions name an `i32` axis, and the two broadcasts take their target
-//! shape from the output buffer. Both are syntax the ported kernel keeps.
+//! The reductions name an axis, and the two broadcasts take their target shape
+//! from the output buffer. The host sizes match the original: (4, 8) input,
+//! (2, 8) tile, so the launch is two programs, one per row block. The original
+//! checks that each output row sums to one; this port compares every element
+//! against `numpy_ref.py softmax`.
 
 use sile::{Device, Tensor};
 use kernels::softmax;
