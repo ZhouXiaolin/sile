@@ -632,6 +632,8 @@ fn format_cast_op(op: CastOp) -> &'static str {
         CastOp::Trunc => "trunc",
         CastOp::Sitofp => "sitofp",
         CastOp::Fptosi => "fptosi",
+        CastOp::Fext => "fpext",
+        CastOp::Ftrunc => "fptrunc",
     }
 }
 

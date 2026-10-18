@@ -228,7 +228,7 @@ fn generate_wrapper(func: &llvm_ir::Function) -> sile_core::Result<String> {
         if is_descriptor_param(param) {
             continue;
         }
-        let qualifier = "float*";
+        let qualifier = c_param_type(&param.ty);
         out.push_str(&format!(
             "  {qualifier} {} = ({qualifier})buffers[{buffer_idx}];\n",
             param.name
@@ -442,7 +442,10 @@ fn c_type(ty: &llvm_ir::Type) -> String {
         llvm_ir::Type::I1 => "bool".to_string(),
         llvm_ir::Type::I32 => "int32_t".to_string(),
         llvm_ir::Type::I64 => "int64_t".to_string(),
-        llvm_ir::Type::F16 => "uint16_t".to_string(),
+        // The half storage is the C float of that width, not its bit pattern:
+        // a load widens and a store narrows, which is the arithmetic the tile
+        // around it assumes.
+        llvm_ir::Type::F16 => "_Float16".to_string(),
         llvm_ir::Type::F32 => "float".to_string(),
         llvm_ir::Type::F64 => "double".to_string(),
         llvm_ir::Type::Ptr { pointee, .. } => format!("{}*", c_type(pointee)),

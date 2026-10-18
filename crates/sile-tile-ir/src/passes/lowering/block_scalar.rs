@@ -128,7 +128,7 @@ pub(crate) fn lower_scalar_inst(
             let row_operand = resolve_operand(*row_coord, ctx);
             let col_operand = resolve_operand(*col_coord, ctx);
             let rank = match tile_ir.types.get(buf) {
-                Some(TileIrType::Buffer { rank }) => *rank,
+                Some(TileIrType::Buffer { rank, .. }) => *rank,
                 _ => 1,
             };
             let linear_index = if rank <= 1 {

@@ -1,6 +1,41 @@
 use crate::tile::Tile;
 use sile_core::{Device, Error, KernelArg, Result};
 
+/// An element a host tensor holds.
+///
+/// The buffer ABI sizes in bytes through [`HostElem::ELEM_SIZE`], and every
+/// constructor speaks f32 — the values an example generates — so a half tensor
+/// is a quantized copy of the same numbers, not a different program.
+pub trait HostElem: Clone + std::fmt::Debug {
+    /// Bytes of one element in the buffer ABI.
+    const ELEM_SIZE: usize;
+
+    fn from_f32(value: f32) -> Self;
+    fn to_f32(self) -> f32;
+}
+
+impl HostElem for f32 {
+    const ELEM_SIZE: usize = 4;
+
+    fn from_f32(value: f32) -> Self {
+        value
+    }
+    fn to_f32(self) -> f32 {
+        self
+    }
+}
+
+impl HostElem for half::f16 {
+    const ELEM_SIZE: usize = 2;
+
+    fn from_f32(value: f32) -> Self {
+        half::f16::from_f32(value)
+    }
+    fn to_f32(self) -> f32 {
+        half::f16::to_f32(self)
+    }
+}
+
 #[derive(Debug)]
 pub struct Tensor<T> {
     data: Vec<T>,
@@ -18,7 +53,7 @@ impl<T: Clone> Clone for Tensor<T> {
     }
 }
 
-impl<T> Tensor<T> {
+impl<T: HostElem> Tensor<T> {
     pub fn shape(&self) -> &[i64] {
         &self.shape
     }
@@ -36,9 +71,7 @@ impl<T> Tensor<T> {
     pub fn partition_mut<const N: usize>(&mut self, shape: [i64; N]) -> PartitionMut<'_, T> {
         PartitionMut::new(self, shape)
     }
-}
 
-impl Tensor<f32> {
     pub fn zeros(shape: impl Into<Vec<i64>>, device: &Device) -> Result<Self> {
         Self::filled(shape.into(), 0.0, device)
     }
@@ -52,7 +85,7 @@ impl Tensor<f32> {
         let shape = shape.into();
         let len = shape.iter().product::<i64>() as usize;
         let mut rng = rand::rng();
-        let data: Vec<f32> = (0..len).map(|_| rng.random_range(0.0..1.0)).collect();
+        let data: Vec<T> = (0..len).map(|_| T::from_f32(rng.random_range(0.0..1.0))).collect();
         Ok(Self {
             data,
             shape,
@@ -60,7 +93,7 @@ impl Tensor<f32> {
         })
     }
 
-    pub fn from_vec(data: Vec<f32>, shape: impl Into<Vec<i64>>, device: &Device) -> Result<Self> {
+    pub fn from_vec(data: Vec<T>, shape: impl Into<Vec<i64>>, device: &Device) -> Result<Self> {
         let shape = shape.into();
         let len = shape.iter().product::<i64>() as usize;
         if data.len() != len {
@@ -79,7 +112,7 @@ impl Tensor<f32> {
     fn filled(shape: Vec<i64>, value: f32, device: &Device) -> Result<Self> {
         let len = shape.iter().product::<i64>() as usize;
         Ok(Self {
-            data: vec![value; len],
+            data: vec![T::from_f32(value); len],
             shape,
             device: device.clone(),
         })
@@ -88,19 +121,26 @@ impl Tensor<f32> {
     pub fn len(&self) -> usize {
         self.data.len()
     }
-    pub fn as_ptr(&self) -> *const f32 {
+    pub fn as_ptr(&self) -> *const T {
         self.data.as_ptr()
     }
-    pub fn as_mut_ptr(&mut self) -> *mut f32 {
+    pub fn as_mut_ptr(&mut self) -> *mut T {
         self.data.as_mut_ptr()
     }
-    pub fn to_vec(&self, _stream: &sile_core::Stream) -> Result<Vec<f32>> {
+    pub fn to_vec(&self, _stream: &sile_core::Stream) -> Result<Vec<T>> {
         Ok(self.data.clone())
+    }
+
+    /// The values as f32, whatever the storage holds. A half tensor's values
+    /// are exact here — widening is lossless — which is what makes one numpy
+    /// reference carry both storages.
+    pub fn to_f32_vec(&self) -> Vec<f32> {
+        self.data.iter().map(|value| HostElem::to_f32(value.clone())).collect()
     }
 
     /// The values back, consuming the buffer: the move the async chain makes
     /// when the last stage copies to the host.
-    pub fn into_vec(self) -> Vec<f32> {
+    pub fn into_vec(self) -> Vec<T> {
         self.data
     }
     pub fn device(&self) -> &Device {
@@ -109,8 +149,9 @@ impl Tensor<f32> {
 
     pub fn as_kernel_arg(&self) -> KernelArg<'_> {
         KernelArg {
-            ptr: self.as_ptr(),
-            mut_ptr: self.as_ptr() as *mut f32,
+            ptr: self.as_ptr() as *const u8,
+            mut_ptr: self.as_ptr() as *mut u8,
+            elem_size: T::ELEM_SIZE,
             shape: &self.shape,
             device: &self.device,
         }
@@ -118,13 +159,21 @@ impl Tensor<f32> {
 
     pub fn as_kernel_arg_mut(&mut self) -> KernelArg<'_> {
         KernelArg {
-            ptr: self.as_ptr(),
-            mut_ptr: self.as_mut_ptr(),
+            ptr: self.as_ptr() as *const u8,
+            mut_ptr: self.as_mut_ptr() as *mut u8,
+            elem_size: T::ELEM_SIZE,
             shape: &self.shape,
             device: &self.device,
         }
     }
 
+    /// `x.load()`: a tile shaped like this buffer.
+    pub fn load(&self) -> Tile<T> {
+        Tile::new(self.shape.clone())
+    }
+}
+
+impl Tensor<f32> {
     // Kernel-context stub methods (used inside #[kernel] bodies)
     pub fn load_tile<const N: usize, const M: usize>(
         &self,
@@ -141,11 +190,6 @@ impl Tensor<f32> {
     /// `x.load_like(y)`: a tile shaped like `y` at this program's coordinates.
     pub fn load_like(&self, y: &Tensor<f32>) -> Tile<f32> {
         Tile::new(y.shape())
-    }
-
-    /// `x.load()`: a tile shaped like this buffer.
-    pub fn load(&self) -> Tile<f32> {
-        Tile::new(self.shape.clone())
     }
 
     pub fn store(&mut self, _value: Tile<f32>) {
@@ -199,7 +243,7 @@ fn check_tiling(base_shape: &[i64], tile: &[i64]) {
 
 impl<'a, T> Partition<'a, T> {
     fn new<const N: usize>(base: &'a Tensor<T>, tile: [i64; N]) -> Self {
-        check_tiling(base.shape(), &tile);
+        check_tiling(&base.shape, &tile);
         Self {
             base,
             tile: tile.to_vec(),
@@ -217,7 +261,10 @@ impl<'a, T> Partition<'a, T> {
     }
 
     /// `part.load([i, j])`: the tile at the given partition coordinates.
-    pub fn load<const N: usize>(&self, _index: [i64; N]) -> Tile<T> {
+    ///
+    /// A tile is always `f32`: a half buffer's load widens it at the buffer
+    /// edge, the same conversion the generated kernel performs.
+    pub fn load<const N: usize>(&self, _index: [i64; N]) -> Tile<f32> {
         Tile::new(self.tile.clone())
     }
 
@@ -229,7 +276,7 @@ impl<'a, T> Partition<'a, T> {
 
 impl<'a, T> PartitionMut<'a, T> {
     fn new<const N: usize>(base: &'a mut Tensor<T>, tile: [i64; N]) -> Self {
-        check_tiling(base.shape(), &tile);
+        check_tiling(&base.shape, &tile);
         Self {
             base,
             tile: tile.to_vec(),

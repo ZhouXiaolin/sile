@@ -42,23 +42,22 @@ impl MetalBackend {
             .map_err(|e| sile_core::Error::Compile(e.to_string()))
     }
 
-    fn upload_to_device(&self, data: &[f32]) -> metal::Buffer {
-        let size = (data.len() * std::mem::size_of::<f32>()) as u64;
-        self.device
-            .new_buffer(size, metal::MTLResourceOptions::StorageModeShared)
-    }
-
-    fn upload_data_to_buffer(&self, buffer: &metal::Buffer, data: &[f32]) {
-        let ptr = buffer.contents() as *mut f32;
+    fn upload_bytes(&self, bytes: &[u8]) -> metal::Buffer {
+        let buffer = self
+            .device
+            .new_buffer(bytes.len() as u64, metal::MTLResourceOptions::StorageModeShared);
+        let ptr = buffer.contents() as *mut u8;
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
         }
+        buffer
     }
 
-    fn download_from_device(&self, buffer: &metal::Buffer) -> Vec<f32> {
-        let ptr = buffer.contents() as *const f32;
-        let len = (buffer.length() / std::mem::size_of::<f32>() as u64) as usize;
-        unsafe { std::slice::from_raw_parts(ptr, len).to_vec() }
+    fn download_bytes(&self, buffer: &metal::Buffer, out: *mut u8, len: usize) {
+        let ptr = buffer.contents() as *const u8;
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr, out, len);
+        }
     }
 
     pub fn execute_llir(
@@ -111,11 +110,11 @@ impl MetalBackend {
 
         let mut mtl_buffers: Vec<metal::Buffer> = Vec::new();
         for arg in args {
-            let data = unsafe {
-                std::slice::from_raw_parts(arg.mut_ptr, arg.shape.iter().product::<i64>() as usize)
-            };
-            let buf = self.upload_to_device(data);
-            self.upload_data_to_buffer(&buf, data);
+            // The bytes travel as the host holds them, so a half buffer is
+            // half the bytes and the kernel reads its own element width.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(arg.ptr, arg.len_in_bytes()) };
+            let buf = self.upload_bytes(bytes);
             mtl_buffers.push(buf);
         }
 
@@ -186,11 +185,7 @@ impl MetalBackend {
         for (i, arg) in args.iter().enumerate() {
             let is_output = matches!(param_kinds.get(i), Some(ParamKind::Output));
             if is_output {
-                let result = self.download_from_device(&mtl_buffers[i]);
-                let len = arg.shape.iter().product::<i64>() as usize;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(result.as_ptr(), arg.mut_ptr, len);
-                }
+                self.download_bytes(&mtl_buffers[i], arg.mut_ptr, arg.len_in_bytes());
             }
         }
 

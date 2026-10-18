@@ -615,6 +615,7 @@ fn parse_param(arg: &syn::FnArg) -> syn::Result<KernelParam> {
             is_mut: false,
             shape: None,
             scalar_ty: Some(scalar_ty),
+            elem: super::ast::BufferElemType::F32,
         });
     }
 
@@ -635,17 +636,20 @@ fn parse_param(arg: &syn::FnArg) -> syn::Result<KernelParam> {
             "a kernel parameter must be a Tensor or a Tile",
         ));
     }
-    // The buffers carry f32. A kernel that names another element type would
-    // otherwise compile and read its bytes as floats, which is a different
-    // program from the one written.
-    if let Some(elem) = buffer_element_spelling(&reference.elem)
-        && elem != "f32"
-    {
-        return Err(syn::Error::new_spanned(
-            &reference.elem,
-            format!("a buffer parameter holds f32; `{elem}` is not carried"),
-        ));
-    }
+    // The buffers carry f32 or f16. A kernel that names another element type
+    // would otherwise compile and read its bytes as floats, which is a
+    // different program from the one written. A half buffer converts at its
+    // loads and stores; the compute between them stays f32.
+    let elem = match buffer_element_spelling(&reference.elem).as_deref() {
+        Some("f16") => super::ast::BufferElemType::F16,
+        Some("f32") | None => super::ast::BufferElemType::F32,
+        Some(other) => {
+            return Err(syn::Error::new_spanned(
+                &reference.elem,
+                format!("a buffer parameter holds f32 or f16; `{other}` is not carried"),
+            ));
+        }
+    };
     let shape = extract_shape_from_type(&reference.elem);
 
     Ok(KernelParam {
@@ -653,6 +657,7 @@ fn parse_param(arg: &syn::FnArg) -> syn::Result<KernelParam> {
         is_mut: reference.mutability.is_some(),
         shape,
         scalar_ty: None,
+        elem,
     })
 }
 
@@ -788,7 +793,9 @@ fn buffer_element_spelling(ty: &syn::Type) -> Option<String> {
     let syn::GenericArgument::Type(syn::Type::Path(elem)) = args.args.first()? else {
         return None;
     };
-    elem.path.get_ident().map(|ident| ident.to_string())
+    // The element is named by its last path segment, so a crate-qualified
+    // `half::f16` spells the same element as a bare `f16`.
+    elem.path.segments.last().map(|seg| seg.ident.to_string())
 }
 
 fn extract_shape_from_type(ty: &syn::Type) -> Option<Vec<KernelShapeDim>> {

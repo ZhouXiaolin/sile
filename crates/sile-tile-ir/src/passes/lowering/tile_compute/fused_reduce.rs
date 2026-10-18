@@ -5,14 +5,15 @@ use sile_llvm_ir as llvm_ir;
 use crate::TileMapExpr;
 use crate::ValueId;
 use crate::passes::lowering::core::{
-    BlockLowerer, REDUCE_UNROLL_THRESHOLD, alloc_tile_result, buffer_rank_of, const_f32, const_i64,
-    emit_bin, emit_cmp, emit_gep, emit_load, emit_store, lower_nested_tile_loop,
-    lower_reduce_extent_loop, lower_reduce_extent_loop_step, resolve_operand,
+    BlockLowerer, REDUCE_UNROLL_THRESHOLD, alloc_tile_result, buffer_elem_of, buffer_rank_of,
+    const_f32, const_i64, emit_bin, emit_cmp, emit_gep, emit_load, emit_store,
+    lower_nested_tile_loop, lower_reduce_extent_loop, lower_reduce_extent_loop_step,
+    resolve_operand,
 };
 use crate::passes::lowering::tile_compute::reduce::{ReduceCombiner, reduce_combine};
 use crate::passes::lowering::tile_expr::{collect_map_load_bases, eval_map_expr_scalar};
 use crate::passes::lowering::tile_memory::{
-    BufferIndexBase, build_buffer_index_base, emit_buffer_element_ptr, emit_buffer_linear_index,
+    BufferIndexBase, build_buffer_index_base, emit_buffer_load, emit_buffer_linear_index,
 };
 
 pub(crate) struct LoadReduceFusion {
@@ -66,6 +67,9 @@ pub(crate) fn lower_fused_load_reduce_inst(
         fusion.src_rows
     };
     let prefix = format!("tile_fused_load_reduce_{}", result.0);
+    // The storage element rides with the lowering: a half buffer widens at
+    // each element load, and the reduce chain stays f32.
+    let elem = buffer_elem_of(fusion.buf, builder.tile_ir());
 
     if reduce_extent <= REDUCE_UNROLL_THRESHOLD {
         // Small extent: fully unroll (original behavior)
@@ -75,11 +79,16 @@ pub(crate) fn lower_fused_load_reduce_inst(
             let dst_tile = dst_tile.clone();
             let axis = fusion.axis;
             let combiner = fusion.combiner;
+            let elem = elem.clone();
 
             move |ctx, _, out, row, col| {
                 // Use vectorized path for sum-reduce along axis=1
-                // (contiguous memory), when extent >= 4.
-                let use_vec = combiner == ReduceCombiner::Sum && axis == 1 && reduce_extent >= 4;
+                // (contiguous memory), when extent >= 4. The VecLoad intrinsic
+                // carries floats, so a half buffer takes the scalar path.
+                let use_vec = combiner == ReduceCombiner::Sum
+                    && axis == 1
+                    && reduce_extent >= 4
+                    && elem == llvm_ir::Type::F32;
 
                 let acc = if use_vec {
                     let vec_chunks = (reduce_extent / 4) as usize;
@@ -116,15 +125,15 @@ pub(crate) fn lower_fused_load_reduce_inst(
                 } else {
                     let first_r = if axis == 1 { row.clone() } else { const_i64(0) };
                     let first_c = if axis == 1 { const_i64(0) } else { col.clone() };
-                    let first_ptr = emit_buffer_element_ptr(
+                    let mut a = emit_buffer_load(
                         ctx,
                         out,
                         buf_operand.clone(),
-                        index_base.clone(),
+                        &index_base,
                         first_r,
                         first_c,
+                        &elem,
                     );
-                    let mut a = emit_load(ctx, out, first_ptr, llvm_ir::Type::F32);
 
                     for idx in 1..reduce_extent {
                         let next_r = if axis == 1 {
@@ -137,15 +146,15 @@ pub(crate) fn lower_fused_load_reduce_inst(
                         } else {
                             col.clone()
                         };
-                        let next_ptr = emit_buffer_element_ptr(
+                        let next = emit_buffer_load(
                             ctx,
                             out,
                             buf_operand.clone(),
-                            index_base.clone(),
+                            &index_base,
                             next_r,
                             next_c,
+                            &elem,
                         );
-                        let next = emit_load(ctx, out, next_ptr, llvm_ir::Type::F32);
                         a = reduce_combine(ctx, out, a, next, combiner);
                     }
                     a
@@ -174,6 +183,7 @@ pub(crate) fn lower_fused_load_reduce_inst(
             buf_operand,
             index_base,
             dst_tile,
+            elem,
         );
     }
 }
@@ -296,6 +306,7 @@ pub(crate) fn lower_fused_map_reduce_inst(
 }
 
 /// Helper: emit tile loop + inner reduce LLVMIR loop for fused load+reduce.
+#[allow(clippy::too_many_arguments)]
 fn lower_fused_load_reduce_loop(
     builder: &mut BlockLowerer<'_>,
     prefix: &str,
@@ -307,6 +318,7 @@ fn lower_fused_load_reduce_loop(
     buf_operand: llvm_ir::Operand,
     index_base: BufferIndexBase,
     dst_tile: llvm_ir::Operand,
+    elem: llvm_ir::Type,
 ) {
     if out_rows == 1 {
         lower_single_col_fused_load_reduce_loop(
@@ -319,6 +331,7 @@ fn lower_fused_load_reduce_loop(
             buf_operand,
             index_base,
             dst_tile,
+            elem,
         );
     } else if out_cols == 1 {
         lower_single_row_fused_load_reduce_loop(
@@ -331,6 +344,7 @@ fn lower_fused_load_reduce_loop(
             buf_operand,
             index_base,
             dst_tile,
+            elem,
         );
     } else {
         lower_full_2d_fused_load_reduce_loop(
@@ -344,10 +358,12 @@ fn lower_fused_load_reduce_loop(
             buf_operand,
             index_base,
             dst_tile,
+            elem,
         );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_single_col_fused_load_reduce_loop(
     builder: &mut BlockLowerer<'_>,
     prefix: &str,
@@ -358,6 +374,7 @@ fn lower_single_col_fused_load_reduce_loop(
     buf_operand: llvm_ir::Operand,
     index_base: BufferIndexBase,
     dst_tile: llvm_ir::Operand,
+    elem: llvm_ir::Type,
 ) {
     let (header, header_params) = builder.create_block(
         &format!("{prefix}_col_header"),
@@ -410,20 +427,21 @@ fn lower_single_col_fused_load_reduce_loop(
         &buf_operand,
         &index_base,
         row.clone(),
+        &elem,
     ) {
         acc
     } else {
         // Scalar fallback
         let init_acc = builder.with_current_insts(|ctx, _, out| {
-            let ptr = emit_buffer_element_ptr(
+            emit_buffer_load(
                 ctx,
                 out,
                 buf_operand.clone(),
-                index_base.clone(),
+                &index_base,
                 if axis == 1 { row.clone() } else { const_i64(0) },
                 if axis == 1 { const_i64(0) } else { col.clone() },
-            );
-            emit_load(ctx, out, ptr, llvm_ir::Type::F32)
+                &elem,
+            )
         });
 
         lower_reduce_extent_loop(
@@ -433,19 +451,19 @@ fn lower_single_col_fused_load_reduce_loop(
             1,
             init_acc,
             |ctx, _, out, reduce_idx, acc| {
-                let ptr = emit_buffer_element_ptr(
+                let next = emit_buffer_load(
                     ctx,
                     out,
                     buf_operand.clone(),
-                    index_base.clone(),
+                    &index_base,
                     if axis == 1 {
                         row.clone()
                     } else {
                         reduce_idx.clone()
                     },
                     if axis == 1 { reduce_idx } else { col.clone() },
+                    &elem,
                 );
-                let next = emit_load(ctx, out, ptr, llvm_ir::Type::F32);
                 reduce_combine(ctx, out, acc, next, combiner)
             },
         )
@@ -477,6 +495,7 @@ fn lower_single_col_fused_load_reduce_loop(
     builder.switch_to(continue_block);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_single_row_fused_load_reduce_loop(
     builder: &mut BlockLowerer<'_>,
     prefix: &str,
@@ -487,6 +506,7 @@ fn lower_single_row_fused_load_reduce_loop(
     buf_operand: llvm_ir::Operand,
     index_base: BufferIndexBase,
     dst_tile: llvm_ir::Operand,
+    elem: llvm_ir::Type,
 ) {
     let (header, header_params) = builder.create_block(
         &format!("{prefix}_row_header"),
@@ -539,20 +559,21 @@ fn lower_single_row_fused_load_reduce_loop(
         &buf_operand,
         &index_base,
         row.clone(),
+        &elem,
     ) {
         acc
     } else {
         // Scalar fallback
         let init_acc = builder.with_current_insts(|ctx, _, out| {
-            let ptr = emit_buffer_element_ptr(
+            emit_buffer_load(
                 ctx,
                 out,
                 buf_operand.clone(),
-                index_base.clone(),
+                &index_base,
                 if axis == 1 { row.clone() } else { const_i64(0) },
                 if axis == 1 { const_i64(0) } else { col.clone() },
-            );
-            emit_load(ctx, out, ptr, llvm_ir::Type::F32)
+                &elem,
+            )
         });
 
         lower_reduce_extent_loop(
@@ -562,19 +583,19 @@ fn lower_single_row_fused_load_reduce_loop(
             1, // start from idx=1 since idx=0 is already in init_acc
             init_acc,
             |ctx, _, out, reduce_idx, acc| {
-                let ptr = emit_buffer_element_ptr(
+                let next = emit_buffer_load(
                     ctx,
                     out,
                     buf_operand.clone(),
-                    index_base.clone(),
+                    &index_base,
                     if axis == 1 {
                         row.clone()
                     } else {
                         reduce_idx.clone()
                     },
                     if axis == 1 { reduce_idx } else { col.clone() },
+                    &elem,
                 );
-                let next = emit_load(ctx, out, ptr, llvm_ir::Type::F32);
                 reduce_combine(ctx, out, acc, next, combiner)
             },
         )
@@ -606,6 +627,7 @@ fn lower_single_row_fused_load_reduce_loop(
     builder.switch_to(continue_block);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_full_2d_fused_load_reduce_loop(
     builder: &mut BlockLowerer<'_>,
     prefix: &str,
@@ -617,6 +639,7 @@ fn lower_full_2d_fused_load_reduce_loop(
     buf_operand: llvm_ir::Operand,
     index_base: BufferIndexBase,
     dst_tile: llvm_ir::Operand,
+    elem: llvm_ir::Type,
 ) {
     let (row_header, row_params) = builder.create_block(
         &format!("{prefix}_row_header"),
@@ -711,16 +734,17 @@ fn lower_full_2d_fused_load_reduce_loop(
         } else {
             const_i64(0)
         },
+        &elem,
     ) {
         acc
     } else {
         // Scalar fallback
         let init_acc = builder.with_current_insts(|ctx, _, out| {
-            let ptr = emit_buffer_element_ptr(
+            emit_buffer_load(
                 ctx,
                 out,
                 buf_operand.clone(),
-                index_base.clone(),
+                &index_base,
                 if axis == 1 {
                     body_row.clone()
                 } else {
@@ -731,8 +755,8 @@ fn lower_full_2d_fused_load_reduce_loop(
                 } else {
                     body_col.clone()
                 },
-            );
-            emit_load(ctx, out, ptr, llvm_ir::Type::F32)
+                &elem,
+            )
         });
 
         lower_reduce_extent_loop(
@@ -742,11 +766,11 @@ fn lower_full_2d_fused_load_reduce_loop(
             1,
             init_acc,
             |ctx, _, out, reduce_idx, acc| {
-                let ptr = emit_buffer_element_ptr(
+                let next = emit_buffer_load(
                     ctx,
                     out,
                     buf_operand.clone(),
-                    index_base.clone(),
+                    &index_base,
                     if axis == 1 {
                         body_row.clone()
                     } else {
@@ -757,8 +781,8 @@ fn lower_full_2d_fused_load_reduce_loop(
                     } else {
                         body_col.clone()
                     },
+                    &elem,
                 );
-                let next = emit_load(ctx, out, ptr, llvm_ir::Type::F32);
                 reduce_combine(ctx, out, acc, next, combiner)
             },
         )
@@ -1196,9 +1220,13 @@ fn emit_vec_reduce_loop(
     buf_operand: &llvm_ir::Operand,
     index_base: &BufferIndexBase,
     row: llvm_ir::Operand,
+    elem: &llvm_ir::Type,
 ) -> Option<llvm_ir::Operand> {
-    // Only vectorize: sum-reduce, axis==1 (contiguous), extent >= 4
-    if combiner != ReduceCombiner::Sum || axis != 1 || reduce_extent < 4 {
+    // Only vectorize: sum-reduce, axis==1 (contiguous), extent >= 4. The
+    // VecLoad intrinsic carries floats, so a half buffer takes the scalar
+    // path.
+    if combiner != ReduceCombiner::Sum || axis != 1 || reduce_extent < 4 || *elem != llvm_ir::Type::F32
+    {
         return None;
     }
 
@@ -1245,15 +1273,15 @@ fn emit_vec_reduce_loop(
             scalar_start,
             vec_acc,
             |ctx, _, out, reduce_idx, acc| {
-                let ptr = emit_buffer_element_ptr(
+                let next = emit_buffer_load(
                     ctx,
                     out,
                     buf_operand.clone(),
-                    index_base.clone(),
+                    index_base,
                     row.clone(),
                     reduce_idx,
+                    elem,
                 );
-                let next = emit_load(ctx, out, ptr, llvm_ir::Type::F32);
                 emit_bin(ctx, out, llvm_ir::BinOp::Add, acc, next, llvm_ir::Type::F32)
             },
         )

@@ -18,8 +18,8 @@ pub(crate) fn llvm_ir_type(ty: &TileIrType) -> llvm_ir::Type {
             llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, llvm_ir::Type::I64)
         }
         TileIrType::Tile { rows, cols } => tile_ptr_type(*rows, *cols),
-        TileIrType::Buffer { .. } => {
-            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, llvm_ir::Type::F32)
+        TileIrType::Buffer { elem, .. } => {
+            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, elem.llvm_type())
         }
         TileIrType::Void => llvm_ir::Type::Void,
     }
@@ -104,8 +104,20 @@ pub(crate) fn comparison_pred(
 
 pub(crate) fn buffer_rank_of(value: ValueId, tile_ir: &TileIrFunction) -> usize {
     match tile_ir.types.get(&value) {
-        Some(TileIrType::Buffer { rank }) => *rank,
+        Some(TileIrType::Buffer { rank, .. }) => *rank,
         _ => 1,
+    }
+}
+
+/// The storage element type of a buffer value.
+///
+/// A load reads this and a store writes it; the tiles on either side stay f32,
+/// so the conversion between the two is the buffer edge and lives where the
+/// load and the store are emitted.
+pub(crate) fn buffer_elem_of(value: ValueId, tile_ir: &TileIrFunction) -> llvm_ir::Type {
+    match tile_ir.types.get(&value) {
+        Some(TileIrType::Buffer { elem, .. }) => elem.llvm_type(),
+        _ => llvm_ir::Type::F32,
     }
 }
 

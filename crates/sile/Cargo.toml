@@ -10,6 +10,7 @@ sile-tile-ir = { path = "../sile-tile-ir" }
 sile-llvm-ir = { path = "../sile-llvm-ir" }
 sile-backend = { path = "../sile-backend" }
 sile-macros = { path = "../sile-macros" }
+half.workspace = true
 rand.workspace = true
 thiserror.workspace = true
 

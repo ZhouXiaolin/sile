@@ -43,6 +43,19 @@ pub struct KernelParam {
     /// shape and no pointer. The kernel reads it as a value. A buffer parameter
     /// has `None` here: its element type is the type of the buffer.
     pub scalar_ty: Option<ScalarType>,
+    /// The element type of a buffer parameter, written `Tensor<f16, ...>`.
+    ///
+    /// The storage may be narrower than the compute: a half buffer converts at
+    /// its loads and stores, and the tiles stay f32. A scalar parameter does
+    /// not read this — scalars carry their own type in `scalar_ty`.
+    pub elem: BufferElemType,
+}
+
+/// The element type a buffer parameter holds, as the kernel writes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BufferElemType {
+    F32,
+    F16,
 }
 
 /// The type of a scalar parameter, as the kernel writes it.

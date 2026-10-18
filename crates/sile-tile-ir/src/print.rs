@@ -451,7 +451,13 @@ fn format_tile_ir_type(ty: &TileIrType) -> String {
         TileIrType::F32 => "tile<f32>".into(),
         TileIrType::ShapeDesc { rank } => format!("shape_desc<{rank}>"),
         TileIrType::Tile { rows, cols } => format!("tile<{rows}x{cols}xf32>"),
-        TileIrType::Buffer { .. } => "tile<ptr<f32>>".into(),
+        TileIrType::Buffer { elem, .. } => {
+            let elem = match elem {
+                BufferElem::F32 => "f32",
+                BufferElem::F16 => "f16",
+            };
+            format!("tile<ptr<{elem}>>")
+        }
         TileIrType::Void => "none".into(),
     }
 }
@@ -478,7 +484,7 @@ fn format_tile_binary_op(op: BinOp, is_float: bool) -> &'static str {
 
 fn buffer_rank_attr(ty: &TileIrType) -> usize {
     match ty {
-        TileIrType::Buffer { rank } => *rank,
+        TileIrType::Buffer { rank, .. } => *rank,
         _ => 0,
     }
 }

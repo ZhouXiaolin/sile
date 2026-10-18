@@ -344,6 +344,23 @@ pub enum SelectSpelling {
     },
 }
 
+/// How a target spells an integer division or remainder.
+#[derive(Clone, Copy, Debug)]
+pub enum IntDivSpelling {
+    /// The operator as the language defines it, for any width. C and MSL
+    /// compile a 64-bit `/` and `%` natively.
+    Operator,
+    /// The division runs in `i32` and the result widens back to `i64`.
+    ///
+    /// naga wraps a 64-bit `/` or `%` in a helper whose `metal::select` passes
+    /// an untyped literal next to a `long long`, which Metal rejects as an
+    /// ambiguous call, so a 64-bit division cannot reach the Metal compiler.
+    /// Index arithmetic — launch ids, tile coordinates, buffer offsets over
+    /// the descriptor — stays far below 2^31, and the operands truncate to
+    /// `i32` before the operator rather than after.
+    I32Widened,
+}
+
 fn select_expr(
     spelling: SelectSpelling,
     cond: String,
@@ -536,6 +553,7 @@ pub fn lower_common_inst_line_with<FValue, FOperand>(
     format_operand: FOperand,
     pointers: PointerSpelling,
     select: SelectSpelling,
+    int_div: IntDivSpelling,
     cast_expr: fn(llvm_ir::CastOp, &llvm_ir::Type, String) -> String,
     gep_elements: &mut HashMap<llvm_ir::ValueId, GepLink>,
 ) -> Option<String>
@@ -552,13 +570,26 @@ where
 
     match &inst.op {
         llvm_ir::InstOp::Bin { op, lhs, rhs } => inst.result.map(|id| {
-            format!(
-                "{} = {} {} {};",
-                value_name(id),
-                format_operand(lhs),
-                bin_op_symbol(*op),
-                format_operand(rhs)
-            )
+            match (int_div, &inst.ty, op) {
+                (
+                    IntDivSpelling::I32Widened,
+                    llvm_ir::Type::I64,
+                    llvm_ir::BinOp::Div | llvm_ir::BinOp::Rem,
+                ) => format!(
+                    "{} = i64((i32({}) {} i32({})));",
+                    value_name(id),
+                    format_operand(lhs),
+                    bin_op_symbol(*op),
+                    format_operand(rhs)
+                ),
+                _ => format!(
+                    "{} = {} {} {};",
+                    value_name(id),
+                    format_operand(lhs),
+                    bin_op_symbol(*op),
+                    format_operand(rhs)
+                ),
+            }
         }),
         llvm_ir::InstOp::Cmp { pred, lhs, rhs } => inst.result.map(|id| {
             format!(
@@ -704,6 +735,11 @@ pub trait TargetDialect {
     /// How this target spells a three-way choice.
     fn select(&self) -> SelectSpelling {
         SelectSpelling::Ternary
+    }
+
+    /// How this target spells an integer division or remainder.
+    fn int_div(&self) -> IntDivSpelling {
+        IntDivSpelling::Operator
     }
 
     /// How this target spells a conversion from one scalar type to another.
@@ -1155,6 +1191,7 @@ impl<D: TargetDialect> TargetEmitter<'_, D> {
                 |op| format_operand(&value_names, D::float_literal, op),
                 self.dialect.pointers(),
                 self.dialect.select(),
+                self.dialect.int_div(),
                 D::cast_expr,
                 &mut self.gep_elements,
             )

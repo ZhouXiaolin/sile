@@ -261,28 +261,51 @@ impl<'a> WgslDialect<'a> {
     /// instead would make every program of a rank-2 kernel the same row:
     /// `dispatch_workgroups(n, 1, 1)` leaves y at zero.
     fn block_id_expr(&self, dim: u8) -> String {
-        let flat = format!("i64({LAUNCH_INDEX}.x)");
+        let flat = format!("i32({LAUNCH_INDEX}.x)");
         let Some(output) = self.output.as_ref() else {
             return match dim {
-                0 => flat,
+                0 => format!("i64({flat})"),
                 _ => "i64(0)".to_string(),
             };
         };
         let Some(abi) = output.param.abi.as_ref() else {
-            return flat;
+            return format!("i64({flat})");
         };
         if abi.rank <= 1 {
             return match dim {
-                0 => flat,
+                0 => format!("i64({flat})"),
                 _ => "i64(0)".to_string(),
             };
         }
-        let axes = emit::grid_axis_exprs(abi, output.rows, output.cols, &self.shapes_name);
+        let axes = self.i32_grid_axes(abi, output.rows, output.cols);
         let Some(extent) = axes.get(dim as usize) else {
             return "i64(0)".to_string();
         };
         let stride = emit::grid_axis_stride(&axes, dim as usize);
-        format!("(({flat} / ({stride})) % ({extent}))")
+        format!("i64((({flat} / ({stride})) % ({extent})))")
+    }
+
+    /// The grid-axis extents spelled in `i32`.
+    ///
+    /// A launch grid never approaches 2^31 tiles, so the flat-index split
+    /// needs no 64-bit arithmetic — and naga wraps a 64-bit division in a
+    /// `metal::select` with an untyped literal, which Metal rejects as an
+    /// ambiguous call. The read widens first, so the division itself is
+    /// 32-bit; `block_id_expr` widens the split result back.
+    fn i32_grid_axes(&self, abi: &llvm_ir::ParamAbi, rows: usize, cols: usize) -> Vec<String> {
+        emit::grid_axis_exprs(abi, rows, cols, &self.shapes_name)
+            .iter()
+            .map(|extent| {
+                let rest = extent
+                    .strip_prefix(self.shapes_name.as_str())
+                    .unwrap_or_else(|| panic!("a grid axis reads the shape descriptor"));
+                let index_end = rest.find(']').unwrap_or_else(|| {
+                    panic!("a grid axis reads one shape descriptor entry: {extent}")
+                });
+                let (read, tail) = rest.split_at(index_end + 1);
+                format!("i32({}{read}){tail}", self.shapes_name)
+            })
+            .collect()
     }
 
     /// Extent of logical grid axis `dim`.
@@ -299,10 +322,10 @@ impl<'a> WgslDialect<'a> {
         let abi = output.param.abi.as_ref().ok_or_else(|| {
             sile_core::Error::Compile("missing output ABI for WGSL grid_dim".into())
         })?;
-        let axes = emit::grid_axis_exprs(abi, output.rows, output.cols, &self.shapes_name);
+        let axes = self.i32_grid_axes(abi, output.rows, output.cols);
         Ok(axes
             .get(dim as usize)
-            .cloned()
+            .map(|extent| format!("i64({extent})"))
             .unwrap_or_else(|| "i64(1)".to_string()))
     }
 }
@@ -404,6 +427,19 @@ impl TargetDialect for WgslDialect<'_> {
 
     fn prelude_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
+        // A half storage is an optional WGSL capability, and the `f16` type it
+        // names is only in scope under its enable directive, which must come
+        // before every declaration. The runtime asks the adapter for the
+        // feature the kernel needs.
+        if self.func.params.iter().any(|param| {
+            matches!(
+                &param.ty,
+                llvm_ir::Type::Ptr { pointee, .. }
+                    if **pointee == llvm_ir::Type::F16
+            )
+        }) {
+            lines.push("enable f16;".to_string());
+        }
         // Kernel buffers bind first, then the two descriptors, so a kernel's
         // bindings stay stable no matter how many shapes or scalars it carries.
         for param in &self.func.params {
@@ -445,6 +481,10 @@ impl TargetDialect for WgslDialect<'_> {
         // the element itself, so the shared instruction lowering must not emit
         // `&` or `*`.
         NO_POINTERS
+    }
+
+    fn int_div(&self) -> emit::IntDivSpelling {
+        emit::IntDivSpelling::I32Widened
     }
 
     fn declares_intrinsic_at_use(&self, inst: &llvm_ir::Inst) -> bool {

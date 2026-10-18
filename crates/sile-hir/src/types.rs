@@ -10,19 +10,22 @@ pub enum ShapeExpr {
 
 /// The element type of a buffer, a tile, or a scalar argument.
 ///
-/// A buffer and a tile hold floats, because that is what every target's memory
-/// path carries. A scalar argument may also be an integer: a kernel divides a
-/// launch index by one, and a division that rounds is a different program.
+/// A buffer may hold half floats: the storage is narrower than the compute,
+/// which stays f32. A buffer and a tile hold floats, because that is what every
+/// target's memory path carries. A scalar argument may also be an integer: a
+/// kernel divides a launch index by one, and a division that rounds is a
+/// different program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ElemType {
     F32,
+    F16,
     I64,
 }
 
 impl ElemType {
     /// Whether a value of this type is a float.
     pub fn is_float(self) -> bool {
-        matches!(self, ElemType::F32)
+        matches!(self, ElemType::F32 | ElemType::F16)
     }
 }
 

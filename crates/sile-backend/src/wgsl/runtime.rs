@@ -22,15 +22,6 @@ fn request_device_error(error: impl std::fmt::Display) -> &'static str {
     Box::leak(error.to_string().into_boxed_str())
 }
 
-/// Read a typed vector back out of mapped bytes.
-fn from_bytes<T: Copy + Default>(bytes: &[u8]) -> Vec<T> {
-    let count = bytes.len() / std::mem::size_of::<T>();
-    let mut out = vec![T::default(); count];
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
-    }
-    out
-}
 
 use super::codegen::generate as generate_wgsl;
 
@@ -46,24 +37,24 @@ impl WgpuBackend {
             power_preference: wgpu::PowerPreference::HighPerformance,
             ..Default::default()
         }))
-        .or_else(|| {
+        .or_else(|_| {
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
         })
-        .ok_or_else(|| sile_core::Error::UnsupportedBackend("no WGPU adapter found"))?;
+        .map_err(|_| sile_core::Error::UnsupportedBackend("no WGPU adapter found"))?;
         let (device, queue) = pollster::block_on(
             adapter.request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("sile wgpu device"),
                     // The lowering makes every index an i64, which is an optional
-                    // WGSL capability rather than a default. Metal, Vulkan and DX12
-                    // all have it, so the kernel asks for it instead of narrowing
-                    // every index to 32 bits.
-                    required_features: adapter
-                        .features()
-                        .intersection(wgpu::Features::SHADER_INT64),
+                    // WGSL capability rather than a default, and a half buffer
+                    // is the same kind of ask. Metal, Vulkan and DX12 all have
+                    // both, so the kernel asks for what it needs instead of
+                    // narrowing every index to 32 bits or every value to f32.
+                    required_features: adapter.features().intersection(
+                        wgpu::Features::SHADER_INT64.union(wgpu::Features::SHADER_F16),
+                    ),
                     ..Default::default()
                 },
-                None,
             ),
         )
         .map_err(|e| sile_core::Error::UnsupportedBackend(request_device_error(e)))?;
@@ -83,22 +74,22 @@ impl WgpuBackend {
         super::validate(&source)?;
 
         // Every kernel buffer becomes one storage buffer, uploaded after the
-        // host leaves its data in shared storage. The shapes descriptor is the
-        // last binding, exactly as `codegen` numbered them.
+        // host leaves its data in shared storage. The bytes travel as the host
+        // holds them, so a half buffer is half the bytes and the kernel reads
+        // its own element width. The shapes descriptor is the last binding,
+        // exactly as `codegen` numbered them.
         let mut buffers = Vec::with_capacity(args.len());
         for arg in args {
-            let data = unsafe {
-                std::slice::from_raw_parts(arg.ptr, arg.shape.iter().product::<i64>() as usize)
-            };
+            let bytes = unsafe { std::slice::from_raw_parts(arg.ptr, arg.len_in_bytes()) };
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("sile kernel buffer"),
-                size: (data.len() * std::mem::size_of::<f32>()) as u64,
+                size: bytes.len() as u64,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_SRC
                     | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.queue.write_buffer(&buffer, 0, as_bytes(data));
+            self.queue.write_buffer(&buffer, 0, bytes);
             buffers.push(buffer);
         }
 
@@ -267,14 +258,16 @@ impl WgpuBackend {
         self.queue.submit(Some(encoder.finish()));
 
         // A kernel writes its output in place, so the host reads the buffer
-        // back. The stream names the device the launch went to, and today a
-        // stream is one device, so the read-back is the whole synchronization.
+        // back. The read-back is a byte copy: the device holds the same
+        // little-endian elements the host laid down, f32 or half alike. The
+        // stream names the device the launch went to, and today a stream is
+        // one device, so the read-back is the whole synchronization.
         let _ = stream;
         for (index, arg) in args.iter().enumerate() {
-            let len = arg.shape.iter().product::<i64>() as usize;
+            let byte_len = arg.len_in_bytes();
             let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("sile readback"),
-                size: (len * std::mem::size_of::<f32>()) as u64,
+                size: byte_len as u64,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -283,24 +276,17 @@ impl WgpuBackend {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("sile copy encoder"),
                 });
-            copy.copy_buffer_to_buffer(
-                &buffers[index],
-                0,
-                &staging,
-                0,
-                (len * std::mem::size_of::<f32>()) as u64,
-            );
+            copy.copy_buffer_to_buffer(&buffers[index], 0, &staging, 0, byte_len as u64);
             self.queue.submit(Some(copy.finish()));
             let slice = staging.slice(..);
             slice.map_async(wgpu::MapMode::Read, |_| {});
-            let _ = self.device.poll(wgpu::Maintain::Wait);
+            let _ = self.device.poll(wgpu::PollType::Wait);
             let mapped = slice.get_mapped_range();
-            let values: Vec<f32> = from_bytes(&mapped);
+            unsafe {
+                std::ptr::copy_nonoverlapping(mapped.as_ptr(), arg.mut_ptr, byte_len);
+            }
             drop(mapped);
             staging.unmap();
-            unsafe {
-                std::ptr::copy_nonoverlapping(values.as_ptr(), arg.mut_ptr, len);
-            }
         }
 
         Ok(())

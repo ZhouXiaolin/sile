@@ -174,6 +174,11 @@ pub enum CastOp {
     Trunc,
     Sitofp,
     Fptosi,
+    /// Widen a float to a wider one: half to float, at a half buffer's loads.
+    Fext,
+    /// Narrow a float to a smaller one: float to half, at a half buffer's
+    /// stores.
+    Ftrunc,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

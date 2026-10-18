@@ -2,9 +2,9 @@ use sile_llvm_ir as llvm_ir;
 
 use crate::ValueId;
 use crate::passes::lowering::core::{
-    BlockLowerer, alloc_tile_result, buffer_rank_of, const_f32, const_i64, emit_bin, emit_gep,
-    emit_load, emit_shape_dim, emit_store, load_tile_scalar_dynamic, lower_1d_tile_coord,
-    lower_nested_tile_loop, resolve_operand, tile_dims_of,
+    BlockLowerer, alloc_tile_result, buffer_elem_of, buffer_rank_of, const_f32, const_i64,
+    emit_bin, emit_cast, emit_gep, emit_load, emit_shape_dim, emit_store, load_tile_scalar_dynamic,
+    lower_1d_tile_coord, lower_nested_tile_loop, resolve_operand, tile_dims_of,
 };
 
 #[derive(Clone)]
@@ -158,21 +158,24 @@ pub(crate) fn lower_tile_load_inst(
         )
     });
     let prefix = format!("tile_load_{}", result.0);
+    // The storage element is the buffer's: a half buffer widens at the load,
+    // and the tile on the other side stays f32.
+    let elem = buffer_elem_of(buf, builder.tile_ir());
     lower_nested_tile_loop(
         builder,
         prefix.as_str(),
         rows,
         cols,
         move |ctx, _, out, row, col| {
-            let src_ptr = emit_buffer_element_ptr(
+            let value = emit_buffer_load(
                 ctx,
                 out,
                 buf_operand.clone(),
-                index_base.clone(),
+                &index_base,
                 row.clone(),
                 col.clone(),
+                &elem,
             );
-            let value = emit_load(ctx, out, src_ptr, llvm_ir::Type::F32);
             let dst_ptr = emit_gep(
                 ctx,
                 out,
@@ -216,6 +219,9 @@ pub(crate) fn lower_tile_store_inst(
         )
     });
     let prefix = format!("tile_store_{}", value.0);
+    // The storage element is the buffer's: a half buffer narrows at the store,
+    // and the tile on the other side stays f32.
+    let elem = buffer_elem_of(buf, builder.tile_ir());
     lower_nested_tile_loop(
         builder,
         prefix.as_str(),
@@ -224,15 +230,16 @@ pub(crate) fn lower_tile_store_inst(
         move |ctx, _, out, row, col| {
             let src =
                 load_tile_scalar_dynamic(ctx, out, value_operand.clone(), row.clone(), col.clone());
-            let dst_ptr = emit_buffer_element_ptr(
+            emit_buffer_store(
                 ctx,
                 out,
                 buf_operand.clone(),
-                index_base.clone(),
+                &index_base,
                 row,
                 col,
+                src,
+                &elem,
             );
-            emit_store(out, dst_ptr, src);
         },
     );
 }
@@ -451,6 +458,7 @@ pub(crate) fn emit_buffer_element_ptr(
     index_base: BufferIndexBase,
     tile_row: llvm_ir::Operand,
     tile_col: llvm_ir::Operand,
+    elem: llvm_ir::Type,
 ) -> llvm_ir::Operand {
     let linear_index = emit_buffer_linear_index(ctx, out, &index_base, tile_row, tile_col);
 
@@ -459,6 +467,79 @@ pub(crate) fn emit_buffer_element_ptr(
         out,
         buf,
         vec![linear_index],
-        llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, llvm_ir::Type::F32),
+        llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, elem),
     )
+}
+
+/// One buffer element read as the f32 the tiles hold.
+///
+/// The load reads the buffer's own storage; a half buffer widens here, at the
+/// load, so everything downstream of it stays f32.
+pub(crate) fn emit_buffer_load(
+    ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
+    out: &mut Vec<llvm_ir::Inst>,
+    buf: llvm_ir::Operand,
+    index_base: &BufferIndexBase,
+    tile_row: llvm_ir::Operand,
+    tile_col: llvm_ir::Operand,
+    elem: &llvm_ir::Type,
+) -> llvm_ir::Operand {
+    let ptr = emit_buffer_element_ptr(
+        ctx,
+        out,
+        buf,
+        index_base.clone(),
+        tile_row,
+        tile_col,
+        elem.clone(),
+    );
+    let value = emit_load(ctx, out, ptr, elem.clone());
+    if *elem == llvm_ir::Type::F16 {
+        emit_cast(
+            ctx,
+            out,
+            llvm_ir::CastOp::Fext,
+            value,
+            llvm_ir::Type::F32,
+        )
+    } else {
+        value
+    }
+}
+
+/// One f32 tile value written to a buffer element.
+///
+/// The store writes the buffer's own storage; a half buffer narrows here, at
+/// the store.
+pub(crate) fn emit_buffer_store(
+    ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
+    out: &mut Vec<llvm_ir::Inst>,
+    buf: llvm_ir::Operand,
+    index_base: &BufferIndexBase,
+    tile_row: llvm_ir::Operand,
+    tile_col: llvm_ir::Operand,
+    value: llvm_ir::Operand,
+    elem: &llvm_ir::Type,
+) {
+    let ptr = emit_buffer_element_ptr(
+        ctx,
+        out,
+        buf,
+        index_base.clone(),
+        tile_row,
+        tile_col,
+        elem.clone(),
+    );
+    let value = if *elem == llvm_ir::Type::F16 {
+        emit_cast(
+            ctx,
+            out,
+            llvm_ir::CastOp::Ftrunc,
+            value,
+            elem.clone(),
+        )
+    } else {
+        value
+    };
+    emit_store(out, ptr, value);
 }

@@ -1,8 +1,8 @@
 use sile_llvm_ir as llvm_ir;
 
 use super::core::{
-    BlockLowerer, LowerLlvmIrCtx, const_f32, const_i64, emit_bin, emit_cmp, emit_gep, emit_load,
-    emit_shape_dim, emit_store, llvm_ir_block, resolve_operand,
+    BlockLowerer, LowerLlvmIrCtx, buffer_elem_of, const_f32, const_i64, emit_bin, emit_cast,
+    emit_cmp, emit_gep, emit_load, emit_shape_dim, emit_store, llvm_ir_block, resolve_operand,
 };
 use crate::{
     BinOp, CmpOp, TileIrBlock, TileIrFunction, TileIrInst, TileIrOp, TileIrParamKind,
@@ -26,6 +26,11 @@ pub(crate) fn lower_canonical_matmul(
     ctx: &mut LowerLlvmIrCtx,
 ) -> Option<Vec<llvm_ir::BasicBlock>> {
     let plan = CanonicalMatmulPlan::detect(tile_ir)?;
+    // Each buffer carries its own storage element: a half input widens at its
+    // load, a half output narrows at its store, and the sum between stays f32.
+    let a_elem = buffer_elem_of(plan.a_buf, tile_ir);
+    let b_elem = buffer_elem_of(plan.b_buf, tile_ir);
+    let c_elem = buffer_elem_of(plan.c_buf, tile_ir);
     let entry = tile_ir.get_block(tile_ir.entry)?;
     let mut builder = BlockLowerer::new(
         tile_ir,
@@ -311,17 +316,39 @@ pub(crate) fn lower_canonical_matmul(
             out,
             a_buf.clone(),
             vec![body_a_index.clone()],
-            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, llvm_ir::Type::F32),
+            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, a_elem.clone()),
         );
-        let lhs = emit_load(ctx, out, a_ptr, llvm_ir::Type::F32);
+        let a_value = emit_load(ctx, out, a_ptr, a_elem.clone());
+        let lhs = if a_elem == llvm_ir::Type::F16 {
+            emit_cast(
+                ctx,
+                out,
+                llvm_ir::CastOp::Fext,
+                a_value,
+                llvm_ir::Type::F32,
+            )
+        } else {
+            a_value
+        };
         let b_ptr = emit_gep(
             ctx,
             out,
             b_buf.clone(),
             vec![body_b_index.clone()],
-            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, llvm_ir::Type::F32),
+            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, b_elem.clone()),
         );
-        let rhs = emit_load(ctx, out, b_ptr, llvm_ir::Type::F32);
+        let b_value = emit_load(ctx, out, b_ptr, b_elem.clone());
+        let rhs = if b_elem == llvm_ir::Type::F16 {
+            emit_cast(
+                ctx,
+                out,
+                llvm_ir::CastOp::Fext,
+                b_value,
+                llvm_ir::Type::F32,
+            )
+        } else {
+            b_value
+        };
         let product = emit_bin(ctx, out, llvm_ir::BinOp::Mul, lhs, rhs, llvm_ir::Type::F32);
         let next_sum = emit_bin(
             ctx,
@@ -403,9 +430,20 @@ pub(crate) fn lower_canonical_matmul(
             out,
             c_buf.clone(),
             vec![c_index],
-            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, llvm_ir::Type::F32),
+            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, c_elem.clone()),
         );
-        emit_store(out, c_ptr, store_sum.clone());
+        let stored = if c_elem == llvm_ir::Type::F16 {
+            emit_cast(
+                ctx,
+                out,
+                llvm_ir::CastOp::Ftrunc,
+                store_sum.clone(),
+                c_elem.clone(),
+            )
+        } else {
+            store_sum.clone()
+        };
+        emit_store(out, c_ptr, stored);
         let next_col = emit_bin(
             ctx,
             out,

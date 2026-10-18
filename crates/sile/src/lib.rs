@@ -7,6 +7,8 @@ pub use sile_hir::{
     BuiltinOp, ElemType, Expr, Kernel, Param, ParamKind, ShapeExpr, Stmt, Type, ValueCategory,
 };
 
+pub use half;
+
 pub mod tensor;
 pub mod tile;
 

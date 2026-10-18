@@ -10,6 +10,6 @@ pub(crate) use emit::{
     lower_reduce_extent_loop, lower_reduce_extent_loop_step,
 };
 pub(crate) use map::{
-    buffer_rank_of, comparison_pred, llvm_ir_block, llvm_ir_type, llvm_ir_value, lower_bin_op,
-    lower_cmp_pred, lower_float_cmp_pred, tile_dims_of,
+    buffer_elem_of, buffer_rank_of, comparison_pred, llvm_ir_block, llvm_ir_type, llvm_ir_value,
+    lower_bin_op, lower_cmp_pred, lower_float_cmp_pred, tile_dims_of,
 };

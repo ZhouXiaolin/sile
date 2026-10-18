@@ -36,6 +36,7 @@ pub fn lower_to_tile_ir(typed: &TypedKernel) -> TileIrFunction {
             _ => (
                 TileIrType::Buffer {
                     rank: rank_of_param(param),
+                    elem: buffer_elem_of_param(param),
                 },
                 TileIrParamKind::Buffer,
             ),
@@ -163,7 +164,7 @@ impl<'a> LowerCtx<'a> {
             .map(|param| param.name.clone())
             .unwrap_or_else(|| format!("v{}", source.0));
         let rank = match self.types.get(&source) {
-            Some(TileIrType::Buffer { rank }) => *rank,
+            Some(TileIrType::Buffer { rank, .. }) => *rank,
             _ => 1,
         };
         let value = self.push_param(
@@ -2000,7 +2001,7 @@ fn lower_store(target: &str, value: &Expr, index: Option<&Expr>, ctx: &mut Lower
         .unwrap_or((1, 1));
 
     let output_rank = match ctx.types.get(&output) {
-        Some(TileIrType::Buffer { rank }) => *rank,
+        Some(TileIrType::Buffer { rank, .. }) => *rank,
         _ => 1,
     };
     // `y.store(t)` names no coordinates, so the tile is the one this program
@@ -2490,7 +2491,7 @@ fn program_tile_coords(rank: usize, ctx: &mut LowerCtx<'_>) -> (Vec<ValueId>, Va
 /// is what every such access already did.
 fn buffer_rank(value: ValueId, ctx: &LowerCtx<'_>) -> usize {
     match ctx.types.get(&value) {
-        Some(TileIrType::Buffer { rank }) => *rank,
+        Some(TileIrType::Buffer { rank, .. }) => *rank,
         _ => 2,
     }
 }
@@ -2668,6 +2669,20 @@ fn rank_of_param(param: &sile_hir::Param) -> usize {
         | sile_hir::Type::Tile { shape, .. }
         | sile_hir::Type::Partition { shape, .. } => shape.rank(),
         sile_hir::Type::Shape(_) | sile_hir::Type::Scalar(_) => 0,
+    }
+}
+
+/// The storage element type a kernel parameter's buffer holds.
+///
+/// Only a tensor names its element in the type, so a half tensor makes the
+/// whole buffer one and everything else stays f32.
+fn buffer_elem_of_param(param: &sile_hir::Param) -> BufferElem {
+    match &param.ty {
+        sile_hir::Type::Tensor {
+            elem: sile_hir::ElemType::F16,
+            ..
+        } => BufferElem::F16,
+        _ => BufferElem::F32,
     }
 }
 

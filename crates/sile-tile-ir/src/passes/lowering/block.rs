@@ -928,7 +928,7 @@ fn trace_loop_carried_splat_seed(
 
 fn buffer_rank_of(value: ValueId, tile_ir: &TileIrFunction) -> usize {
     match tile_ir.types.get(&value) {
-        Some(TileIrType::Buffer { rank }) => *rank,
+        Some(TileIrType::Buffer { rank, .. }) => *rank,
         _ => 0,
     }
 }

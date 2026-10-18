@@ -2,8 +2,9 @@ use sile_llvm_ir as llvm_ir;
 
 use crate::ValueId;
 use crate::passes::lowering::core::{
-    BlockLowerer, alloc_tile_result, const_f32, const_i64, emit_bin, emit_cmp, emit_gep, emit_load,
-    emit_shape_dim, emit_store, load_tile_scalar_dynamic, resolve_operand,
+    BlockLowerer, alloc_tile_result, buffer_elem_of, const_f32, const_i64, emit_bin, emit_cast,
+    emit_cmp, emit_gep, emit_load, emit_shape_dim, emit_store, load_tile_scalar_dynamic,
+    resolve_operand,
 };
 
 #[derive(Clone, Copy)]
@@ -277,6 +278,8 @@ pub(crate) fn lower_fused_tile_mma_inst(
 
     let a_buf = resolve_operand(a_load.buf, builder.ctx());
     let b_buf = resolve_operand(b_load.buf, builder.ctx());
+    let a_elem = buffer_elem_of(a_load.buf, builder.tile_ir());
+    let b_elem = buffer_elem_of(b_load.buf, builder.tile_ir());
     let (a_origin, a_stride, b_origin, b_stride) = builder.with_current_insts(|ctx, _, out| {
         let a_origin = compute_rank2_tile_origin(
             ctx,
@@ -632,17 +635,39 @@ pub(crate) fn lower_fused_tile_mma_inst(
             out,
             a_buf.clone(),
             vec![body_a_index.clone()],
-            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, llvm_ir::Type::F32),
+            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, a_elem.clone()),
         );
-        let lhs = emit_load(ctx, out, a_ptr, llvm_ir::Type::F32);
+        let a_value = emit_load(ctx, out, a_ptr, a_elem.clone());
+        let lhs = if a_elem == llvm_ir::Type::F16 {
+            emit_cast(
+                ctx,
+                out,
+                llvm_ir::CastOp::Fext,
+                a_value,
+                llvm_ir::Type::F32,
+            )
+        } else {
+            a_value
+        };
         let b_ptr = emit_gep(
             ctx,
             out,
             b_buf.clone(),
             vec![body_b_index.clone()],
-            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, llvm_ir::Type::F32),
+            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, b_elem.clone()),
         );
-        let rhs = emit_load(ctx, out, b_ptr, llvm_ir::Type::F32);
+        let b_value = emit_load(ctx, out, b_ptr, b_elem.clone());
+        let rhs = if b_elem == llvm_ir::Type::F16 {
+            emit_cast(
+                ctx,
+                out,
+                llvm_ir::CastOp::Fext,
+                b_value,
+                llvm_ir::Type::F32,
+            )
+        } else {
+            b_value
+        };
         let product = emit_bin(ctx, out, llvm_ir::BinOp::Mul, lhs, rhs, llvm_ir::Type::F32);
         let next_sum = emit_bin(
             ctx,

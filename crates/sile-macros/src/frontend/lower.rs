@@ -108,12 +108,16 @@ fn lower_param(
         }
         None => quote! { ::sile::hir::ShapeExpr::dynamic() },
     };
+    let elem = match param.elem {
+        super::ast::BufferElemType::F32 => quote! { ::sile::hir::ElemType::F32 },
+        super::ast::BufferElemType::F16 => quote! { ::sile::hir::ElemType::F16 },
+    };
     Ok(quote! {
         ::sile::hir::Param::new(
             #name,
             #kind,
             ::sile::hir::Type::tensor(
-                ::sile::hir::ElemType::F32,
+                #elem,
                 #shape,
             ),
         )

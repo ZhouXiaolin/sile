@@ -47,10 +47,29 @@ pub enum TileIrType {
     ShapeDesc { rank: usize },
     /// Tile of f32 with known shape
     Tile { rows: i64, cols: i64 },
-    /// Opaque buffer pointer (kernel parameter)
-    Buffer { rank: usize },
+    /// Opaque buffer pointer (kernel parameter). The element type is the
+    /// buffer's storage: a half buffer converts at its loads and stores, and
+    /// every tile between them stays f32.
+    Buffer { rank: usize, elem: BufferElem },
     /// Unit (for instructions with no meaningful result)
     Void,
+}
+
+/// The element type a buffer's storage holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BufferElem {
+    F32,
+    F16,
+}
+
+impl BufferElem {
+    /// The LLVM IR type of one element of this storage.
+    pub fn llvm_type(self) -> sile_llvm_ir::Type {
+        match self {
+            BufferElem::F32 => sile_llvm_ir::Type::F32,
+            BufferElem::F16 => sile_llvm_ir::Type::F16,
+        }
+    }
 }
 
 impl fmt::Display for TileIrType {
@@ -60,7 +79,13 @@ impl fmt::Display for TileIrType {
             TileIrType::F32 => write!(f, "f32"),
             TileIrType::ShapeDesc { rank } => write!(f, "shape_desc<rank={rank}>"),
             TileIrType::Tile { rows, cols } => write!(f, "tile<f32, {rows}x{cols}>"),
-            TileIrType::Buffer { rank } => write!(f, "buffer<f32, rank={rank}>"),
+            TileIrType::Buffer { rank, elem } => {
+                let elem = match elem {
+                    BufferElem::F32 => "f32",
+                    BufferElem::F16 => "f16",
+                };
+                write!(f, "buffer<{elem}, rank={rank}>")
+            }
             TileIrType::Void => write!(f, "void"),
         }
     }
