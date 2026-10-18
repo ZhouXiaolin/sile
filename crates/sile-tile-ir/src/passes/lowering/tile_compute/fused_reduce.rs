@@ -241,6 +241,7 @@ pub(crate) fn lower_fused_map_reduce_inst(
                     tile_ir,
                     &fused_load_bases,
                     out,
+                    false,
                 );
 
                 for idx in 1..reduce_extent {
@@ -262,6 +263,7 @@ pub(crate) fn lower_fused_map_reduce_inst(
                         tile_ir,
                         &fused_load_bases,
                         out,
+                        false,
                     );
                     acc = reduce_combine(ctx, out, acc, next, is_max);
                 }
@@ -921,6 +923,7 @@ fn lower_single_col_fused_map_reduce_loop(
             tile_ir,
             fused_load_bases,
             out,
+            false,
         )
     });
 
@@ -944,6 +947,7 @@ fn lower_single_col_fused_map_reduce_loop(
                 tile_ir,
                 fused_load_bases,
                 out,
+                false,
             );
             reduce_combine(ctx, out, acc, next, is_max)
         },
@@ -1036,6 +1040,7 @@ fn lower_single_row_fused_map_reduce_loop(
             tile_ir,
             fused_load_bases,
             out,
+            false,
         )
     });
 
@@ -1059,6 +1064,7 @@ fn lower_single_row_fused_map_reduce_loop(
                 tile_ir,
                 fused_load_bases,
                 out,
+                false,
             );
             reduce_combine(ctx, out, acc, next, is_max)
         },
@@ -1365,6 +1371,7 @@ fn lower_full_2d_fused_map_reduce_loop(
             tile_ir,
             fused_load_bases,
             out,
+            false,
         )
     });
 
@@ -1392,6 +1399,7 @@ fn lower_full_2d_fused_map_reduce_loop(
                 tile_ir,
                 fused_load_bases,
                 out,
+                false,
             );
             reduce_combine(ctx, out, acc, next, is_max)
         },

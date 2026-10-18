@@ -2,10 +2,13 @@
 //!
 //! Three kernels, three launches: a tiled gemm, a matvec that reduces along the
 //! contraction axis, and an in-place ReLU. The host compares the result with a
-//! plain Rust reference.
+//! numpy reference.
 
 use sile::ct::*;
 use sile::{Device, Tensor};
+
+#[path = "common/mod.rs"]
+mod common;
 
 #[sile::kernel]
 fn gemm<const BM: i64, const BN: i64, const BK: i64>(
@@ -84,35 +87,22 @@ fn main() -> sile::Result<()> {
     let w0_host = w0.to_vec(&stream)?;
     let w1_host = w1.to_vec(&stream)?;
     let x_host = x.to_vec(&stream)?;
+    let expected = common::numpy(
+        "mlp",
+        &[dim.to_string(), dim.to_string(), dim.to_string()],
+        &[&x_host, &w0_host, &w1_host],
+    );
     let dim = dim as usize;
-    let mut mid = vec![0.0f32; dim * dim];
-    for i in 0..dim {
-        for j in 0..dim {
-            let mut sum = 0.0;
-            for k in 0..dim {
-                sum += x_host[i * dim + k] * w0_host[k * dim + j];
-            }
-            mid[i * dim + j] = sum;
-        }
-    }
-    let mut want = vec![0.0f32; dim];
-    for i in 0..dim {
-        let mut sum = 0.0;
-        for k in 0..dim {
-            sum += mid[i * dim + k] * w1_host[k];
-        }
-        want[i] = sum.max(0.0);
-    }
 
     let mut max_diff = 0.0f32;
     for i in 0..dim {
-        let diff = (got[i] - want[i]).abs();
+        let diff = (got[i] - expected[i]).abs();
         max_diff = max_diff.max(diff);
         assert!(
             diff < 1e-3,
             "Mismatch at index {i}: GPU={}, CPU={}",
             got[i],
-            want[i]
+            expected[i]
         );
     }
     println!("cutile mlp dim={dim} max difference = {max_diff:.2e} on {device:?}");

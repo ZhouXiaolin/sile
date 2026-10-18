@@ -5,6 +5,9 @@
 use sile::ct::*;
 use sile::{Device, Tensor};
 
+#[path = "common/mod.rs"]
+mod common;
+
 #[sile::kernel]
 fn gemm<const BM: i64, const BN: i64, const BK: i64, const K: i64>(
     z: &mut Tensor<f32, { [BM, BN] }>,
@@ -42,9 +45,20 @@ fn main() -> Result<(), sile::Error> {
         .apply(&stream)?;
 
     let z_host = z.to_vec(&stream)?;
+    let x_host = x.to_vec(&stream)?;
+    let y_host = y.to_vec(&stream)?;
+    let expected = common::numpy(
+        "matmul",
+        &[m.to_string(), K.to_string(), n.to_string()],
+        &[&x_host, &y_host],
+    );
     for (i, value) in z_host.iter().enumerate().take(10) {
         println!("z_host[{i}] = {value} answer = {K}");
-        assert!((value - K as f32).abs() < 1e-3, "z[{i}] = {value}, want {K}");
+        assert!(
+            (value - expected[i]).abs() < 1e-3,
+            "z[{i}] = {value}, want {}",
+            expected[i]
+        );
     }
     println!("cutile gemm {m}x{n}x{K} ok on {:?}", device);
     Ok(())

@@ -93,6 +93,10 @@ fn parse_stmt(stmt: &syn::Stmt, body: &mut Vec<KernelStmt>) -> syn::Result<()> {
                 parse_for_loop(for_loop, body)?;
                 return Ok(());
             }
+            if let syn::Expr::If(if_expr) = expr {
+                body.push(parse_if(if_expr)?);
+                return Ok(());
+            }
             if let syn::Expr::Assign(assign) = expr {
                 let name = match assign.left.as_ref() {
                     syn::Expr::Path(path) => path.path.segments.last().unwrap().ident.clone(),
@@ -227,6 +231,14 @@ fn collect_block_id_bindings(body: &[KernelStmt], out: &mut Vec<syn::Ident>) {
                 }
             }
             KernelStmt::ForLoop { body, .. } => collect_block_id_bindings(body, out),
+            KernelStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_block_id_bindings(then_body, out);
+                collect_block_id_bindings(else_body, out);
+            }
             _ => {}
         }
     }
@@ -236,7 +248,7 @@ fn is_block_id_call(expr: &KernelExpr) -> bool {
     matches!(
         expr,
         KernelExpr::Call { func, .. }
-            if func == "get_tile_block_id" || func == "program_id" || func == "id"
+            if func == "get_tile_block_id" || func == "program_id"
     )
 }
 
@@ -262,6 +274,15 @@ fn rewrite_block_id_fields(body: &mut [KernelStmt], block_ids: &[syn::Ident]) {
                 rewrite_block_id_expr(start, block_ids);
                 rewrite_block_id_expr(end, block_ids);
                 rewrite_block_id_fields(body, block_ids);
+            }
+            KernelStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                rewrite_block_id_expr(cond, block_ids);
+                rewrite_block_id_fields(then_body, block_ids);
+                rewrite_block_id_fields(else_body, block_ids);
             }
             KernelStmt::Continue => {}
         }
@@ -348,6 +369,42 @@ fn rewrite_block_id_syn(expr: &mut syn::Expr, block_ids: &[syn::Ident]) {
     }
 }
 
+/// `if cond { .. } else { .. }`.
+///
+/// The arms hold statements, so they go through the same parser a loop body
+/// does. An `else if` is an `if` statement inside the else arm, which is what
+/// makes one variant carry a whole chain.
+fn parse_if(if_expr: &syn::ExprIf) -> syn::Result<KernelStmt> {
+    let cond = parse_expr(&if_expr.cond)?;
+    let then_body = parse_block(&if_expr.then_branch)?;
+    let else_body = match &if_expr.else_branch {
+        None => Vec::new(),
+        Some((_, branch)) => match branch.as_ref() {
+            syn::Expr::Block(block) => parse_block(&block.block)?,
+            syn::Expr::If(nested) => vec![parse_if(nested)?],
+            other => {
+                return Err(syn::Error::new_spanned(
+                    other,
+                    "an else branch must be a block or another `if`",
+                ));
+            }
+        },
+    };
+    Ok(KernelStmt::If {
+        cond,
+        then_body,
+        else_body,
+    })
+}
+
+fn parse_block(block: &syn::Block) -> syn::Result<Vec<KernelStmt>> {
+    let mut body = Vec::new();
+    for stmt in &block.stmts {
+        parse_stmt(stmt, &mut body)?;
+    }
+    Ok(body)
+}
+
 fn parse_for_loop(for_loop: &syn::ExprForLoop, body: &mut Vec<KernelStmt>) -> syn::Result<()> {
     let var = match for_loop.pat.as_ref() {
         syn::Pat::Ident(pat) => pat.ident.clone(),
@@ -390,10 +447,7 @@ fn parse_for_loop(for_loop: &syn::ExprForLoop, body: &mut Vec<KernelStmt>) -> sy
             ));
         }
     };
-    let mut loop_body = Vec::new();
-    for inner_stmt in &for_loop.body.stmts {
-        parse_stmt(inner_stmt, &mut loop_body)?;
-    }
+    let loop_body = parse_block(&for_loop.body)?;
     body.push(KernelStmt::ForLoop {
         var,
         start,
@@ -445,6 +499,17 @@ fn parse_param(arg: &syn::FnArg) -> syn::Result<KernelParam> {
             "a kernel parameter must be a Tensor or a Tile",
         ));
     }
+    // The buffers carry f32. A kernel that names another element type would
+    // otherwise compile and read its bytes as floats, which is a different
+    // program from the one written.
+    if let Some(elem) = buffer_element_spelling(&reference.elem)
+        && elem != "f32"
+    {
+        return Err(syn::Error::new_spanned(
+            &reference.elem,
+            format!("a buffer parameter holds f32; `{elem}` is not carried"),
+        ));
+    }
     let shape = extract_shape_from_type(&reference.elem);
 
     Ok(KernelParam {
@@ -477,9 +542,10 @@ fn scalar_type(ty: &syn::Type) -> Option<ScalarType> {
 
 /// The value of a float constant written as a path.
 ///
-/// A kernel writes an infinity or a not-a-number as the associated constant
-/// Rust spells them with, so the two a sentinel needs are read here. Every
-/// other path is not a value.
+/// A kernel writes a limit value as the associated constant Rust spells it
+/// with: the two infinities a sentinel needs, plus not-a-number, the smallest
+/// and largest finite values, and the spacing of ones. Every other path is not
+/// a value.
 fn float_constant(path: &syn::Path) -> Option<f32> {
     let names: Vec<String> = path
         .segments
@@ -489,6 +555,10 @@ fn float_constant(path: &syn::Path) -> Option<f32> {
     match names.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["f32", "NEG_INFINITY"] => Some(f32::NEG_INFINITY),
         ["f32", "INFINITY"] => Some(f32::INFINITY),
+        ["f32", "NAN"] => Some(f32::NAN),
+        ["f32", "EPSILON"] => Some(f32::EPSILON),
+        ["f32", "MIN"] => Some(f32::MIN),
+        ["f32", "MAX"] => Some(f32::MAX),
         _ => None,
     }
 }
@@ -545,12 +615,32 @@ fn is_shape_bearing_type(ty: &syn::Type) -> bool {
         .is_some_and(|segment| segment.ident == "Tensor" || segment.ident == "Tile")
 }
 
-fn extract_shape_from_type(ty: &syn::Type) -> Option<Vec<KernelShapeDim>> {
+/// The element type a `Tensor`/`Tile` parameter names, as the source spells it.
+///
+/// A type with no element argument (`Tensor<f32>` has one, but a bare path does
+/// not) or a generic parameter returns the name it carries either way, so the
+/// caller can name it in an error.
+fn buffer_element_spelling(ty: &syn::Type) -> Option<String> {
     let syn::Type::Path(type_path) = ty else {
         return None;
     };
     let last_seg = type_path.path.segments.last()?;
-    if last_seg.ident != "Tensor" {
+    let syn::PathArguments::AngleBracketed(args) = &last_seg.arguments else {
+        return None;
+    };
+    let syn::GenericArgument::Type(syn::Type::Path(elem)) = args.args.first()? else {
+        return None;
+    };
+    elem.path.get_ident().map(|ident| ident.to_string())
+}
+
+fn extract_shape_from_type(ty: &syn::Type) -> Option<Vec<KernelShapeDim>> {    let syn::Type::Path(type_path) = ty else {
+        return None;
+    };
+    let last_seg = type_path.path.segments.last()?;
+    // A parameter may name its view as `Tensor` or as `Tile`; both carry the
+    // shape the same way, so both extract it here.
+    if last_seg.ident != "Tensor" && last_seg.ident != "Tile" {
         return None;
     }
     let syn::PathArguments::AngleBracketed(args) = &last_seg.arguments else {
@@ -657,6 +747,16 @@ fn parse_expr(expr: &syn::Expr) -> syn::Result<KernelExpr> {
                 syn::BinOp::Mul(_) => BinOpKind::Mul,
                 syn::BinOp::Div(_) => BinOpKind::Div,
                 syn::BinOp::Rem(_) => BinOpKind::Rem,
+                syn::BinOp::Eq(_) => BinOpKind::Eq,
+                syn::BinOp::Ne(_) => BinOpKind::Ne,
+                syn::BinOp::Lt(_) => BinOpKind::Lt,
+                syn::BinOp::Le(_) => BinOpKind::Le,
+                syn::BinOp::Gt(_) => BinOpKind::Gt,
+                syn::BinOp::Ge(_) => BinOpKind::Ge,
+                // `&` and `&&` are one operation, and so are `|` and `||`: an
+                // operand here is a value, so there is nothing to short circuit.
+                syn::BinOp::BitAnd(_) | syn::BinOp::And(_) => BinOpKind::And,
+                syn::BinOp::BitOr(_) | syn::BinOp::Or(_) => BinOpKind::Or,
                 _ => {
                     return Err(syn::Error::new_spanned(
                         &binary.op,
@@ -669,6 +769,18 @@ fn parse_expr(expr: &syn::Expr) -> syn::Result<KernelExpr> {
                 op,
                 right: Box::new(right),
             })
+        }
+        syn::Expr::Unary(unary) => {
+            let inner = parse_expr(&unary.expr)?;
+            match unary.op {
+                // CuTile writes `-x` for a negated tile or a negative scalar,
+                // so a minus lowers to the negation operation the IR has.
+                syn::UnOp::Neg(_) => Ok(KernelExpr::Neg(Box::new(inner))),
+                _ => Err(syn::Error::new_spanned(
+                    &unary.op,
+                    "unsupported unary operator",
+                )),
+            }
         }
         syn::Expr::Path(path) => match path.path.get_ident().cloned() {
             Some(ident) => Ok(KernelExpr::Var(ident)),

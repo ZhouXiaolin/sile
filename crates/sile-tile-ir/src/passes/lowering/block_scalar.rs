@@ -1,8 +1,8 @@
 use sile_llvm_ir as llvm_ir;
 
 use super::core::{
-    LowerLlvmIrCtx, const_i64, emit_gep, emit_load, llvm_ir_type,
-    llvm_ir_value, load_tile_scalar_dynamic, lower_bin_op, lower_cmp_pred, resolve_operand,
+    LowerLlvmIrCtx, comparison_pred, const_i64, emit_gep, emit_load, llvm_ir_type,
+    llvm_ir_value, load_tile_scalar_dynamic, lower_bin_op, resolve_operand,
 };
 use crate::ir::*;
 use crate::passes::lowering::tile_memory::emit_strided_element_index;
@@ -105,7 +105,11 @@ pub(crate) fn lower_scalar_inst(
                 result_name: Some(format!("v{}", inst.result.0)),
                 ty: llvm_ir::Type::I1,
                 op: llvm_ir::InstOp::Cmp {
-                    pred: lower_cmp_pred(*op),
+                    // A comparison of two counts is a signed integer
+                    // comparison, and a comparison of two elements is an
+                    // ordered float one. Both are one instruction here, and
+                    // the operands say which one this is.
+                    pred: comparison_pred(*op, *lhs, *rhs, tile_ir),
                     lhs: resolve_operand(*lhs, ctx),
                     rhs: resolve_operand(*rhs, ctx),
                 },
@@ -200,6 +204,7 @@ pub(crate) fn lower_scalar_inst(
         | TileIrOp::ReduceMax { .. }
         | TileIrOp::ReduceMin { .. }
         | TileIrOp::Broadcast { .. }
+        | TileIrOp::Reshape { .. }
         | TileIrOp::Map { .. } => {
             unreachable!("tile ops are lowered by dedicated tile lowering paths")
         }

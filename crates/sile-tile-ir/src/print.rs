@@ -200,6 +200,9 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
         TileIrOp::Broadcast { value, rows, cols } => {
             format!("broadcast {value} {{shape = [{rows}, {cols}]}}")
         }
+        TileIrOp::Reshape { value, rows, cols } => {
+            format!("reshape {value} {{shape = [{rows}, {cols}]}}")
+        }
         TileIrOp::Map { expr, rows, cols } => {
             format!(
                 "map {} {{shape = [{rows}, {cols}]}}",
@@ -237,6 +240,7 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
 fn format_tile_map_expr(expr: &TileMapExpr) -> String {
     match expr {
         TileMapExpr::Value(value) => value.to_string(),
+        TileMapExpr::Iota => "iota".to_string(),
         TileMapExpr::LoadPtrTko {
             buf,
             row_coord,
@@ -373,6 +377,8 @@ fn format_tile_binary_op(op: BinOp, is_float: bool) -> &'static str {
         (BinOp::Div, false) => "divi",
         (BinOp::Rem, true) => "remf",
         (BinOp::Rem, false) => "remi",
+        (BinOp::And, _) => "and",
+        (BinOp::Or, _) => "or",
     }
 }
 

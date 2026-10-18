@@ -6,6 +6,9 @@
 use sile::ct::*;
 use sile::{Device, Tensor};
 
+#[path = "common/mod.rs"]
+mod common;
+
 #[sile::kernel]
 fn softmax<const BM: i64, const BN: i64>(
     y: &mut Tensor<f32, { [BM, BN] }>,
@@ -27,7 +30,7 @@ fn main() -> sile::Result<()> {
     let (m, n) = (4i64, 8i64);
     let (bm, bn) = (2i64, n);
     let data: Vec<f32> = (0..m * n).map(|v| v as f32).collect();
-    let x = Tensor::from_vec(data, [m, n], &device)?;
+    let x = Tensor::from_vec(data.clone(), [m, n], &device)?;
     let mut y = Tensor::zeros([m, n], &device)?;
 
     softmax::<2, 8>(&mut y, &x)
@@ -41,6 +44,13 @@ fn main() -> sile::Result<()> {
         println!("softmax(x).sum(axis=1)[{i}] = {sum}");
         assert!((sum - 1.0).abs() < 1e-4, "row {i} sums to {sum}");
     }
+    let expected = common::numpy("softmax", &[m.to_string(), n.to_string()], &[&data]);
+    let worst = y_host
+        .iter()
+        .zip(&expected)
+        .map(|(got, expected)| (got - expected).abs())
+        .fold(0.0f32, f32::max);
+    assert!(worst <= 1e-5, "softmax differs from numpy by {worst}");
     println!("cutile softmax {m}x{n} ok on {device:?}");
     Ok(())
 }

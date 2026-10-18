@@ -15,9 +15,16 @@ pub fn validate(source: &str) -> Result<()> {
     if std::env::var_os("SILE_PRINT_WGSL").is_some() {
         eprintln!("{source}");
     }
-    let module = naga::front::wgsl::Frontend::new()
-        .parse(source)
-        .map_err(|e| sile_core::Error::Compile(format!("generated WGSL does not parse: {e}")))?;
+    let module = naga::front::wgsl::Frontend::new().parse(source).map_err(|e| {
+        let line = e
+            .labels()
+            .next()
+            .map(|(span, _)| span.location(source).line_number)
+            .unwrap_or(0);
+        sile_core::Error::Compile(format!(
+            "generated WGSL does not parse at line {line}: {e}"
+        ))
+    })?;
     // The lowering makes every index an i64, which WGSL allows only when the
     // target enables the capability, so validation permits it rather than
     // rejecting a shader the device would accept.

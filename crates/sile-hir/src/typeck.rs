@@ -72,7 +72,7 @@ pub fn check_kernel(kernel: &Kernel) -> Result<TypedKernel, TypeError> {
         locals.insert(name.clone(), Type::Scalar(ElemType::F32));
     }
 
-    check_block(&kernel.body, &mut locals, kernel, false)?;
+    check_block(&kernel.body, &mut locals, kernel, Scope::Kernel)?;
 
     Ok(TypedKernel {
         kernel: kernel.clone(),
@@ -80,11 +80,38 @@ pub fn check_kernel(kernel: &Kernel) -> Result<TypedKernel, TypeError> {
     })
 }
 
+/// What a `continue` in the block being checked would continue.
+///
+/// A `continue` is the back edge of a loop, and the lowering writes that edge
+/// after the loop body. A branch has its own terminator, so a `continue` inside
+/// one would leave the other arm without an edge to the join point. The checker
+/// rejects it there rather than lower a kernel whose arms disagree about where
+/// the iteration ends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// The kernel body, which has no iteration to end.
+    Kernel,
+    /// A loop body: a `continue` ends this pass and starts the next.
+    Loop,
+    /// A branch, which the lowering seals with a jump to its join point.
+    Branch,
+}
+
+impl Scope {
+    /// The scope a statement inside a branch of this block is checked in.
+    fn inside_branch(self) -> Self {
+        match self {
+            Self::Loop => Self::Branch,
+            other => other,
+        }
+    }
+}
+
 fn check_block(
     body: &[Stmt],
     locals: &mut BTreeMap<String, Type>,
     kernel: &Kernel,
-    in_loop: bool,
+    scope: Scope,
 ) -> Result<(), TypeError> {
     for stmt in body {
         match stmt {
@@ -220,7 +247,7 @@ fn check_block(
                 // it is scoped here rather than left in the kernel's locals.
                 let outer = locals.clone();
                 locals.insert(var.clone(), Type::Scalar(ElemType::F32));
-                let result = check_block(body, locals, kernel, true);
+                let result = check_block(body, locals, kernel, Scope::Loop);
                 // A `let` in the body is a fresh binding on each iteration. It
                 // is not a loop-carried value, and it does not exist after the
                 // loop. Leaving it in scope made the body's `let t = ...`
@@ -229,16 +256,50 @@ fn check_block(
                 *locals = outer;
                 result?;
             }
+            // A branch is control flow over a scalar, so its condition has one
+            // truth value. A tile condition is a per-element choice, which is
+            // what `select` is for, and lowering it as a branch would test the
+            // first element and drop the rest.
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                let cond_ty = infer_expr(cond, locals)?;
+                if !matches!(cond_ty, Type::Scalar(_)) {
+                    return Err(TypeError::invalid_kernel(format!(
+                        "an `if` condition must be a scalar, got {:?}; use `select` to choose per element",
+                        cond_ty.category()
+                    )));
+                }
+                // Both arms are checked in the enclosing scope, and the names
+                // they bind are dropped afterwards, the way a loop body's are.
+                // A name either arm assigns keeps its value: the lowering
+                // carries it to the join point.
+                let outer = locals.clone();
+                let then_result = check_block(then_body, locals, kernel, scope.inside_branch());
+                *locals = outer.clone();
+                let else_result = check_block(else_body, locals, kernel, scope.inside_branch());
+                *locals = outer;
+                then_result?;
+                else_result?;
+            }
             // `continue` has no type, so it has nothing to infer. It does have
             // to be inside a loop: outside one there is no iteration to end, and
             // the lowering would have no header to branch to.
-            Stmt::Continue => {
-                if !in_loop {
+            Stmt::Continue => match scope {
+                Scope::Loop => {}
+                Scope::Kernel => {
                     return Err(TypeError::invalid_kernel(
                         "`continue` is only meaningful inside a loop".to_string(),
                     ));
                 }
-            }
+                Scope::Branch => {
+                    return Err(TypeError::invalid_kernel(
+                        "`continue` inside a branch is not supported: write it after the branch, or use a loop condition".to_string(),
+                    ));
+                }
+            },
         }
     }
     Ok(())
@@ -298,7 +359,7 @@ fn infer_builtin(
             ElemType::F32,
             declared_shape(args, 1, locals),
         )),
-        BuiltinOp::LoadTileLike2D => Ok(Type::tile(
+        BuiltinOp::LoadLike => Ok(Type::tile(
             ElemType::F32,
             // `load_tile_mut(z)` names only the buffer, so the tile shape is
             // the buffer's own tile shape: the output parameter declares it.
@@ -331,6 +392,13 @@ fn infer_builtin(
             check_tile_shape(&shape)?;
             Ok(Type::tile(ElemType::F32, shape))
         }
+        // `iota(shape![N])` names a shape and yields a tile of that shape, one
+        // element per coordinate.
+        BuiltinOp::Iota => {
+            let shape = declared_shape(args, 0, locals);
+            check_tile_shape(&shape)?;
+            Ok(Type::tile(ElemType::F32, shape))
+        }
         BuiltinOp::Reshape | BuiltinOp::Broadcast => {
             let shape = declared_shape(args, 1, locals);
             check_tile_shape(&shape)?;
@@ -352,6 +420,8 @@ fn infer_builtin(
         // output buffer and lowered as a one-element tile.
         BuiltinOp::Max
         | BuiltinOp::Min
+        | BuiltinOp::And
+        | BuiltinOp::Or
         | BuiltinOp::Add
         | BuiltinOp::Sub
         | BuiltinOp::Mul
@@ -473,7 +543,7 @@ fn check_arity(op: BuiltinOp, actual: usize) -> Result<(), TypeError> {
         BuiltinOp::LoadTile => (3, 3),
         // `load_like(x, y)` takes its shape from `y`; `load_tile_mut(z)` takes
         // it from `z`'s own declaration, so one argument is enough.
-        BuiltinOp::LoadTileLike2D => (1, 3),
+        BuiltinOp::LoadLike => (1, 3),
         BuiltinOp::Partition | BuiltinOp::PartitionMut => (2, 2),
         // `part.load([i, j])` names coordinates; `y.load()` names only the
         // buffer and loads the tile the program owns, so the index is optional.
@@ -481,6 +551,8 @@ fn check_arity(op: BuiltinOp, actual: usize) -> Result<(), TypeError> {
         BuiltinOp::Store => (1, 1),
         BuiltinOp::Max
         | BuiltinOp::Min
+        | BuiltinOp::And
+        | BuiltinOp::Or
         | BuiltinOp::Add
         | BuiltinOp::Sub
         | BuiltinOp::Mul
@@ -500,6 +572,7 @@ fn check_arity(op: BuiltinOp, actual: usize) -> Result<(), TypeError> {
         BuiltinOp::ShapeOf | BuiltinOp::ShapeDim => (1, 2),
         BuiltinOp::Mma => (3, 3),
         BuiltinOp::Constant => (2, 2),
+        BuiltinOp::Iota => (1, 1),
         BuiltinOp::ScalarDiv => (2, 2),
         BuiltinOp::Index => (2, 2),
     };

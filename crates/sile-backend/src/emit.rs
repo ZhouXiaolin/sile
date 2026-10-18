@@ -327,10 +327,15 @@ pub const NO_POINTERS: PointerSpelling = PointerSpelling {
 /// expression, so it calls `select(on_false, on_true, cond)` instead. The two
 /// argument orders differ, which is why the spelling is a parameter and not a
 /// format string.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum SelectSpelling {
     Ternary,
-    Function,
+    Function {
+        /// WGSL resolves a bare integer argument of a call to `i32` before
+        /// overload resolution sees the context, so an `i64` result needs its
+        /// integer constants wrapped: `select(i64(0), i64(1), cond)`.
+        int_const: fn(i64) -> String,
+    },
 }
 
 fn select_expr(
@@ -341,7 +346,7 @@ fn select_expr(
 ) -> String {
     match spelling {
         SelectSpelling::Ternary => format!("({cond}) ? ({on_true}) : ({on_false})"),
-        SelectSpelling::Function => format!("select({on_false}, {on_true}, {cond})"),
+        SelectSpelling::Function { .. } => format!("select({on_false}, {on_true}, {cond})"),
     }
 }
 
@@ -525,6 +530,7 @@ pub fn lower_common_inst_line_with<FValue, FOperand>(
     format_operand: FOperand,
     pointers: PointerSpelling,
     select: SelectSpelling,
+    cast_expr: fn(llvm_ir::CastOp, &llvm_ir::Type, String) -> String,
     gep_elements: &mut HashMap<llvm_ir::ValueId, GepLink>,
 ) -> Option<String>
 where
@@ -562,15 +568,20 @@ where
             on_true,
             on_false,
         } => inst.result.map(|id| {
+            let arg = |op: &llvm_ir::Operand| -> String {
+                match (select, &inst.ty, op) {
+                    (
+                        SelectSpelling::Function { int_const },
+                        llvm_ir::Type::I64,
+                        llvm_ir::Operand::Const(llvm_ir::Constant::Int(value)),
+                    ) => int_const(*value),
+                    _ => format_operand(op),
+                }
+            };
             format!(
                 "{} = {};",
                 value_name(id),
-                select_expr(
-                    select,
-                    format_operand(cond),
-                    format_operand(on_true),
-                    format_operand(on_false)
-                )
+                select_expr(select, arg(cond), arg(on_true), arg(on_false))
             )
         }),
         llvm_ir::InstOp::Load { ptr } => inst.result.map(|id| {
@@ -586,9 +597,16 @@ where
         } else {
             format!("{} = {};", element(ptr), format_operand(value))
         }),
-        llvm_ir::InstOp::Cast { value, .. } => inst
-            .result
-            .map(|id| format!("{} = {};", value_name(id), format_operand(value))),
+        // A conversion is a value the target may have to spell: one language
+        // converts where the value is assigned, and another names the type it
+        // converts to.
+        llvm_ir::InstOp::Cast { op, value, to } => inst.result.map(|id| {
+            format!(
+                "{} = {};",
+                value_name(id),
+                cast_expr(*op, to, format_operand(value))
+            )
+        }),
         // A language with addresses materializes the pointer; one without
         // already recorded the element above and emits nothing.
         llvm_ir::InstOp::Gep { base, indices } if pointers.has_address_of => {
@@ -680,6 +698,19 @@ pub trait TargetDialect {
     /// How this target spells a three-way choice.
     fn select(&self) -> SelectSpelling {
         SelectSpelling::Ternary
+    }
+
+    /// How this target spells a conversion from one scalar type to another.
+    ///
+    /// An associated function, not a method, so the shared instruction printer
+    /// can call it without borrowing the dialect. A language that converts
+    /// where the value is assigned writes the value alone; one that has no
+    /// implicit conversion names the type it converts to.
+    fn cast_expr(_op: llvm_ir::CastOp, _to: &llvm_ir::Type, value: String) -> String
+    where
+        Self: Sized,
+    {
+        value
     }
 
     /// Name this target uses for the shape descriptor.
@@ -1118,6 +1149,7 @@ impl<D: TargetDialect> TargetEmitter<'_, D> {
                 |op| format_operand(&value_names, D::float_literal, op),
                 self.dialect.pointers(),
                 self.dialect.select(),
+                D::cast_expr,
                 &mut self.gep_elements,
             )
         };
@@ -1367,8 +1399,8 @@ fn emit_structured_if_else<E: StructuredEmitter>(
     else {
         return Err(Error::Compile(messages.unsupported_cond_br.into()));
     };
-    let join = shared_branch_join(func, *true_target, *false_target)
-        .ok_or_else(|| Error::Compile(messages.unsupported_cond_br.into()))?;
+    let join =
+        branch_join(func, block.id).ok_or_else(|| Error::Compile(messages.unsupported_cond_br.into()))?;
 
     let (cond_expr, skip_result) = branch_condition_expr::<E>(func, block, cond, false);
     emitter.emit_block_insts_except(block, skip_result)?;
@@ -1731,23 +1763,113 @@ fn is_loop_header(func: &llvm_ir::Function, block: &llvm_ir::BasicBlock) -> bool
             || block_reaches(func, false_target, block.id, &mut HashSet::new()))
 }
 
-fn shared_branch_join(
+/// The block the two arms of a branch continue at: the join.
+///
+/// An arm may end at the join directly, or it may run nested structured code
+/// first: a tile operation in an arm lowers to a loop nest of its own. The join
+/// is then the closest block that every path out of the branch passes through,
+/// which is the immediate post-dominator of the branch. Asking for the nearest
+/// block both arms reach would name a block inside an arm instead, because the
+/// loop that encloses the branch reaches the arm's blocks too.
+fn branch_join(func: &llvm_ir::Function, block_id: llvm_ir::BlockId) -> Option<llvm_ir::BlockId> {
+    let post_dominators = compute_post_dominators(func);
+    // A block closer to the branch post-dominates a farther one, so it has the
+    // larger set: the join is the closest, which is the largest.
+    let mut best: Option<(llvm_ir::BlockId, usize)> = None;
+    for candidate in post_dominators.get(&block_id)? {
+        if *candidate == block_id {
+            continue;
+        }
+        let covered = post_dominators.get(candidate).map_or(0, HashSet::len);
+        if best.is_none_or(|(_, best_covered)| covered > best_covered) {
+            best = Some((*candidate, covered));
+        }
+    }
+    best.map(|(join, _)| join)
+}
+
+/// The post-dominators of every block, each set including the block itself.
+///
+/// A block post-dominates a second block when every path from the second block
+/// to a return passes through the first. This is the dominator computation on
+/// the reversed graph: a block's set is the intersection of its successors'
+/// sets, and a block that returns post-dominates only itself.
+fn compute_post_dominators(
     func: &llvm_ir::Function,
-    true_target: llvm_ir::BlockId,
-    false_target: llvm_ir::BlockId,
-) -> Option<llvm_ir::BlockId> {
-    let true_block = get_block(func, true_target)?;
-    let false_block = get_block(func, false_target)?;
-    match (&true_block.terminator, &false_block.terminator) {
-        (
-            llvm_ir::Terminator::Br {
-                target: true_join, ..
-            },
-            llvm_ir::Terminator::Br {
-                target: false_join, ..
-            },
-        ) if true_join == false_join => Some(*true_join),
-        _ => None,
+) -> HashMap<llvm_ir::BlockId, HashSet<llvm_ir::BlockId>> {
+    let returns = |block: &llvm_ir::BasicBlock| {
+        matches!(block.terminator, llvm_ir::Terminator::Ret { .. })
+    };
+    if !func.blocks.iter().any(returns) {
+        // Nothing returns, so no path ends and no block post-dominates another.
+        return func
+            .blocks
+            .iter()
+            .map(|block| (block.id, HashSet::from([block.id])))
+            .collect();
+    }
+
+    let all: HashSet<llvm_ir::BlockId> = func.blocks.iter().map(|block| block.id).collect();
+    let mut post_dominators: HashMap<llvm_ir::BlockId, HashSet<llvm_ir::BlockId>> = func
+        .blocks
+        .iter()
+        .map(|block| {
+            let set = if returns(block) {
+                HashSet::from([block.id])
+            } else {
+                all.clone()
+            };
+            (block.id, set)
+        })
+        .collect();
+
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            if returns(block) {
+                continue;
+            }
+            let mut new_set: Option<HashSet<llvm_ir::BlockId>> = None;
+            for successor in terminator_successors(&block.terminator) {
+                let successor_set = post_dominators
+                    .get(&successor)
+                    .cloned()
+                    .unwrap_or_default();
+                new_set = Some(match new_set {
+                    None => successor_set,
+                    Some(current) => current.intersection(&successor_set).copied().collect(),
+                });
+            }
+            let mut new_set = new_set.unwrap_or_default();
+            new_set.insert(block.id);
+            if post_dominators.get(&block.id) != Some(&new_set) {
+                post_dominators.insert(block.id, new_set);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    post_dominators
+}
+
+fn terminator_successors(terminator: &llvm_ir::Terminator) -> Vec<llvm_ir::BlockId> {
+    match terminator {
+        llvm_ir::Terminator::Br { target, .. } => vec![*target],
+        llvm_ir::Terminator::CondBr {
+            true_target,
+            false_target,
+            ..
+        } => vec![*true_target, *false_target],
+        llvm_ir::Terminator::Switch {
+            default, cases, ..
+        } => {
+            let mut targets = vec![*default];
+            targets.extend(cases.iter().map(|(_, target)| *target));
+            targets
+        }
+        llvm_ir::Terminator::Ret { .. } => Vec::new(),
     }
 }
 

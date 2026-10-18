@@ -3,6 +3,9 @@
 use sile::ct::*;
 use sile::{Device, Tensor};
 
+#[path = "common/mod.rs"]
+mod common;
+
 #[sile::kernel]
 fn matmul<const BM: i64, const BN: i64, const BK: i64>(
     c: &mut Tensor<f32, { [BM, BN] }>,
@@ -41,18 +44,19 @@ fn main() -> sile::Result<()> {
     let c_host = c.to_vec(&stream)?;
     let a_host = a.to_vec(&stream)?;
     let b_host = b.to_vec(&stream)?;
+    let expected = common::numpy(
+        "matmul",
+        &[m.to_string(), k.to_string(), n.to_string()],
+        &[&a_host, &b_host],
+    );
     let (m, n, k) = (m as usize, n as usize, k as usize);
     for i in 0..m {
         for j in 0..n {
-            let mut sum = 0.0f32;
-            for l in 0..k {
-                sum += a_host[i * k + l] * b_host[l * n + j];
-            }
             assert!(
-                (c_host[i * n + j] - sum).abs() < 1e-2,
+                (c_host[i * n + j] - expected[i * n + j]).abs() < 1e-2,
                 "mismatch at c[{i}][{j}]: got {}, expected {}",
                 c_host[i * n + j],
-                sum
+                expected[i * n + j]
             );
         }
     }

@@ -7,6 +7,9 @@
 use sile::ct::*;
 use sile::{Device, Tensor};
 
+#[path = "common/mod.rs"]
+mod common;
+
 #[sile::kernel]
 fn saxpy<const BM: i64, const BN: i64>(
     y: &mut Tensor<f32, { [BM, BN] }>,
@@ -32,15 +35,19 @@ fn main() -> sile::Result<()> {
     let x = Tensor::from_vec(values.clone(), [m, n], &device)?;
     let mut y = Tensor::from_vec(values.clone(), [m, n], &device)?;
 
+    // The kernel updates y in place, so the reference reads y as it is here,
+    // before the launch.
+    let y_host = values.clone();
+
     saxpy::<BM, BN>(&mut y, a, &x)
         .grid(((m / BM) as u32, (n / BN) as u32, 1))
         .apply(&stream)?;
 
     let out = y.to_vec(&stream)?;
-    for (i, got) in out.iter().enumerate().take(10) {
-        let expected = a * values[i] + values[i];
-        println!("{a} * {} + {} = {got} (expected {expected})", values[i], values[i]);
-        assert_eq!(*got, expected, "element {i}");
+    let expected = common::numpy("saxpy", &[a.to_string()], &[&values, &y_host]);
+    for (i, (got, expected)) in out.iter().zip(&expected).enumerate().take(10) {
+        println!("{a} * {} + {} = {got} (expected {expected})", values[i], y_host[i]);
+        assert_eq!(got, expected, "element {i}");
     }
     println!("cutile saxpy {m}x{n} ok on {:?}", device);
     Ok(())

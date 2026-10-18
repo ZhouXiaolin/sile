@@ -6,6 +6,9 @@
 use sile::ct::*;
 use sile::{Device, Tensor};
 
+#[path = "common/mod.rs"]
+mod common;
+
 #[sile::kernel]
 fn dropout<const BM: i64>(
     p: f32,
@@ -44,16 +47,13 @@ fn main() -> sile::Result<()> {
         .apply(&stream)?;
 
     let got = out.to_vec(&stream)?;
+    let expected = common::numpy("dropout", &[p.to_string()], &[&x_data, &keep_data]);
     for i in 0..len as usize {
-        let expected = if keep_data[i] > p {
-            x_data[i] / (1.0 - p)
-        } else {
-            0.0
-        };
         assert!(
-            (got[i] - expected).abs() < 1e-5,
-            "out[{i}] = {}, expected {expected}",
-            got[i]
+            (got[i] - expected[i]).abs() < 1e-5,
+            "out[{i}] = {}, expected {}",
+            got[i],
+            expected[i]
         );
     }
     println!("cutile dropout {len} ok on {device:?}");

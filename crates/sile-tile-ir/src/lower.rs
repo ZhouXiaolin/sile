@@ -194,6 +194,18 @@ impl<'a> LowerCtx<'a> {
         new_id
     }
 
+    /// Give a sealed block the parameters its incoming edges pass.
+    ///
+    /// A loop learns the parameters of its header and its body only after the
+    /// blocks exist, so it names them by id. Patching whichever block was
+    /// sealed last would be wrong: a body that ends in a branch seals the
+    /// blocks of that branch too.
+    fn set_block_params(&mut self, id: BlockId, params: Vec<ValueId>) {
+        if let Some(block) = self.blocks.iter_mut().find(|block| block.id == id) {
+            block.params = params;
+        }
+    }
+
     fn finish(self) -> TileIrFunction {
         TileIrFunction {
             name: self.typed.kernel.name.clone(),
@@ -247,9 +259,204 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx<'_>) -> Flow {
         } => {
             lower_for_loop(var, start, end, body, ctx);
         }
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            return lower_if(cond, then_body, else_body, ctx);
+        }
         Stmt::Continue => return Flow::Continue,
     }
     Flow::Next
+}
+
+/// `if cond { .. } else { .. }`.
+///
+/// The branch is one conditional jump to two blocks, and each block jumps to a
+/// join block. A name either arm assigns becomes a block parameter of the join,
+/// which is the phi a reader of the IR would write, and it is what makes
+///
+/// ```text
+/// if CAUSAL == 1 { mask_start = ...; }
+/// ```
+///
+/// leave `mask_start` set after the branch.
+fn lower_if(cond: &Expr, then_body: &[Stmt], else_body: &[Stmt], ctx: &mut LowerCtx<'_>) -> Flow {
+    // A condition over constants is known here, so the arm that is never taken
+    // does not reach the IR at all. This is what makes a const parameter do its
+    // work: `if CAUSAL == 1` is a straight line when the caller passes one, and
+    // nothing at all when it passes zero.
+    if let Some(taken) = try_eval_cond(cond, ctx) {
+        for stmt in if taken { then_body } else { else_body } {
+            if lower_stmt(stmt, ctx) == Flow::Continue {
+                return Flow::Continue;
+            }
+        }
+        return Flow::Next;
+    }
+
+    // A name either arm assigns is carried to the join. The names the arms bind
+    // for themselves are not: a `let` is fresh in the arm it appears in.
+    let carried = find_carried_vars(&[then_body, else_body], ctx);
+    let init: Vec<(String, ValueId)> = carried
+        .iter()
+        .filter_map(|name| ctx.locals.get(name).map(|value| (name.clone(), *value)))
+        .collect();
+
+    let cond_value = lower_condition(cond, ctx);
+
+    let then_id = ctx.new_block();
+    let else_id = ctx.new_block();
+    let join_id = ctx.new_block();
+
+    let init_args: Vec<ValueId> = init.iter().map(|(_, value)| *value).collect();
+    ctx.seal_block(TileIrTerminator::Branch {
+        cond: cond_value,
+        true_target: then_id,
+        true_args: init_args.clone(),
+        false_target: else_id,
+        false_args: init_args,
+    });
+
+    let then_args = lower_branch(then_id, then_body, &init, join_id, ctx);
+    let else_args = lower_branch(else_id, else_body, &init, join_id, ctx);
+    debug_assert_eq!(then_args.len(), init.len());
+    debug_assert_eq!(else_args.len(), init.len());
+
+    // ── Join block ──
+    //
+    // Each arm passes its final value for every carried name, so the join reads
+    // one value per name whichever arm ran. The block stays open: the statement
+    // after the branch is emitted into it, and `pending_exit_params` gives it
+    // the parameters the arms jump with.
+    ctx.current_block = join_id;
+    let join_params: Vec<ValueId> = init
+        .iter()
+        .map(|(name, value)| {
+            let param = ctx.fresh_value();
+            let ty = ctx.types.get(value).cloned().unwrap_or(TileIrType::Void);
+            ctx.types.insert(param, ty);
+            ctx.locals.insert(name.clone(), param);
+            param
+        })
+        .collect();
+    ctx.pending_exit_params = Some((join_id, join_params));
+
+    Flow::Next
+}
+
+/// Lower one arm of a branch and jump from it to the join.
+///
+/// The arm receives every carried name as a block parameter, so it reads and
+/// writes the names the enclosing scope had. A name the arm does not assign
+/// keeps its parameter, and that value is what the arm passes on.
+fn lower_branch(
+    block_id: BlockId,
+    body: &[Stmt],
+    init: &[(String, ValueId)],
+    join_id: BlockId,
+    ctx: &mut LowerCtx<'_>,
+) -> Vec<ValueId> {
+    ctx.current_block = block_id;
+    let arm_params: Vec<ValueId> = init
+        .iter()
+        .map(|(name, value)| {
+            let param = ctx.fresh_value();
+            let ty = ctx.types.get(value).cloned().unwrap_or(TileIrType::Void);
+            ctx.types.insert(param, ty);
+            ctx.locals.insert(name.clone(), param);
+            param
+        })
+        .collect();
+    for stmt in body {
+        // A `continue` cannot reach here: the checker rejects one inside a
+        // branch, because the arm it sits in would end somewhere the other arm
+        // does not.
+        let _ = lower_stmt(stmt, ctx);
+    }
+    // The arm ends where the statements left it, which is a nested construct's
+    // join when the arm ends with one.
+    let args: Vec<ValueId> = init
+        .iter()
+        .map(|(name, value)| ctx.locals.get(name).copied().unwrap_or(*value))
+        .collect();
+    ctx.seal_block(TileIrTerminator::Jump {
+        target: join_id,
+        args: args.clone(),
+    });
+    // The arm's own block takes the same parameters. The seal above may have
+    // sealed a nested construct's join instead, so the parameters go on by id.
+    ctx.set_block_params(block_id, arm_params);
+    args
+}
+
+/// The predicate a branch tests.
+///
+/// A comparison of two scalars is the predicate itself: one `icmp` or one
+/// `fcmp`, which is what the branch reads. Lowering it to a mask and then
+/// testing the mask says the same thing in three instructions.
+///
+/// Every other condition is a value. A mask holds where it is not zero and a
+/// count is true where it is not zero, so the test is against zero. The checker
+/// has already rejected a condition that is a tile: a per-element choice is
+/// what `select` is for.
+fn lower_condition(cond: &Expr, ctx: &mut LowerCtx<'_>) -> ValueId {
+    if let Expr::Builtin { op, args } = cond
+        && let Some(cmp) = compare_op(*op)
+        && let (Some(lhs_arg), Some(rhs_arg)) = (args.first(), args.get(1))
+    {
+        let lhs = lower_expr(lhs_arg, ctx);
+        let rhs = lower_expr(rhs_arg, ctx);
+        if tile_shape_of(lhs, ctx).is_none() && tile_shape_of(rhs, ctx).is_none() {
+            return ctx.emit(TileIrOp::ICmp { op: cmp, lhs, rhs }, TileIrType::I64);
+        }
+        // A comparison of tiles is per element, so it is a mask the branch
+        // tests. The checker rejects this condition, and lowering it as a test
+        // of the mask keeps the operands evaluated once.
+        let mask = lower_compare(cmp, lhs, rhs, ctx);
+        return test_nonzero(mask, ctx);
+    }
+    test_nonzero(lower_expr(cond, ctx), ctx)
+}
+
+/// A value as the predicate a branch tests.
+fn test_nonzero(value: ValueId, ctx: &mut LowerCtx<'_>) -> ValueId {
+    let zero = if is_float_operand(value, ctx) {
+        ctx.emit(TileIrOp::ConstF64(0.0), TileIrType::F32)
+    } else {
+        ctx.emit(TileIrOp::ConstI64(0), TileIrType::I64)
+    };
+    ctx.emit(
+        TileIrOp::ICmp {
+            op: CmpOp::Ne,
+            lhs: value,
+            rhs: zero,
+        },
+        TileIrType::I64,
+    )
+}
+
+/// The comparison a builtin names, if it names one.
+fn compare_op(op: BuiltinOp) -> Option<CmpOp> {
+    match op {
+        BuiltinOp::Lt => Some(CmpOp::Lt),
+        BuiltinOp::Le => Some(CmpOp::Le),
+        BuiltinOp::Gt => Some(CmpOp::Gt),
+        BuiltinOp::Ge => Some(CmpOp::Ge),
+        BuiltinOp::Eq => Some(CmpOp::Eq),
+        BuiltinOp::Ne => Some(CmpOp::Ne),
+        _ => None,
+    }
+}
+
+/// Whether a condition is known before the kernel runs.
+///
+/// A const parameter is a compile-time value, so `if CAUSAL == 1` names a
+/// branch that is always taken or never taken. A comparison folds to `1` or
+/// `0`, and `&`/`|` combine those, so one rule reads a count and a mask alike.
+fn try_eval_cond(expr: &Expr, ctx: &LowerCtx<'_>) -> Option<bool> {
+    try_eval_i64(expr, ctx).map(|value| value != 0)
 }
 
 fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut LowerCtx<'_>) {
@@ -314,7 +521,7 @@ fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut 
     // Identify loop-carried variables by scanning the loop body. Only names
     // that already exist outside the loop are carried; a `let` in the body is
     // a fresh binding on each iteration.
-    let carried_names = find_loop_carried_vars(body, ctx);
+    let carried_names = find_carried_vars(&[body], ctx);
 
     // Collect initial values for carried variables
     let init_carried: Vec<(String, ValueId)> = carried_names
@@ -393,9 +600,7 @@ fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut 
     });
 
     // Store header block params
-    if let Some(header_block) = ctx.blocks.last_mut() {
-        header_block.params = header_params;
-    }
+    ctx.set_block_params(header_id, header_params);
 
     // ── Body block ──
     ctx.current_block = body_id;
@@ -458,9 +663,7 @@ fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut 
     });
 
     // Store body block params
-    if let Some(body_block) = ctx.blocks.last_mut() {
-        body_block.params = body_block_params;
-    }
+    ctx.set_block_params(body_id, body_block_params);
 
     // ── Exit block ──
     ctx.current_block = exit_id;
@@ -518,20 +721,21 @@ fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut 
     ctx.pending_exit_params = Some((exit_id, placeholder.params));
 }
 
-/// Find variables that are assigned within the loop body and already exist
-/// outside it. These become block parameters of the loop.
+/// Find variables that are assigned within the bodies and already exist
+/// outside them. These become block parameters of the block the bodies join.
 ///
-/// A `let` in the body is not one of them: it is a fresh binding on each
-/// iteration, so it has no value to carry in. Treating it as carried made the
-/// loop read a value from before the loop and write it back as if the body had
-/// assigned it.
-fn find_loop_carried_vars(body: &[Stmt], ctx: &LowerCtx<'_>) -> Vec<String> {
+/// A `let` in a body is not one of them: it is a fresh binding, so it has no
+/// value to carry in. Treating it as carried made the loop read a value from
+/// before the loop and write it back as if the body had assigned it.
+fn find_carried_vars(bodies: &[&[Stmt]], ctx: &LowerCtx<'_>) -> Vec<String> {
     let mut vars = Vec::new();
-    collect_carried_names(body, ctx, &mut vars);
+    for body in bodies {
+        collect_carried_names(body, ctx, &mut vars);
+    }
     vars
 }
 
-/// Walk the body, including nested loops.
+/// Walk the bodies, including nested loops and branches.
 ///
 /// An assignment inside a nested loop is still an assignment to the outer
 /// loop's variable. Scanning only the top level missed it, so the outer loop
@@ -545,6 +749,14 @@ fn collect_carried_names(body: &[Stmt], ctx: &LowerCtx<'_>, vars: &mut Vec<Strin
                 }
             }
             Stmt::ForLoop { body, .. } => collect_carried_names(body, ctx, vars),
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_carried_names(then_body, ctx, vars);
+                collect_carried_names(else_body, ctx, vars);
+            }
             Stmt::Let { .. } | Stmt::Store { .. } | Stmt::AtomicAdd { .. } | Stmt::Continue => {}
         }
     }
@@ -715,7 +927,7 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 TileIrType::Tile { rows, cols },
             )
         }
-        BuiltinOp::LoadTileLike2D => {
+        BuiltinOp::LoadLike => {
             let input = lower_expr(&args[0], ctx);
             let _ = ctx.get_or_create_shape_desc_param(input);
             // `load_tile_like_2d(x, y)` takes the tile shape from the output
@@ -762,9 +974,14 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                     TileIrType::Tile { rows, cols },
                 )
             } else {
-                // Reshape is a no-op at tile level, just update type
-                ctx.types.insert(input, TileIrType::Tile { rows, cols });
-                input
+                ctx.emit(
+                    TileIrOp::Reshape {
+                        value: input,
+                        rows,
+                        cols,
+                    },
+                    TileIrType::Tile { rows, cols },
+                )
             }
         }
         BuiltinOp::Mma => {
@@ -796,30 +1013,28 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
         BuiltinOp::Max | BuiltinOp::Min => {
             let lhs = lower_expr(&args[0], ctx);
             let rhs = lower_expr(&args[1], ctx);
-            let operand_shape = tile_shape_of(lhs, ctx).or_else(|| tile_shape_of(rhs, ctx));
-            let (rows, cols) = operand_shape.unwrap_or((1, 1));
-            let (op, ty) = match (op, operand_shape) {
-                (BuiltinOp::Max, Some(_)) => (CmpOp::Ge, TileIrType::Tile { rows, cols }),
-                (BuiltinOp::Max, None) => (CmpOp::Ge, TileIrType::F32),
-                (_, Some(_)) => (CmpOp::Le, TileIrType::Tile { rows, cols }),
-                (_, None) => (CmpOp::Le, TileIrType::F32),
-            };
-            ctx.emit(
-                TileIrOp::Map {
-                    expr: TileMapExpr::Select {
-                        cond: Box::new(TileMapExpr::Cmp {
-                            op,
-                            lhs: Box::new(TileMapExpr::Value(lhs)),
-                            rhs: Box::new(TileMapExpr::Value(rhs)),
-                        }),
-                        on_true: Box::new(TileMapExpr::Value(lhs)),
-                        on_false: Box::new(TileMapExpr::Value(rhs)),
-                    },
-                    rows,
-                    cols,
-                },
-                ty,
-            )
+            lower_extreme(op == BuiltinOp::Max, lhs, rhs, ctx)
+        }
+        // A mask is `0.0` or `1.0`, so a conjunction of masks is their product
+        // and a disjunction is their maximum. Two counts are anded and ored bit
+        // by bit instead, and the operands say which of the two an operator
+        // means.
+        BuiltinOp::And | BuiltinOp::Or => {
+            let lhs = lower_expr(&args[0], ctx);
+            let rhs = lower_expr(&args[1], ctx);
+            if !is_float_operand(lhs, ctx) && !is_float_operand(rhs, ctx) {
+                let op = if op == BuiltinOp::And {
+                    BinOp::And
+                } else {
+                    BinOp::Or
+                };
+                return ctx.emit(TileIrOp::IBinary { op, lhs, rhs }, TileIrType::I64);
+            }
+            if op == BuiltinOp::And {
+                lower_arith(BinOp::Mul, lhs, rhs, ctx)
+            } else {
+                lower_extreme(true, lhs, rhs, ctx)
+            }
         }
         // `ceil_div(a, b)` is `(a + b - 1) / b`. CuTile names it as one
         // operation over counts, and the three integer steps are what every
@@ -864,74 +1079,7 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 BuiltinOp::Rem => BinOp::Rem,
                 _ => unreachable!(),
             };
-            // Check if tile or scalar
-            if let Some((rows, cols)) = tile_shape_of(lhs, ctx).or_else(|| tile_shape_of(rhs, ctx))
-            {
-                // No target has a fused tile remainder, so it rides the map
-                // node the way the unary functions do.
-                if bin_op == BinOp::Rem {
-                    return ctx.emit(
-                        TileIrOp::Map {
-                            expr: TileMapExpr::Rem {
-                                lhs: Box::new(TileMapExpr::Value(lhs)),
-                                rhs: Box::new(TileMapExpr::Value(rhs)),
-                            },
-                            rows,
-                            cols,
-                        },
-                        TileIrType::Tile { rows, cols },
-                    );
-                }
-                let op = match bin_op {
-                    BinOp::Add => TileIrOp::AddF {
-                        lhs,
-                        rhs,
-                        rows,
-                        cols,
-                    },
-                    BinOp::Sub => TileIrOp::SubF {
-                        lhs,
-                        rhs,
-                        rows,
-                        cols,
-                    },
-                    BinOp::Mul => TileIrOp::MulF {
-                        lhs,
-                        rhs,
-                        rows,
-                        cols,
-                    },
-                    BinOp::Div => TileIrOp::DivF {
-                        lhs,
-                        rhs,
-                        rows,
-                        cols,
-                    },
-                    BinOp::Rem => unreachable!("a remainder rides the map node"),
-                };
-                ctx.emit(op, TileIrType::Tile { rows, cols })
-            } else if is_float_operand(lhs, ctx) || is_float_operand(rhs, ctx) {
-                // A scalar chain that touches a float stays float: `rms / n`
-                // divides an f32 by a count, and integer division would round
-                // the mean down before the square root ever sees it.
-                ctx.emit(
-                    TileIrOp::FBinary {
-                        op: bin_op,
-                        lhs,
-                        rhs,
-                    },
-                    TileIrType::F32,
-                )
-            } else {
-                ctx.emit(
-                    TileIrOp::IBinary {
-                        op: bin_op,
-                        lhs,
-                        rhs,
-                    },
-                    TileIrType::I64,
-                )
-            }
+            lower_arith(bin_op, lhs, rhs, ctx)
         }
         // A transpose walks the tile it writes and reads its operand with the
         // two coordinates exchanged, which is a map over the transposed domain.
@@ -984,52 +1132,17 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
         | BuiltinOp::Ne => {
             let lhs = lower_expr(&args[0], ctx);
             let rhs = lower_expr(&args[1], ctx);
-            let (rows, cols) = tile_shape_of(lhs, ctx)
-                .or_else(|| tile_shape_of(rhs, ctx))
-                .unwrap_or((1, 1));
-            let cmp = match op {
-                BuiltinOp::Gt => CmpOp::Gt,
-                BuiltinOp::Lt => CmpOp::Lt,
-                BuiltinOp::Ge => CmpOp::Ge,
-                BuiltinOp::Le => CmpOp::Le,
-                BuiltinOp::Eq => CmpOp::Eq,
-                BuiltinOp::Ne => CmpOp::Ne,
-                _ => unreachable!(),
-            };
-            let ty = if tile_shape_of(lhs, ctx).is_some() || tile_shape_of(rhs, ctx).is_some() {
-                TileIrType::Tile { rows, cols }
-            } else {
-                TileIrType::F32
-            };
-            ctx.emit(
-                TileIrOp::Map {
-                    expr: TileMapExpr::Cmp {
-                        op: cmp,
-                        lhs: Box::new(TileMapExpr::Value(lhs)),
-                        rhs: Box::new(TileMapExpr::Value(rhs)),
-                    },
-                    rows,
-                    cols,
-                },
-                ty,
-            )
+            let cmp = compare_op(op).expect("a comparison names a comparison");
+            lower_compare(cmp, lhs, rhs, ctx)
         }
         BuiltinOp::Select => {
             let cond = lower_expr(&args[0], ctx);
             let on_true = lower_expr(&args[1], ctx);
             let on_false = lower_expr(&args[2], ctx);
-            let (rows, cols) = tile_shape_of(on_true, ctx)
+            let shape = tile_shape_of(on_true, ctx)
                 .or_else(|| tile_shape_of(on_false, ctx))
-                .or_else(|| tile_shape_of(cond, ctx))
-                .unwrap_or((1, 1));
-            let ty = if tile_shape_of(on_true, ctx).is_some()
-                || tile_shape_of(on_false, ctx).is_some()
-                || tile_shape_of(cond, ctx).is_some()
-            {
-                TileIrType::Tile { rows, cols }
-            } else {
-                TileIrType::F32
-            };
+                .or_else(|| tile_shape_of(cond, ctx));
+            let (rows, cols) = shape.unwrap_or((1, 1));
             ctx.emit(
                 TileIrOp::Map {
                     expr: TileMapExpr::Select {
@@ -1040,7 +1153,22 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                     rows,
                     cols,
                 },
-                ty,
+                pointwise_result_ty(shape, &[on_true, on_false], ctx),
+            )
+        }
+        // `iota(shape![N])` is the sequence `0, 1, …, N-1`, so its map reads the
+        // coordinate it walks and nothing else. CuTile names it for a rank-one
+        // shape, which is one row of N columns here.
+        BuiltinOp::Iota => {
+            let shape = args.first().map(|arg| extract_const_shape(arg, ctx));
+            let (rows, cols) = shape_to_2d(&shape.unwrap_or_default());
+            ctx.emit(
+                TileIrOp::Map {
+                    expr: TileMapExpr::Iota,
+                    rows,
+                    cols,
+                },
+                TileIrType::Tile { rows, cols },
             )
         }
         // `tile_to_scalar(t)` reads element `(0, 0)`. A one-element tile has
@@ -1276,6 +1404,114 @@ fn lower_atomic_add(target: &str, index: &Expr, value: &Expr, ctx: &mut LowerCtx
 
 // ── Helpers ────────────────────────────────────────────────────────
 
+/// An arithmetic operation over two values.
+///
+/// A tile operand makes it a tile operation, and a scalar chain that touches a
+/// float stays float: `rms / n` divides an f32 by a count, and integer division
+/// would round the mean down before the square root ever sees it.
+fn lower_arith(op: BinOp, lhs: ValueId, rhs: ValueId, ctx: &mut LowerCtx<'_>) -> ValueId {
+    let shape = tile_shape_of(lhs, ctx).or_else(|| tile_shape_of(rhs, ctx));
+    let Some((rows, cols)) = shape else {
+        if is_float_operand(lhs, ctx) || is_float_operand(rhs, ctx) {
+            return ctx.emit(TileIrOp::FBinary { op, lhs, rhs }, TileIrType::F32);
+        }
+        return ctx.emit(TileIrOp::IBinary { op, lhs, rhs }, TileIrType::I64);
+    };
+    // No target has a fused tile remainder, so it rides the map node the way
+    // the unary functions do.
+    if op == BinOp::Rem {
+        return ctx.emit(
+            TileIrOp::Map {
+                expr: TileMapExpr::Rem {
+                    lhs: Box::new(TileMapExpr::Value(lhs)),
+                    rhs: Box::new(TileMapExpr::Value(rhs)),
+                },
+                rows,
+                cols,
+            },
+            TileIrType::Tile { rows, cols },
+        );
+    }
+    let op = match op {
+        BinOp::Add => TileIrOp::AddF { lhs, rhs, rows, cols },
+        BinOp::Sub => TileIrOp::SubF { lhs, rhs, rows, cols },
+        BinOp::Mul => TileIrOp::MulF { lhs, rhs, rows, cols },
+        BinOp::Div => TileIrOp::DivF { lhs, rhs, rows, cols },
+        BinOp::Rem => unreachable!("a remainder rides the map node"),
+        BinOp::And | BinOp::Or => {
+            unreachable!("a bitwise operation is not a tile operation")
+        }
+    };
+    ctx.emit(op, TileIrType::Tile { rows, cols })
+}
+
+/// A comparison of two values, as the `0.0`/`1.0` mask this IR reads.
+///
+/// A tile operand makes the comparison elementwise, so the result is a tile of
+/// the same shape. Without one it is a scalar comparison, and the operand type
+/// carries through: `j >= mask_start` compares two counts, and the count it
+/// yields is what a following division needs.
+fn lower_compare(cmp: CmpOp, lhs: ValueId, rhs: ValueId, ctx: &mut LowerCtx<'_>) -> ValueId {
+    let shape = tile_shape_of(lhs, ctx).or_else(|| tile_shape_of(rhs, ctx));
+    let (rows, cols) = shape.unwrap_or((1, 1));
+    ctx.emit(
+        TileIrOp::Map {
+            expr: TileMapExpr::Cmp {
+                op: cmp,
+                lhs: Box::new(TileMapExpr::Value(lhs)),
+                rhs: Box::new(TileMapExpr::Value(rhs)),
+            },
+            rows,
+            cols,
+        },
+        pointwise_result_ty(shape, &[lhs, rhs], ctx),
+    )
+}
+
+/// The larger, or the smaller, of two values, element by element.
+///
+/// A maximum is one comparison and one select, which is what the map node
+/// carries, and no target has an instruction that does more.
+fn lower_extreme(max: bool, lhs: ValueId, rhs: ValueId, ctx: &mut LowerCtx<'_>) -> ValueId {
+    let shape = tile_shape_of(lhs, ctx).or_else(|| tile_shape_of(rhs, ctx));
+    let (rows, cols) = shape.unwrap_or((1, 1));
+    let op = if max { CmpOp::Ge } else { CmpOp::Le };
+    ctx.emit(
+        TileIrOp::Map {
+            expr: TileMapExpr::Select {
+                cond: Box::new(TileMapExpr::Cmp {
+                    op,
+                    lhs: Box::new(TileMapExpr::Value(lhs)),
+                    rhs: Box::new(TileMapExpr::Value(rhs)),
+                }),
+                on_true: Box::new(TileMapExpr::Value(lhs)),
+                on_false: Box::new(TileMapExpr::Value(rhs)),
+            },
+            rows,
+            cols,
+        },
+        pointwise_result_ty(shape, &[lhs, rhs], ctx),
+    )
+}
+
+/// The type a pointwise operation over these operands produces.
+///
+/// An operation with a tile operand is a tile of that operand's shape. Without
+/// one it is a scalar, and the operands say which kind: a count stays a count,
+/// and mixing in a float makes the result a float. `min(mask_start,
+/// k_seqlen_tiles)` compares two counts, and the smaller one is still a count.
+fn pointwise_result_ty(
+    shape: Option<(i64, i64)>,
+    operands: &[ValueId],
+    ctx: &LowerCtx<'_>,
+) -> TileIrType {
+    match shape {
+        Some((rows, cols)) => TileIrType::Tile { rows, cols },
+        None if operands.iter().any(|value| is_float_operand(*value, ctx)) => TileIrType::F32,
+        None => TileIrType::I64,
+    }
+}
+
 /// Whether a value is a float, either an element value or a scalar.
 fn is_float_operand(value: ValueId, ctx: &LowerCtx<'_>) -> bool {
     matches!(
@@ -1321,6 +1557,45 @@ fn try_eval_i64(expr: &Expr, ctx: &LowerCtx<'_>) -> Option<i64> {
             let lhs = try_eval_i64(args.first()?, ctx)?;
             let rhs = try_eval_i64(args.get(1)?, ctx)?;
             (rhs != 0).then_some(lhs / rhs)
+        }
+        Expr::Builtin {
+            op: BuiltinOp::Rem,
+            args,
+        } => {
+            let lhs = try_eval_i64(args.first()?, ctx)?;
+            let rhs = try_eval_i64(args.get(1)?, ctx)?;
+            (rhs != 0).then_some(lhs % rhs)
+        }
+        // A comparison of two constants is a constant, and a mask is `1` where
+        // it holds and `0` where it does not. `&` and `|` combine those the way
+        // they combine any two counts, which is what lets `if CAUSAL == 1` and
+        // `if (CAUSAL == 1) || (EVEN_K == 0)` both fold to one answer.
+        Expr::Builtin {
+            op:
+                op @ (BuiltinOp::Eq
+                | BuiltinOp::Ne
+                | BuiltinOp::Lt
+                | BuiltinOp::Le
+                | BuiltinOp::Gt
+                | BuiltinOp::Ge
+                | BuiltinOp::And
+                | BuiltinOp::Or),
+            args,
+        } => {
+            let lhs = try_eval_i64(args.first()?, ctx)?;
+            let rhs = try_eval_i64(args.get(1)?, ctx)?;
+            let value = match op {
+                BuiltinOp::Eq => lhs == rhs,
+                BuiltinOp::Ne => lhs != rhs,
+                BuiltinOp::Lt => lhs < rhs,
+                BuiltinOp::Le => lhs <= rhs,
+                BuiltinOp::Gt => lhs > rhs,
+                BuiltinOp::Ge => lhs >= rhs,
+                BuiltinOp::And => (lhs & rhs) != 0,
+                BuiltinOp::Or => (lhs | rhs) != 0,
+                _ => unreachable!("the arm names the operations it reads"),
+            };
+            Some(value as i64)
         }
         Expr::Shape(shape) => match shape {
             ShapeExpr::Constant(v) => Some(*v),
@@ -1617,6 +1892,15 @@ fn collect_buffer_tile_shapes(
                 collect_buffer_tile_shapes(inner, buf_name, ctx, out);
             }
         }
+        sile_hir::Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            for inner in then_body.iter().chain(else_body) {
+                collect_buffer_tile_shapes(inner, buf_name, ctx, out);
+            }
+        }
         sile_hir::Stmt::Store { value, .. } => {
             collect_tile_shapes_in_expr(value, buf_name, ctx, out);
         }
@@ -1730,6 +2014,11 @@ fn resolve_type_shape(ty: &sile_hir::Type, ctx: &LowerCtx<'_>) -> Option<Vec<i64
             }
             other => Some(vec![resolve_shape_dim(other, ctx)]),
         },
+        // A shape bound to a name carries its extents, so a reshape can name
+        // it: `let tile_shape = shape![1, BLOCK_SIZE]; t.reshape(tile_shape)`.
+        sile_hir::Type::Shape(ShapeExpr::Tuple(dims)) => {
+            Some(dims.iter().map(|d| resolve_shape_dim(d, ctx)).collect())
+        }
         sile_hir::Type::Shape(_) | sile_hir::Type::Scalar(_) => None,
     }
 }

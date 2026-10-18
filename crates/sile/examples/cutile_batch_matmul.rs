@@ -9,6 +9,9 @@
 use sile::ct::*;
 use sile::{Device, Tensor};
 
+#[path = "common/mod.rs"]
+mod common;
+
 #[sile::kernel]
 fn batch_matmul<const BM: i64, const BN: i64, const BK: i64>(
     c: &mut Tensor<f32, { [1, BM, BN] }>,
@@ -47,26 +50,35 @@ fn main() -> sile::Result<()> {
     let a = Tensor::random([batch, m, k], &device)?;
     let b = Tensor::random([batch, k, n], &device)?;
     let mut c = Tensor::zeros([batch, m, n], &device)?;
+    // The random inputs exist only on the device, so their bytes come back
+    // before the launch and travel to python for the reference result.
+    let a_host = a.to_vec(&stream)?;
+    let b_host = b.to_vec(&stream)?;
 
     batch_matmul::<BM, BN, BK>(&mut c, &a, &b)
         .grid((batch as u32, (m / BM) as u32, (n / BN) as u32))
         .apply(&stream)?;
 
     let c_host = c.to_vec(&stream)?;
-    let a_host = a.to_vec(&stream)?;
-    let b_host = b.to_vec(&stream)?;
+    let expected = common::numpy(
+        "batch_matmul",
+        &[
+            batch.to_string(),
+            m.to_string(),
+            k.to_string(),
+            n.to_string(),
+        ],
+        &[&a_host, &b_host],
+    );
     let (batch, m, n, k) = (batch as usize, m as usize, n as usize, k as usize);
     for bi in 0..batch {
         for i in 0..m {
             for j in 0..n {
-                let mut sum = 0.0f32;
-                for l in 0..k {
-                    sum += a_host[(bi * m + i) * k + l] * b_host[(bi * k + l) * n + j];
-                }
                 let got = c_host[(bi * m + i) * n + j];
+                let want = expected[(bi * m + i) * n + j];
                 assert!(
-                    (got - sum).abs() < 1e-3,
-                    "mismatch at c[{bi}][{i}][{j}]: got {got}, expected {sum}"
+                    (got - want).abs() < 1e-3,
+                    "mismatch at c[{bi}][{i}][{j}]: got {got}, expected {want}"
                 );
             }
         }

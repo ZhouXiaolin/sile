@@ -3,29 +3,41 @@ use std::collections::HashMap;
 use crate::{BinOp, TileIrFunction, TileIrInst, TileIrOp, TileIrTerminator, ValueId};
 
 pub fn run(mut func: TileIrFunction) -> TileIrFunction {
-    for block in &mut func.blocks {
+    // Two phases, because a value one block computes may be a duplicate of a
+    // value an earlier block computes. A use of the duplicate can sit in a third
+    // block, or inside a map expression, and the replacement has to reach it.
+    // Rewriting as the scan goes would miss both.
+    let mut replacements = HashMap::<ValueId, ValueId>::new();
+    for block in &func.blocks {
+        // A duplicate is only folded into a value of its own block: the two are
+        // then in the same block and the first one dominates every use of the
+        // second. Folding across blocks would need a dominator check.
         let mut expr_to_value = HashMap::<String, ValueId>::new();
-        let mut replacements = HashMap::<ValueId, ValueId>::new();
-        let mut new_insts = Vec::with_capacity(block.insts.len());
-
         for inst in &block.insts {
-            let rewritten_op = rewrite_op(inst.op.clone(), &replacements);
-            let rewritten_inst = TileIrInst {
-                result: inst.result,
-                op: rewritten_op,
-            };
-
-            if let Some(key) = expr_key(&rewritten_inst.op) {
+            // The key reads the operands the instruction will have, so two
+            // instructions that differ only in a duplicate operand match.
+            let op = rewrite_op(inst.op.clone(), &replacements);
+            if let Some(key) = expr_key(&op) {
                 if let Some(existing) = expr_to_value.get(&key).copied() {
-                    replacements.insert(rewritten_inst.result, existing);
+                    replacements.insert(inst.result, existing);
                     continue;
                 }
-                expr_to_value.insert(key, rewritten_inst.result);
+                expr_to_value.insert(key, inst.result);
             }
-
-            new_insts.push(rewritten_inst);
         }
+    }
 
+    for block in &mut func.blocks {
+        let mut new_insts = Vec::with_capacity(block.insts.len());
+        for inst in &block.insts {
+            if replacements.contains_key(&inst.result) {
+                continue;
+            }
+            new_insts.push(TileIrInst {
+                result: inst.result,
+                op: rewrite_op(inst.op.clone(), &replacements),
+            });
+        }
         block.insts = new_insts;
         block.terminator = rewrite_terminator(block.terminator.clone(), &replacements);
     }
@@ -89,6 +101,9 @@ fn expr_key(op: &TileIrOp) -> Option<String> {
         } => Some(format!("divf:{}:{}:{rows}:{cols}", lhs.0, rhs.0)),
         TileIrOp::Broadcast { value, rows, cols } => {
             Some(format!("broadcast:{}:{rows}:{cols}", value.0))
+        }
+        TileIrOp::Reshape { value, rows, cols } => {
+            Some(format!("reshape:{}:{rows}:{cols}", value.0))
         }
         TileIrOp::Map { .. } => None,
         TileIrOp::ShapeDim { shape, dim } => Some(format!("shape_dim:{}:{dim}", shape.0)),
@@ -287,6 +302,11 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             rows,
             cols,
         },
+        TileIrOp::Reshape { value, rows, cols } => TileIrOp::Reshape {
+            value: rewrite(value),
+            rows,
+            cols,
+        },
         TileIrOp::Map { expr, rows, cols } => TileIrOp::Map {
             expr: rewrite_map_expr(expr, replacements),
             rows,
@@ -342,6 +362,8 @@ fn rewrite_map_expr(
     let rewrite = |value: ValueId| resolve_replacement(value, replacements);
     match expr {
         crate::TileMapExpr::Value(value) => crate::TileMapExpr::Value(rewrite(value)),
+        // A sequence reads no value, so there is nothing to replace.
+        crate::TileMapExpr::Iota => crate::TileMapExpr::Iota,
         crate::TileMapExpr::LoadPtrTko {
             buf,
             row_coord,

@@ -148,10 +148,6 @@ impl Tensor<f32> {
         Tile::new(self.shape.clone())
     }
 
-    pub fn load_tile_like_2d(&self, _target: &Tensor<f32>) -> Tile<f32> {
-        Tile::new(_target.shape().to_vec())
-    }
-
     pub fn store(&mut self, _value: Tile<f32>) {
         // no-op in host context; handled by codegen
     }

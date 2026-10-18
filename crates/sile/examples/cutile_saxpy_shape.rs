@@ -8,6 +8,9 @@
 use sile::ct::*;
 use sile::{Device, Tensor};
 
+#[path = "common/mod.rs"]
+mod common;
+
 #[sile::kernel]
 fn saxpy<const S: [i64; 2]>(
     y: &mut Tensor<f32, S>,
@@ -30,6 +33,10 @@ fn main() -> sile::Result<()> {
     let x = Tensor::from_vec(values.clone(), [m, n], &device)?;
     let mut y = Tensor::from_vec(values.clone(), [m, n], &device)?;
 
+    // The kernel updates y in place, so the reference reads y as it is here,
+    // before the launch.
+    let y_host = values.clone();
+
     // `const S: [i64; 2]` becomes `S_0` and `S_1`, so the call passes the two
     // extents the tensor has.
     saxpy::<2, 8>(&mut y, a, &x)
@@ -37,10 +44,10 @@ fn main() -> sile::Result<()> {
         .apply(&stream)?;
 
     let out = y.to_vec(&stream)?;
-    for (i, got) in out.iter().enumerate().take(10) {
-        let expected = a * values[i] + values[i];
-        println!("{a} * {} + {} = {got} (expected {expected})", values[i], values[i]);
-        assert_eq!(*got, expected, "element {i}");
+    let expected = common::numpy("saxpy", &[a.to_string()], &[&values, &y_host]);
+    for (i, (got, expected)) in out.iter().zip(&expected).enumerate().take(10) {
+        println!("{a} * {} + {} = {got} (expected {expected})", values[i], y_host[i]);
+        assert_eq!(got, expected, "element {i}");
     }
     println!("cutile saxpy with const shape {m}x{n} ok on {device:?}");
     Ok(())

@@ -20,13 +20,13 @@ pub use tile::Tile;
 /// import and nothing else.
 pub mod ct {
     pub use crate::tile::{
-        IntoElement, ScalarBroadcast, TileView, get_tile_block_id, id, load_tile_mut,
-        num_programs, num_tiles, program_id, Tile,
+        IntoElement, ScalarBroadcast, TileView, get_tile_block_id, load_tile_mut, num_programs,
+        num_tiles, program_id, Tile,
     };
     pub use crate::{
         broadcast_scalar, ceil_div, constant, convert_scalar, eq_tile, exp, exp2, ge_tile, gt_tile,
-        le_tile, log, log2, lt_tile, mma, ne_tile, reduce_max, reduce_min, reduce_sum, rsqrt,
-        scalar_to_tile, select, sqrt, tile_to_scalar, true_div,
+        iota, le_tile, log, log2, lt_tile, mma, ne_tile, reduce_max, reduce_min, reduce_sum,
+        rsqrt, scalar_to_tile, select, sqrt, tile_to_scalar, true_div,
     };
     // CuTile writes a tile operation with a `_tile` suffix and the scalar one
     // without. Both names reach the same operation here.
@@ -78,10 +78,6 @@ pub mod schedule {
 pub mod kernel_launcher;
 pub use kernel_launcher::KernelLauncher;
 
-pub fn load_tile_like_2d(_x: &Tensor<f32>, y: &Tensor<f32>) -> Tile<f32> {
-    Tile::new(y.shape())
-}
-
 pub fn reduce_max(tile: Tile<f32>, axis: i64) -> Tile<f32> {
     tile.reduced_shape(axis)
 }
@@ -130,8 +126,22 @@ pub fn convert_scalar(value: i64) -> f32 {
 }
 
 /// `broadcast_scalar(s, shape)`: the free-function spelling of `.broadcast`.
-pub fn broadcast_scalar<const N: usize>(_value: f32, _shape: [i64; N]) -> Tile<f32> {
+///
+/// The scalar may be an element or a count: `broadcast_scalar(j * BN, shape)`
+/// splats a coordinate across the tile it indexes.
+pub fn broadcast_scalar<V: crate::tile::IntoElement, const N: usize>(
+    _value: V,
+    _shape: [i64; N],
+) -> Tile<f32> {
     Tile::new(_shape)
+}
+
+/// `iota(shape)`: the sequence `0, 1, …, N-1` across a rank-one shape.
+///
+/// The host body reads only the shape, because the sequence itself is the
+/// coordinate each element is written at and no value it computes is read.
+pub fn iota<const N: usize>(shape: [i64; N]) -> Tile<f32> {
+    Tile::new(shape)
 }
 
 /// `gt_tile(a, b)`: a tile of `0.0`/`1.0` from an elementwise comparison.

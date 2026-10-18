@@ -190,10 +190,7 @@ fn lower_stmt(
             let var_name = var.to_string();
             let start_val = lower_expr(start, const_params)?;
             let end_val = lower_expr(end, const_params)?;
-            let body_stmts = body
-                .iter()
-                .map(|s| lower_stmt(s, const_params))
-                .collect::<syn::Result<Vec<_>>>()?;
+            let body_stmts = lower_stmts(body, const_params)?;
             quote! {
                 ::sile::hir::Stmt::ForLoop {
                     var: #var_name.to_string(),
@@ -203,8 +200,34 @@ fn lower_stmt(
                 }
             }
         }
+        KernelStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            let cond = lower_expr(cond, const_params)?;
+            let then_body = lower_stmts(then_body, const_params)?;
+            let else_body = lower_stmts(else_body, const_params)?;
+            quote! {
+                ::sile::hir::Stmt::If {
+                    cond: #cond,
+                    then_body: vec![#(#then_body),*],
+                    else_body: vec![#(#else_body),*],
+                }
+            }
+        }
         KernelStmt::Continue => quote! { ::sile::hir::Stmt::Continue },
     })
+}
+
+fn lower_stmts(
+    stmts: &[KernelStmt],
+    const_params: &[ConstParam],
+) -> syn::Result<Vec<proc_macro2::TokenStream>> {
+    stmts
+        .iter()
+        .map(|stmt| lower_stmt(stmt, const_params))
+        .collect()
 }
 
 /// Free functions the front end knows how to translate.
@@ -213,7 +236,6 @@ fn lower_stmt(
 /// unsupported operation, and both must fail at compile time rather than become
 /// an unbound variable.
 const BUILTIN_FUNCTIONS: &[&str] = &[
-    "load_tile_like_2d",
     "load_like",
     "load_tile_mut",
     "constant",
@@ -223,6 +245,7 @@ const BUILTIN_FUNCTIONS: &[&str] = &[
     "max",
     "min",
     "ceil_div",
+    "iota",
     "reduce_max",
     "reduce_sum",
     "reduce_min",
@@ -247,7 +270,6 @@ const BUILTIN_FUNCTIONS: &[&str] = &[
     "broadcast_scalar",
     "program_id",
     "get_tile_block_id",
-    "id",
     "num_programs",
     "num_tiles",
 ];
@@ -269,7 +291,6 @@ const BUILTIN_METHODS: &[&str] = &[
     "rsqrt",
     "exp2",
     "shape",
-    "load_tile_like_2d",
     "store",
     "atomic_add",
     "clone",
@@ -299,13 +320,27 @@ fn lower_expr(
             })?;
             quote! { ::sile::hir::Expr::ScalarF32(#val) }
         }
-        // A non-finite float has no literal spelling in Rust, so the constant
-        // is emitted by name rather than as a token.
+        // A float constant is emitted by name rather than as a token: the
+        // values a kernel writes (`f32::NEG_INFINITY` and its neighbours) have
+        // no literal spelling in Rust, and the names round-trip exactly.
         KernelExpr::FloatConst(value) => {
-            let token = if value.is_sign_negative() {
+            let token = if value.is_nan() {
+                quote! { ::core::primitive::f32::NAN }
+            } else if *value == f32::NEG_INFINITY {
                 quote! { ::core::primitive::f32::NEG_INFINITY }
-            } else {
+            } else if *value == f32::INFINITY {
                 quote! { ::core::primitive::f32::INFINITY }
+            } else if *value == f32::EPSILON {
+                quote! { ::core::primitive::f32::EPSILON }
+            } else if *value == f32::MIN {
+                quote! { ::core::primitive::f32::MIN }
+            } else if *value == f32::MAX {
+                quote! { ::core::primitive::f32::MAX }
+            } else {
+                return Err(syn::Error::new(
+                    expr.span(),
+                    "unsupported float constant in a kernel body",
+                ));
             };
             quote! { ::sile::hir::Expr::ScalarF32(#token) }
         }
@@ -331,11 +366,28 @@ fn lower_expr(
                 BinOpKind::Mul => quote! { ::sile::hir::BuiltinOp::Mul },
                 BinOpKind::Div => quote! { ::sile::hir::BuiltinOp::Div },
                 BinOpKind::Rem => quote! { ::sile::hir::BuiltinOp::Rem },
+                BinOpKind::Eq => quote! { ::sile::hir::BuiltinOp::Eq },
+                BinOpKind::Ne => quote! { ::sile::hir::BuiltinOp::Ne },
+                BinOpKind::Lt => quote! { ::sile::hir::BuiltinOp::Lt },
+                BinOpKind::Le => quote! { ::sile::hir::BuiltinOp::Le },
+                BinOpKind::Gt => quote! { ::sile::hir::BuiltinOp::Gt },
+                BinOpKind::Ge => quote! { ::sile::hir::BuiltinOp::Ge },
+                BinOpKind::And => quote! { ::sile::hir::BuiltinOp::And },
+                BinOpKind::Or => quote! { ::sile::hir::BuiltinOp::Or },
             };
             quote! {
                 ::sile::hir::Expr::Builtin {
                     op: #hir_op,
                     args: vec![#left_expr, #right_expr],
+                }
+            }
+        }
+        KernelExpr::Neg(inner) => {
+            let inner_expr = lower_expr(inner, const_params)?;
+            quote! {
+                ::sile::hir::Expr::Builtin {
+                    op: ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Neg),
+                    args: vec![#inner_expr],
                 }
             }
         }
@@ -379,9 +431,7 @@ fn lower_call(
         .collect::<syn::Result<Vec<_>>>()?;
 
     let op = match func_name.as_str() {
-        "load_tile_like_2d" | "load_like" | "load_tile_mut" => {
-            quote! { ::sile::hir::BuiltinOp::LoadTileLike2D }
-        }
+        "load_like" | "load_tile_mut" => quote! { ::sile::hir::BuiltinOp::LoadLike },
         "constant" => quote! { ::sile::hir::BuiltinOp::Constant },
         "mma" => quote! { ::sile::hir::BuiltinOp::Mma },
         // A tile spelling and a scalar spelling of the same operation: the
@@ -389,6 +439,7 @@ fn lower_call(
         "max_tile" | "max" => quote! { ::sile::hir::BuiltinOp::Max },
         "min_tile" | "min" => quote! { ::sile::hir::BuiltinOp::Min },
         "ceil_div" => quote! { ::sile::hir::BuiltinOp::CeilDiv },
+        "iota" => quote! { ::sile::hir::BuiltinOp::Iota },
         "reduce_max" => quote! { ::sile::hir::BuiltinOp::ReduceMax },
         "reduce_sum" => quote! { ::sile::hir::BuiltinOp::ReduceSum },
         // A minimum is a maximum with the operands swapped and the predicate
@@ -468,12 +519,8 @@ fn lower_method_call(
         // The same view, opened for writing. The buffer's own parameter
         // decides whether the store through the view is legal.
         "partition_mut" => quote! { ::sile::hir::BuiltinOp::PartitionMut },
-        // `x.load_like(y)` takes its tile shape from `y`, the same way
-        // `load_tile_like_2d(x, y)` does.
-        "load_like" | "load_tile_like_2d" => quote! { ::sile::hir::BuiltinOp::LoadTileLike2D },
-        // `load_tile_mut(y)` is `load_like(y)`: the mutability of the output
-        // lives in the parameter, not in the load.
-        "load_tile_mut" => quote! { ::sile::hir::BuiltinOp::LoadTileLike2D },
+        // `x.load_like(y)` takes its tile shape from `y`.
+        "load_like" | "load_tile_mut" => quote! { ::sile::hir::BuiltinOp::LoadLike },
         "reshape" => quote! { ::sile::hir::BuiltinOp::Reshape },
         "broadcast" => quote! { ::sile::hir::BuiltinOp::Broadcast },
         "transpose" => quote! { ::sile::hir::BuiltinOp::Transpose },
@@ -530,12 +577,11 @@ fn lower_field_access(
     const_params: &[ConstParam],
 ) -> syn::Result<proc_macro2::TokenStream> {
     // `tile::program_id(axis)` is a scalar in CuTile Rust, so a field access on
-    // it is the historical tuple spelling and the axis wins. `tile::id()` has no
-    // axis argument, so there the field selects the axis. Accepting both keeps
-    // `id().1` working while making `program_id(1)` mean axis one.
+    // it is the tuple spelling and the axis wins. `get_tile_block_id()` has no
+    // axis argument, so there the field selects the axis.
     if let KernelExpr::Call { func, args } = target {
         let func_name = func.to_string();
-        if func_name == "program_id" || func_name == "id" || func_name == "get_tile_block_id" {
+        if func_name == "program_id" || func_name == "get_tile_block_id" {
             let axis = if func_name == "program_id" {
                 match args.first() {
                     Some(KernelExpr::Lit(lit)) => lit.base10_parse::<i64>().map_err(|_| {
@@ -550,8 +596,8 @@ fn lower_field_access(
                     None => 0,
                 }
             } else {
-                // `id()` and `get_tile_block_id()` both return the whole launch
-                // index, so the field selects the axis.
+                // `get_tile_block_id()` returns the whole launch index, so the
+                // field selects the axis.
                 field.parse::<i64>().map_err(|_| {
                     syn::Error::new(
                         func.span(),

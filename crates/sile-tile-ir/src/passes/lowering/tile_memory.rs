@@ -4,7 +4,7 @@ use crate::ValueId;
 use crate::passes::lowering::core::{
     BlockLowerer, alloc_tile_result, buffer_rank_of, const_f32, const_i64, emit_bin, emit_gep,
     emit_load, emit_shape_dim, emit_store, load_tile_scalar_dynamic, lower_1d_tile_coord,
-    lower_nested_tile_loop, resolve_operand,
+    lower_nested_tile_loop, resolve_operand, tile_dims_of,
 };
 
 #[derive(Clone)]
@@ -53,6 +53,78 @@ pub(crate) fn lower_tile_uninit_inst(
     builder: &mut BlockLowerer<'_>,
 ) {
     let _ = alloc_tile_result(builder, result, rows, cols);
+}
+
+/// Lower `reshape`: a fresh tile walked in the new extent, each element read
+/// from the operand at the row-major linear position.
+pub(crate) fn lower_tile_reshape_inst(
+    result: ValueId,
+    value: ValueId,
+    rows: i64,
+    cols: i64,
+    builder: &mut BlockLowerer<'_>,
+) {
+    let (_, src_cols) = tile_dims_of(value, builder.tile_ir()).unwrap_or((rows, cols));
+    let dst_tile = alloc_tile_result(builder, result, rows, cols);
+    let src_tile = resolve_operand(value, builder.ctx());
+    let elem_ptr_ty = llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::F32);
+    let prefix = format!("tile_reshape_{}", result.0);
+    lower_nested_tile_loop(
+        builder,
+        prefix.as_str(),
+        rows,
+        cols,
+        move |ctx, _, out, row, col| {
+            let row_offset = emit_bin(
+                ctx,
+                out,
+                llvm_ir::BinOp::Mul,
+                row.clone(),
+                const_i64(cols),
+                llvm_ir::Type::I64,
+            );
+            let linear = emit_bin(
+                ctx,
+                out,
+                llvm_ir::BinOp::Add,
+                row_offset,
+                col.clone(),
+                llvm_ir::Type::I64,
+            );
+            let src_row = emit_bin(
+                ctx,
+                out,
+                llvm_ir::BinOp::Div,
+                linear.clone(),
+                const_i64(src_cols),
+                llvm_ir::Type::I64,
+            );
+            let src_col = emit_bin(
+                ctx,
+                out,
+                llvm_ir::BinOp::Rem,
+                linear,
+                const_i64(src_cols),
+                llvm_ir::Type::I64,
+            );
+            let src_ptr = emit_gep(
+                ctx,
+                out,
+                src_tile.clone(),
+                vec![src_row, src_col],
+                elem_ptr_ty.clone(),
+            );
+            let elem = emit_load(ctx, out, src_ptr, llvm_ir::Type::F32);
+            let dst_ptr = emit_gep(
+                ctx,
+                out,
+                dst_tile.clone(),
+                vec![row, col],
+                elem_ptr_ty.clone(),
+            );
+            emit_store(out, dst_ptr, elem);
+        },
+    );
 }
 
 pub(crate) fn lower_tile_load_inst(

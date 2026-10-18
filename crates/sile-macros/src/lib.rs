@@ -136,10 +136,22 @@ fn rewrite_expr(expr: &syn::Expr) -> syn::Expr {
         syn::Expr::Unsafe(unsafe_block) => syn::Expr::Block(syn::ExprBlock {
             attrs: unsafe_block.attrs.clone(),
             label: None,
-            block: syn::Block {
-                brace_token: unsafe_block.block.brace_token,
-                stmts: unsafe_block.block.stmts.iter().map(rewrite_stmt).collect(),
-            },
+            block: rewrite_block(&unsafe_block.block),
+        }),
+        // A branch is a block, and a block holds bindings: an annotation inside
+        // one is DSL syntax, the same as an annotation at the top of the body.
+        syn::Expr::If(if_expr) => syn::Expr::If(syn::ExprIf {
+            cond: Box::new(rewrite_expr(&if_expr.cond)),
+            then_branch: rewrite_block(&if_expr.then_branch),
+            else_branch: if_expr
+                .else_branch
+                .as_ref()
+                .map(|(token, expr)| (*token, Box::new(rewrite_expr(expr)))),
+            ..if_expr.clone()
+        }),
+        syn::Expr::Block(block) => syn::Expr::Block(syn::ExprBlock {
+            block: rewrite_block(&block.block),
+            ..block.clone()
         }),
         syn::Expr::Array(arr) => syn::Expr::Array(syn::ExprArray {
             elems: arr.elems.iter().map(rewrite_expr).collect(),
@@ -148,36 +160,9 @@ fn rewrite_expr(expr: &syn::Expr) -> syn::Expr {
         syn::Expr::Path(_) | syn::Expr::Lit(_) | syn::Expr::Range(_) => expr.clone(),
         syn::Expr::ForLoop(for_loop) => {
             // Rewrite statements inside for loop body
-            let new_stmts: Vec<_> = for_loop
-                .body
-                .stmts
-                .iter()
-                .map(|s| match s {
-                    syn::Stmt::Local(local) => {
-                        if let syn::Pat::Type(pat_type) = &local.pat {
-                            let inner_pat = pat_type.pat.as_ref().clone();
-                            let init = local.init.as_ref().map(|init| syn::LocalInit {
-                                eq_token: init.eq_token,
-                                expr: Box::new(rewrite_expr(&init.expr)),
-                                diverge: init.diverge.clone(),
-                            });
-                            return syn::Stmt::Local(syn::Local {
-                                pat: inner_pat,
-                                init,
-                                ..local.clone()
-                            });
-                        }
-                        s.clone()
-                    }
-                    syn::Stmt::Expr(e, semi) => syn::Stmt::Expr(rewrite_expr(e), *semi),
-                    other => other.clone(),
-                })
-                .collect();
             syn::Expr::ForLoop(syn::ExprForLoop {
-                body: syn::Block {
-                    brace_token: for_loop.body.brace_token,
-                    stmts: new_stmts,
-                },
+                expr: Box::new(rewrite_expr(&for_loop.expr)),
+                body: rewrite_block(&for_loop.body),
                 ..for_loop.clone()
             })
         }
@@ -195,6 +180,18 @@ fn rewrite_expr(expr: &syn::Expr) -> syn::Expr {
 /// path such as `f32::NEG_INFINITY`, which is a value.
 fn is_mode_argument(arg: &syn::Expr) -> bool {
     matches!(arg, syn::Expr::Path(path) if frontend::parse::is_mode_path(&path.path))
+}
+
+/// A block whose statements the host body can compile.
+///
+/// Every statement goes through [`rewrite_stmt`], which is what drops the DSL
+/// type annotations and rewrites a shape access. A block nested in a branch or
+/// a loop needs the same treatment as the body of the kernel.
+fn rewrite_block(block: &syn::Block) -> syn::Block {
+    syn::Block {
+        brace_token: block.brace_token,
+        stmts: block.stmts.iter().map(rewrite_stmt).collect(),
+    }
 }
 
 fn rewrite_stmt(stmt: &syn::Stmt) -> syn::Stmt {

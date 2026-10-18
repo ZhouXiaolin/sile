@@ -14,6 +14,9 @@
 use sile::ct::*;
 use sile::{Device, Tensor};
 
+#[path = "common/mod.rs"]
+mod common;
+
 #[sile::kernel]
 fn fmha<const BM: i64, const BN: i64, const D: i64>(
     out: &mut Tensor<f32, { [1, BM, D] }>, // (b*h, m, d)
@@ -93,51 +96,6 @@ fn fmha<const BM: i64, const BN: i64, const D: i64>(
     out.store(acc);
 }
 
-/// One head of one batch, on the host: the same arithmetic the kernel performs,
-/// without the tiling.
-#[allow(clippy::too_many_arguments)]
-fn reference(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    b: usize,
-    h: usize,
-    hkv: usize,
-    m: usize,
-    d: usize,
-    qk_scale: f32,
-) -> Vec<f32> {
-    let mut out = vec![0.0f32; b * h * m * d];
-    let group = h / hkv;
-    for batch in 0..b {
-        for head in 0..h {
-            let kv_head = head / group;
-            for row in 0..m {
-                let mut scores = vec![0.0f32; m];
-                for col in 0..m {
-                    let mut dot = 0.0f32;
-                    for i in 0..d {
-                        dot += q[((batch * h + head) * m + row) * d + i]
-                            * k[((batch * hkv + kv_head) * m + col) * d + i];
-                    }
-                    scores[col] = dot * qk_scale;
-                }
-                let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let weights: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
-                let total: f32 = weights.iter().sum();
-                for i in 0..d {
-                    let mut value = 0.0f32;
-                    for col in 0..m {
-                        value += weights[col] / total * v[((batch * hkv + kv_head) * m + col) * d + i];
-                    }
-                    out[((batch * h + head) * m + row) * d + i] = value;
-                }
-            }
-        }
-    }
-    out
-}
-
 fn main() -> sile::Result<()> {
     let device = Device::default()?;
     let stream = device.create_stream()?;
@@ -166,16 +124,16 @@ fn main() -> sile::Result<()> {
         .apply(&stream)?;
 
     let got = out.to_vec(&stream)?;
-    let expected = reference(
-        &q_data,
-        &k_data,
-        &v_data,
-        b as usize,
-        h as usize,
-        hkv as usize,
-        m as usize,
-        d as usize,
-        qk_scale,
+    // The GQA group comes from the array sizes on the python side: the q plane
+    // count over the kv plane count, with the batch folded into the planes.
+    let expected = common::numpy(
+        "flash_attention",
+        &[
+            m.to_string(),
+            d.to_string(),
+            qk_scale.to_string(),
+        ],
+        &[&q_data, &k_data, &v_data],
     );
     let worst = got
         .iter()

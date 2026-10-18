@@ -1,4 +1,4 @@
-use std::ops::{Add, Div, Index, Mul, Sub};
+use std::ops::{Add, BitAnd, Div, Index, Mul, Sub};
 
 /// A tile program's index, or a grid extent, as (x, y, z).
 ///
@@ -62,11 +62,6 @@ impl<T> TileView for crate::tensor::Partition<T> {}
 /// kernel and not of the launch.
 pub fn num_tiles<V: TileView>(_view: &V, _axis: i64) -> i64 {
     0
-}
-
-/// Deprecated spelling of [`program_id`].
-pub fn id() -> TileId {
-    TileId(0, 0, 0)
 }
 
 /// The current tile program's block id, as `(x, y, z)`.
@@ -314,6 +309,15 @@ impl Mul for Tile<f32> {
 impl Div for Tile<f32> {
     type Output = Self;
     fn div(self, _rhs: Self) -> Self {
+        self
+    }
+}
+
+/// `a & b` on two masks. A mask is `0.0` or `1.0`, so a conjunction is the
+/// product, and the host body carries the left operand's shape.
+impl BitAnd for Tile<f32> {
+    type Output = Self;
+    fn bitand(self, _rhs: Self) -> Self {
         self
     }
 }

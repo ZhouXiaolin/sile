@@ -91,6 +91,15 @@ pub enum KernelStmt {
         end: KernelExpr,
         body: Vec<KernelStmt>,
     },
+    /// `if cond { .. } else { .. }`.
+    ///
+    /// `else if` reaches here as an `if` statement in the else body, so one
+    /// variant carries every chain.
+    If {
+        cond: KernelExpr,
+        then_body: Vec<KernelStmt>,
+        else_body: Vec<KernelStmt>,
+    },
     Continue,
 }
 
@@ -112,6 +121,8 @@ pub enum KernelExpr {
         op: BinOpKind,
         right: Box<KernelExpr>,
     },
+    /// `-expr`: the negation CuTile writes on a tile or a scalar.
+    Neg(Box<KernelExpr>),
     Array(syn::ExprArray),
     FieldAccess {
         target: Box<KernelExpr>,
@@ -176,6 +187,7 @@ impl KernelExpr {
             Self::MethodCall { method, .. } => method.span(),
             Self::Call { func, .. } => func.span(),
             Self::BinaryOp { left, .. } => left.span(),
+            Self::Neg(inner) => inner.span(),
             Self::FieldAccess { target, .. } => target.span(),
             Self::Index { target, .. } => target.span(),
             Self::ShapeMacro(mac) => mac.span(),
@@ -192,4 +204,17 @@ pub enum BinOpKind {
     Mul,
     Div,
     Rem,
+    /// `==`, `!=`, `<`, `<=`, `>`, `>=`: an elementwise comparison, whose value
+    /// is `1.0` where it holds and `0.0` where it does not.
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    /// `&` and `&&`. The two differ only in short circuiting, and an operand
+    /// here has no effect to short circuit, so both are one operation.
+    And,
+    /// `|` and `||`. The same.
+    Or,
 }

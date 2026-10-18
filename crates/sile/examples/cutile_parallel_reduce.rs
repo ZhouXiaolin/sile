@@ -7,6 +7,9 @@
 use sile::ct::*;
 use sile::{Device, Tensor};
 
+#[path = "common/mod.rs"]
+mod common;
+
 #[sile::kernel]
 fn parallel_reduce<const TILE: i64>(a: &Tensor<f32, { [-1] }>, out: &mut Tensor<f32, { [1] }>) {
     let pid = get_tile_block_id();
@@ -30,7 +33,8 @@ fn main() -> sile::Result<()> {
         .apply(&stream)?;
 
     let result = out.to_vec(&stream)?[0];
-    let expected = (LEN * (LEN + 1) / 2) as f32;
+    let a_host = a.to_vec(&stream)?;
+    let expected = common::numpy("parallel_reduce", &[], &[&a_host])[0];
     // Each tile is summed exactly, then added f32-atomically into one
     // accumulator, so the error grows with the tile count rather than with the
     // data: 100 tiles lands about 32 units short in f32, which is 6.4e-7

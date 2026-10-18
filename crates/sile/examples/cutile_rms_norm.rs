@@ -13,6 +13,9 @@
 use sile::ct::*;
 use sile::{Device, Tensor};
 
+#[path = "common/mod.rs"]
+mod common;
+
 #[sile::kernel]
 fn rms_norm<const N: i64, const BLOCK_SIZE: i64>(
     x: &Tensor<f32, { [-1, N] }>,
@@ -69,18 +72,16 @@ fn main() -> sile::Result<()> {
         .apply(&stream)?;
 
     let got = out.to_vec(&stream)?;
-    for i in 0..m as usize {
-        let row = &x_data[i * n as usize..(i + 1) * n as usize];
-        let mean_square = row.iter().map(|v| v * v).sum::<f32>() / n as f32;
-        let scale = 1.0 / (mean_square + eps).sqrt();
-        for j in 0..n as usize {
-            let expected = row[j] * scale * w_data[j];
-            let actual = got[i * n as usize + j];
-            assert!(
-                (actual - expected).abs() < 1e-4,
-                "out[{i}][{j}] = {actual}, expected {expected}"
-            );
-        }
+    let expected = common::numpy(
+        "rms_norm",
+        &[m.to_string(), n.to_string(), eps.to_string()],
+        &[&x_data, &w_data],
+    );
+    for (i, (actual, expected)) in got.iter().zip(&expected).enumerate() {
+        assert!(
+            (actual - expected).abs() < 1e-4,
+            "out[{i}] = {actual}, expected {expected}"
+        );
     }
     println!("cutile rms_norm {m}x{n} ok on {device:?}");
     Ok(())

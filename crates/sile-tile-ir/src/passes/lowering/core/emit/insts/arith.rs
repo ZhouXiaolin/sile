@@ -107,6 +107,28 @@ pub(crate) fn emit_intrinsic(
     llvm_ir::Operand::Value(id)
 }
 
+/// A conversion from one scalar type to another.
+///
+/// The instruction names both the conversion and the type it produces, so a
+/// target that has no implicit conversion still knows what to write.
+pub(crate) fn emit_cast(
+    ctx: &mut LowerLlvmIrCtx,
+    out: &mut Vec<llvm_ir::Inst>,
+    op: llvm_ir::CastOp,
+    value: llvm_ir::Operand,
+    to: llvm_ir::Type,
+) -> llvm_ir::Operand {
+    let (id, name) = ctx.fresh_value("v");
+    out.push(llvm_ir::Inst {
+        result: Some(id),
+        result_name: Some(name),
+        ty: to.clone(),
+        op: llvm_ir::InstOp::Cast { op, value, to },
+        metadata: Vec::new(),
+    });
+    llvm_ir::Operand::Value(id)
+}
+
 pub(crate) fn const_i64(value: i64) -> llvm_ir::Operand {
     llvm_ir::Operand::Const(llvm_ir::Constant::Int(value))
 }

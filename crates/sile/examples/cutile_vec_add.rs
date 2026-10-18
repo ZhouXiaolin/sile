@@ -5,6 +5,9 @@
 use sile::ct::*;
 use sile::{Device, Tensor};
 
+#[path = "common/mod.rs"]
+mod common;
+
 #[sile::kernel]
 fn vec_add<const TILE: i64>(
     c: &mut Tensor<f32, { [TILE] }>,
@@ -32,9 +35,11 @@ fn main() -> sile::Result<()> {
         .apply(&stream)?;
 
     let got = c.to_vec(&stream)?;
+    let a_host = a.to_vec(&stream)?;
+    let b_host = b.to_vec(&stream)?;
+    let expected = common::numpy("vec_add", &[], &[&a_host, &b_host]);
     for (i, value) in got.iter().enumerate() {
-        let expected = (i + 1) as f32 + 2.0;
-        assert_eq!(*value, expected, "element {i}");
+        assert_eq!(*value, expected[i], "element {i}");
     }
     println!("cutile vec_add {len} ok on {device:?}");
     Ok(())

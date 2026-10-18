@@ -137,6 +137,13 @@ pub enum TileMapExpr {
         src_rows: i64,
         src_cols: i64,
     },
+    /// `iota(shape![N])`: the rank-one sequence `0, 1, …, N-1`.
+    ///
+    /// The element at each coordinate is the coordinate itself, so this map
+    /// reads the walk it is standing on instead of an operand. CuTile names it
+    /// for a rank-one shape only, so one element per column is the whole
+    /// sequence and the expression carries no axis.
+    Iota,
     /// `t.transpose()`: the same elements, read with the two coordinates
     /// exchanged.
     ///
@@ -277,6 +284,20 @@ pub enum TileIrOp {
         rows: i64,
         cols: i64,
     },
+    /// `cuda_tile.reshape`
+    ///
+    /// The same elements in a new extent. A reshape is a view in CuTile, and
+    /// row-major flattening makes the view a linear identity, but this IR
+    /// materializes tiles in private memory whose every access is spelled by
+    /// the extent the value was defined with. Re-typing the operand in place
+    /// would leave the definition and the uses reading one storage with two
+    /// strides, so the reshape is a value of its own: a walk over the new
+    /// extent that reads the operand through the linear position.
+    Reshape {
+        value: ValueId,
+        rows: i64,
+        cols: i64,
+    },
     /// Canonical fused pointwise map over a tile domain.
     Map {
         expr: TileMapExpr,
@@ -339,6 +360,13 @@ pub enum BinOp {
     Div,
     /// The remainder of a division.
     Rem,
+    /// The bitwise and of two counts. A conjunction of masks is a product, so
+    /// it uses `Mul` instead: the operands say which of the two an operator
+    /// means, and they are the ones that know whether a value is a mask.
+    And,
+    /// The bitwise or of two counts. A disjunction of masks is a maximum, so it
+    /// uses `Select` instead.
+    Or,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -359,6 +387,8 @@ impl fmt::Display for BinOp {
             BinOp::Mul => write!(f, "mul"),
             BinOp::Div => write!(f, "div"),
             BinOp::Rem => write!(f, "rem"),
+            BinOp::And => write!(f, "and"),
+            BinOp::Or => write!(f, "or"),
         }
     }
 }
@@ -499,6 +529,7 @@ impl TileIrFunction {
             | TileIrOp::ReduceMax { value, .. }
             | TileIrOp::ReduceMin { value, .. } => vec![*value],
             TileIrOp::Broadcast { value, .. } => vec![*value],
+            TileIrOp::Reshape { value, .. } => vec![*value],
             TileIrOp::Map { expr, .. } => tile_map_expr_uses(expr),
             TileIrOp::Extract {
                 tile,
@@ -555,7 +586,9 @@ fn collect_tile_map_expr_uses(expr: &TileMapExpr, uses: &mut Vec<ValueId>) {
             uses.push(*row_coord);
             uses.push(*col_coord);
         }
-        TileMapExpr::Splat { .. } => {}
+        // A sequence and a splat read no operand: the value is the coordinate
+        // the walk stands on, and the constant the map carries.
+        TileMapExpr::Splat { .. } | TileMapExpr::Iota => {}
         TileMapExpr::Cmp { lhs, rhs, .. }
         | TileMapExpr::Add { lhs, rhs }
         | TileMapExpr::Sub { lhs, rhs }

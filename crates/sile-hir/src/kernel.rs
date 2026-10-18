@@ -15,7 +15,7 @@ pub enum BuiltinOp {
     /// `num_tiles(buffer, axis)`: tile count along one buffer axis.
     NumTiles,
     LoadTile,
-    LoadTileLike2D,
+    LoadLike,
     /// `x.partition(shape)`: a view of a buffer tiled by `shape`.
     ///
     /// It carries no data. It names the buffer and the tile extent, so a later
@@ -63,6 +63,24 @@ pub enum BuiltinOp {
     Ne,
     /// `select(cond, a, b)`: `a` where `cond` is non-zero, else `b`.
     Select,
+    /// `iota(shape![N])`: the rank-one sequence `0, 1, …, N-1`.
+    ///
+    /// CuTile names it as one operation, so it stays one here. The sequence is
+    /// the coordinate of each element, which is what a kernel reads to build an
+    /// index tile.
+    Iota,
+    /// `a & b` and `a && b`: the conjunction of two masks, or the bitwise and
+    /// of two counts.
+    ///
+    /// Rust tells the two spellings apart by whether the operands are short
+    /// circuited, and an operand here has no effect to short circuit, so both
+    /// reach this one operation. The operands say which of the two meanings it
+    /// has: a mask is `0.0`/`1.0`, so a conjunction of masks is their product,
+    /// while two counts are anded bit by bit.
+    And,
+    /// `a | b` and `a || b`: the disjunction of two masks, or the bitwise or of
+    /// two counts. The same split as [`BuiltinOp::And`].
+    Or,
     /// `tile_to_scalar(t)`: the single element a one-element tile holds.
     TileToScalar,
     /// `scalar_to_tile(s)`: a one-element tile holding `s`.
@@ -153,6 +171,20 @@ pub enum Stmt {
         start: Expr,
         end: Expr,
         body: Vec<Stmt>,
+    },
+    /// `if cond { .. } else { .. }`: a branch on a scalar condition.
+    ///
+    /// A branch is control flow, so its condition has one truth value for the
+    /// whole program. A condition that is a tile is a per-element choice, which
+    /// is what `select` is for, and the checker rejects it here.
+    ///
+    /// A name that either arm assigns keeps its value after the branch: the
+    /// lowering carries it to the join point as a block parameter, which is the
+    /// phi a reader of the IR would write.
+    If {
+        cond: Expr,
+        then_body: Vec<Stmt>,
+        else_body: Vec<Stmt>,
     },
     /// `continue`: end this pass through the loop body.
     ///

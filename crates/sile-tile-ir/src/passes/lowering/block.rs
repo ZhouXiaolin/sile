@@ -17,7 +17,8 @@ use super::tile_expr::{
     lower_pointwise_rank1_store_map_inst, lower_tile_expr_inst, lower_tile_map_inst,
 };
 use super::tile_memory::{
-    lower_tile_constant_inst, lower_tile_load_inst, lower_tile_store_inst, lower_tile_uninit_inst,
+    lower_tile_constant_inst, lower_tile_load_inst, lower_tile_reshape_inst,
+    lower_tile_store_inst, lower_tile_uninit_inst,
 };
 
 pub(crate) fn lower_block(
@@ -154,6 +155,9 @@ pub(crate) fn lower_block(
             }
             TileIrOp::Map { expr, rows, cols } => {
                 lower_tile_map_inst(inst.result, expr.clone(), *rows, *cols, &mut builder);
+            }
+            TileIrOp::Reshape { value, rows, cols } => {
+                lower_tile_reshape_inst(inst.result, *value, *rows, *cols, &mut builder);
             }
             TileIrOp::StorePtrTko {
                 buf,
