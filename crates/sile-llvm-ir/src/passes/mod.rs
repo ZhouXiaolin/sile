@@ -1,7 +1,12 @@
 pub mod canonicalize;
+mod cfg;
 pub mod cse;
+pub mod instcombine;
+pub mod licm;
 pub mod loop_simplify;
+pub mod loop_unroll;
 pub mod phi_alias;
+pub mod sroa;
 pub mod verify;
 
 use crate::Function;
@@ -14,6 +19,11 @@ pub enum LlvmIrPassKind {
     LoopSimplify,
     PhiAlias,
     Cse,
+    InstCombine,
+    LoopUnroll,
+    Licm,
+    Sroa,
+    Dce,
     VerifyOutput,
 }
 
@@ -33,6 +43,13 @@ pub const RECOMMENDED_PIPELINE: &[LlvmIrPassKind] = &[
     LlvmIrPassKind::LoopSimplify,
     LlvmIrPassKind::PhiAlias,
     LlvmIrPassKind::Cse,
+    LlvmIrPassKind::InstCombine,
+    LlvmIrPassKind::LoopUnroll,
+    LlvmIrPassKind::InstCombine,
+    LlvmIrPassKind::Licm,
+    LlvmIrPassKind::Sroa,
+    LlvmIrPassKind::Dce,
+    LlvmIrPassKind::Cse,
     LlvmIrPassKind::VerifyOutput,
 ];
 
@@ -50,6 +67,14 @@ pub fn run_pipeline(mut func: Function, pipeline: &[LlvmIrPassKind]) -> Result<F
             LlvmIrPassKind::LoopSimplify => loop_simplify::run(func),
             LlvmIrPassKind::PhiAlias => phi_alias::run(func),
             LlvmIrPassKind::Cse => cse::run(func),
+            LlvmIrPassKind::InstCombine => instcombine::run(func),
+            LlvmIrPassKind::LoopUnroll => loop_unroll::run(func),
+            LlvmIrPassKind::Licm => licm::run(func),
+            LlvmIrPassKind::Sroa => sroa::run(func),
+            LlvmIrPassKind::Dce => {
+                canonicalize::eliminate_dead_insts(&mut func);
+                func
+            }
         };
     }
     Ok(func)

@@ -759,7 +759,7 @@ fn remove_expr_loop(func: &mut Function, expr_loop: &PointwiseExprLoop) {
         .retain(|block| !expr_loop.blocks.contains(&block.id));
 }
 
-fn eliminate_dead_insts(func: &mut Function) {
+pub(crate) fn eliminate_dead_insts(func: &mut Function) {
     loop {
         let used = collect_used_values(func);
         let mut changed = false;
@@ -910,14 +910,17 @@ fn is_removable_inst(op: &InstOp) -> bool {
     }
 }
 
-fn rewrite_inst_operands(inst: Inst, replacements: &HashMap<ValueId, Operand>) -> Inst {
+pub(crate) fn rewrite_inst_operands(
+    inst: Inst,
+    replacements: &HashMap<ValueId, Operand>,
+) -> Inst {
     Inst {
         op: remap_inst_op(inst.op, replacements, &HashMap::new()),
         ..inst
     }
 }
 
-fn rewrite_terminator_operands(
+pub(crate) fn rewrite_terminator_operands(
     terminator: Terminator,
     replacements: &HashMap<ValueId, Operand>,
 ) -> Terminator {
@@ -1055,7 +1058,10 @@ fn remap_operand(
     }
 }
 
-fn rewrite_operand(operand: Operand, replacements: &HashMap<ValueId, Operand>) -> Operand {
+pub(crate) fn rewrite_operand(
+    operand: Operand,
+    replacements: &HashMap<ValueId, Operand>,
+) -> Operand {
     match operand {
         Operand::Value(value) => replacements
             .get(&value)

@@ -42,6 +42,10 @@ pub fn run(mut func: Function) -> Function {
             {
                 if let Some(existing) = visible.get(&key).copied() {
                     if let Some(result) = rewritten.result {
+                        // A value offered by the entry state may itself have
+                        // been replaced while an earlier block was rewritten;
+                        // the use must name the value that still exists.
+                        let existing = resolve(existing, &replacements);
                         replacements.insert(result, existing);
                         continue;
                     }
@@ -54,7 +58,30 @@ pub fn run(mut func: Function) -> Function {
         block.insts = new_insts;
         block.terminator = rewrite_terminator(block.terminator.clone(), &replacements);
     }
+    // A later replacement can make an earlier rewrite point at a value the
+    // pass removed, so every operand is resolved against the final map.
+    for block in &mut func.blocks {
+        block.insts = std::mem::take(&mut block.insts)
+            .into_iter()
+            .map(|inst| rewrite_inst(inst, &replacements))
+            .collect();
+        block.terminator = rewrite_terminator(block.terminator.clone(), &replacements);
+    }
     func
+}
+
+/// Follow a replacement chain to the value that still has a definition.
+fn resolve(value: ValueId, replacements: &HashMap<ValueId, ValueId>) -> ValueId {
+    let mut value = value;
+    let mut hops = 0;
+    while let Some(next) = replacements.get(&value) {
+        value = *next;
+        hops += 1;
+        if hops > 64 {
+            break;
+        }
+    }
+    value
 }
 
 /// Expressions available at the entry of every block, keyed by expression.

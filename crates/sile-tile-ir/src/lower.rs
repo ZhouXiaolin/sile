@@ -1500,6 +1500,13 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                     },
                     TileIrType::Tile { rows, cols },
                 )
+            } else if tile_shape_of(input, ctx) == Some((rows, cols)) {
+                // A reshape to the extent the operand already has is a view of
+                // the same row-major storage: every index of the result is the
+                // same index of the operand. Emitting it would allocate a second
+                // tile and copy every element for no reason, so the result
+                // aliases the operand and the copy never exists.
+                input
             } else {
                 ctx.emit(
                     TileIrOp::Reshape {
