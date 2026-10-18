@@ -556,6 +556,7 @@ pub fn lower_common_inst_line_with<FValue, FOperand>(
     int_div: IntDivSpelling,
     cast_expr: fn(llvm_ir::CastOp, &llvm_ir::Type, String) -> String,
     gep_elements: &mut HashMap<llvm_ir::ValueId, GepLink>,
+    folded_geps: &HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)>,
 ) -> Option<String>
 where
     FValue: Fn(llvm_ir::ValueId) -> String,
@@ -566,6 +567,21 @@ where
 
     let element = |ptr: &llvm_ir::Operand| -> String {
         element_operand(ptr, gep_elements, &value_name, &format_operand)
+    };
+    // A pointer target reads straight through the geps a single load or store
+    // uses, so the access spells `base[i]` and the gep itself leaves no text.
+    let addressed = |ptr: &llvm_ir::Operand| -> Option<String> {
+        match ptr {
+            llvm_ir::Operand::Value(id) => folded_geps.get(id).map(|(base, indices)| {
+                let suffix = indices
+                    .iter()
+                    .map(|idx| format!("[{}]", format_operand(idx)))
+                    .collect::<Vec<_>>()
+                    .join("");
+                format!("{}{}", format_operand(base), suffix)
+            }),
+            _ => None,
+        }
     };
 
     match &inst.op {
@@ -622,18 +638,24 @@ where
             )
         }),
         llvm_ir::InstOp::Load { ptr } => inst.result.map(|id| {
-            if pointers.load_deref {
+            if let Some(address) = addressed(ptr) {
+                format!("{} = {};", value_name(id), address)
+            } else if pointers.load_deref {
                 format!("{} = *({});", value_name(id), format_operand(ptr))
             } else {
                 // No pointer to dereference, so the load reads the element.
                 format!("{} = {};", value_name(id), element(ptr))
             }
         }),
-        llvm_ir::InstOp::Store { ptr, value } => Some(if pointers.load_deref {
-            format!("*({}) = {};", format_operand(ptr), format_operand(value))
-        } else {
-            format!("{} = {};", element(ptr), format_operand(value))
-        }),
+        llvm_ir::InstOp::Store { ptr, value } => {
+            if let Some(address) = addressed(ptr) {
+                Some(format!("{} = {};", address, format_operand(value)))
+            } else if pointers.load_deref {
+                Some(format!("*({}) = {};", format_operand(ptr), format_operand(value)))
+            } else {
+                Some(format!("{} = {};", element(ptr), format_operand(value)))
+            }
+        }
         // A conversion is a value the target may have to spell: one language
         // converts where the value is assigned, and another names the type it
         // converts to.
@@ -644,22 +666,30 @@ where
                 cast_expr(*op, to, format_operand(value))
             )
         }),
-        // A language with addresses materializes the pointer; one without
-        // already recorded the element above and emits nothing.
+        // A language with addresses materializes the pointer — unless its only
+        // use folded into the access it serves — and one without already
+        // recorded the element above and emits nothing.
         llvm_ir::InstOp::Gep { base, indices } if pointers.has_address_of => {
-            inst.result.map(|id| {
-                let index_suffix = indices
-                    .iter()
-                    .map(|idx| format!("[{}]", format_operand(idx)))
-                    .collect::<Vec<_>>()
-                    .join("");
-                format!(
-                    "{} = &({}{});",
-                    value_name(id),
-                    format_operand(base),
-                    index_suffix
-                )
-            })
+            let folded_away = inst
+                .result
+                .is_some_and(|id| folded_geps.contains_key(&id));
+            if folded_away {
+                None
+            } else {
+                inst.result.map(|id| {
+                    let index_suffix = indices
+                        .iter()
+                        .map(|idx| format!("[{}]", format_operand(idx)))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    format!(
+                        "{} = &({}{});",
+                        value_name(id),
+                        format_operand(base),
+                        index_suffix
+                    )
+                })
+            }
         }
         _ => None,
     }
@@ -851,6 +881,23 @@ pub struct TargetEmitter<'a, D: TargetDialect> {
     /// Filled by [`lower_common_inst_line_with`], so the emitter must own it and
     /// pass it on every instruction.
     pub gep_elements: HashMap<llvm_ir::ValueId, GepLink>,
+    /// Geps whose only use is the load or store reading through them, with the
+    /// base and indices to spell at that use.
+    ///
+    /// A pointer target writes `base[i]` on the spot; materializing the pointer
+    /// first is a declaration and a line for nothing. Filled for a target with
+    /// addresses only, and empty for a pointer-free one.
+    pub folded_geps: HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)>,
+    /// Values the traversal actually wrote an assignment for.
+    ///
+    /// The declaration pass runs before the body, so it cannot see which values
+    /// the structured lowering will fold away — a loop header's condition, a
+    /// gep a load folded through. The body records them here and the held-back
+    /// declarations are filtered by it.
+    assigned_values: HashSet<llvm_ir::ValueId>,
+    /// Declarations held back while the body emits, filtered, then written.
+    deferred_decls: Vec<(llvm_ir::ValueId, llvm_ir::Type)>,
+    defer_decls: bool,
     pub indent: usize,
     out: String,
 }
@@ -916,6 +963,104 @@ pub fn collect_alloca_results(func: &llvm_ir::Function) -> HashSet<llvm_ir::Valu
         .collect()
 }
 
+/// The values one instruction reads.
+pub fn inst_operands(inst: &llvm_ir::Inst) -> Vec<&llvm_ir::Operand> {
+    match &inst.op {
+        llvm_ir::InstOp::Gep { base, indices } => {
+            let mut all = vec![base];
+            all.extend(indices.iter());
+            all
+        }
+        llvm_ir::InstOp::Load { ptr } => vec![ptr],
+        llvm_ir::InstOp::Store { ptr, value } => vec![ptr, value],
+        llvm_ir::InstOp::AtomicAdd { ptr, value } => vec![ptr, value],
+        llvm_ir::InstOp::Memcpy { dst, src, size } => vec![dst, src, size],
+        llvm_ir::InstOp::Bin { lhs, rhs, .. } => vec![lhs, rhs],
+        llvm_ir::InstOp::Cmp { lhs, rhs, .. } => vec![lhs, rhs],
+        llvm_ir::InstOp::Cast { value, .. } => vec![value],
+        llvm_ir::InstOp::Select {
+            cond,
+            on_true,
+            on_false,
+        } => vec![cond, on_true, on_false],
+        llvm_ir::InstOp::Call { args, .. } | llvm_ir::InstOp::Intrinsic { args, .. } => {
+            args.iter().collect()
+        }
+        llvm_ir::InstOp::Alloca { .. } => Vec::new(),
+    }
+}
+
+/// The values a terminator reads.
+pub fn terminator_operands(term: &llvm_ir::Terminator) -> Vec<&llvm_ir::Operand> {
+    match term {
+        llvm_ir::Terminator::Br { args, .. } => args.iter().collect(),
+        llvm_ir::Terminator::CondBr {
+            cond,
+            true_args,
+            false_args,
+            ..
+        } => {
+            let mut all = vec![cond];
+            all.extend(true_args.iter());
+            all.extend(false_args.iter());
+            all
+        }
+        llvm_ir::Terminator::Switch { value, .. } => vec![value],
+        llvm_ir::Terminator::Ret { value } => value.iter().collect(),
+    }
+}
+
+/// The geps whose only use is the load or store reading through them.
+///
+/// A pointer target spells that access as `base[i]` where the value is used,
+/// so the gep itself leaves no text. Anything else — a pointer that lives
+/// across statements, one gep feeding two accesses — stays a value.
+pub fn collect_folded_geps(
+    func: &llvm_ir::Function,
+) -> HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)> {
+    let mut uses: HashMap<llvm_ir::ValueId, usize> = HashMap::new();
+    let mut users: HashMap<llvm_ir::ValueId, &llvm_ir::Inst> = HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let mut note = |used: &llvm_ir::Operand| {
+                if let llvm_ir::Operand::Value(id) = used {
+                    *uses.entry(*id).or_insert(0) += 1;
+                    users.insert(*id, inst);
+                }
+            };
+            for used in inst_operands(inst) {
+                note(used);
+            }
+        }
+        for used in terminator_operands(&block.terminator) {
+            if let llvm_ir::Operand::Value(id) = used {
+                *uses.entry(*id).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut folded = HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let llvm_ir::InstOp::Gep { base, indices } = &inst.op else {
+                continue;
+            };
+            let Some(result) = inst.result else {
+                continue;
+            };
+            if uses.get(&result).copied() != Some(1) {
+                continue;
+            }
+            if matches!(
+                users.get(&result).map(|user| &user.op),
+                Some(llvm_ir::InstOp::Load { .. } | llvm_ir::InstOp::Store { .. })
+            ) {
+                folded.insert(result, (base.clone(), indices.clone()));
+            }
+        }
+    }
+    folded
+}
+
 impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
     pub fn new(func: &'a llvm_ir::Function, dialect: D) -> Self {
         // A target that has no pointers reads the Gep table from the first
@@ -925,6 +1070,11 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
             HashMap::new()
         } else {
             collect_gep_elements(func)
+        };
+        let folded_geps = if dialect.pointers().has_address_of {
+            collect_folded_geps(func)
+        } else {
+            HashMap::new()
         };
         let value_names = build_value_names(func)
             .into_iter()
@@ -950,6 +1100,10 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
             value_names,
             declared_values: HashSet::new(),
             gep_elements,
+            folded_geps,
+            assigned_values: HashSet::new(),
+            deferred_decls: Vec::new(),
+            defer_decls: false,
             indent: 0,
             out: String::new(),
         }
@@ -1008,14 +1162,44 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
         }
         for (id, ty) in lines {
             if self.declared_values.insert(id) {
-                let name = self.value_name(id);
-                let decl = self
-                    .dialect
-                    .var_decl(&ty, &name, self.storage_values.contains(&id));
-                if let Some(decl) = decl {
-                    self.writeln(&decl);
+                if self.defer_decls {
+                    self.deferred_decls.push((id, ty));
+                } else {
+                    self.write_decl(id, &ty);
                 }
             }
+        }
+    }
+
+    /// The held-back declarations, filtered by what the body actually wrote.
+    ///
+    /// The declaration pass cannot see what the structured lowering folds —
+    /// a loop header's condition never reaches the text — so the body's
+    /// assignments arbitrate. Storage the body fills element-wise and block
+    /// params the headers carry stay declared regardless.
+    fn flush_decls(&mut self) {
+        for (id, ty) in std::mem::take(&mut self.deferred_decls) {
+            let assigned = self.assigned_values.contains(&id);
+            let storage = self.storage_values.contains(&id);
+            let block_param = self
+                .func
+                .blocks
+                .iter()
+                .any(|block| block.params.iter().any(|param| param.id == id));
+            if assigned || storage || block_param {
+                self.write_decl(id, &ty);
+            }
+        }
+    }
+
+    /// The declaration text for one value.
+    fn write_decl(&mut self, id: llvm_ir::ValueId, ty: &llvm_ir::Type) {
+        let name = self.value_name(id);
+        let decl = self
+            .dialect
+            .var_decl(ty, &name, self.storage_values.contains(&id));
+        if let Some(decl) = decl {
+            self.writeln(&decl);
         }
     }
 
@@ -1059,7 +1243,14 @@ impl<D: TargetDialect> TextCodegen for TargetEmitter<'_, D> {
     }
 
     fn emit_body(&mut self) -> Result<()> {
+        // Declarations follow the signature but depend on the body: the
+        // structured lowering folds instructions away, and a value whose
+        // assignment never materializes must not be declared. So the body
+        // emits first, the declarations are filtered, and the two halves
+        // join here in source order.
+        self.defer_decls = true;
         self.emit_value_decls_inner();
+        let body_start = self.out.len();
         self.out.push('\n');
         if self.emit_structured_from(self.func.entry, &[])?.is_some() {
             return Err(Error::Compile(
@@ -1068,6 +1259,9 @@ impl<D: TargetDialect> TextCodegen for TargetEmitter<'_, D> {
         }
         self.indent = 0;
         self.out.push_str("}\n");
+        let body = self.out.split_off(body_start);
+        self.flush_decls();
+        self.out.push_str(&body);
         Ok(())
     }
 
@@ -1177,6 +1371,11 @@ impl<D: TargetDialect> TargetEmitter<'_, D> {
                 intrinsic,
                 args,
             )?;
+            if !lines.is_empty() {
+                if let Some(id) = inst.result {
+                    self.assigned_values.insert(id);
+                }
+            }
             for line in lines {
                 self.writeln(&line);
             }
@@ -1194,10 +1393,14 @@ impl<D: TargetDialect> TargetEmitter<'_, D> {
                 self.dialect.int_div(),
                 D::cast_expr,
                 &mut self.gep_elements,
+                &self.folded_geps,
             )
         };
         if let Some(line) = line {
             self.writeln(&line);
+            if let Some(id) = inst.result {
+                self.assigned_values.insert(id);
+            }
             return Ok(());
         }
 
@@ -1209,6 +1412,11 @@ impl<D: TargetDialect> TargetEmitter<'_, D> {
             |id| value_name(&value_names, id),
             |op| format_operand(&value_names, D::float_literal, op),
         )?;
+        if !lines.is_empty() {
+            if let Some(id) = inst.result {
+                self.assigned_values.insert(id);
+            }
+        }
         for line in lines {
             self.writeln(&line);
         }

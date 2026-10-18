@@ -36,6 +36,29 @@ pub(crate) fn emit_bin(
     rhs: llvm_ir::Operand,
     ty: llvm_ir::Type,
 ) -> llvm_ir::Operand {
+    // Integer arithmetic whose value is already known here stays out of the
+    // emitted source: every target would otherwise spell the same fold as
+    // text, and a degenerate axis division (`index / 1`) reads worse than the
+    // value it computes.
+    if matches!(ty, llvm_ir::Type::I64 | llvm_ir::Type::I32) {
+        if let llvm_ir::BinOp::Div | llvm_ir::BinOp::Rem = op
+            && let llvm_ir::Operand::Const(llvm_ir::Constant::Int(1)) = rhs
+        {
+            return if matches!(op, llvm_ir::BinOp::Div) {
+                lhs
+            } else {
+                const_i64(0)
+            };
+        }
+        if let (
+            llvm_ir::Operand::Const(llvm_ir::Constant::Int(a)),
+            llvm_ir::Operand::Const(llvm_ir::Constant::Int(b)),
+        ) = (&lhs, &rhs)
+            && let Some(value) = fold_int_const(op, *a, *b)
+        {
+            return const_i64(value);
+        }
+    }
     let (id, name) = ctx.fresh_value("v");
     out.push(llvm_ir::Inst {
         result: Some(id),
@@ -45,6 +68,23 @@ pub(crate) fn emit_bin(
         metadata: Vec::new(),
     });
     llvm_ir::Operand::Value(id)
+}
+
+/// The value of an integer constant operation, `None` when it has none: a
+/// division by zero folds nowhere, and overflow leaves the operation for the
+/// target to spell.
+fn fold_int_const(op: llvm_ir::BinOp, a: i64, b: i64) -> Option<i64> {
+    match op {
+        llvm_ir::BinOp::Add => a.checked_add(b),
+        llvm_ir::BinOp::Sub => a.checked_sub(b),
+        llvm_ir::BinOp::Mul => a.checked_mul(b),
+        llvm_ir::BinOp::Div if b != 0 => a.checked_div(b),
+        llvm_ir::BinOp::Rem if b != 0 => a.checked_rem(b),
+        llvm_ir::BinOp::And => Some(a & b),
+        llvm_ir::BinOp::Or => Some(a | b),
+        llvm_ir::BinOp::Xor => Some(a ^ b),
+        _ => None,
+    }
 }
 
 pub(crate) fn emit_cmp(

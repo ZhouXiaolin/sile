@@ -181,13 +181,15 @@ impl emit::TargetDialect for CDialect {
             llvm_ir::InstOp::Intrinsic { .. } => Err(sile_core::Error::Compile(
                 "LLVM IR C codegen cannot spell an intrinsic in extra_inst_stmt".into(),
             )),
-            // The shared lowering spells these the same way on every target. A
-            // result-less operator reaching here would otherwise be dropped,
-            // and the kernel would read an undefined name.
+            // The shared lowering spells these the same way on every target —
+            // or folds a gep away when the load or store reading through it is
+            // its only use. A result-less operator reaching here would
+            // otherwise be dropped, and the kernel would read an undefined
+            // name.
+            llvm_ir::InstOp::Gep { .. } => Ok(vec![]),
             llvm_ir::InstOp::Bin { .. }
             | llvm_ir::InstOp::Cmp { .. }
             | llvm_ir::InstOp::Cast { .. }
-            | llvm_ir::InstOp::Gep { .. }
             | llvm_ir::InstOp::Load { .. }
             | llvm_ir::InstOp::Select { .. }
             | llvm_ir::InstOp::Store { .. } => Err(sile_core::Error::Compile(format!(
