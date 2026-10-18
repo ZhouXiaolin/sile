@@ -43,20 +43,20 @@ fn expr_key(op: &TileIrOp) -> Option<String> {
             let (lhs, rhs) = canonical_pair(*op, *lhs, *rhs);
             Some(format!("ibinary:{op:?}:{}:{}", lhs.0, rhs.0))
         }
+        TileIrOp::FBinary { op, lhs, rhs } => {
+            let (lhs, rhs) = canonical_pair(*op, *lhs, *rhs);
+            Some(format!("fbinary:{op:?}:{}:{}", lhs.0, rhs.0))
+        }
         TileIrOp::ICmp { op, lhs, rhs } => Some(format!("icmp:{op:?}:{}:{}", lhs.0, rhs.0)),
         TileIrOp::Splat { value, rows, cols } => {
             Some(format!("splat:{}:{rows}:{cols}", value.to_bits()))
         }
-        TileIrOp::NegF {
+        TileIrOp::UnaryF {
+            op,
             operand,
             rows,
             cols,
-        } => Some(format!("negf:{}:{rows}:{cols}", operand.0)),
-        TileIrOp::Exp {
-            operand,
-            rows,
-            cols,
-        } => Some(format!("exp:{}:{rows}:{cols}", operand.0)),
+        } => Some(format!("unary:{op:?}:{}:{rows}:{cols}", operand.0)),
         TileIrOp::AddF {
             lhs,
             rhs,
@@ -111,7 +111,8 @@ fn expr_key(op: &TileIrOp) -> Option<String> {
         | TileIrOp::SileAtomicAdd { .. }
         | TileIrOp::MmaF { .. }
         | TileIrOp::ReduceSum { .. }
-        | TileIrOp::ReduceMax { .. } => None,
+        | TileIrOp::ReduceMax { .. }
+        | TileIrOp::ReduceMin { .. } => None,
     }
 }
 
@@ -130,6 +131,7 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             buf,
             row_coord,
             col_coord,
+            outer_coords,
             rows,
             cols,
             stride_shape_idx,
@@ -137,6 +139,7 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             buf: rewrite(buf),
             row_coord: rewrite(row_coord),
             col_coord: rewrite(col_coord),
+            outer_coords: outer_coords.iter().map(|c| rewrite(*c)).collect(),
             rows,
             cols,
             stride_shape_idx,
@@ -146,6 +149,7 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             value,
             row_coord,
             col_coord,
+            outer_coords,
             rows,
             cols,
             stride_shape_idx,
@@ -154,6 +158,7 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             value: rewrite(value),
             row_coord: rewrite(row_coord),
             col_coord: rewrite(col_coord),
+            outer_coords: outer_coords.iter().map(|c| rewrite(*c)).collect(),
             rows,
             cols,
             stride_shape_idx,
@@ -163,12 +168,14 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             value,
             row_coord,
             col_coord,
+            outer_coords,
             stride_shape_idx,
         } => TileIrOp::SileAtomicAdd {
             buf: rewrite(buf),
             value: rewrite(value),
             row_coord: rewrite(row_coord),
             col_coord: rewrite(col_coord),
+            outer_coords: outer_coords.iter().map(|c| rewrite(*c)).collect(),
             stride_shape_idx,
         },
         TileIrOp::Splat { value, rows, cols } => TileIrOp::Splat { value, rows, cols },
@@ -216,20 +223,13 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             rows,
             cols,
         },
-        TileIrOp::NegF {
+        TileIrOp::UnaryF {
+            op,
             operand,
             rows,
             cols,
-        } => TileIrOp::NegF {
-            operand: rewrite(operand),
-            rows,
-            cols,
-        },
-        TileIrOp::Exp {
-            operand,
-            rows,
-            cols,
-        } => TileIrOp::Exp {
+        } => TileIrOp::UnaryF {
+            op,
             operand: rewrite(operand),
             rows,
             cols,
@@ -271,6 +271,17 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             in_rows,
             in_cols,
         },
+        TileIrOp::ReduceMin {
+            value,
+            axis,
+            in_rows,
+            in_cols,
+        } => TileIrOp::ReduceMin {
+            value: rewrite(value),
+            axis,
+            in_rows,
+            in_cols,
+        },
         TileIrOp::Broadcast { value, rows, cols } => TileIrOp::Broadcast {
             value: rewrite(value),
             rows,
@@ -291,6 +302,11 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             col_coord: rewrite(col_coord),
         },
         TileIrOp::IBinary { op, lhs, rhs } => TileIrOp::IBinary {
+            op,
+            lhs: rewrite(lhs),
+            rhs: rewrite(rhs),
+        },
+        TileIrOp::FBinary { op, lhs, rhs } => TileIrOp::FBinary {
             op,
             lhs: rewrite(lhs),
             rhs: rewrite(rhs),
@@ -330,6 +346,7 @@ fn rewrite_map_expr(
             buf,
             row_coord,
             col_coord,
+            outer_coords,
             rows,
             cols,
             stride_shape_idx,
@@ -337,6 +354,7 @@ fn rewrite_map_expr(
             buf: rewrite(buf),
             row_coord: rewrite(row_coord),
             col_coord: rewrite(col_coord),
+            outer_coords: outer_coords.iter().map(|c| rewrite(*c)).collect(),
             rows,
             cols,
             stride_shape_idx,
@@ -363,10 +381,15 @@ fn rewrite_map_expr(
             lhs: Box::new(rewrite_map_expr(*lhs, replacements)),
             rhs: Box::new(rewrite_map_expr(*rhs, replacements)),
         },
-        crate::TileMapExpr::Neg { operand } => crate::TileMapExpr::Neg {
-            operand: Box::new(rewrite_map_expr(*operand, replacements)),
+        crate::TileMapExpr::Rem { lhs, rhs } => crate::TileMapExpr::Rem {
+            lhs: Box::new(rewrite_map_expr(*lhs, replacements)),
+            rhs: Box::new(rewrite_map_expr(*rhs, replacements)),
         },
-        crate::TileMapExpr::Exp { operand } => crate::TileMapExpr::Exp {
+        crate::TileMapExpr::Transpose { value } => crate::TileMapExpr::Transpose {
+            value: Box::new(rewrite_map_expr(*value, replacements)),
+        },
+        crate::TileMapExpr::Unary { op, operand } => crate::TileMapExpr::Unary {
+            op,
             operand: Box::new(rewrite_map_expr(*operand, replacements)),
         },
         crate::TileMapExpr::Select {

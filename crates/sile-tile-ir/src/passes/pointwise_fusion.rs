@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{TileIrFunction, TileIrInst, TileIrOp, TileMapExpr, ValueId};
+use crate::{TileIrFunction, TileIrInst, TileIrOp, TileIrType, TileMapExpr, ValueId};
 
 pub fn run(mut func: TileIrFunction) -> TileIrFunction {
     let use_counts = build_use_counts(&func);
+    let types = &func.types;
 
     for block in &mut func.blocks {
         let defs = block
@@ -24,7 +25,7 @@ pub fn run(mut func: TileIrFunction) -> TileIrFunction {
             }
 
             if let Some((expr, newly_fused)) =
-                build_pointwise_map_expr(inst.result, &defs, &use_counts, true)
+                build_pointwise_map_expr(inst.result, &defs, types, &use_counts, true)
             {
                 fused_values.extend(newly_fused);
                 let (rows, cols) = tile_shape_for_op(&inst.op);
@@ -51,8 +52,7 @@ fn is_pointwise_root(op: &TileIrOp) -> bool {
             | TileIrOp::SubF { .. }
             | TileIrOp::MulF { .. }
             | TileIrOp::DivF { .. }
-            | TileIrOp::NegF { .. }
-            | TileIrOp::Exp { .. }
+            | TileIrOp::UnaryF { .. }
             | TileIrOp::Broadcast { .. }
     )
 }
@@ -75,6 +75,7 @@ fn build_use_counts(func: &TileIrFunction) -> HashMap<ValueId, usize> {
 fn build_pointwise_map_expr(
     value: ValueId,
     defs: &HashMap<ValueId, TileIrOp>,
+    types: &HashMap<ValueId, TileIrType>,
     use_counts: &HashMap<ValueId, usize>,
     is_root: bool,
 ) -> Option<(TileMapExpr, HashSet<ValueId>)> {
@@ -88,6 +89,7 @@ fn build_pointwise_map_expr(
             buf,
             row_coord,
             col_coord,
+            outer_coords,
             rows,
             cols,
             stride_shape_idx,
@@ -96,6 +98,7 @@ fn build_pointwise_map_expr(
                 buf,
                 row_coord,
                 col_coord,
+                outer_coords,
                 rows,
                 cols,
                 stride_shape_idx,
@@ -104,58 +107,46 @@ fn build_pointwise_map_expr(
         )),
         TileIrOp::Splat { value, .. } => Some((TileMapExpr::Splat { value }, HashSet::new())),
         TileIrOp::AddF { lhs, rhs, .. } => {
-            build_binary_expr(value, lhs, rhs, defs, use_counts, |lhs, rhs| {
+            build_binary_expr(value, lhs, rhs, defs, types, use_counts, |lhs, rhs| {
                 TileMapExpr::Add { lhs, rhs }
             })
         }
         TileIrOp::SubF { lhs, rhs, .. } => {
-            build_binary_expr(value, lhs, rhs, defs, use_counts, |lhs, rhs| {
+            build_binary_expr(value, lhs, rhs, defs, types, use_counts, |lhs, rhs| {
                 TileMapExpr::Sub { lhs, rhs }
             })
         }
         TileIrOp::MulF { lhs, rhs, .. } => {
-            build_binary_expr(value, lhs, rhs, defs, use_counts, |lhs, rhs| {
+            build_binary_expr(value, lhs, rhs, defs, types, use_counts, |lhs, rhs| {
                 TileMapExpr::Mul { lhs, rhs }
             })
         }
         TileIrOp::DivF { lhs, rhs, .. } => {
-            build_binary_expr(value, lhs, rhs, defs, use_counts, |lhs, rhs| {
+            build_binary_expr(value, lhs, rhs, defs, types, use_counts, |lhs, rhs| {
                 TileMapExpr::Div { lhs, rhs }
             })
         }
-        TileIrOp::NegF { operand, .. } => {
-            let (operand_expr, fused) = build_map_child_expr(operand, defs, use_counts);
+        TileIrOp::UnaryF { op, operand, .. } => {
+            let (operand_expr, fused) = build_map_child_expr(operand, defs, types, use_counts);
             let mut fused_values = fused;
             if !matches!(operand_expr, TileMapExpr::Value(_)) {
                 fused_values.insert(operand);
             }
             Some((
-                TileMapExpr::Neg {
-                    operand: Box::new(operand_expr),
-                },
-                fused_values,
-            ))
-        }
-        TileIrOp::Exp { operand, .. } => {
-            let (operand_expr, fused) = build_map_child_expr(operand, defs, use_counts);
-            let mut fused_values = fused;
-            if !matches!(operand_expr, TileMapExpr::Value(_)) {
-                fused_values.insert(operand);
-            }
-            Some((
-                TileMapExpr::Exp {
+                TileMapExpr::Unary {
+                    op,
                     operand: Box::new(operand_expr),
                 },
                 fused_values,
             ))
         }
         TileIrOp::Broadcast { value: src, .. } => {
-            let (src_expr, fused) = build_map_child_expr(src, defs, use_counts);
+            let (src_expr, fused) = build_map_child_expr(src, defs, types, use_counts);
             let mut fused_values = fused;
             if !matches!(src_expr, TileMapExpr::Value(_)) {
                 fused_values.insert(src);
             }
-            let (src_rows, src_cols) = defs.get(&src).map(tile_shape_for_op).unwrap_or((1, 1));
+            let (src_rows, src_cols) = tile_shape_for_value(src, defs, types);
             Some((
                 TileMapExpr::Broadcast {
                     value: Box::new(src_expr),
@@ -174,11 +165,12 @@ fn build_binary_expr(
     lhs: ValueId,
     rhs: ValueId,
     defs: &HashMap<ValueId, TileIrOp>,
+    types: &HashMap<ValueId, TileIrType>,
     use_counts: &HashMap<ValueId, usize>,
     ctor: impl Fn(Box<TileMapExpr>, Box<TileMapExpr>) -> TileMapExpr,
 ) -> Option<(TileMapExpr, HashSet<ValueId>)> {
-    let (lhs_expr, lhs_fused) = build_map_child_expr(lhs, defs, use_counts);
-    let (rhs_expr, rhs_fused) = build_map_child_expr(rhs, defs, use_counts);
+    let (lhs_expr, lhs_fused) = build_map_child_expr(lhs, defs, types, use_counts);
+    let (rhs_expr, rhs_fused) = build_map_child_expr(rhs, defs, types, use_counts);
     let mut fused_values = lhs_fused;
     fused_values.extend(rhs_fused);
     if !matches!(lhs_expr, TileMapExpr::Value(_)) {
@@ -194,10 +186,31 @@ fn build_binary_expr(
 fn build_map_child_expr(
     value: ValueId,
     defs: &HashMap<ValueId, TileIrOp>,
+    types: &HashMap<ValueId, TileIrType>,
     use_counts: &HashMap<ValueId, usize>,
 ) -> (TileMapExpr, HashSet<ValueId>) {
-    build_pointwise_map_expr(value, defs, use_counts, false)
+    build_pointwise_map_expr(value, defs, types, use_counts, false)
         .unwrap_or_else(|| (TileMapExpr::Value(value), HashSet::new()))
+}
+
+/// The shape a map reads `value` at.
+///
+/// A value this block defines reports the shape of its own op. A block
+/// parameter has no op here, so the function's type table is the only record of
+/// its shape. Assuming a scalar instead would read element zero of every row,
+/// which is what a loop-carried operand used to do.
+fn tile_shape_for_value(
+    value: ValueId,
+    defs: &HashMap<ValueId, TileIrOp>,
+    types: &HashMap<ValueId, TileIrType>,
+) -> (i64, i64) {
+    if let Some(op) = defs.get(&value) {
+        return tile_shape_for_op(op);
+    }
+    match types.get(&value) {
+        Some(TileIrType::Tile { rows, cols }) => (*rows, *cols),
+        _ => (1, 1),
+    }
 }
 
 fn tile_shape_for_op(op: &TileIrOp) -> (i64, i64) {
@@ -208,8 +221,7 @@ fn tile_shape_for_op(op: &TileIrOp) -> (i64, i64) {
         | TileIrOp::SubF { rows, cols, .. }
         | TileIrOp::MulF { rows, cols, .. }
         | TileIrOp::DivF { rows, cols, .. }
-        | TileIrOp::NegF { rows, cols, .. }
-        | TileIrOp::Exp { rows, cols, .. }
+        | TileIrOp::UnaryF { rows, cols, .. }
         | TileIrOp::Broadcast { rows, cols, .. }
         | TileIrOp::Map { rows, cols, .. } => (*rows, *cols),
         TileIrOp::ReduceSum {

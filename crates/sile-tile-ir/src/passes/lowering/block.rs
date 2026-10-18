@@ -10,7 +10,7 @@ use super::core::{BlockLowerer, LowerLlvmIrCtx, llvm_ir_block, llvm_ir_type, llv
 use super::tile_compute::{
     FusedAccInit, FusedTileLoad, LoadReduceFusion, MapReduceFusion, lower_fused_load_reduce_inst,
     lower_fused_map_reduce_inst, lower_fused_tile_mma_inst, lower_tile_mma_inst,
-    lower_tile_reduce_inst,
+    ReduceCombiner, lower_tile_reduce_inst,
 };
 use super::tile_expr::{
     PointwiseTileDefs, build_pointwise_tile_defs, lower_pointwise_rank1_store_inst,
@@ -122,6 +122,7 @@ pub(crate) fn lower_block(
                 buf,
                 row_coord,
                 col_coord,
+                outer_coords,
                 rows,
                 cols,
                 stride_shape_idx,
@@ -129,6 +130,7 @@ pub(crate) fn lower_block(
                 lower_tile_load_inst(
                     inst.result,
                     *buf,
+                    outer_coords,
                     *row_coord,
                     *col_coord,
                     *rows,
@@ -141,8 +143,7 @@ pub(crate) fn lower_block(
             | TileIrOp::SubF { rows, cols, .. }
             | TileIrOp::MulF { rows, cols, .. }
             | TileIrOp::DivF { rows, cols, .. }
-            | TileIrOp::NegF { rows, cols, .. }
-            | TileIrOp::Exp { rows, cols, .. }
+            | TileIrOp::UnaryF { rows, cols, .. }
             | TileIrOp::Broadcast { rows, cols, .. } => {
                 let pending_tiles = pointwise_plan
                     .expr_fusions
@@ -159,6 +160,7 @@ pub(crate) fn lower_block(
                 value,
                 row_coord,
                 col_coord,
+                outer_coords,
                 rows,
                 cols,
                 stride_shape_idx,
@@ -166,6 +168,7 @@ pub(crate) fn lower_block(
                 lower_tile_store_inst(
                     *buf,
                     *value,
+                    outer_coords,
                     *row_coord,
                     *col_coord,
                     *rows,
@@ -213,7 +216,7 @@ pub(crate) fn lower_block(
                 lower_tile_reduce_inst(
                     inst.result,
                     *value,
-                    false,
+                    ReduceCombiner::Sum,
                     *axis,
                     *in_rows,
                     *in_cols,
@@ -229,7 +232,23 @@ pub(crate) fn lower_block(
                 lower_tile_reduce_inst(
                     inst.result,
                     *value,
-                    true,
+                    ReduceCombiner::Max,
+                    *axis,
+                    *in_rows,
+                    *in_cols,
+                    &mut builder,
+                );
+            }
+            TileIrOp::ReduceMin {
+                value,
+                axis,
+                in_rows,
+                in_cols,
+            } => {
+                lower_tile_reduce_inst(
+                    inst.result,
+                    *value,
+                    ReduceCombiner::Min,
                     *axis,
                     *in_rows,
                     *in_cols,
@@ -307,6 +326,7 @@ impl PointwiseLoweringPlan {
                 buf: a_buf,
                 row_coord: a_row_coord,
                 col_coord: a_col_coord,
+                outer_coords: a_outer,
                 rows: a_rows,
                 cols: a_cols,
                 stride_shape_idx: a_stride_shape_idx,
@@ -318,6 +338,7 @@ impl PointwiseLoweringPlan {
                 buf: b_buf,
                 row_coord: b_row_coord,
                 col_coord: b_col_coord,
+                outer_coords: b_outer,
                 rows: b_rows,
                 cols: b_cols,
                 stride_shape_idx: b_stride_shape_idx,
@@ -325,6 +346,12 @@ impl PointwiseLoweringPlan {
             else {
                 continue;
             };
+            // The fusion reads each operand at the coordinates the loop is
+            // standing on, which only names the operand when the tile is the
+            // whole of the axes above it.
+            if !a_outer.is_empty() || !b_outer.is_empty() {
+                continue;
+            }
             if use_counts.get(a).copied().unwrap_or(0) != 1
                 || use_counts.get(b).copied().unwrap_or(0) != 1
                 || use_counts.get(acc).copied().unwrap_or(0) != 1
@@ -408,8 +435,7 @@ impl PointwiseLoweringPlan {
                 | TileIrOp::SubF { rows, cols, .. }
                 | TileIrOp::MulF { rows, cols, .. }
                 | TileIrOp::DivF { rows, cols, .. }
-                | TileIrOp::NegF { rows, cols, .. }
-                | TileIrOp::Exp { rows, cols, .. }
+                | TileIrOp::UnaryF { rows, cols, .. }
                 | TileIrOp::Broadcast { rows, cols, .. } => Some((*rows, *cols)),
                 _ => None,
             };
@@ -458,6 +484,7 @@ impl PointwiseLoweringPlan {
                 buf,
                 row_coord,
                 col_coord,
+                outer_coords,
                 rows,
                 cols,
                 stride_shape_idx,
@@ -469,6 +496,7 @@ impl PointwiseLoweringPlan {
                         buf: *buf,
                         row_coord: *row_coord,
                         col_coord: *col_coord,
+                        outer_coords: outer_coords.clone(),
                         src_rows: *rows,
                         src_cols: *cols,
                         stride_shape_idx: *stride_shape_idx,

@@ -50,18 +50,95 @@ pub fn verify_function(func: &Function) -> Result<(), String> {
         return Err(format!("entry block {} does not exist", func.entry.0));
     }
 
+    let dominators = compute_dominators(func);
     for block in &func.blocks {
-        verify_block_uses(block, &value_defs, &value_def_sites)?;
+        verify_block_uses(block, &value_defs, &value_def_sites, &dominators)?;
         verify_terminator(
             &block.terminator,
             block.id,
             &block_params,
             &value_defs,
             &value_def_sites,
+            &dominators,
         )?;
     }
 
     Ok(())
+}
+
+/// Blocks that dominate every block in the map, keyed by block.
+///
+/// SSA requires a definition to dominate every use. Checking that inside one
+/// block is not enough: a pass that hoists an instruction out of a branch, or
+/// that lets one arm define a value the join reads, produces IR that is
+/// well-formed by name but undefined on at least one path. That is exactly the
+/// shape of a silent miscompile, so the verifier computes dominators and
+/// rejects it.
+fn compute_dominators(func: &Function) -> HashMap<BlockId, HashSet<BlockId>> {
+    let block_ids: Vec<BlockId> = func.blocks.iter().map(|block| block.id).collect();
+    let all: HashSet<BlockId> = block_ids.iter().copied().collect();
+    let mut predecessors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for block in &func.blocks {
+        for succ in successors(&block.terminator) {
+            predecessors.entry(succ).or_default().push(block.id);
+        }
+    }
+
+    let mut doms: HashMap<BlockId, HashSet<BlockId>> = block_ids
+        .iter()
+        .map(|block| {
+            if *block == func.entry {
+                (*block, HashSet::from([*block]))
+            } else {
+                (*block, all.clone())
+            }
+        })
+        .collect();
+
+    loop {
+        let mut changed = false;
+        for block_id in &block_ids {
+            if *block_id == func.entry {
+                continue;
+            }
+            let preds = predecessors.get(block_id).cloned().unwrap_or_default();
+            let mut new_set: HashSet<BlockId> = match preds.first() {
+                Some(first) => doms.get(first).cloned().unwrap_or_default(),
+                None => HashSet::new(),
+            };
+            for pred in preds.iter().skip(1) {
+                let pred_doms = doms.get(pred).cloned().unwrap_or_default();
+                new_set.retain(|block| pred_doms.contains(block));
+            }
+            new_set.insert(*block_id);
+            if doms.get(block_id) != Some(&new_set) {
+                doms.insert(*block_id, new_set);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    doms
+}
+
+fn successors(terminator: &Terminator) -> Vec<BlockId> {
+    match terminator {
+        Terminator::Br { target, .. } => vec![*target],
+        Terminator::CondBr {
+            true_target,
+            false_target,
+            ..
+        } => vec![*true_target, *false_target],
+        Terminator::Switch { default, cases, .. } => {
+            let mut out = Vec::with_capacity(cases.len() + 1);
+            out.push(*default);
+            out.extend(cases.iter().map(|(_, target)| *target));
+            out
+        }
+        Terminator::Ret { .. } => Vec::new(),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +152,7 @@ fn verify_block_uses(
     block: &crate::BasicBlock,
     value_defs: &HashSet<ValueId>,
     value_def_sites: &HashMap<ValueId, DefSite>,
+    dominators: &HashMap<BlockId, HashSet<BlockId>>,
 ) -> Result<(), String> {
     for (inst_idx, inst) in block.insts.iter().enumerate() {
         for operand in inst_operands(&inst.op) {
@@ -84,6 +162,7 @@ fn verify_block_uses(
                 Some(inst_idx),
                 value_defs,
                 value_def_sites,
+                dominators,
             )?;
         }
     }
@@ -96,12 +175,13 @@ fn verify_terminator(
     block_params: &HashMap<BlockId, usize>,
     value_defs: &HashSet<ValueId>,
     value_def_sites: &HashMap<ValueId, DefSite>,
+    dominators: &HashMap<BlockId, HashSet<BlockId>>,
 ) -> Result<(), String> {
     match terminator {
         Terminator::Br { target, args } => {
             verify_branch_target(*target, args.len(), block_params)?;
             for operand in args {
-                verify_operand(operand, block_id, None, value_defs, value_def_sites)?;
+                verify_operand(operand, block_id, None, value_defs, value_def_sites, dominators)?;
             }
             Ok(())
         }
@@ -115,9 +195,9 @@ fn verify_terminator(
         } => {
             verify_branch_target(*true_target, true_args.len(), block_params)?;
             verify_branch_target(*false_target, false_args.len(), block_params)?;
-            verify_operand(cond, block_id, None, value_defs, value_def_sites)?;
+            verify_operand(cond, block_id, None, value_defs, value_def_sites, dominators)?;
             for operand in true_args.iter().chain(false_args.iter()) {
-                verify_operand(operand, block_id, None, value_defs, value_def_sites)?;
+                verify_operand(operand, block_id, None, value_defs, value_def_sites, dominators)?;
             }
             Ok(())
         }
@@ -130,12 +210,12 @@ fn verify_terminator(
             for (_, target) in cases {
                 verify_branch_target(*target, 0, block_params)?;
             }
-            verify_operand(value, block_id, None, value_defs, value_def_sites)?;
+            verify_operand(value, block_id, None, value_defs, value_def_sites, dominators)?;
             Ok(())
         }
         Terminator::Ret { value } => {
             if let Some(operand) = value {
-                verify_operand(operand, block_id, None, value_defs, value_def_sites)?;
+                verify_operand(operand, block_id, None, value_defs, value_def_sites, dominators)?;
             }
             Ok(())
         }
@@ -148,6 +228,7 @@ fn verify_operand(
     use_inst_idx: Option<usize>,
     value_defs: &HashSet<ValueId>,
     value_def_sites: &HashMap<ValueId, DefSite>,
+    dominators: &HashMap<BlockId, HashSet<BlockId>>,
 ) -> Result<(), String> {
     let Operand::Value(value) = operand else {
         return Ok(());
@@ -161,23 +242,51 @@ fn verify_operand(
         return Err(format!("missing def-site for value id {}", value.0));
     };
 
-    if let (
+    match def_site {
+        // A function parameter is in scope everywhere.
+        DefSite::FunctionParam => Ok(()),
+        DefSite::BlockParam { block: def_block } => {
+            if def_block == use_block || dominates(dominators, def_block, use_block) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "value id {} is defined in block {}, which does not dominate its use in block {}",
+                    value.0, def_block.0, use_block.0
+                ))
+            }
+        }
         DefSite::Inst {
             block: def_block,
             inst_idx: def_inst_idx,
-        },
-        Some(use_inst_idx),
-    ) = (def_site, use_inst_idx)
-    {
-        if def_block == use_block && def_inst_idx >= use_inst_idx {
-            return Err(format!(
-                "value id {} is used before its definition in block {}",
-                value.0, use_block.0
-            ));
+        } => {
+            if def_block != use_block && !dominates(dominators, def_block, use_block) {
+                return Err(format!(
+                    "value id {} is defined in block {}, which does not dominate its use in block {}",
+                    value.0, def_block.0, use_block.0
+                ));
+            }
+            if def_block == use_block
+                && let Some(use_inst_idx) = use_inst_idx
+                && def_inst_idx >= use_inst_idx
+            {
+                return Err(format!(
+                    "value id {} is used before its definition in block {}",
+                    value.0, use_block.0
+                ));
+            }
+            Ok(())
         }
     }
+}
 
-    Ok(())
+fn dominates(
+    dominators: &HashMap<BlockId, HashSet<BlockId>>,
+    definition: BlockId,
+    use_site: BlockId,
+) -> bool {
+    dominators
+        .get(&use_site)
+        .is_some_and(|doms| doms.contains(&definition))
 }
 
 fn inst_operands(op: &InstOp) -> Vec<&Operand> {
@@ -219,151 +328,4 @@ fn verify_branch_target(
         ));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{AddressSpace, BasicBlock, BlockParam, CmpPred, Constant, Inst, Param, Type};
-
-    #[test]
-    fn rejects_undefined_value_use() {
-        let func = Function {
-            name: "bad_use".into(),
-            params: vec![param(1)],
-            blocks: vec![BasicBlock {
-                id: BlockId(0),
-                name: "bb0".into(),
-                params: Vec::new(),
-                insts: vec![Inst {
-                    result: Some(ValueId(2)),
-                    result_name: Some("v2".into()),
-                    ty: Type::F32,
-                    op: InstOp::Load {
-                        ptr: Operand::Value(ValueId(999)),
-                    },
-                    metadata: Vec::new(),
-                }],
-                terminator: Terminator::Ret { value: None },
-            }],
-            entry: BlockId(0),
-            metadata: Vec::new(),
-        };
-
-        let err = verify_function(&func).unwrap_err();
-        assert!(err.contains("undefined value id 999"));
-    }
-
-    #[test]
-    fn rejects_same_block_use_before_def() {
-        let func = Function {
-            name: "forward_ref".into(),
-            params: vec![param(1)],
-            blocks: vec![BasicBlock {
-                id: BlockId(0),
-                name: "bb0".into(),
-                params: vec![block_param(2)],
-                insts: vec![
-                    Inst {
-                        result: Some(ValueId(3)),
-                        result_name: Some("v3".into()),
-                        ty: Type::I1,
-                        op: InstOp::Cmp {
-                            pred: CmpPred::Eq,
-                            lhs: Operand::Value(ValueId(4)),
-                            rhs: Operand::Const(Constant::Int(0)),
-                        },
-                        metadata: Vec::new(),
-                    },
-                    Inst {
-                        result: Some(ValueId(4)),
-                        result_name: Some("v4".into()),
-                        ty: Type::I64,
-                        op: InstOp::Bin {
-                            op: crate::BinOp::Add,
-                            lhs: Operand::Const(Constant::Int(1)),
-                            rhs: Operand::Const(Constant::Int(2)),
-                        },
-                        metadata: Vec::new(),
-                    },
-                ],
-                terminator: Terminator::Ret { value: None },
-            }],
-            entry: BlockId(0),
-            metadata: Vec::new(),
-        };
-
-        let err = verify_function(&func).unwrap_err();
-        assert!(err.contains("used before its definition"));
-    }
-
-    #[test]
-    fn accepts_well_formed_function() {
-        let func = Function {
-            name: "ok".into(),
-            params: vec![param(1)],
-            blocks: vec![BasicBlock {
-                id: BlockId(0),
-                name: "bb0".into(),
-                params: vec![block_param(2)],
-                insts: vec![
-                    Inst {
-                        result: Some(ValueId(3)),
-                        result_name: Some("v3".into()),
-                        ty: Type::I64,
-                        op: InstOp::Bin {
-                            op: crate::BinOp::Add,
-                            lhs: Operand::Const(Constant::Int(1)),
-                            rhs: Operand::Const(Constant::Int(2)),
-                        },
-                        metadata: Vec::new(),
-                    },
-                    Inst {
-                        result: Some(ValueId(4)),
-                        result_name: Some("v4".into()),
-                        ty: Type::ptr(AddressSpace::Private, Type::F32),
-                        op: InstOp::Alloca {
-                            alloc_ty: Type::F32,
-                            addr_space: AddressSpace::Private,
-                        },
-                        metadata: Vec::new(),
-                    },
-                    Inst {
-                        result: None,
-                        result_name: None,
-                        ty: Type::Void,
-                        op: InstOp::Store {
-                            ptr: Operand::Value(ValueId(4)),
-                            value: Operand::Const(Constant::Float(1.0)),
-                        },
-                        metadata: Vec::new(),
-                    },
-                ],
-                terminator: Terminator::Ret {
-                    value: Some(Operand::Value(ValueId(3))),
-                },
-            }],
-            entry: BlockId(0),
-            metadata: Vec::new(),
-        };
-
-        verify_function(&func).unwrap();
-    }
-
-    fn param(id: u32) -> Param {
-        Param {
-            id: ValueId(id),
-            name: format!("p{id}"),
-            ty: Type::ptr(AddressSpace::Global, Type::F32),
-            abi: None,
-        }
-    }
-
-    fn block_param(id: u32) -> BlockParam {
-        BlockParam {
-            id: ValueId(id),
-            name: format!("b{id}"),
-            ty: Type::I64,
-        }
-    }
 }

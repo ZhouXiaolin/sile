@@ -1,10 +1,17 @@
-use sile::{Device, Tensor, tile};
+//! A parallel reduction written the way cutile-rs writes it.
+//!
+//! The reduction lowers one whole tile to a scalar, and the scalar is added
+//! into the output atomically, so the answer is a sum over the launch rather
+//! than over one program.
+
+use sile::ct::*;
+use sile::{Device, Tensor};
 
 #[sile::kernel]
 fn parallel_reduce<const TILE: i64>(a: &Tensor<f32, { [-1] }>, out: &mut Tensor<f32, { [1] }>) {
-    let pid = tile::id().0;
-    let tile_a = a.load_tile([TILE], [pid]);
-    let sum_tile = sile::reduce_sum(tile_a, 0);
+    let pid = get_tile_block_id();
+    let tile_a = a.load_tile([TILE], [pid.0]);
+    let sum_tile = reduce_sum(tile_a, 0i64);
     out.atomic_add(0, sum_tile[0]);
 }
 
@@ -29,7 +36,8 @@ fn main() -> sile::Result<()> {
     // data: 100 tiles lands about 32 units short in f32, which is 6.4e-7
     // relative. A 1e-5 relative bound is therefore honest and not a shrug.
     let tolerance = expected * 1e-5;
-    println!("sum = {}, expected = {}", result, expected);
+    println!("sum = {result}, expected = {expected}");
     assert!((result - expected).abs() < tolerance);
+    println!("cutile parallel_reduce {LEN} ok on {device:?}");
     Ok(())
 }

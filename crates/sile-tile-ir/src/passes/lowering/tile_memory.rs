@@ -58,6 +58,7 @@ pub(crate) fn lower_tile_uninit_inst(
 pub(crate) fn lower_tile_load_inst(
     result: ValueId,
     buf: ValueId,
+    outer_coords: &[ValueId],
     row_coord: ValueId,
     col_coord: ValueId,
     rows: i64,
@@ -75,6 +76,7 @@ pub(crate) fn lower_tile_load_inst(
             ctx,
             out,
             buf_operand.clone(),
+            outer_coords,
             row_operand.clone(),
             col_operand.clone(),
             rows,
@@ -114,6 +116,7 @@ pub(crate) fn lower_tile_load_inst(
 pub(crate) fn lower_tile_store_inst(
     buf: ValueId,
     value: ValueId,
+    outer_coords: &[ValueId],
     row_coord: ValueId,
     col_coord: ValueId,
     rows: i64,
@@ -131,6 +134,7 @@ pub(crate) fn lower_tile_store_inst(
             ctx,
             out,
             buf_operand.clone(),
+            outer_coords,
             row_operand.clone(),
             col_operand.clone(),
             rows,
@@ -161,10 +165,84 @@ pub(crate) fn lower_tile_store_inst(
     );
 }
 
+/// The flat index of one element of a buffer with two or more axes, and the
+/// row stride it used.
+///
+/// `src_row` and `src_col` already carry the tile origin. A tile covers the
+/// last two axes, so every axis above them is a plane of planes: its
+/// coordinate picks one, and its stride is the product of the extents below
+/// it. The list of outer coordinates is outermost first, so walking it
+/// backwards walks the axes from the tile outward and each step is one
+/// multiplication. Every strided access in the lowering goes through here, so
+/// the outer axes are added in one place.
+///
+/// A tile covers the whole of an outer axis, because a partition's shape has
+/// extent one above the last two axes, so an outer coordinate is a tile index
+/// and needs no scaling.
+pub(crate) fn emit_strided_element_index(
+    ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
+    out: &mut Vec<llvm_ir::Inst>,
+    buf: llvm_ir::Operand,
+    outer_coords: &[llvm_ir::Operand],
+    stride_shape_idx: usize,
+    src_row: llvm_ir::Operand,
+    src_col: llvm_ir::Operand,
+) -> (llvm_ir::Operand, llvm_ir::Operand) {
+    let stride = emit_shape_dim(ctx, out, buf.clone(), stride_shape_idx);
+    let row_offset = emit_bin(
+        ctx,
+        out,
+        llvm_ir::BinOp::Mul,
+        src_row,
+        stride.clone(),
+        llvm_ir::Type::I64,
+    );
+    let mut index = emit_bin(
+        ctx,
+        out,
+        llvm_ir::BinOp::Add,
+        row_offset,
+        src_col,
+        llvm_ir::Type::I64,
+    );
+    // The stride of the row axis is `stride`, so the stride of the axis just
+    // above it is the row extent times `stride`, and so on outward.
+    let mut running = stride.clone();
+    for i in (0..outer_coords.len()).rev() {
+        let inner_extent = emit_shape_dim(ctx, out, buf.clone(), i + 1);
+        running = emit_bin(
+            ctx,
+            out,
+            llvm_ir::BinOp::Mul,
+            running,
+            inner_extent,
+            llvm_ir::Type::I64,
+        );
+        let origin = emit_bin(
+            ctx,
+            out,
+            llvm_ir::BinOp::Mul,
+            outer_coords[i].clone(),
+            running.clone(),
+            llvm_ir::Type::I64,
+        );
+        index = emit_bin(
+            ctx,
+            out,
+            llvm_ir::BinOp::Add,
+            origin,
+            index,
+            llvm_ir::Type::I64,
+        );
+    }
+    (index, stride)
+}
+
 pub(crate) fn build_buffer_index_base(
     ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
     out: &mut Vec<llvm_ir::Inst>,
     buf: llvm_ir::Operand,
+    outer_coords: &[ValueId],
     row_coord: llvm_ir::Operand,
     col_coord: llvm_ir::Operand,
     rows: i64,
@@ -203,22 +281,18 @@ pub(crate) fn build_buffer_index_base(
             const_i64(cols),
             llvm_ir::Type::I64,
         );
-        let stride = emit_shape_dim(ctx, out, buf, stride_shape_idx);
-        let row_origin = emit_bin(
+        let outer_operands: Vec<llvm_ir::Operand> = outer_coords
+            .iter()
+            .map(|coord| resolve_operand(*coord, ctx))
+            .collect();
+        let (tile_origin, stride) = emit_strided_element_index(
             ctx,
             out,
-            llvm_ir::BinOp::Mul,
+            buf,
+            &outer_operands,
+            stride_shape_idx,
             row_tile_base,
-            stride.clone(),
-            llvm_ir::Type::I64,
-        );
-        let tile_origin = emit_bin(
-            ctx,
-            out,
-            llvm_ir::BinOp::Add,
-            row_origin,
             col_tile_base,
-            llvm_ir::Type::I64,
         );
         BufferIndexBase::Strided2D {
             tile_origin,

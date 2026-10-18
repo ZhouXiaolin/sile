@@ -15,16 +15,39 @@ pub fn lower_to_tile_ir(typed: &TypedKernel) -> TileIrFunction {
     ctx.current_block = entry;
 
     // Register kernel params as Tile IR params
+    let mut scalar_index = 0usize;
+    let mut scalar_i64_index = 0usize;
     for param in &typed.kernel.params {
-        let rank = rank_of_param(param);
-        let ty = TileIrType::Buffer { rank };
-        let value = ctx.push_param(param.name.clone(), ty, TileIrParamKind::Buffer);
+        let (ty, kind) = match &param.ty {
+            sile_hir::Type::Scalar(elem) => {
+                // A float and an integer travel in their own descriptor, so
+                // each counts its own slots.
+                let (ty, index) = if elem.is_float() {
+                    let index = scalar_index;
+                    scalar_index += 1;
+                    (TileIrType::F32, index)
+                } else {
+                    let index = scalar_i64_index;
+                    scalar_i64_index += 1;
+                    (TileIrType::I64, index)
+                };
+                (ty, TileIrParamKind::Scalar { index })
+            }
+            _ => (
+                TileIrType::Buffer {
+                    rank: rank_of_param(param),
+                },
+                TileIrParamKind::Buffer,
+            ),
+        };
+        let value = ctx.push_param(param.name.clone(), ty, kind);
         ctx.locals.insert(param.name.clone(), value);
     }
 
-    // Lower body statements
+    // Lower body statements. A `continue` cannot reach here: the checker
+    // rejects one outside a loop, and a loop body lowers its own statements.
     for stmt in &typed.kernel.body {
-        lower_stmt(stmt, &mut ctx);
+        let _ = lower_stmt(stmt, &mut ctx);
     }
 
     // Seal the current block with return
@@ -184,14 +207,30 @@ impl<'a> LowerCtx<'a> {
 
 // ── Statement lowering ─────────────────────────────────────────────
 
-fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx<'_>) {
+/// What a statement did to the path through the block it is in.
+///
+/// A `continue` ends that path: the statements after it in the same loop body
+/// do not run, so the body stops lowering there and the loop's existing back
+/// edge to its header becomes the `continue`. Every other statement lets the
+/// next one follow it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Next,
+    Continue,
+}
+
+fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx<'_>) -> Flow {
     match stmt {
         Stmt::Let { name, expr, .. } | Stmt::Assign { name, expr } => {
             let value = lower_expr(expr, ctx);
             ctx.locals.insert(name.clone(), value);
         }
-        Stmt::Store { target, value } => {
-            lower_store(target, value, ctx);
+        Stmt::Store {
+            target,
+            value,
+            index,
+        } => {
+            lower_store(target, value, index.as_ref(), ctx);
         }
         Stmt::AtomicAdd {
             target,
@@ -208,12 +247,20 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx<'_>) {
         } => {
             lower_for_loop(var, start, end, body, ctx);
         }
+        Stmt::Continue => return Flow::Continue,
     }
+    Flow::Next
 }
 
 fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut LowerCtx<'_>) {
     let start_const = try_eval_i64(start, ctx);
     let end_const = try_eval_i64(end, ctx);
+
+    // Bindings made inside the body are local to the loop, so the locals map
+    // is restored when the loop ends. The type checker already rejects a use
+    // after the loop; this keeps the lowering from silently shadowing an outer
+    // name if a later stage ever accepts one.
+    let outer_locals = ctx.locals.clone();
 
     // If bounds are compile-time known and small, unroll.
     if let (Some(start_val), Some(end_val)) = (start_const, end_const) {
@@ -222,9 +269,24 @@ fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut 
                 let const_val = ctx.emit(TileIrOp::ConstI64(i), TileIrType::I64);
                 ctx.locals.insert(var.to_string(), const_val);
                 for inner in body {
-                    lower_stmt(inner, ctx);
+                    // An unrolled `continue` ends this copy of the body, so the
+                    // remaining statements of this iteration do not run and the
+                    // next constant follows.
+                    if lower_stmt(inner, ctx) == Flow::Continue {
+                        break;
+                    }
                 }
             }
+            // An unrolled body still assigns to outer names, so their final
+            // values stay. Names the body introduced are dropped.
+            let outer_names: Vec<String> = outer_locals.keys().cloned().collect();
+            let mut restored = outer_locals;
+            for name in outer_names {
+                if let Some(value) = ctx.locals.get(&name).copied() {
+                    restored.insert(name, value);
+                }
+            }
+            ctx.locals = restored;
             return;
         }
     }
@@ -249,8 +311,10 @@ fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut 
     //   exit(...):
     //     <continue>
 
-    // Identify loop-carried variables by scanning the loop body
-    let carried_names = find_loop_carried_vars(body);
+    // Identify loop-carried variables by scanning the loop body. Only names
+    // that already exist outside the loop are carried; a `let` in the body is
+    // a fresh binding on each iteration.
+    let carried_names = find_loop_carried_vars(body, ctx);
 
     // Collect initial values for carried variables
     let init_carried: Vec<(String, ValueId)> = carried_names
@@ -357,9 +421,13 @@ fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut 
         })
         .collect();
 
-    // Execute loop body
+    // Execute loop body. A `continue` stops the body here, and the back edge
+    // below carries the values the loop holds at that point, which is what a
+    // `continue` does: it ends this pass through the body and starts the next.
     for inner in body {
-        lower_stmt(inner, ctx);
+        if lower_stmt(inner, ctx) == Flow::Continue {
+            break;
+        }
     }
 
     // k_next = k + 1
@@ -414,7 +482,14 @@ fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut 
         })
         .collect();
 
-    // Exit block params (no k, just carried values)
+    // Exit block params (no k, just carried values). Everything the body bound
+    // for itself goes out of scope here; only the carried names survive, bound
+    // to the exit block's parameters.
+    ctx.locals = outer_locals;
+    for (name, param) in &exit_params {
+        ctx.locals.insert(name.clone(), *param);
+    }
+
     let exit_block_params: Vec<ValueId> = exit_params.iter().map(|(_, v)| *v).collect();
 
     // We don't seal exit here — the caller will continue emitting into it.
@@ -443,26 +518,36 @@ fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut 
     ctx.pending_exit_params = Some((exit_id, placeholder.params));
 }
 
-/// Find variables that are assigned within the loop body
-/// (these need to become block parameters for the loop)
-fn find_loop_carried_vars(body: &[Stmt]) -> Vec<String> {
+/// Find variables that are assigned within the loop body and already exist
+/// outside it. These become block parameters of the loop.
+///
+/// A `let` in the body is not one of them: it is a fresh binding on each
+/// iteration, so it has no value to carry in. Treating it as carried made the
+/// loop read a value from before the loop and write it back as if the body had
+/// assigned it.
+fn find_loop_carried_vars(body: &[Stmt], ctx: &LowerCtx<'_>) -> Vec<String> {
     let mut vars = Vec::new();
+    collect_carried_names(body, ctx, &mut vars);
+    vars
+}
+
+/// Walk the body, including nested loops.
+///
+/// An assignment inside a nested loop is still an assignment to the outer
+/// loop's variable. Scanning only the top level missed it, so the outer loop
+/// never carried the value and the backedge dropped the update.
+fn collect_carried_names(body: &[Stmt], ctx: &LowerCtx<'_>, vars: &mut Vec<String>) {
     for stmt in body {
         match stmt {
             Stmt::Assign { name, .. } => {
-                if !vars.contains(name) {
+                if ctx.locals.contains_key(name) && !vars.contains(name) {
                     vars.push(name.clone());
                 }
             }
-            Stmt::Let { name, .. } => {
-                if !vars.contains(name) {
-                    vars.push(name.clone());
-                }
-            }
-            _ => {}
+            Stmt::ForLoop { body, .. } => collect_carried_names(body, ctx, vars),
+            Stmt::Let { .. } | Stmt::Store { .. } | Stmt::AtomicAdd { .. } | Stmt::Continue => {}
         }
     }
-    vars
 }
 
 // ── Expression lowering ────────────────────────────────────────────
@@ -493,7 +578,13 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx<'_>) -> ValueId {
 
 fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueId {
     match op {
-        BuiltinOp::ProgramId => ctx.get_or_create_program_id_param(0),
+        BuiltinOp::ProgramId => {
+            // `program_id(axis)` names its axis; the historical `id()` spelling
+            // reached here through `ShapeDim`, which carries the same axis in
+            // its second argument.
+            let dim = args.first().and_then(|arg| try_eval_i64(arg, ctx)).unwrap_or(0);
+            ctx.get_or_create_program_id_param(dim)
+        }
         BuiltinOp::NumPrograms => {
             // num_programs(axis): the launch extent. Taken from the axis index
             // argument when it is a literal.
@@ -508,7 +599,7 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 .get(1)
                 .and_then(|arg| try_eval_i64(arg, ctx))
                 .unwrap_or(0) as usize;
-            let tile_extent = load_tile_extent_for_buffer(buffer, ctx);
+            let tile_extent = load_tile_extent_for_buffer(buffer, dim, ctx);
             ctx.emit(
                 TileIrOp::NumTiles {
                     shape,
@@ -552,6 +643,51 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 TileIrType::Tile { rows, cols },
             )
         }
+        // A partition is a view, not an instruction. It names the buffer, so
+        // the value that reaches a later `load` or `store` is the buffer
+        // itself; the tile extent travels in the HIR type and is read there.
+        // `partition_mut` is the same view, opened for writing.
+        BuiltinOp::Partition | BuiltinOp::PartitionMut => lower_expr(&args[0], ctx),
+        BuiltinOp::Load => {
+            // `part.load([i, j])` is `load_tile(shape, [i, j])` with the shape
+            // taken from the partition. The partition lowers to its buffer, so
+            // the buffer is `args[0]` and the tile extent comes from the HIR.
+            //
+            // `y.load()` names no coordinates: the tile is the one the program
+            // owns, which is the same tile `load_like` reads.
+            let base = lower_expr(&args[0], ctx);
+            let _ = ctx.get_or_create_shape_desc_param(base);
+            let tile_shape = partition_tile_extent(&args[0], ctx);
+            let tile_shape = if tile_shape.is_empty() {
+                args.first().and_then(|arg| expr_shape(arg, ctx)).unwrap_or_default()
+            } else {
+                tile_shape
+            };
+            let coords = args
+                .get(1)
+                .map(|arg| extract_runtime_coords(arg, ctx))
+                .unwrap_or_default();
+            let (rows, cols) = shape_to_2d(&tile_shape);
+            let (plane, row_coord, col_coord) = if coords.is_empty() {
+                program_tile_coords(buffer_rank(base, ctx), ctx)
+            } else {
+                let (row, col) = coords_to_2d(&coords, ctx);
+                (outer_coords(&coords), row, col)
+            };
+            let stride_shape_idx = param_stride_dim(&base, ctx);
+            ctx.emit(
+                TileIrOp::LoadPtrTko {
+                    buf: base,
+                    outer_coords: plane,
+                    row_coord,
+                    col_coord,
+                    rows,
+                    cols,
+                    stride_shape_idx,
+                },
+                TileIrType::Tile { rows, cols },
+            )
+        }
         BuiltinOp::LoadTile => {
             let base = lower_expr(&args[0], ctx);
             let _ = ctx.get_or_create_shape_desc_param(base);
@@ -569,6 +705,7 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
             ctx.emit(
                 TileIrOp::LoadPtrTko {
                     buf: base,
+                    outer_coords: outer_coords(&coords),
                     row_coord,
                     col_coord,
                     rows,
@@ -581,17 +718,24 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
         BuiltinOp::LoadTileLike2D => {
             let input = lower_expr(&args[0], ctx);
             let _ = ctx.get_or_create_shape_desc_param(input);
+            // `load_tile_like_2d(x, y)` takes the tile shape from the output
+            // buffer `y`, which is the second argument. A third argument, when
+            // present, is the index and does not carry the shape.
+            //
+            // `load_tile_mut(z)` names only the buffer, so the tile is the one
+            // `z` declares: its own parameter shape.
             let shape = args
                 .get(1)
                 .and_then(|arg| expr_shape(arg, ctx))
+                .or_else(|| args.first().and_then(|arg| expr_shape(arg, ctx)))
                 .unwrap_or_default();
             let (rows, cols) = shape_to_2d(&shape);
-            let row_coord = ctx.get_or_create_program_id_param(0);
-            let col_coord = ctx.get_or_create_program_id_param(1);
+            let (plane, row_coord, col_coord) = program_tile_coords(buffer_rank(input, ctx), ctx);
             let stride_shape_idx = param_stride_dim(&input, ctx);
             ctx.emit(
                 TileIrOp::LoadPtrTko {
                     buf: input,
+                    outer_coords: plane,
                     row_coord,
                     col_coord,
                     rows,
@@ -646,17 +790,25 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 },
             )
         }
-        BuiltinOp::Max => {
+        // A maximum and a minimum are one comparison and one select each, so
+        // they ride the map node: the map already carries a scalar expression
+        // per element, and no target has an instruction that does more.
+        BuiltinOp::Max | BuiltinOp::Min => {
             let lhs = lower_expr(&args[0], ctx);
             let rhs = lower_expr(&args[1], ctx);
-            let (rows, cols) = tile_shape_of(lhs, ctx)
-                .or_else(|| tile_shape_of(rhs, ctx))
-                .unwrap_or((1, 1));
+            let operand_shape = tile_shape_of(lhs, ctx).or_else(|| tile_shape_of(rhs, ctx));
+            let (rows, cols) = operand_shape.unwrap_or((1, 1));
+            let (op, ty) = match (op, operand_shape) {
+                (BuiltinOp::Max, Some(_)) => (CmpOp::Ge, TileIrType::Tile { rows, cols }),
+                (BuiltinOp::Max, None) => (CmpOp::Ge, TileIrType::F32),
+                (_, Some(_)) => (CmpOp::Le, TileIrType::Tile { rows, cols }),
+                (_, None) => (CmpOp::Le, TileIrType::F32),
+            };
             ctx.emit(
                 TileIrOp::Map {
                     expr: TileMapExpr::Select {
                         cond: Box::new(TileMapExpr::Cmp {
-                            op: CmpOp::Ge,
+                            op,
                             lhs: Box::new(TileMapExpr::Value(lhs)),
                             rhs: Box::new(TileMapExpr::Value(rhs)),
                         }),
@@ -666,10 +818,42 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                     rows,
                     cols,
                 },
-                TileIrType::Tile { rows, cols },
+                ty,
             )
         }
-        BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Mul | BuiltinOp::Div => {
+        // `ceil_div(a, b)` is `(a + b - 1) / b`. CuTile names it as one
+        // operation over counts, and the three integer steps are what every
+        // target would have to write, so the lowering writes them once.
+        BuiltinOp::CeilDiv => {
+            let lhs = lower_expr(&args[0], ctx);
+            let rhs = lower_expr(&args[1], ctx);
+            let one = ctx.emit(TileIrOp::ConstI64(1), TileIrType::I64);
+            let biased = ctx.emit(
+                TileIrOp::IBinary {
+                    op: BinOp::Add,
+                    lhs,
+                    rhs,
+                },
+                TileIrType::I64,
+            );
+            let adjusted = ctx.emit(
+                TileIrOp::IBinary {
+                    op: BinOp::Sub,
+                    lhs: biased,
+                    rhs: one,
+                },
+                TileIrType::I64,
+            );
+            ctx.emit(
+                TileIrOp::IBinary {
+                    op: BinOp::Div,
+                    lhs: adjusted,
+                    rhs,
+                },
+                TileIrType::I64,
+            )
+        }
+        BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Mul | BuiltinOp::Div | BuiltinOp::Rem => {
             let lhs = lower_expr(&args[0], ctx);
             let rhs = lower_expr(&args[1], ctx);
             let bin_op = match op {
@@ -677,11 +861,27 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 BuiltinOp::Sub => BinOp::Sub,
                 BuiltinOp::Mul => BinOp::Mul,
                 BuiltinOp::Div => BinOp::Div,
+                BuiltinOp::Rem => BinOp::Rem,
                 _ => unreachable!(),
             };
             // Check if tile or scalar
             if let Some((rows, cols)) = tile_shape_of(lhs, ctx).or_else(|| tile_shape_of(rhs, ctx))
             {
+                // No target has a fused tile remainder, so it rides the map
+                // node the way the unary functions do.
+                if bin_op == BinOp::Rem {
+                    return ctx.emit(
+                        TileIrOp::Map {
+                            expr: TileMapExpr::Rem {
+                                lhs: Box::new(TileMapExpr::Value(lhs)),
+                                rhs: Box::new(TileMapExpr::Value(rhs)),
+                            },
+                            rows,
+                            cols,
+                        },
+                        TileIrType::Tile { rows, cols },
+                    );
+                }
                 let op = match bin_op {
                     BinOp::Add => TileIrOp::AddF {
                         lhs,
@@ -707,8 +907,21 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                         rows,
                         cols,
                     },
+                    BinOp::Rem => unreachable!("a remainder rides the map node"),
                 };
                 ctx.emit(op, TileIrType::Tile { rows, cols })
+            } else if is_float_operand(lhs, ctx) || is_float_operand(rhs, ctx) {
+                // A scalar chain that touches a float stays float: `rms / n`
+                // divides an f32 by a count, and integer division would round
+                // the mean down before the square root ever sees it.
+                ctx.emit(
+                    TileIrOp::FBinary {
+                        op: bin_op,
+                        lhs,
+                        rhs,
+                    },
+                    TileIrType::F32,
+                )
             } else {
                 ctx.emit(
                     TileIrOp::IBinary {
@@ -720,27 +933,176 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 )
             }
         }
-        BuiltinOp::Exp => {
+        // A transpose walks the tile it writes and reads its operand with the
+        // two coordinates exchanged, which is a map over the transposed domain.
+        BuiltinOp::Transpose => {
+            let value = lower_expr(&args[0], ctx);
+            let (rows, cols) = tile_shape_of(value, ctx).unwrap_or((1, 1));
+            ctx.emit(
+                TileIrOp::Map {
+                    expr: TileMapExpr::Transpose {
+                        value: Box::new(TileMapExpr::Value(value)),
+                    },
+                    rows: cols,
+                    cols: rows,
+                },
+                TileIrType::Tile {
+                    rows: cols,
+                    cols: rows,
+                },
+            )
+        }
+        // Every unary float operation is pointwise, so it rides the map node:
+        // the map already carries a scalar expression per element, and one op
+        // per transcendental would grow every traversal of the IR for no gain.
+        // A scalar operand makes the map a scalar, which the lowering reads off
+        // the result type.
+        BuiltinOp::Unary(unary) => {
             let operand = lower_expr(&args[0], ctx);
-            if let Some((rows, cols)) = tile_shape_of(operand, ctx) {
-                ctx.emit(
-                    TileIrOp::Exp {
-                        operand,
-                        rows,
-                        cols,
+            let operand_shape = tile_shape_of(operand, ctx);
+            let (rows, cols) = operand_shape.unwrap_or((1, 1));
+            let ty = match operand_shape {
+                Some(_) => TileIrType::Tile { rows, cols },
+                None => TileIrType::F32,
+            };
+            ctx.emit(
+                TileIrOp::Map {
+                    expr: TileMapExpr::Unary {
+                        op: unary,
+                        operand: Box::new(TileMapExpr::Value(operand)),
                     },
-                    TileIrType::Tile { rows, cols },
-                )
+                    rows,
+                    cols,
+                },
+                ty,
+            )
+        }
+        // A comparison yields `0.0`/`1.0` per element, so it is a map too. The
+        // select that consumes it reads the same coordinates, which is what
+        // makes `select(gt_tile(a, b), a, b)` a pointwise maximum.
+        BuiltinOp::Gt | BuiltinOp::Lt | BuiltinOp::Ge | BuiltinOp::Le | BuiltinOp::Eq
+        | BuiltinOp::Ne => {
+            let lhs = lower_expr(&args[0], ctx);
+            let rhs = lower_expr(&args[1], ctx);
+            let (rows, cols) = tile_shape_of(lhs, ctx)
+                .or_else(|| tile_shape_of(rhs, ctx))
+                .unwrap_or((1, 1));
+            let cmp = match op {
+                BuiltinOp::Gt => CmpOp::Gt,
+                BuiltinOp::Lt => CmpOp::Lt,
+                BuiltinOp::Ge => CmpOp::Ge,
+                BuiltinOp::Le => CmpOp::Le,
+                BuiltinOp::Eq => CmpOp::Eq,
+                BuiltinOp::Ne => CmpOp::Ne,
+                _ => unreachable!(),
+            };
+            let ty = if tile_shape_of(lhs, ctx).is_some() || tile_shape_of(rhs, ctx).is_some() {
+                TileIrType::Tile { rows, cols }
             } else {
-                ctx.emit(
-                    TileIrOp::Exp {
-                        operand,
-                        rows: 1,
-                        cols: 1,
+                TileIrType::F32
+            };
+            ctx.emit(
+                TileIrOp::Map {
+                    expr: TileMapExpr::Cmp {
+                        op: cmp,
+                        lhs: Box::new(TileMapExpr::Value(lhs)),
+                        rhs: Box::new(TileMapExpr::Value(rhs)),
                     },
-                    TileIrType::F32,
-                )
-            }
+                    rows,
+                    cols,
+                },
+                ty,
+            )
+        }
+        BuiltinOp::Select => {
+            let cond = lower_expr(&args[0], ctx);
+            let on_true = lower_expr(&args[1], ctx);
+            let on_false = lower_expr(&args[2], ctx);
+            let (rows, cols) = tile_shape_of(on_true, ctx)
+                .or_else(|| tile_shape_of(on_false, ctx))
+                .or_else(|| tile_shape_of(cond, ctx))
+                .unwrap_or((1, 1));
+            let ty = if tile_shape_of(on_true, ctx).is_some()
+                || tile_shape_of(on_false, ctx).is_some()
+                || tile_shape_of(cond, ctx).is_some()
+            {
+                TileIrType::Tile { rows, cols }
+            } else {
+                TileIrType::F32
+            };
+            ctx.emit(
+                TileIrOp::Map {
+                    expr: TileMapExpr::Select {
+                        cond: Box::new(TileMapExpr::Value(cond)),
+                        on_true: Box::new(TileMapExpr::Value(on_true)),
+                        on_false: Box::new(TileMapExpr::Value(on_false)),
+                    },
+                    rows,
+                    cols,
+                },
+                ty,
+            )
+        }
+        // `tile_to_scalar(t)` reads element `(0, 0)`. A one-element tile has
+        // one element, so the read is the value.
+        BuiltinOp::TileToScalar => {
+            let tile = lower_expr(&args[0], ctx);
+            let zero = ctx.emit(TileIrOp::ConstI64(0), TileIrType::I64);
+            ctx.emit(
+                TileIrOp::Extract {
+                    tile,
+                    row_coord: zero,
+                    col_coord: zero,
+                },
+                TileIrType::F32,
+            )
+        }
+        // `scalar_to_tile(s)` splats one value into a one-element tile.
+        BuiltinOp::ScalarToTile => {
+            let value = lower_expr(&args[0], ctx);
+            let (rows, cols) = (1, 1);
+            ctx.emit(
+                TileIrOp::Map {
+                    expr: TileMapExpr::Value(value),
+                    rows,
+                    cols,
+                },
+                TileIrType::Tile { rows, cols },
+            )
+        }
+        // `convert_scalar(x)` is the identity: every element here is f32.
+        // `convert_scalar(x)` names a scalar constant as an element value, so
+        // its result is a float. `let n: f32 = convert_scalar(N);` is how CuTile
+        // writes a count into an arithmetic expression.
+        BuiltinOp::ConvertScalar => {
+            let value = args.first().and_then(|arg| try_eval_i64(arg, ctx)).unwrap_or(0);
+            ctx.emit(TileIrOp::ConstF64(value as f64), TileIrType::F32)
+        }
+        // `reduce_min` is the same reduction with the other combiner. The tile
+        // IR carries the combiner, so the op needs one more variant and no new
+        // shape rule.
+        BuiltinOp::ReduceMin => {
+            let value = lower_expr(&args[0], ctx);
+            let (in_rows, in_cols) = tile_shape_of(value, ctx).unwrap_or((1, 1));
+            let requested_axis = args.get(1).map(|arg| eval_i64(arg, ctx)).unwrap_or(1);
+            let axis = if in_rows == 1 { 1 } else { requested_axis };
+            let (out_rows, out_cols) = if axis == 1 {
+                (in_rows, 1)
+            } else {
+                (1, in_cols)
+            };
+            ctx.emit(
+                TileIrOp::ReduceMin {
+                    value,
+                    axis,
+                    in_rows,
+                    in_cols,
+                },
+                TileIrType::Tile {
+                    rows: out_rows,
+                    cols: out_cols,
+                },
+            )
         }
         BuiltinOp::ReduceMax | BuiltinOp::ReduceSum => {
             let value = lower_expr(&args[0], ctx);
@@ -776,9 +1138,25 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 },
             )
         }
-        BuiltinOp::ShapeOf | BuiltinOp::ScalarDiv => {
-            let v = lower_expr(&args[0], ctx);
-            v
+        BuiltinOp::ShapeOf => {
+            // A shape is metadata, not a runtime value. Returning the operand
+            // would let a later scalar use read a buffer pointer as if it were
+            // an extent.
+            ctx.emit(TileIrOp::ConstI64(0), TileIrType::I64)
+        }
+        BuiltinOp::ScalarDiv => {
+            // Scalar division is integer division, the same operation the
+            // binary `Div` performs when neither side is a tile.
+            let lhs = lower_expr(&args[0], ctx);
+            let rhs = lower_expr(&args[1], ctx);
+            ctx.emit(
+                TileIrOp::IBinary {
+                    op: BinOp::Div,
+                    lhs,
+                    rhs,
+                },
+                TileIrType::I64,
+            )
         }
         BuiltinOp::Index => {
             let target = lower_expr(&args[0], ctx);
@@ -804,7 +1182,7 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
     }
 }
 
-fn lower_store(target: &str, value: &Expr, ctx: &mut LowerCtx<'_>) {
+fn lower_store(target: &str, value: &Expr, index: Option<&Expr>, ctx: &mut LowerCtx<'_>) {
     let output = ctx
         .locals
         .get(target)
@@ -821,17 +1199,34 @@ fn lower_store(target: &str, value: &Expr, ctx: &mut LowerCtx<'_>) {
         Some(TileIrType::Buffer { rank }) => *rank,
         _ => 1,
     };
-    let row_coord = if output_rank <= 1 {
-        ctx.emit(TileIrOp::ConstI64(0), TileIrType::I64)
-    } else {
-        ctx.get_or_create_program_id_param(0)
-    };
-    let col_coord = if output_rank <= 1 {
-        ctx.get_or_create_program_id_param(0)
-    } else if rows > 1 || cols > 1 {
-        ctx.get_or_create_program_id_param(1)
-    } else {
-        ctx.emit(TileIrOp::ConstI64(0), TileIrType::I64)
+    // `y.store(t)` names no coordinates, so the tile is the one this program
+    // owns and the launch index addresses it. `part.store(t, [i, j])` names
+    // them, and then the launch index plays no part: the store writes the tile
+    // at the coordinates the kernel computed.
+    let (plane, row_coord, col_coord) = match index {
+        Some(index) => {
+            let coords = match index {
+                Expr::Shape(_) => extract_runtime_coords(index, ctx),
+                other => vec![lower_expr(other, ctx)],
+            };
+            let (row, col) = coords_to_2d(&coords, ctx);
+            (outer_coords(&coords), row, col)
+        }
+        None if output_rank >= 3 => program_tile_coords(output_rank, ctx),
+        None if output_rank <= 1 => (
+            Vec::new(),
+            ctx.emit(TileIrOp::ConstI64(0), TileIrType::I64),
+            ctx.get_or_create_program_id_param(0),
+        ),
+        None => {
+            let row = ctx.get_or_create_program_id_param(0);
+            let col = if rows > 1 || cols > 1 {
+                ctx.get_or_create_program_id_param(1)
+            } else {
+                ctx.emit(TileIrOp::ConstI64(0), TileIrType::I64)
+            };
+            (Vec::new(), row, col)
+        }
     };
 
     let stride_shape_idx = param_stride_dim(&output, ctx);
@@ -840,6 +1235,7 @@ fn lower_store(target: &str, value: &Expr, ctx: &mut LowerCtx<'_>) {
         TileIrOp::StorePtrTko {
             buf: output,
             value: stored,
+            outer_coords: plane,
             row_coord,
             col_coord,
             rows,
@@ -869,6 +1265,7 @@ fn lower_atomic_add(target: &str, index: &Expr, value: &Expr, ctx: &mut LowerCtx
         TileIrOp::SileAtomicAdd {
             buf: output,
             value: accumulated,
+            outer_coords: outer_coords(&coords),
             row_coord,
             col_coord,
             stride_shape_idx,
@@ -878,6 +1275,14 @@ fn lower_atomic_add(target: &str, index: &Expr, value: &Expr, ctx: &mut LowerCtx
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
+
+/// Whether a value is a float, either an element value or a scalar.
+fn is_float_operand(value: ValueId, ctx: &LowerCtx<'_>) -> bool {
+    matches!(
+        ctx.types.get(&value),
+        Some(TileIrType::F32 | TileIrType::Tile { .. })
+    )
+}
 
 fn eval_i64(expr: &Expr, ctx: &LowerCtx<'_>) -> i64 {
     try_eval_i64(expr, ctx).unwrap_or(0)
@@ -927,12 +1332,35 @@ fn try_eval_i64(expr: &Expr, ctx: &LowerCtx<'_>) -> Option<i64> {
 }
 
 fn extract_const_shape(expr: &Expr, ctx: &LowerCtx<'_>) -> Vec<i64> {
-    match expr {
-        Expr::Shape(ShapeExpr::Tuple(dims)) => {
-            dims.iter().map(|dim| resolve_shape_dim(dim, ctx)).collect()
-        }
-        Expr::Shape(dim) => vec![resolve_shape_dim(dim, ctx)],
-        _ => vec![],
+    // `x.shape()` names the shape `x` was declared with, which the checker put
+    // on the binding's type. A dynamic extent has no compile-time value, so a
+    // shape that holds one is not a constant shape.
+    if let Expr::Builtin {
+        op: BuiltinOp::ShapeOf,
+        args,
+    } = expr
+    {
+        return args
+            .first()
+            .and_then(|arg| expr_shape(arg, ctx))
+            .filter(|dims| dims.iter().all(|dim| *dim >= 0))
+            .unwrap_or_default();
+    }
+    let shape = match expr {
+        Expr::Shape(shape) => shape.clone(),
+        // A shape bound to a name (`let ts = shape![1, 8];`) carries its
+        // dimensions in the binding's type, the same way a partition does.
+        Expr::Var(name) => match ctx.typed.locals.get(name) {
+            Some(sile_hir::Type::Shape(shape)) | Some(sile_hir::Type::Tile { shape, .. }) => {
+                shape.clone()
+            }
+            _ => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+    match shape {
+        ShapeExpr::Tuple(dims) => dims.iter().map(|dim| resolve_shape_dim(dim, ctx)).collect(),
+        other => vec![resolve_shape_dim(&other, ctx)],
     }
 }
 
@@ -942,6 +1370,38 @@ fn resolve_shape_dim(dim: &ShapeExpr, ctx: &LowerCtx<'_>) -> i64 {
         ShapeExpr::Constant(v) => *v,
         ShapeExpr::Symbol(name) => ctx.const_values.get(name).copied().unwrap_or(-1),
         ShapeExpr::Tuple(_) => -1,
+    }
+}
+
+/// Tile extent a partition was declared with.
+///
+/// The partition lowers to its buffer, so its extent is not in the value table.
+/// The HIR type of the partition does carry it, which is why this reads the
+/// typed kernel rather than the value the partition produced.
+fn partition_tile_extent(partition: &Expr, ctx: &LowerCtx<'_>) -> Vec<i64> {
+    // A partition written inline already carries its shape; one bound to a name
+    // carries it in the binding's type, which the checker recorded.
+    if let Expr::Builtin {
+        op: BuiltinOp::Partition,
+        args,
+    } = partition
+        && let Some(shape) = args.get(1)
+    {
+        let extent = extract_const_shape(shape, ctx);
+        if !extent.is_empty() {
+            return extent;
+        }
+    }
+    let ty = match partition {
+        Expr::Var(name) => ctx.typed.locals.get(name),
+        _ => None,
+    };
+    match ty {
+        Some(sile_hir::Type::Partition { shape, .. }) => match shape {
+            ShapeExpr::Tuple(dims) => dims.iter().map(|dim| resolve_shape_dim(dim, ctx)).collect(),
+            other => vec![resolve_shape_dim(other, ctx)],
+        },
+        _ => Vec::new(),
     }
 }
 
@@ -982,10 +1442,18 @@ fn shape_to_2d(shape: &[i64]) -> (i64, i64) {
     match shape {
         [] => (1, 1),
         [cols] => (1, *cols),
-        [rows, cols, ..] => (*rows, *cols),
+        // A tile is two-dimensional, so its last two extents name it and the
+        // extents above them are the planes the tile sits in. A tile shape must
+        // have one of each of those, which the checker enforces; a buffer shape
+        // may have any number, and the program that owns the tile picks one.
+        [.., rows, cols] => (*rows, *cols),
     }
 }
 
+/// The two coordinates that name a tile.
+///
+/// A tile covers the last two axes of the buffer, so the tile is always the
+/// last two coordinates, whatever the rank. [`outer_coords`] reads the rest.
 fn coords_to_2d(coords: &[ValueId], ctx: &mut LowerCtx<'_>) -> (ValueId, ValueId) {
     match coords {
         [] => {
@@ -997,7 +1465,62 @@ fn coords_to_2d(coords: &[ValueId], ctx: &mut LowerCtx<'_>) -> (ValueId, ValueId
             let zero = ctx.emit(TileIrOp::ConstI64(0), TileIrType::I64);
             (zero, *col)
         }
-        [row, col, ..] => (*row, *col),
+        [.., row, col] => (*row, *col),
+    }
+}
+
+/// The coordinates of the axes above the tile, outermost first.
+///
+/// A tile covers the last two axes of the buffer, so every axis above them is
+/// a plane of planes and its coordinate is one of these. A rank-1 or rank-2
+/// index names the tile alone, so the list is empty.
+fn outer_coords(coords: &[ValueId]) -> Vec<ValueId> {
+    if coords.len() <= 2 {
+        Vec::new()
+    } else {
+        coords[..coords.len() - 2].to_vec()
+    }
+}
+
+/// The coordinates of the tile the program owns.
+///
+/// The launch index is the program's position in the grid, and the grid has one
+/// axis for each buffer axis the tile does not cover. A rank-2 buffer addresses
+/// its tile with `(row, col)`, so the launch index is those two. A rank-3 buffer
+/// addresses a plane of tiles with `(plane, row, col)`, and the launch index is
+/// those three. The tile is the last two axes in both cases.
+///
+/// The launch index fills the buffer axes from the outermost inward, because a
+/// grid has three axes at most. An axis the grid does not reach is zero: that
+/// is the tile the program owns when the buffer is wider than the grid, which
+/// is what a tile covering the whole of a trailing axis needs.
+fn program_tile_coords(rank: usize, ctx: &mut LowerCtx<'_>) -> (Vec<ValueId>, ValueId, ValueId) {
+    if rank < 3 {
+        return (
+            Vec::new(),
+            ctx.get_or_create_program_id_param(0),
+            ctx.get_or_create_program_id_param(1),
+        );
+    }
+    let axis_coord = |ctx: &mut LowerCtx<'_>, axis: usize| match axis {
+        0 | 1 | 2 => ctx.get_or_create_program_id_param(axis as i64),
+        _ => ctx.emit(TileIrOp::ConstI64(0), TileIrType::I64),
+    };
+    let outer: Vec<ValueId> = (0..rank - 2).map(|axis| axis_coord(ctx, axis)).collect();
+    let row_coord = axis_coord(ctx, rank - 2);
+    let col_coord = axis_coord(ctx, rank - 1);
+    (outer, row_coord, col_coord)
+}
+
+/// How many axes the buffer has.
+///
+/// A value that is not a buffer has no axes to speak of; two is the answer that
+/// keeps a non-buffer access addressing one tile with a row and a column, which
+/// is what every such access already did.
+fn buffer_rank(value: ValueId, ctx: &LowerCtx<'_>) -> usize {
+    match ctx.types.get(&value) {
+        Some(TileIrType::Buffer { rank }) => *rank,
+        _ => 2,
     }
 }
 
@@ -1013,8 +1536,11 @@ fn param_shape_2d(name: &str, ctx: &LowerCtx<'_>) -> Option<(i64, i64)> {
     let sile_hir::Type::Tensor { shape, .. } = &param.ty else {
         return None;
     };
+    // A rank-3 declared shape names a plane extent and then the tile, the same
+    // way a rank-3 tile shape does.
     let dims = match shape {
         ShapeExpr::Tuple(dims) if dims.len() == 2 => dims,
+        ShapeExpr::Tuple(dims) if dims.len() == 3 => &dims[1..],
         _ => return None,
     };
     Some((
@@ -1029,92 +1555,138 @@ fn param_stride_dim(buf: &ValueId, ctx: &LowerCtx<'_>) -> usize {
         if param.value == *buf {
             let hir_param = &ctx.typed.kernel.params[i];
             let rank = rank_of_param(hir_param);
-            // stride dim is typically 1 for 2D (column stride)
-            return if rank >= 2 { 1 } else { 0 };
+            // The row stride is the innermost extent, which is the last shape
+            // dimension: index 1 of a rank-2 buffer, index 2 of a rank-3 one.
+            return rank.saturating_sub(1);
         }
     }
     1
 }
 
-/// Tile extent this buffer is loaded through, used by `num_tiles`.
+/// Tile extent this buffer is loaded with, along one axis, for `num_tiles`.
 ///
-/// `num_tiles(buf, axis)` divides the buffer extent by the tile extent. The tile
-/// extent comes from the buffer's own `load_tile` shape, so the lowering has to
-/// find that load. The kernel body is a single forward pass and `num_tiles` may
-/// appear before the load, so the search is order-independent.
-fn load_tile_extent_for_buffer(buf: ValueId, ctx: &LowerCtx<'_>) -> i64 {
-    let Some(hir_param) = ctx
-        .mir_params
-        .iter()
-        .position(|param| param.value == buf)
-        .map(|index| &ctx.typed.kernel.params[index])
-    else {
+/// `num_tiles(buf, axis)` divides the buffer's extent along `axis` by the tile's
+/// extent along the same axis, so the lowering has to find the tile shape the
+/// buffer is used with. A partition names it (`x.partition(shape![BM, BK])`) and
+/// so does a direct load (`x.load_tile([BK], [k])`); both spellings describe the
+/// same tiling, so both are read. The kernel body is a single forward pass and
+/// `num_tiles` may appear before the load, so the search is order-independent.
+fn load_tile_extent_for_buffer(buf: ValueId, axis: usize, ctx: &LowerCtx<'_>) -> i64 {
+    let Some(index) = ctx.mir_params.iter().position(|param| param.value == buf) else {
         return 1;
     };
-    let mut extents = Vec::new();
+    let hir_param = &ctx.typed.kernel.params[index];
+    let buffer_rank = rank_of_param(hir_param);
+    let mut shapes = Vec::new();
     for stmt in &ctx.typed.kernel.body {
-        collect_buffer_tile_extents(stmt, &hir_param.name, ctx, &mut extents);
+        collect_buffer_tile_shapes(stmt, &hir_param.name, ctx, &mut shapes);
     }
-    // One buffer normally uses a single tile extent; take the largest so a tile
-    // count is never inflated by a smaller probe load.
-    extents.into_iter().max().unwrap_or(1)
+    // The tile covers the buffer's last axes, so a tile shape shorter than the
+    // buffer lines up with the trailing axes and each leading axis the tile does
+    // not name holds one tile per element.
+    let extent = |dims: &[i64]| -> i64 {
+        let leading = buffer_rank.saturating_sub(dims.len());
+        if axis < leading {
+            1
+        } else {
+            dims.get(axis - leading).copied().unwrap_or(1)
+        }
+    };
+    // One buffer normally uses a single tile shape; take the largest extent so a
+    // tile count is never inflated by a smaller probe load.
+    shapes
+        .iter()
+        .map(|dims| extent(dims))
+        .max()
+        .unwrap_or(1)
 }
 
-/// Append the tile extents that `buf_name` is loaded with anywhere in `stmt`.
-fn collect_buffer_tile_extents(
+/// Append the tile shapes `buf_name` is loaded with anywhere in `stmt`.
+fn collect_buffer_tile_shapes(
     stmt: &sile_hir::Stmt,
     buf_name: &str,
     ctx: &LowerCtx<'_>,
-    out: &mut Vec<i64>,
+    out: &mut Vec<Vec<i64>>,
 ) {
     match stmt {
         sile_hir::Stmt::Let { expr, .. } | sile_hir::Stmt::Assign { expr, .. } => {
-            collect_buffer_tile_extents_in_expr(expr, buf_name, ctx, out);
+            collect_tile_shapes_in_expr(expr, buf_name, ctx, out);
         }
         sile_hir::Stmt::ForLoop { body, .. } => {
             for inner in body {
-                collect_buffer_tile_extents(inner, buf_name, ctx, out);
+                collect_buffer_tile_shapes(inner, buf_name, ctx, out);
             }
         }
         sile_hir::Stmt::Store { value, .. } => {
-            collect_buffer_tile_extents_in_expr(value, buf_name, ctx, out);
+            collect_tile_shapes_in_expr(value, buf_name, ctx, out);
         }
         sile_hir::Stmt::AtomicAdd { index, value, .. } => {
-            collect_buffer_tile_extents_in_expr(index, buf_name, ctx, out);
-            collect_buffer_tile_extents_in_expr(value, buf_name, ctx, out);
+            collect_tile_shapes_in_expr(index, buf_name, ctx, out);
+            collect_tile_shapes_in_expr(value, buf_name, ctx, out);
         }
+        sile_hir::Stmt::Continue => {}
     }
 }
 
-fn collect_buffer_tile_extents_in_expr(
+fn collect_tile_shapes_in_expr(
     expr: &sile_hir::Expr,
     buf_name: &str,
     ctx: &LowerCtx<'_>,
-    out: &mut Vec<i64>,
+    out: &mut Vec<Vec<i64>>,
 ) {
     let sile_hir::Expr::Builtin { op, args } = expr else {
         return;
     };
-    if *op == BuiltinOp::LoadTile {
-        let matches_buffer =
-            matches!(args.first(), Some(sile_hir::Expr::Var(name)) if name == buf_name);
-        if matches_buffer {
-            let shape = args.get(1).map(|arg| extract_const_shape(arg, ctx));
-            if let Some(dims) = shape {
-                let (_, cols) = shape_to_2d(&dims);
-                out.push(cols);
+    match op {
+        // `x.load_tile([BK], [k])`: the tile shape is the second argument.
+        BuiltinOp::LoadTile => {
+            if matches!(args.first(), Some(sile_hir::Expr::Var(name)) if name == buf_name)
+                && let Some(dims) = args.get(1).map(|arg| extract_const_shape(arg, ctx))
+                && !dims.is_empty()
+            {
+                out.push(dims);
             }
         }
+        // `part.load([i, j])` and `x.load()`: the tile shape belongs to the
+        // partition or to the buffer itself, and the checker recorded it on the
+        // binding's type.
+        BuiltinOp::Load => {
+            let Some(sile_hir::Expr::Var(name)) = args.first() else {
+                return;
+            };
+            // A bare `x.load()` names the buffer's whole declared shape, so it
+            // describes one tile and adds nothing to the search.
+            let Some(sile_hir::Type::Partition {
+                source: Some(source),
+                shape,
+                ..
+            }) = ctx.typed.locals.get(name)
+            else {
+                return;
+            };
+            if source != buf_name {
+                return;
+            }
+            let dims = extract_const_shape(&sile_hir::Expr::Shape(shape.clone()), ctx);
+            if !dims.is_empty() {
+                out.push(dims);
+            }
+        }
+        _ => {}
     }
+    // A tile another expression produced is a load too: `num_tiles` may be
+    // written in terms of it.
     for arg in args {
-        collect_buffer_tile_extents_in_expr(arg, buf_name, ctx, out);
+        collect_tile_shapes_in_expr(arg, buf_name, ctx, out);
     }
 }
 
 fn rank_of_param(param: &sile_hir::Param) -> usize {
     match &param.ty {
-        sile_hir::Type::Tensor { shape, .. } | sile_hir::Type::Tile { shape, .. } => shape.rank(),
-        sile_hir::Type::Shape | sile_hir::Type::Scalar(_) => 0,
+        sile_hir::Type::Tensor { shape, .. }
+        | sile_hir::Type::Tile { shape, .. }
+        | sile_hir::Type::Partition { shape, .. } => shape.rank(),
+        sile_hir::Type::Shape(_) | sile_hir::Type::Scalar(_) => 0,
     }
 }
 
@@ -1150,12 +1722,14 @@ fn type_shape_for_name(name: &str, ctx: &LowerCtx<'_>) -> Option<Vec<i64>> {
 
 fn resolve_type_shape(ty: &sile_hir::Type, ctx: &LowerCtx<'_>) -> Option<Vec<i64>> {
     match ty {
-        sile_hir::Type::Tensor { shape, .. } | sile_hir::Type::Tile { shape, .. } => match shape {
+        sile_hir::Type::Tensor { shape, .. }
+        | sile_hir::Type::Tile { shape, .. }
+        | sile_hir::Type::Partition { shape, .. } => match shape {
             ShapeExpr::Tuple(dims) => {
                 Some(dims.iter().map(|d| resolve_shape_dim(d, ctx)).collect())
             }
             other => Some(vec![resolve_shape_dim(other, ctx)]),
         },
-        sile_hir::Type::Shape | sile_hir::Type::Scalar(_) => None,
+        sile_hir::Type::Shape(_) | sile_hir::Type::Scalar(_) => None,
     }
 }

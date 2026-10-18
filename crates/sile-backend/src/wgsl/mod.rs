@@ -12,6 +12,9 @@ use sile_core::Result;
 /// target's text is checked by a compiler during the test or by the driver, and
 /// WGSL has one here, so its bugs surface at compile time.
 pub fn validate(source: &str) -> Result<()> {
+    if std::env::var_os("SILE_PRINT_WGSL").is_some() {
+        eprintln!("{source}");
+    }
     let module = naga::front::wgsl::Frontend::new()
         .parse(source)
         .map_err(|e| sile_core::Error::Compile(format!("generated WGSL does not parse: {e}")))?;

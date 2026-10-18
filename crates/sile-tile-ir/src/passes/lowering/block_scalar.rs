@@ -1,10 +1,11 @@
 use sile_llvm_ir as llvm_ir;
 
 use super::core::{
-    LowerLlvmIrCtx, const_i64, emit_bin, emit_gep, emit_load, emit_shape_dim, llvm_ir_type,
+    LowerLlvmIrCtx, const_i64, emit_gep, emit_load, llvm_ir_type,
     llvm_ir_value, load_tile_scalar_dynamic, lower_bin_op, lower_cmp_pred, resolve_operand,
 };
 use crate::ir::*;
+use crate::passes::lowering::tile_memory::emit_strided_element_index;
 
 pub(crate) fn lower_scalar_inst(
     inst: &TileIrInst,
@@ -77,7 +78,7 @@ pub(crate) fn lower_scalar_inst(
                 metadata: Vec::new(),
             });
         }
-        TileIrOp::IBinary { op, lhs, rhs } => {
+        TileIrOp::IBinary { op, lhs, rhs } | TileIrOp::FBinary { op, lhs, rhs } => {
             let llir_id = llvm_ir_value(inst.result);
             ctx.names.insert(llir_id, format!("v{}", inst.result.0));
             ctx.operands
@@ -116,32 +117,33 @@ pub(crate) fn lower_scalar_inst(
             value,
             row_coord,
             col_coord,
+            outer_coords,
             stride_shape_idx,
         } => {
             let buf_operand = resolve_operand(*buf, ctx);
             let row_operand = resolve_operand(*row_coord, ctx);
             let col_operand = resolve_operand(*col_coord, ctx);
-            let linear_index = match tile_ir.types.get(buf) {
-                Some(TileIrType::Buffer { rank }) if *rank <= 1 => col_operand,
-                _ => {
-                    let stride = emit_shape_dim(ctx, out, buf_operand.clone(), *stride_shape_idx);
-                    let row_offset = emit_bin(
-                        ctx,
-                        out,
-                        llvm_ir::BinOp::Mul,
-                        row_operand,
-                        stride,
-                        llvm_ir::Type::I64,
-                    );
-                    emit_bin(
-                        ctx,
-                        out,
-                        llvm_ir::BinOp::Add,
-                        row_offset,
-                        col_operand,
-                        llvm_ir::Type::I64,
-                    )
-                }
+            let rank = match tile_ir.types.get(buf) {
+                Some(TileIrType::Buffer { rank }) => *rank,
+                _ => 1,
+            };
+            let linear_index = if rank <= 1 {
+                col_operand
+            } else {
+                let outer_operands: Vec<llvm_ir::Operand> = outer_coords
+                    .iter()
+                    .map(|coord| resolve_operand(*coord, ctx))
+                    .collect();
+                emit_strided_element_index(
+                    ctx,
+                    out,
+                    buf_operand.clone(),
+                    &outer_operands,
+                    *stride_shape_idx,
+                    row_operand,
+                    col_operand,
+                )
+                .0
             };
             let ptr = emit_gep(
                 ctx,
@@ -192,11 +194,11 @@ pub(crate) fn lower_scalar_inst(
         | TileIrOp::SubF { .. }
         | TileIrOp::MulF { .. }
         | TileIrOp::DivF { .. }
-        | TileIrOp::NegF { .. }
-        | TileIrOp::Exp { .. }
+        | TileIrOp::UnaryF { .. }
         | TileIrOp::MmaF { .. }
         | TileIrOp::ReduceSum { .. }
         | TileIrOp::ReduceMax { .. }
+        | TileIrOp::ReduceMin { .. }
         | TileIrOp::Broadcast { .. }
         | TileIrOp::Map { .. } => {
             unreachable!("tile ops are lowered by dedicated tile lowering paths")

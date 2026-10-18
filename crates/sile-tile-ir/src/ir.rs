@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+pub use sile_hir::UnaryOp;
+
 // ── Value & Block identifiers ──────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -79,6 +81,13 @@ pub enum TileMapExpr {
         buf: ValueId,
         row_coord: ValueId,
         col_coord: ValueId,
+        /// One coordinate for each axis above the tile, outermost first.
+        ///
+        /// A tile covers the last two axes of the buffer, so every axis above
+        /// them is a plane of planes: this coordinate picks which one. A
+        /// rank-1 or rank-2 buffer has no such axis, so the list is empty and
+        /// the addressing is what it was.
+        outer_coords: Vec<ValueId>,
         rows: i64,
         cols: i64,
         stride_shape_idx: usize,
@@ -107,11 +116,16 @@ pub enum TileMapExpr {
         lhs: Box<TileMapExpr>,
         rhs: Box<TileMapExpr>,
     },
-    Neg {
+    /// A one-operand float operation. The operation is data, so a traversal of
+    /// this tree never has to know which transcendentals exist.
+    Unary {
+        op: UnaryOp,
         operand: Box<TileMapExpr>,
     },
-    Exp {
-        operand: Box<TileMapExpr>,
+    /// The remainder of a division.
+    Rem {
+        lhs: Box<TileMapExpr>,
+        rhs: Box<TileMapExpr>,
     },
     Select {
         cond: Box<TileMapExpr>,
@@ -123,6 +137,15 @@ pub enum TileMapExpr {
         src_rows: i64,
         src_cols: i64,
     },
+    /// `t.transpose()`: the same elements, read with the two coordinates
+    /// exchanged.
+    ///
+    /// A map walks the tile domain and reads each operand at the coordinates it
+    /// is standing on, so a transpose is that walk with the pair exchanged. The
+    /// destination domain is the operand's, with its two extents swapped.
+    Transpose {
+        value: Box<TileMapExpr>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -133,6 +156,13 @@ pub enum TileIrOp {
         buf: ValueId,
         row_coord: ValueId,
         col_coord: ValueId,
+        /// One coordinate for each axis above the tile, outermost first.
+        ///
+        /// A tile covers the last two axes of the buffer, so every axis above
+        /// them is a plane of planes: this coordinate picks which one. A
+        /// rank-1 or rank-2 buffer has no such axis, so the list is empty and
+        /// the addressing is what it was.
+        outer_coords: Vec<ValueId>,
         rows: i64,
         cols: i64,
         /// Which shape dimension to use as stride
@@ -144,6 +174,13 @@ pub enum TileIrOp {
         value: ValueId,
         row_coord: ValueId,
         col_coord: ValueId,
+        /// One coordinate for each axis above the tile, outermost first.
+        ///
+        /// A tile covers the last two axes of the buffer, so every axis above
+        /// them is a plane of planes: this coordinate picks which one. A
+        /// rank-1 or rank-2 buffer has no such axis, so the list is empty and
+        /// the addressing is what it was.
+        outer_coords: Vec<ValueId>,
         rows: i64,
         cols: i64,
         stride_shape_idx: usize,
@@ -154,6 +191,13 @@ pub enum TileIrOp {
         value: ValueId,
         row_coord: ValueId,
         col_coord: ValueId,
+        /// One coordinate for each axis above the tile, outermost first.
+        ///
+        /// A tile covers the last two axes of the buffer, so every axis above
+        /// them is a plane of planes: this coordinate picks which one. A
+        /// rank-1 or rank-2 buffer has no such axis, so the list is empty and
+        /// the addressing is what it was.
+        outer_coords: Vec<ValueId>,
         stride_shape_idx: usize,
     },
     /// Splat a scalar constant to a full tile
@@ -186,14 +230,13 @@ pub enum TileIrOp {
         rows: i64,
         cols: i64,
     },
-    /// `cuda_tile.negf`
-    NegF {
-        operand: ValueId,
-        rows: i64,
-        cols: i64,
-    },
-    /// `cuda_tile.exp`
-    Exp {
+    /// A one-operand float operation over a tile.
+    ///
+    /// CuTile spells each of these as its own op (`cuda_tile.exp`), and so does
+    /// every target. They share one variant here because the shape and the
+    /// operand are what a traversal needs; which function it is, is data.
+    UnaryF {
+        op: UnaryOp,
         operand: ValueId,
         rows: i64,
         cols: i64,
@@ -221,6 +264,13 @@ pub enum TileIrOp {
         in_rows: i64,
         in_cols: i64,
     },
+    /// `cuda_tile.reduce` with min combiner
+    ReduceMin {
+        value: ValueId,
+        axis: i64,
+        in_rows: i64,
+        in_cols: i64,
+    },
     /// `cuda_tile.broadcast`
     Broadcast {
         value: ValueId,
@@ -243,6 +293,17 @@ pub enum TileIrOp {
     // ── Scalar / index operations ──
     /// Integer binary operation
     IBinary {
+        op: BinOp,
+        lhs: ValueId,
+        rhs: ValueId,
+    },
+    /// Float binary operation on scalars.
+    ///
+    /// The two are separate ops, not one op with a type attribute: an integer
+    /// division and a float division are different instructions all the way
+    /// down, and the reader of the IR should not have to look up a type table
+    /// to tell which one is meant.
+    FBinary {
         op: BinOp,
         lhs: ValueId,
         rhs: ValueId,
@@ -276,6 +337,8 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    /// The remainder of a division.
+    Rem,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,6 +358,7 @@ impl fmt::Display for BinOp {
             BinOp::Sub => write!(f, "sub"),
             BinOp::Mul => write!(f, "mul"),
             BinOp::Div => write!(f, "div"),
+            BinOp::Rem => write!(f, "rem"),
         }
     }
 }
@@ -356,6 +420,15 @@ pub enum TileIrParamKind {
     Buffer,
     LaunchIndex { dim: i64 },
     ShapeDesc { source: ValueId },
+    /// A scalar kernel argument, read from slot `index` of the scalar
+    /// descriptor.
+    ///
+    /// The descriptor is a side channel exactly as the shape descriptor is: the
+    /// kernel receives one pointer and loads the value. Keeping it a load of a
+    /// descriptor rather than a function parameter is what lets all three
+    /// targets share one LLVM IR signature, because WGSL has no way to pass a
+    /// value into an entry point.
+    Scalar { index: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -384,36 +457,47 @@ impl TileIrFunction {
                 buf,
                 row_coord,
                 col_coord,
+                outer_coords,
                 ..
             } => {
-                vec![*buf, *row_coord, *col_coord]
+                let mut uses = vec![*buf, *row_coord, *col_coord];
+                uses.extend(outer_coords.iter().copied());
+                uses
             }
             TileIrOp::StorePtrTko {
                 buf,
                 value,
                 row_coord,
                 col_coord,
+                outer_coords,
                 ..
             } => {
-                vec![*buf, *value, *row_coord, *col_coord]
+                let mut uses = vec![*buf, *value, *row_coord, *col_coord];
+                uses.extend(outer_coords.iter().copied());
+                uses
             }
             TileIrOp::SileAtomicAdd {
                 buf,
                 value,
                 row_coord,
                 col_coord,
+                outer_coords,
                 ..
             } => {
-                vec![*buf, *value, *row_coord, *col_coord]
+                let mut uses = vec![*buf, *value, *row_coord, *col_coord];
+                uses.extend(outer_coords.iter().copied());
+                uses
             }
             TileIrOp::Splat { .. } => vec![],
             TileIrOp::AddF { lhs, rhs, .. }
             | TileIrOp::SubF { lhs, rhs, .. }
             | TileIrOp::MulF { lhs, rhs, .. }
             | TileIrOp::DivF { lhs, rhs, .. } => vec![*lhs, *rhs],
-            TileIrOp::NegF { operand, .. } | TileIrOp::Exp { operand, .. } => vec![*operand],
+            TileIrOp::UnaryF { operand, .. } => vec![*operand],
             TileIrOp::MmaF { a, b, acc, .. } => vec![*a, *b, *acc],
-            TileIrOp::ReduceSum { value, .. } | TileIrOp::ReduceMax { value, .. } => vec![*value],
+            TileIrOp::ReduceSum { value, .. }
+            | TileIrOp::ReduceMax { value, .. }
+            | TileIrOp::ReduceMin { value, .. } => vec![*value],
             TileIrOp::Broadcast { value, .. } => vec![*value],
             TileIrOp::Map { expr, .. } => tile_map_expr_uses(expr),
             TileIrOp::Extract {
@@ -421,7 +505,9 @@ impl TileIrFunction {
                 row_coord,
                 col_coord,
             } => vec![*tile, *row_coord, *col_coord],
-            TileIrOp::IBinary { lhs, rhs, .. } => vec![*lhs, *rhs],
+            TileIrOp::IBinary { lhs, rhs, .. } | TileIrOp::FBinary { lhs, rhs, .. } => {
+                vec![*lhs, *rhs]
+            }
             TileIrOp::ICmp { lhs, rhs, .. } => vec![*lhs, *rhs],
             TileIrOp::ConstI64(_) | TileIrOp::ConstF64(_) => vec![],
             TileIrOp::ShapeDim { shape, .. } => vec![*shape],
@@ -474,11 +560,12 @@ fn collect_tile_map_expr_uses(expr: &TileMapExpr, uses: &mut Vec<ValueId>) {
         | TileMapExpr::Add { lhs, rhs }
         | TileMapExpr::Sub { lhs, rhs }
         | TileMapExpr::Mul { lhs, rhs }
-        | TileMapExpr::Div { lhs, rhs } => {
+        | TileMapExpr::Div { lhs, rhs }
+        | TileMapExpr::Rem { lhs, rhs } => {
             collect_tile_map_expr_uses(lhs, uses);
             collect_tile_map_expr_uses(rhs, uses);
         }
-        TileMapExpr::Neg { operand } | TileMapExpr::Exp { operand } => {
+        TileMapExpr::Unary { operand, .. } | TileMapExpr::Transpose { value: operand } => {
             collect_tile_map_expr_uses(operand, uses);
         }
         TileMapExpr::Select {

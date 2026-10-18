@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use self::block::lower_block;
 use self::canonical_matmul::lower_canonical_matmul;
 use self::core::{LowerLlvmIrCtx, llvm_ir_block, llvm_ir_type, llvm_ir_value};
-use crate::{TileIrFunction, TileIrOp, TileIrParamKind, ValueId};
+use crate::{TileIrFunction, TileIrOp, TileIrParamKind, TileIrType, ValueId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LlvmIrLoweringPassKind {
@@ -34,7 +34,9 @@ pub const RECOMMENDED_LLVM_IR_LOWERING_PIPELINE: &[LlvmIrLoweringPassKind] = &[
 pub const ACTIVE_LLVM_IR_LOWERING_PIPELINE: &[LlvmIrLoweringPassKind] =
     RECOMMENDED_LLVM_IR_LOWERING_PIPELINE;
 
-const SHAPES_PARAM_NAME: &str = "__sile_shapes";
+const SHAPES_PARAM_NAME: &str = llvm_ir::SHAPES_PARAM_NAME;
+const SCALARS_PARAM_NAME: &str = llvm_ir::SCALARS_PARAM_NAME;
+const SCALARS_I64_PARAM_NAME: &str = llvm_ir::SCALARS_I64_PARAM_NAME;
 
 struct LlvmIrLoweringState<'a> {
     tile_ir: &'a TileIrFunction,
@@ -89,8 +91,12 @@ fn run_llvm_ir_lowering_pipeline_inner(
         match pass {
             LlvmIrLoweringPassKind::LowerParams => {
                 let mut ctx = LowerLlvmIrCtx::new(state.tile_ir);
-                let param_abis = lower_param_abis(state.typed);
-                let mut abi_idx = 0usize;
+                // The ABIs are in HIR parameter order and only a shape-bearing
+                // parameter has one, so the ones that exist line up with the
+                // buffer parameters in order. Counting them as the loop walks
+                // the parameters keeps a scalar argument from shifting every
+                // later buffer onto its neighbour's shape offset.
+                let mut buffer_abis = lower_param_abis(state.typed).into_iter().flatten();
                 let mut params = state
                     .tile_ir
                     .params
@@ -101,8 +107,7 @@ fn run_llvm_ir_lowering_pipeline_inner(
                             ctx.names.insert(id, param.name.clone());
                             ctx.operands
                                 .insert(param.value, llvm_ir::Operand::Value(id));
-                            let abi = param_abis.get(abi_idx).cloned().flatten();
-                            abi_idx += 1;
+                            let abi = buffer_abis.next();
                             if let Some(abi) = abi.clone() {
                                 ctx.shape_offsets.insert(id, abi.shape_offset);
                             }
@@ -113,9 +118,9 @@ fn run_llvm_ir_lowering_pipeline_inner(
                                 abi,
                             })
                         }
-                        TileIrParamKind::LaunchIndex { .. } | TileIrParamKind::ShapeDesc { .. } => {
-                            None
-                        }
+                        TileIrParamKind::LaunchIndex { .. }
+                        | TileIrParamKind::ShapeDesc { .. }
+                        | TileIrParamKind::Scalar { .. } => None,
                     })
                     .collect::<Vec<_>>();
                 let (shapes_id, _) = ctx.fresh_value("arg");
@@ -128,6 +133,37 @@ fn run_llvm_ir_lowering_pipeline_inner(
                     ty: llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, llvm_ir::Type::I64),
                     abi: None,
                 });
+                let (scalars_id, _) = ctx.fresh_value("arg");
+                ctx.names.insert(scalars_id, SCALARS_PARAM_NAME.into());
+                ctx.scalars_param = Some(llvm_ir::Operand::Value(scalars_id));
+                params.push(llvm_ir::Param {
+                    id: scalars_id,
+                    name: SCALARS_PARAM_NAME.into(),
+                    ty: llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, llvm_ir::Type::F32),
+                    abi: None,
+                });
+                // The integer scalars travel in a descriptor of their own, and
+                // only a kernel that takes one declares it. A signature that
+                // carries no integer scalar is therefore unchanged.
+                let has_i64_scalar = state.tile_ir.params.iter().any(|param| {
+                    matches!(param.kind, TileIrParamKind::Scalar { .. })
+                        && matches!(param.ty, TileIrType::I64)
+                });
+                if has_i64_scalar {
+                    let (scalars_i64_id, _) = ctx.fresh_value("arg");
+                    ctx.names
+                        .insert(scalars_i64_id, SCALARS_I64_PARAM_NAME.into());
+                    ctx.scalars_i64_param = Some(llvm_ir::Operand::Value(scalars_i64_id));
+                    params.push(llvm_ir::Param {
+                        id: scalars_i64_id,
+                        name: SCALARS_I64_PARAM_NAME.into(),
+                        ty: llvm_ir::Type::ptr(
+                            llvm_ir::AddressSpace::Constant,
+                            llvm_ir::Type::I64,
+                        ),
+                        abi: None,
+                    });
+                }
                 state.ctx = Some(ctx);
                 state.params = Some(params);
             }
@@ -289,6 +325,58 @@ fn build_prologue_block(
                     ctx.shape_dim_cache.insert((result_id, dim), dim_value);
                 }
             }
+            TileIrParamKind::Scalar { index } => {
+                // The scalar descriptor is one array of every scalar the launch
+                // passed, so the argument is a load at its own slot. Emitting
+                // the load here rather than at each use keeps a scalar read out
+                // of the kernel's loop bodies.
+                //
+                // A float scalar and an integer scalar read their own
+                // descriptor, and the parameter's type says which.
+                let (elem, scalars_operand) = match param.ty {
+                    TileIrType::I64 => (
+                        llvm_ir::Type::I64,
+                        ctx.scalars_i64_param.clone().expect(
+                            "integer scalar param prologue requires explicit \
+                             __sile_scalars_i64 parameter",
+                        ),
+                    ),
+                    _ => (
+                        llvm_ir::Type::F32,
+                        ctx.scalars_param.clone().expect(
+                            "scalar param prologue requires explicit __sile_scalars parameter",
+                        ),
+                    ),
+                };
+                let slot = {
+                    let (id, name) = ctx.fresh_value("v");
+                    insts.push(llvm_ir::Inst {
+                        result: Some(id),
+                        result_name: Some(name),
+                        ty: llvm_ir::Type::ptr(
+                            llvm_ir::AddressSpace::Constant,
+                            elem.clone(),
+                        ),
+                        op: llvm_ir::InstOp::Gep {
+                            base: scalars_operand,
+                            indices: vec![llvm_ir::Operand::Const(llvm_ir::Constant::Int(
+                                *index as i64,
+                            ))],
+                        },
+                        metadata: Vec::new(),
+                    });
+                    id
+                };
+                insts.push(llvm_ir::Inst {
+                    result: Some(result_id),
+                    result_name: Some(param.name.clone()),
+                    ty: elem,
+                    op: llvm_ir::InstOp::Load {
+                        ptr: llvm_ir::Operand::Value(slot),
+                    },
+                    metadata: Vec::new(),
+                });
+            }
             TileIrParamKind::Buffer => {}
         }
     }
@@ -312,13 +400,20 @@ fn build_prologue_block(
 /// parameter ABI keeps backends from having to guess the tiling from the CFG,
 /// which is both fragile and duplicated across targets.
 fn attach_tile_abi(params: &mut [llvm_ir::Param], tile_ir: &TileIrFunction) {
-    // buffer ValueId -> (rows, cols) from the first store through that buffer.
+    // buffer ValueId -> (rows, cols) from the first full-tile store through
+    // that buffer.
+    //
+    // An atomic add is not a tile store. `parallel_reduce` accumulates one
+    // scalar per program into a one-element output, and reading that as a
+    // `[1, 1]` tile made every backend split the launch index by the output's
+    // own extent: `sile_tiles_n = 1 / 1`, so every program ran the same row.
     let mut tile_by_buffer: HashMap<ValueId, (i64, i64)> = HashMap::new();
     for block in &tile_ir.blocks {
         for inst in &block.insts {
             if let TileIrOp::StorePtrTko {
                 buf, rows, cols, ..
             } = &inst.op
+                && *rows > 1
             {
                 tile_by_buffer.entry(*buf).or_insert((*rows, *cols));
             }
@@ -333,13 +428,19 @@ fn attach_tile_abi(params: &mut [llvm_ir::Param], tile_ir: &TileIrFunction) {
             continue;
         };
         // Match the LLVM IR param back to its Tile IR buffer by value id.
-        let Some(tile) = tile_ir
+        let tile = tile_ir
             .params
             .iter()
             .filter(|p| matches!(p.kind, TileIrParamKind::Buffer))
             .find(|p| llvm_ir_value(p.value) == param.id)
-            .and_then(|p| tile_by_buffer.get(&p.value))
-        else {
+            .and_then(|p| tile_by_buffer.get(&p.value));
+        // A buffer with no full-tile store is not a tiled output: it is read
+        // or accumulated into one element at a time. Leaving `tile` empty is
+        // what tells the backends to treat the launch index as the program id
+        // directly, without splitting it by an output extent that does not
+        // describe the tiling.
+        let Some(tile) = tile else {
+            abi.tile = None;
             continue;
         };
         abi.tile = Some((
@@ -365,7 +466,7 @@ fn lower_param_abis(typed: &TypedKernel) -> Vec<Option<llvm_ir::ParamAbi>> {
                 next_shape_offset += abi.rank;
                 Some(abi)
             }
-            HirType::Shape | HirType::Scalar(_) => None,
+            HirType::Shape(_) | HirType::Scalar(_) | HirType::Partition { .. } => None,
         })
         .collect()
 }

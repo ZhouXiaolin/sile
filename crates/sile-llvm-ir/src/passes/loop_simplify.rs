@@ -1,8 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{
-    BasicBlock, BlockId, BlockParam, Constant, Function, Metadata, Operand, Terminator, ValueId,
-};
+use crate::{BasicBlock, BlockId, Constant, Function, Metadata, Operand, Terminator};
 
 /// Conservative loop-oriented canonicalization.
 ///
@@ -124,6 +122,13 @@ fn successors(terminator: &Terminator) -> Vec<BlockId> {
 /// Insert a `Br`-terminated preheader block between each CondBr predecessor
 /// and a loop header, so that LICM's `find_structured_loops` can recognise
 /// the loop.
+///
+/// The preheader holds no instructions, so it needs no block parameters. It
+/// forwards the CondBr's arguments to the header unchanged. Copying the header
+/// parameters into the preheader instead made every loop carry a second set of
+/// variables (`loop_col_pre = 0; for (loop_col = loop_col_pre; ...)`), and a
+/// constant argument can never be folded away by `PhiAlias`, which only
+/// replaces values.
 fn insert_preheaders(func: &mut Function) {
     // Build predecessor map
     let mut predecessors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
@@ -135,19 +140,6 @@ fn insert_preheaders(func: &mut Function) {
     }
 
     let mut next_block_id = func.blocks.iter().map(|b| b.id.0).max().unwrap_or(0) + 1;
-    let mut next_value_id = func
-        .blocks
-        .iter()
-        .flat_map(|b| {
-            b.insts
-                .iter()
-                .filter_map(|i| i.result)
-                .chain(b.params.iter().map(|p| p.id))
-        })
-        .map(|v| v.0)
-        .max()
-        .unwrap_or(0)
-        + 1;
 
     let mut new_blocks: Vec<BasicBlock> = Vec::new();
     // Collect (cond_br_block_id, header_id, new_preheader_id) triples.
@@ -196,34 +188,30 @@ fn insert_preheaders(func: &mut Function) {
             let preheader_id = BlockId(next_block_id);
             next_block_id += 1;
 
-            // Create preheader params matching header params.
-            let preheader_params: Vec<BlockParam> = block
-                .params
-                .iter()
-                .map(|p| {
-                    let new_id = ValueId(next_value_id);
-                    next_value_id += 1;
-                    BlockParam {
-                        id: new_id,
-                        name: format!("{}_pre", p.name),
-                        ty: p.ty.clone(),
-                    }
-                })
-                .collect();
-
-            let args: Vec<Operand> = preheader_params
-                .iter()
-                .map(|p| Operand::Value(p.id))
-                .collect();
-
+            let Terminator::CondBr {
+                true_target,
+                true_args,
+                false_target,
+                false_args,
+                ..
+            } = &pred.terminator
+            else {
+                continue;
+            };
+            let incoming_args = if *true_target == block.id {
+                true_args.clone()
+            } else {
+                debug_assert_eq!(*false_target, block.id);
+                false_args.clone()
+            };
             new_blocks.push(BasicBlock {
                 id: preheader_id,
                 name: format!("{}_preheader", block.name),
-                params: preheader_params,
+                params: Vec::new(),
                 insts: vec![],
                 terminator: Terminator::Br {
                     target: block.id,
-                    args,
+                    args: incoming_args,
                 },
             });
 
@@ -231,7 +219,9 @@ fn insert_preheaders(func: &mut Function) {
         }
     }
 
-    // Apply redirects to existing CondBr terminators.
+    // Apply redirects to existing CondBr terminators. The edge now enters a
+    // parameterless preheader, so the arguments it carried go with the edge;
+    // the preheader forwards the same values to the header itself.
     for (cond_br_id, old_header, new_preheader) in &redirects {
         let block = func
             .blocks
@@ -241,13 +231,17 @@ fn insert_preheaders(func: &mut Function) {
         match &mut block.terminator {
             Terminator::CondBr {
                 true_target,
+                true_args,
                 false_target,
+                false_args,
                 ..
             } => {
                 if *true_target == *old_header {
                     *true_target = *new_preheader;
+                    true_args.clear();
                 } else if *false_target == *old_header {
                     *false_target = *new_preheader;
+                    false_args.clear();
                 }
             }
             _ => unreachable!(),

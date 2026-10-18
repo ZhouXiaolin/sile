@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 
 use crate::ir::*;
@@ -8,6 +8,8 @@ pub fn format_llvm_ir(func: &Function) -> String {
     let names = build_value_names(func);
     let block_names = build_block_names(func);
     let types = build_value_types(func);
+    let incoming = build_incoming(func);
+    let mut footer = ModuleFooter::default();
 
     writeln!(
         &mut out,
@@ -28,18 +30,20 @@ pub fn format_llvm_ir(func: &Function) -> String {
             .get(&block.id)
             .cloned()
             .unwrap_or_else(|| block.name.clone());
+        // A block parameter is defined by the block label, not by an
+        // instruction, so the label has to carry it.
         writeln!(&mut out, "{}:", block_name).unwrap();
-        if !block.params.is_empty() {
+        for (index, param) in block.params.iter().enumerate() {
             writeln!(
                 &mut out,
-                "  ; args({})",
-                format_block_params(&block.params, &names)
+                "  {}",
+                format_block_param_phi(block.id, index, param, &incoming, &names, &block_names)
             )
             .unwrap();
         }
 
         for inst in &block.insts {
-            let line = format_inst(inst, &names, &types);
+            let line = format_inst(inst, &names, &types, &mut footer);
             if !line.is_empty() {
                 writeln!(&mut out, "  {}", line).unwrap();
             }
@@ -54,6 +58,7 @@ pub fn format_llvm_ir(func: &Function) -> String {
     }
 
     writeln!(&mut out, "}}").unwrap();
+    out.push_str(&footer.format());
     out
 }
 
@@ -143,35 +148,99 @@ fn format_param_comment(param: &Param, names: &HashMap<ValueId, String>) -> Opti
     }
 }
 
-fn format_block_params(params: &[BlockParam], names: &HashMap<ValueId, String>) -> String {
-    params
+/// The value each block receives from each predecessor.
+///
+/// LLVM's textual IR cannot name a block parameter: its lexer reads a label only
+/// when a colon follows the name at once, so `header(%i: i64):` is not a label
+/// at all. The same control flow is written with `phi` instructions, which is
+/// the form LLVM's own writer produces for an in-memory block argument.
+fn build_incoming(func: &Function) -> HashMap<BlockId, Vec<(BlockId, Vec<Operand>)>> {
+    let mut incoming: HashMap<BlockId, Vec<(BlockId, Vec<Operand>)>> = HashMap::new();
+    for block in &func.blocks {
+        match &block.terminator {
+            Terminator::Br { target, args } => {
+                incoming.entry(*target).or_default().push((block.id, args.clone()));
+            }
+            Terminator::CondBr {
+                true_target,
+                true_args,
+                false_target,
+                false_args,
+                ..
+            } => {
+                incoming
+                    .entry(*true_target)
+                    .or_default()
+                    .push((block.id, true_args.clone()));
+                incoming
+                    .entry(*false_target)
+                    .or_default()
+                    .push((block.id, false_args.clone()));
+            }
+            Terminator::Switch { .. } | Terminator::Ret { .. } => {}
+        }
+    }
+    incoming
+}
+
+/// One block parameter, as the phi that carries it.
+fn format_block_param_phi(
+    block: BlockId,
+    index: usize,
+    param: &BlockParam,
+    incoming: &HashMap<BlockId, Vec<(BlockId, Vec<Operand>)>>,
+    names: &HashMap<ValueId, String>,
+    block_names: &HashMap<BlockId, String>,
+) -> String {
+    let name = names
+        .get(&param.id)
+        .cloned()
+        .unwrap_or_else(|| format!("v{}", param.id.0));
+    let ty = format_type(&param.ty);
+    let Some(edges) = incoming.get(&block) else {
+        // A block with no predecessor receives nothing: only the entry block is
+        // like that, and nothing passes it a value.
+        return format!("%{name} = freeze {ty} undef");
+    };
+    let edges = edges
         .iter()
-        .map(|param| {
-            format!(
-                "%{}: {}",
-                names
-                    .get(&param.id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("v{}", param.id.0)),
-                format_type(&param.ty)
-            )
+        .map(|(predecessor, args)| {
+            let value = args
+                .get(index)
+                .map(|arg| format_operand(arg, names))
+                .unwrap_or_else(|| "undef".to_string());
+            let predecessor_name = block_names
+                .get(predecessor)
+                .cloned()
+                .unwrap_or_else(|| format!("bb{}", predecessor.0));
+            format!("[ {value}, %{predecessor_name} ]")
         })
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+    format!("%{name} = phi {ty} {edges}")
 }
 
 fn format_inst(
     inst: &Inst,
     names: &HashMap<ValueId, String>,
     types: &HashMap<ValueId, Type>,
+    footer: &mut ModuleFooter,
 ) -> String {
+    // An `alloca` takes its alignment before the address space, so it is the one
+    // memory instruction whose alignment is not written last.
+    let alloca_alignment = if matches!(&inst.op, InstOp::Alloca { .. }) {
+        format_alignment_attribute(&inst.metadata)
+    } else {
+        String::new()
+    };
     let body = match &inst.op {
         InstOp::Alloca {
             alloc_ty,
             addr_space,
         } => format!(
-            "alloca {}, addrspace({})",
+            "alloca {}{}, addrspace({})",
             format_type(alloc_ty),
+            alloca_alignment,
             format_addr_space_number(addr_space)
         ),
         InstOp::Gep { base, indices } => format!(
@@ -215,21 +284,24 @@ fn format_inst(
             format_operand(size, names),
         ),
         InstOp::Bin { op, lhs, rhs } => format!(
-            "{} {}, {}",
+            "{} {} {}, {}",
             format_bin_op(*op, &inst.ty),
+            format_type(&inst.ty),
             format_operand(lhs, names),
             format_operand(rhs, names)
         ),
         InstOp::Cmp { pred, lhs, rhs } => format!(
-            "{} {} {}, {}",
+            "{} {} {} {}, {}",
             format_cmp_mnemonic(*pred),
             format_cmp_pred(*pred),
+            shared_operand_type(lhs, rhs, types),
             format_operand(lhs, names),
             format_operand(rhs, names)
         ),
         InstOp::Cast { op, value, to } => format!(
-            "{} {} to {}",
+            "{} {} {} to {}",
             format_cast_op(*op),
+            format_operand_type(value, types),
             format_operand(value, names),
             format_type(to)
         ),
@@ -240,9 +312,9 @@ fn format_inst(
         } => format!(
             "select i1 {}, {} {}, {} {}",
             format_operand(cond, names),
-            format_operand_type(on_true, types),
+            format_type(&inst.ty),
             format_operand(on_true, names),
-            format_operand_type(on_false, types),
+            format_type(&inst.ty),
             format_operand(on_false, names)
         ),
         InstOp::Call { func, args } => format!(
@@ -259,22 +331,17 @@ fn format_inst(
                 .join(", ")
         ),
         InstOp::Intrinsic { intrinsic, args } => {
-            format_intrinsic(intrinsic, &inst.ty, args, names, types)
+            format_intrinsic(intrinsic, &inst.ty, args, names, types, footer)
         }
     };
 
-    let metadata = if inst.metadata.is_empty() {
+    let attributes = if matches!(&inst.op, InstOp::Alloca { .. }) {
         String::new()
     } else {
-        format!(
-            " [{}]",
-            inst.metadata
-                .iter()
-                .map(format_metadata)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+        format_alignment_attribute(&inst.metadata)
     };
+    let attachments = format_metadata_attachments(&inst.metadata, footer);
+    let suffix = format!("{attributes}{attachments}");
 
     match inst.result {
         Some(id) => format!(
@@ -284,9 +351,9 @@ fn format_inst(
                 .cloned()
                 .unwrap_or_else(|| format!("v{}", id.0)),
             body,
-            metadata
+            suffix
         ),
-        None => format!("{}{}", body, metadata),
+        None => format!("{}{}", body, suffix),
     }
 }
 
@@ -337,10 +404,12 @@ fn format_terminator(
                 .get(default)
                 .cloned()
                 .unwrap_or_else(|| format!("bb{}", default.0)),
+            // A case literal carries the type of the value it is compared with.
             cases
                 .iter()
                 .map(|(literal, target)| format!(
-                    "{} , label %{}",
+                    "{} {}, label %{}",
+                    format_operand_type(value, types),
                     literal,
                     block_names
                         .get(target)
@@ -402,10 +471,26 @@ fn format_operand_type(operand: &Operand, types: &HashMap<ValueId, Type>) -> Str
     }
 }
 
+/// The type two operands of one instruction share.
+///
+/// A constant in this IR carries no width, so its type comes from the operand
+/// beside it: the same `0.0` is a `float` next to a float and a `double` next
+/// to a double. Reading the constant's own type instead made every comparison
+/// against a float constant a `double` one.
+fn shared_operand_type(lhs: &Operand, rhs: &Operand, types: &HashMap<ValueId, Type>) -> String {
+    match (lhs, rhs) {
+        (Operand::Value(_), _) | (_, Operand::Value(_)) => {
+            let valued = if matches!(lhs, Operand::Value(_)) { lhs } else { rhs };
+            format_operand_type(valued, types)
+        }
+        _ => format_operand_type(lhs, types),
+    }
+}
+
 fn format_constant_type(constant: &Constant) -> &'static str {
     match constant {
         Constant::Int(_) => "i64",
-        Constant::Float(_) => "f64",
+        Constant::Float(_) => "double",
         Constant::Bool(_) => "i1",
     }
 }
@@ -465,9 +550,11 @@ fn format_type(ty: &Type) -> String {
         Type::I1 => "i1".to_string(),
         Type::I32 => "i32".to_string(),
         Type::I64 => "i64".to_string(),
-        Type::F16 => "f16".to_string(),
-        Type::F32 => "f32".to_string(),
-        Type::F64 => "f64".to_string(),
+        // LLVM names its floating-point types after their width in the IEEE
+        // sense, not after the bit count: `half`, `float`, `double`.
+        Type::F16 => "half".to_string(),
+        Type::F32 => "float".to_string(),
+        Type::F64 => "double".to_string(),
         Type::Ptr { addr_space, .. } => format_llvm_ptr_type(addr_space),
         Type::Vector { len, elem } => format!("<{} x {}>", len, format_type(elem)),
         Type::Array { len, elem } => format!("[{} x {}]", len, format_type(elem)),
@@ -497,10 +584,12 @@ fn format_bin_op(op: BinOp, ty: &Type) -> &'static str {
         (BinOp::Sub, true) => "fsub",
         (BinOp::Mul, true) => "fmul",
         (BinOp::Div, true) => "fdiv",
+        (BinOp::Rem, true) => "frem",
         (BinOp::Add, false) => "add",
         (BinOp::Sub, false) => "sub",
         (BinOp::Mul, false) => "mul",
         (BinOp::Div, false) => "sdiv",
+        (BinOp::Rem, false) => "srem",
         (BinOp::And, _) => "and",
         (BinOp::Or, _) => "or",
     }
@@ -549,65 +638,67 @@ fn format_intrinsic(
     args: &[Operand],
     names: &HashMap<ValueId, String>,
     types: &HashMap<ValueId, Type>,
+    footer: &mut ModuleFooter,
 ) -> String {
+    let operand = |index: usize| -> (String, String) {
+        let arg = &args[index];
+        (
+            format_operand_type(arg, types),
+            format_operand(arg, names),
+        )
+    };
     match intrinsic {
-        Intrinsic::ThreadId { dim } => {
-            format!("call i32 @llvm.nvvm.tid.{}()", format_dim_suffix(*dim))
-        }
-        Intrinsic::BlockId { dim } => {
-            format!("call i32 @llvm.nvvm.ctaid.{}()", format_dim_suffix(*dim))
-        }
-        Intrinsic::GridDim { dim } => {
-            format!("call i32 @llvm.nvvm.nctaid.{}()", format_dim_suffix(*dim))
-        }
+        Intrinsic::ThreadId { dim } => format_runtime_call(
+            &format!("sile.thread.id.{}", format_dim_suffix(*dim)),
+            result_ty,
+            &[],
+            footer,
+        ),
+        Intrinsic::BlockId { dim } => format_runtime_call(
+            &format!("sile.block.id.{}", format_dim_suffix(*dim)),
+            result_ty,
+            &[],
+            footer,
+        ),
+        Intrinsic::GridDim { dim } => format_runtime_call(
+            &format!("sile.grid.dim.{}", format_dim_suffix(*dim)),
+            result_ty,
+            &[],
+            footer,
+        ),
         Intrinsic::Barrier { .. } => "call void @llvm.nvvm.barrier0()".to_string(),
-        Intrinsic::Exp => {
-            let arg = args.first().expect("exp intrinsic expects one argument");
+        Intrinsic::Exp | Intrinsic::Exp2 | Intrinsic::Log | Intrinsic::Log2 | Intrinsic::Sqrt => {
+            let function = intrinsic
+                .float_function()
+                .expect("a float function has a name");
+            let arg = args.first().expect("a float function takes one argument");
             format!(
-                "call {} @llvm.exp.{}({} {})",
+                "call {} @llvm.{}.{}({} {})",
                 format_type(result_ty),
+                function,
                 format_exp_suffix(result_ty),
                 format_operand_type(arg, types),
                 format_operand(arg, names)
             )
         }
-        Intrinsic::VecLoad { len } => {
-            let ptr = &args[0];
-            let offset = &args[1];
-            format!(
-                "call {} @llvm.vec.load.{}({} {}, {} {})",
-                format_type(result_ty),
-                len,
-                format_operand_type(ptr, types),
-                format_operand(ptr, names),
-                format_operand_type(offset, types),
-                format_operand(offset, names)
-            )
-        }
-        Intrinsic::VecStore { len } => {
-            let ptr = &args[0];
-            let offset = &args[1];
-            let value = &args[2];
-            format!(
-                "call void @llvm.vec.store.{}({} {}, {} {}, {} {})",
-                len,
-                format_operand_type(ptr, types),
-                format_operand(ptr, names),
-                format_operand_type(offset, types),
-                format_operand(offset, names),
-                format_operand_type(value, types),
-                format_operand(value, names)
-            )
-        }
-        Intrinsic::VecReduceAdd => {
-            let vector = &args[0];
-            format!(
-                "call {} @llvm.vec.reduce.add({} {})",
-                format_type(result_ty),
-                format_operand_type(vector, types),
-                format_operand(vector, names)
-            )
-        }
+        Intrinsic::VecLoad { len } => format_runtime_call(
+            &format!("sile.vec.load.{len}"),
+            result_ty,
+            &[operand(0), operand(1)],
+            footer,
+        ),
+        Intrinsic::VecStore { len } => format_runtime_call(
+            &format!("sile.vec.store.{len}"),
+            result_ty,
+            &[operand(0), operand(1), operand(2)],
+            footer,
+        ),
+        Intrinsic::VecReduceAdd => format_runtime_call(
+            "sile.vec.reduce.add",
+            result_ty,
+            &[operand(0)],
+            footer,
+        ),
     }
 }
 
@@ -643,17 +734,130 @@ fn operand_is_float(operand: &Operand, types: &HashMap<ValueId, Type>) -> bool {
     }
 }
 
-fn format_metadata(metadata: &Metadata) -> String {
-    match metadata {
-        Metadata::Parallel => "parallel".to_string(),
-        Metadata::Reduction => "reduction".to_string(),
-        Metadata::VectorizeWidth(width) => format!("vectorize_width={width}"),
-        Metadata::Unroll(factor) => format!("unroll={factor}"),
-        Metadata::Alignment(bytes) => format!("align={bytes}"),
-        Metadata::NoAlias => "noalias".to_string(),
-        Metadata::ReadOnly => "readonly".to_string(),
-        Metadata::WriteOnly => "writeonly".to_string(),
+/// The parts of a module that are collected while it is written: the metadata
+/// nodes it references and the declarations its calls need.
+///
+/// LLVM spells alignment as an instruction attribute and every other hint as a
+/// metadata node. This IR carries both in one list, so the printer splits them:
+/// the module stays one `llvm-as` accepts, and no hint is dropped.
+#[derive(Default)]
+struct ModuleFooter {
+    metadata: Vec<Metadata>,
+    declares: BTreeSet<String>,
+}
+
+impl ModuleFooter {
+    /// The number that names `metadata` in the printed module.
+    fn metadata_number(&mut self, metadata: &Metadata) -> usize {
+        if let Some(index) = self.metadata.iter().position(|node| node == metadata) {
+            return index;
+        }
+        self.metadata.push(metadata.clone());
+        self.metadata.len() - 1
     }
+
+    /// Record a declaration the module needs.
+    fn declare(&mut self, declaration: String) {
+        self.declares.insert(declaration);
+    }
+
+    /// The declarations and metadata nodes, in a stable order.
+    fn format(&self) -> String {
+        let mut out = String::new();
+        for declaration in &self.declares {
+            writeln!(&mut out, "{declaration}").unwrap();
+        }
+        for (number, node) in self.metadata.iter().enumerate() {
+            writeln!(&mut out, "!{number} = {}", format_metadata_node(node)).unwrap();
+        }
+        out
+    }
+}
+
+/// A call to a primitive the runtime supplies, and the declaration it needs.
+///
+/// These are not LLVM intrinsics: no portable LLVM intrinsic names a workgroup
+/// id or a vector load. Naming them under `sile.` keeps the module valid LLVM —
+/// a call to a declared function — and says plainly that the runtime supplies
+/// them, which is what the three backends do.
+fn format_runtime_call(
+    name: &str,
+    result_ty: &Type,
+    args: &[(String, String)],
+    footer: &mut ModuleFooter,
+) -> String {
+    let parameters = args
+        .iter()
+        .map(|(ty, _)| ty.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    footer.declare(format!(
+        "declare {} @{name}({parameters})",
+        format_type(result_ty)
+    ));
+    let operands = args
+        .iter()
+        .map(|(ty, value)| format!("{ty} {value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("call {} @{name}({operands})", format_type(result_ty))
+}
+
+/// Whether LLVM accepts this hint as an instruction attribute.
+///
+/// Alignment is the only one: LLVM has an `align` attribute on the memory
+/// instructions, and no attribute for the rest.
+fn is_instruction_attribute(metadata: &Metadata) -> bool {
+    matches!(metadata, Metadata::Alignment(_))
+}
+
+/// The name this hint is attached under.
+fn metadata_name(metadata: &Metadata) -> &'static str {
+    match metadata {
+        Metadata::Parallel => "sile.parallel",
+        Metadata::Reduction => "sile.reduction",
+        Metadata::VectorizeWidth(_) => "sile.vectorize_width",
+        Metadata::Unroll(_) => "sile.unroll",
+        Metadata::Alignment(_) => "sile.align",
+        Metadata::NoAlias => "sile.noalias",
+        Metadata::ReadOnly => "sile.readonly",
+        Metadata::WriteOnly => "sile.writeonly",
+    }
+}
+
+/// The definition of one metadata node.
+fn format_metadata_node(metadata: &Metadata) -> String {
+    let name = metadata_name(metadata);
+    match metadata {
+        Metadata::VectorizeWidth(width) => format!("!{{!\"{name}\", i32 {width}}}"),
+        Metadata::Unroll(factor) => format!("!{{!\"{name}\", i32 {factor}}}"),
+        Metadata::Alignment(bytes) => format!("!{{!\"{name}\", i32 {bytes}}}"),
+        _ => format!("!{{!\"{name}\"}}"),
+    }
+}
+
+/// The alignment attribute, which every memory instruction takes last.
+fn format_alignment_attribute(metadata: &[Metadata]) -> String {
+    let mut out = String::new();
+    for entry in metadata {
+        if let Metadata::Alignment(bytes) = entry {
+            write!(&mut out, ", align {bytes}").unwrap();
+        }
+    }
+    out
+}
+
+/// The named metadata that follows the body, as `!sile.unroll !0`.
+fn format_metadata_attachments(metadata: &[Metadata], footer: &mut ModuleFooter) -> String {
+    let mut out = String::new();
+    for entry in metadata {
+        if is_instruction_attribute(entry) {
+            continue;
+        }
+        let number = footer.metadata_number(entry);
+        write!(&mut out, ", !{} !{}", metadata_name(entry), number).unwrap();
+    }
+    out
 }
 
 fn format_param_abi(abi: &ParamAbi) -> String {

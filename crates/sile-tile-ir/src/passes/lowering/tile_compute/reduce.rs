@@ -7,32 +7,51 @@ use crate::passes::lowering::core::{
     lower_reduce_extent_loop, resolve_operand,
 };
 
+/// Which combiner a reduction applies to the elements it folds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReduceCombiner {
+    Sum,
+    Max,
+    Min,
+}
+
+/// The boolean spelling the fusion plans already carry: `true` is a maximum.
+impl From<bool> for ReduceCombiner {
+    fn from(is_max: bool) -> Self {
+        if is_max { Self::Max } else { Self::Sum }
+    }
+}
+
 pub(crate) fn reduce_combine(
     ctx: &mut LowerLlvmIrCtx,
     out: &mut Vec<llvm_ir::Inst>,
     acc: llvm_ir::Operand,
     next: llvm_ir::Operand,
-    is_max: bool,
+    combiner: impl Into<ReduceCombiner>,
 ) -> llvm_ir::Operand {
-    if is_max {
-        let is_gt = emit_cmp(
-            ctx,
-            out,
-            llvm_ir::CmpPred::Ogt,
-            next.clone(),
-            acc.clone(),
-            llvm_ir::Type::I1,
-        );
-        emit_select(ctx, out, is_gt, next, acc, llvm_ir::Type::F32)
-    } else {
-        emit_bin(ctx, out, llvm_ir::BinOp::Add, acc, next, llvm_ir::Type::F32)
-    }
+    let pred = match combiner.into() {
+        ReduceCombiner::Sum => {
+            return emit_bin(ctx, out, llvm_ir::BinOp::Add, acc, next, llvm_ir::Type::F32);
+        }
+        // `max(a, b)` is `b > a ? b : a`; `min` asks the opposite question.
+        ReduceCombiner::Max => llvm_ir::CmpPred::Ogt,
+        ReduceCombiner::Min => llvm_ir::CmpPred::Olt,
+    };
+    let is_better = emit_cmp(
+        ctx,
+        out,
+        pred,
+        next.clone(),
+        acc.clone(),
+        llvm_ir::Type::I1,
+    );
+    emit_select(ctx, out, is_better, next, acc, llvm_ir::Type::F32)
 }
 
 pub(crate) fn lower_tile_reduce_inst(
     result: ValueId,
     value: ValueId,
-    is_max: bool,
+    combiner: ReduceCombiner,
     axis: i64,
     in_rows: i64,
     in_cols: i64,
@@ -80,7 +99,7 @@ pub(crate) fn lower_tile_reduce_inst(
                             col.clone()
                         },
                     );
-                    acc = reduce_combine(ctx, out, acc, next, is_max);
+                    acc = reduce_combine(ctx, out, acc, next, combiner);
                 }
 
                 let dst_ptr = emit_gep(
@@ -104,7 +123,7 @@ pub(crate) fn lower_tile_reduce_inst(
             out_cols,
             reduce_extent,
             axis,
-            is_max,
+            combiner,
             src_tile,
             dst_tile,
         );
@@ -120,7 +139,7 @@ fn lower_tile_reduce_loop(
     out_cols: i64,
     reduce_extent: i64,
     axis: i64,
-    is_max: bool,
+    combiner: ReduceCombiner,
     src_tile: llvm_ir::Operand,
     dst_tile: llvm_ir::Operand,
 ) {
@@ -132,7 +151,7 @@ fn lower_tile_reduce_loop(
             out_cols,
             reduce_extent,
             axis,
-            is_max,
+            combiner,
             src_tile,
             dst_tile,
         );
@@ -143,7 +162,7 @@ fn lower_tile_reduce_loop(
             out_rows,
             reduce_extent,
             axis,
-            is_max,
+            combiner,
             src_tile,
             dst_tile,
         );
@@ -155,7 +174,7 @@ fn lower_tile_reduce_loop(
             out_cols,
             reduce_extent,
             axis,
-            is_max,
+            combiner,
             src_tile,
             dst_tile,
         );
@@ -169,7 +188,7 @@ fn lower_single_col_reduce_loop(
     cols: i64,
     reduce_extent: i64,
     axis: i64,
-    is_max: bool,
+    combiner: ReduceCombiner,
     src_tile: llvm_ir::Operand,
     dst_tile: llvm_ir::Operand,
 ) {
@@ -245,7 +264,7 @@ fn lower_single_col_reduce_loop(
                 },
                 if axis == 1 { reduce_idx } else { col.clone() },
             );
-            reduce_combine(ctx, out, acc, next, is_max)
+            reduce_combine(ctx, out, acc, next, combiner)
         },
     );
 
@@ -283,7 +302,7 @@ fn lower_single_row_reduce_loop(
     rows: i64,
     reduce_extent: i64,
     axis: i64,
-    is_max: bool,
+    combiner: ReduceCombiner,
     src_tile: llvm_ir::Operand,
     dst_tile: llvm_ir::Operand,
 ) {
@@ -359,7 +378,7 @@ fn lower_single_row_reduce_loop(
                 },
                 if axis == 1 { reduce_idx } else { col.clone() },
             );
-            reduce_combine(ctx, out, acc, next, is_max)
+            reduce_combine(ctx, out, acc, next, combiner)
         },
     );
 
@@ -398,7 +417,7 @@ fn lower_full_2d_reduce_loop(
     cols: i64,
     reduce_extent: i64,
     axis: i64,
-    is_max: bool,
+    combiner: ReduceCombiner,
     src_tile: llvm_ir::Operand,
     dst_tile: llvm_ir::Operand,
 ) {
@@ -522,7 +541,7 @@ fn lower_full_2d_reduce_loop(
                     body_col.clone()
                 },
             );
-            reduce_combine(ctx, out, acc, next, is_max)
+            reduce_combine(ctx, out, acc, next, combiner)
         },
     );
 

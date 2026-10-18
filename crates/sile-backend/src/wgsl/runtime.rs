@@ -9,6 +9,8 @@
 use sile_core::{KernelArg, LaunchConfig, Result, Stream};
 use sile_llvm_ir::Function as LlvmIrFunction;
 
+use crate::emit::{flatten_grid, is_descriptor_param};
+
 /// Bytes of a typed slice, which is the only way `write_buffer` takes data.
 fn as_bytes<T>(data: &[T]) -> &[u8] {
     unsafe {
@@ -74,6 +76,8 @@ impl WgpuBackend {
         &self,
         func: &LlvmIrFunction,
         args: &[KernelArg<'_>],
+        scalars: &[f32],
+        scalars_i64: &[i64],
         launch: &LaunchConfig,
         stream: &Stream,
     ) -> Result<()> {
@@ -98,37 +102,89 @@ impl WgpuBackend {
             buffers.push(buffer);
         }
 
+        // A kernel declares the integer scalar descriptor only when it takes
+        // an integer scalar, so the host asks the shader rather than assuming.
+        let has_scalars_i64 = func
+            .params
+            .iter()
+            .any(|param| crate::emit::is_scalars_i64_param(param));
+
         let shapes: Vec<i64> = args.iter().flat_map(|a| a.shape.iter().copied()).collect();
         let shapes_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sile shapes"),
-            size: (shapes.len() * std::mem::size_of::<i64>()) as u64,
+            size: (shapes.len().max(1) * std::mem::size_of::<i64>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         self.queue
             .write_buffer(&shapes_buffer, 0, as_bytes(&shapes));
 
+        // The scalar descriptor binds after the shape descriptor, matching the
+        // order `codegen` numbered the bindings in. A kernel with no scalar
+        // argument still carries the parameter, so the buffer exists and holds
+        // one unused element.
+        let scalars_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sile scalars"),
+            size: (scalars.len().max(1) * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        if !scalars.is_empty() {
+            self.queue
+                .write_buffer(&scalars_buffer, 0, as_bytes(scalars));
+        }
+
+        // The integer scalar descriptor binds after the float one, and only a
+        // kernel that declares one gets a binding: a bind group entry without
+        // a binding in the shader is an error, not an unused slot.
+        let scalars_i64_buffer = if has_scalars_i64 {
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sile scalars i64"),
+                size: (scalars_i64.len().max(1) * std::mem::size_of::<i64>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            if !scalars_i64.is_empty() {
+                self.queue.write_buffer(&buffer, 0, as_bytes(scalars_i64));
+            }
+            Some(buffer)
+        } else {
+            None
+        };
+
         // A float atomic add binds the same storage a second time as an integer
         // atomic, so the alias bindings come after the kernel buffers and the
         // shape descriptor and cover the buffers `codegen` names.
         let aliases = super::codegen::atomic_alias_bindings(func);
 
-        // The shape descriptor is the one read-only binding, and the kernel
-        // buffers are the read-write ones. `codegen` puts the descriptor last,
-        // so its binding number is the count of kernel buffers.
+        // The two descriptors are the read-only bindings, and the kernel
+        // buffers and the atomic aliases are the read-write ones. `codegen`
+        // puts the descriptors first among the trailing bindings, shapes then
+        // scalars, so their numbers are the count of kernel buffers and the one
+        // after it, and the aliases follow both.
+        // The descriptors are the trailing bindings and the aliases come after
+        // them, so every number after the kernel buffers shifts with the count
+        // of descriptors the kernel declares.
+        let descriptor_count = func
+            .params
+            .iter()
+            .filter(|param| is_descriptor_param(param))
+            .count();
         let read_write = |index: usize| wgpu::BindGroupLayoutEntry {
             binding: index as u32,
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Storage {
-                    read_only: index == args.len(),
+                    read_only: index >= args.len() && index < args.len() + descriptor_count,
                 },
                 has_dynamic_offset: false,
                 min_binding_size: None,
             },
             count: None,
         };
-        let binding_count = args.len() + 1 + aliases.len();
+        let binding_count = args.len() + descriptor_count + aliases.len();
         let layout = self
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -138,16 +194,23 @@ impl WgpuBackend {
         let entries = (0..binding_count)
             .map(|index| wgpu::BindGroupEntry {
                 binding: index as u32,
-                resource: if index == args.len() {
-                    shapes_buffer.as_entire_binding()
-                } else if index < args.len() {
+                resource: if index < args.len() {
                     buffers[index].as_entire_binding()
+                } else if index == args.len() {
+                    shapes_buffer.as_entire_binding()
+                } else if index == args.len() + 1 {
+                    scalars_buffer.as_entire_binding()
+                } else if index < args.len() + descriptor_count {
+                    scalars_i64_buffer
+                        .as_ref()
+                        .expect("an integer scalar binding needs its buffer")
+                        .as_entire_binding()
                 } else {
                     // The alias of one kernel buffer, bound over the same
-                    // storage. `codegen` numbers these after the descriptor in
+                    // storage. `codegen` numbers these after the descriptors in
                     // the order it declared the buffers, which is the order of
                     // `aliases`.
-                    let buffer = aliases[index - args.len() - 1];
+                    let buffer = aliases[index - args.len() - descriptor_count];
                     buffers[buffer].as_entire_binding()
                 },
             })
@@ -192,11 +255,8 @@ impl WgpuBackend {
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(
-                launch.grid[0].max(1),
-                launch.grid[1].max(1),
-                launch.grid[2].max(1),
-            );
+            let grid = flatten_grid(func, launch);
+            pass.dispatch_workgroups(grid[0].max(1), grid[1].max(1), grid[2].max(1));
         }
         self.queue.submit(Some(encoder.finish()));
 

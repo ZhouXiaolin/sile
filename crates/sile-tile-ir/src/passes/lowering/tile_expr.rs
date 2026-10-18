@@ -4,11 +4,13 @@ use sile_llvm_ir as llvm_ir;
 
 use crate::passes::lowering::core::{
     BlockLowerer, LowerLlvmIrCtx, alloc_tile_result, buffer_rank_of, const_f32, const_i64,
-    emit_bin, emit_cmp, emit_gep, emit_intrinsic, emit_load, emit_select, emit_shape_dim,
-    emit_store, load_tile_scalar_dynamic, lower_1d_tile_coord, lower_bin_op,
-    lower_nested_tile_loop, resolve_operand, tile_dims_of,
+    emit_bin, emit_cmp, emit_gep, emit_intrinsic, emit_load, emit_select, emit_store,
+    load_tile_scalar_dynamic, lower_1d_tile_coord, lower_bin_op, lower_nested_tile_loop,
+    resolve_operand, tile_dims_of,
 };
-use crate::{CmpOp, TileIrFunction, TileIrOp, TileMapExpr, ValueId};
+
+use super::tile_memory::emit_strided_element_index;
+use crate::{CmpOp, TileIrFunction, TileIrOp, TileMapExpr, UnaryOp, ValueId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CoordOperandKey {
@@ -187,6 +189,24 @@ pub(crate) fn lower_tile_map_inst(
     cols: i64,
     builder: &mut BlockLowerer<'_>,
 ) {
+    // A map over a tile fills private storage, one element per iteration. A map
+    // whose operands are all scalars is a single value: `min(a, b)` of two
+    // scalars is one comparison and one choice. The result type says which of
+    // the two this map is, and the scalar one needs neither storage nor a loop.
+    if !matches!(
+        builder.tile_ir().types.get(&result),
+        Some(crate::TileIrType::Tile { .. })
+    ) {
+        let zero = const_i64(0);
+        builder.with_current_insts(|ctx, tile_ir, out| {
+            let mut bases = HashMap::new();
+            let mut coord_bases = HashMap::new();
+            collect_map_load_bases(&expr, ctx, tile_ir, out, &mut bases, &mut coord_bases);
+            let value = eval_map_expr_scalar(&expr, zero.clone(), zero, ctx, tile_ir, &bases, out);
+            ctx.operands.insert(result, value);
+        });
+        return;
+    }
     let dst_tile = alloc_tile_result(builder, result, rows, cols);
     let fused_load_bases = builder.with_current_insts(|ctx, tile_ir, out| {
         let mut bases = HashMap::new();
@@ -320,6 +340,7 @@ fn eval_tile_scalar(
                 buf,
                 row_coord,
                 col_coord,
+                outer_coords,
                 rows,
                 cols,
                 stride_shape_idx,
@@ -401,23 +422,20 @@ fn eval_tile_scalar(
                         col,
                         llvm_ir::Type::I64,
                     );
-                    let stride = emit_shape_dim(ctx, out, buf_operand.clone(), stride_shape_idx);
-                    let row_offset = emit_bin(
+                    let outer_operands: Vec<llvm_ir::Operand> = outer_coords
+                        .iter()
+                        .map(|coord| resolve_operand(*coord, ctx))
+                        .collect();
+                    emit_strided_element_index(
                         ctx,
                         out,
-                        llvm_ir::BinOp::Mul,
+                        buf_operand.clone(),
+                        &outer_operands,
+                        stride_shape_idx,
                         src_row,
-                        stride,
-                        llvm_ir::Type::I64,
-                    );
-                    emit_bin(
-                        ctx,
-                        out,
-                        llvm_ir::BinOp::Add,
-                        row_offset,
                         src_col,
-                        llvm_ir::Type::I64,
                     )
+                    .0
                 };
                 let src_ptr = emit_gep(
                     ctx,
@@ -461,7 +479,7 @@ fn eval_tile_scalar(
                 };
                 return emit_bin(ctx, out, lower_bin_op(bin_op), lhs, rhs, llvm_ir::Type::F32);
             }
-            TileIrOp::NegF { operand, .. } => {
+            TileIrOp::UnaryF { op, operand, .. } => {
                 let src = eval_tile_scalar(
                     operand,
                     row.clone(),
@@ -472,35 +490,15 @@ fn eval_tile_scalar(
                     fused_load_bases,
                     out,
                 );
-                return emit_bin(
-                    ctx,
-                    out,
-                    llvm_ir::BinOp::Sub,
-                    const_f32(0.0),
-                    src,
-                    llvm_ir::Type::F32,
-                );
-            }
-            TileIrOp::Exp { operand, .. } => {
-                let src = eval_tile_scalar(
-                    operand,
-                    row.clone(),
-                    col.clone(),
-                    ctx,
-                    tile_ir,
-                    pending_tiles,
-                    fused_load_bases,
-                    out,
-                );
-                return emit_intrinsic(
-                    ctx,
-                    out,
-                    llvm_ir::Intrinsic::Exp,
-                    vec![src],
-                    llvm_ir::Type::F32,
-                );
+                return eval_unary_scalar(op, src, ctx, out);
             }
             TileIrOp::Broadcast { value: src, .. } => {
+                // A broadcast of a scalar has no tile to index, so the value is
+                // the scalar itself. `a.broadcast(y.shape())` is the way CuTile
+                // splats one argument across a tile.
+                if tile_dims_of(src, tile_ir).is_none() {
+                    return resolve_operand(src, ctx);
+                }
                 let (src_rows, src_cols) = tile_dims_of(src, tile_ir).unwrap_or((1, 1));
                 let src_row = if src_rows == 1 { const_i64(0) } else { row };
                 let src_col = if src_cols == 1 { const_i64(0) } else { col };
@@ -517,6 +515,13 @@ fn eval_tile_scalar(
             }
             _ => {}
         }
+    }
+
+    // A value with no tile type is a scalar, not a private tile: the operand is
+    // the element itself. Indexing it would read through a float as a pointer,
+    // which is how a broadcast scalar became `&(a[0][0])` in the generated C.
+    if tile_dims_of(value, tile_ir).is_none() {
+        return resolve_operand(value, ctx);
     }
 
     load_tile_scalar_dynamic(ctx, out, resolve_operand(value, ctx), row, col)
@@ -562,7 +567,7 @@ fn collect_fused_load_bases(
             collect_fused_load_bases(lhs, pending_tiles, ctx, tile_ir, out, bases, coord_bases);
             collect_fused_load_bases(rhs, pending_tiles, ctx, tile_ir, out, bases, coord_bases);
         }
-        TileIrOp::NegF { operand, .. } | TileIrOp::Exp { operand, .. } => {
+        TileIrOp::UnaryF { operand, .. } => {
             collect_fused_load_bases(
                 operand,
                 pending_tiles,
@@ -573,6 +578,8 @@ fn collect_fused_load_bases(
                 coord_bases,
             );
         }
+        // A broadcast of a scalar has no load to hoist, and the recursive call
+        // returns immediately when the source is not a pending tile.
         TileIrOp::Broadcast { value, .. } => {
             collect_fused_load_bases(value, pending_tiles, ctx, tile_ir, out, bases, coord_bases);
         }
@@ -621,11 +628,12 @@ pub(crate) fn collect_map_load_bases(
         | TileMapExpr::Add { lhs, rhs }
         | TileMapExpr::Sub { lhs, rhs }
         | TileMapExpr::Mul { lhs, rhs }
-        | TileMapExpr::Div { lhs, rhs } => {
+        | TileMapExpr::Div { lhs, rhs }
+        | TileMapExpr::Rem { lhs, rhs } => {
             collect_map_load_bases(lhs, ctx, tile_ir, out, bases, coord_bases);
             collect_map_load_bases(rhs, ctx, tile_ir, out, bases, coord_bases);
         }
-        TileMapExpr::Neg { operand } | TileMapExpr::Exp { operand } => {
+        TileMapExpr::Unary { operand, .. } => {
             collect_map_load_bases(operand, ctx, tile_ir, out, bases, coord_bases);
         }
         TileMapExpr::Select {
@@ -637,8 +645,58 @@ pub(crate) fn collect_map_load_bases(
             collect_map_load_bases(on_true, ctx, tile_ir, out, bases, coord_bases);
             collect_map_load_bases(on_false, ctx, tile_ir, out, bases, coord_bases);
         }
-        TileMapExpr::Broadcast { value, .. } => {
+        TileMapExpr::Broadcast { value, .. } | TileMapExpr::Transpose { value } => {
             collect_map_load_bases(value, ctx, tile_ir, out, bases, coord_bases);
+        }
+    }
+}
+
+/// One unary float operation on one value.
+///
+/// A negation is a subtraction from zero and a reciprocal square root is one
+/// over the square root: neither is an instruction any target spells the way
+/// this IR prints the others, and the two steps are what they mean.
+fn eval_unary_scalar(
+    op: UnaryOp,
+    operand: llvm_ir::Operand,
+    ctx: &mut LowerLlvmIrCtx,
+    out: &mut Vec<llvm_ir::Inst>,
+) -> llvm_ir::Operand {
+    match op {
+        UnaryOp::Neg => emit_bin(
+            ctx,
+            out,
+            llvm_ir::BinOp::Sub,
+            const_f32(0.0),
+            operand,
+            llvm_ir::Type::F32,
+        ),
+        UnaryOp::Rsqrt => {
+            let root = emit_intrinsic(
+                ctx,
+                out,
+                llvm_ir::Intrinsic::Sqrt,
+                vec![operand],
+                llvm_ir::Type::F32,
+            );
+            emit_bin(
+                ctx,
+                out,
+                llvm_ir::BinOp::Div,
+                const_f32(1.0),
+                root,
+                llvm_ir::Type::F32,
+            )
+        }
+        UnaryOp::Exp | UnaryOp::Exp2 | UnaryOp::Log | UnaryOp::Log2 | UnaryOp::Sqrt => {
+            let intrinsic = match op {
+                UnaryOp::Exp => llvm_ir::Intrinsic::Exp,
+                UnaryOp::Exp2 => llvm_ir::Intrinsic::Exp2,
+                UnaryOp::Log => llvm_ir::Intrinsic::Log,
+                UnaryOp::Log2 => llvm_ir::Intrinsic::Log2,
+                _ => llvm_ir::Intrinsic::Sqrt,
+            };
+            emit_intrinsic(ctx, out, intrinsic, vec![operand], llvm_ir::Type::F32)
         }
     }
 }
@@ -654,17 +712,25 @@ pub(crate) fn eval_map_expr_scalar(
 ) -> llvm_ir::Operand {
     match expr {
         TileMapExpr::Value(value) => {
-            load_tile_scalar_dynamic(ctx, out, resolve_operand(*value, ctx), row, col)
+            // A value with no tile type is a scalar operand, so the map reads
+            // it directly instead of indexing a private tile.
+            if tile_dims_of(*value, tile_ir).is_none() {
+                resolve_operand(*value, ctx)
+            } else {
+                load_tile_scalar_dynamic(ctx, out, resolve_operand(*value, ctx), row, col)
+            }
         }
         TileMapExpr::LoadPtrTko {
             buf,
             row_coord,
             col_coord,
+            outer_coords,
             rows,
             cols,
             stride_shape_idx,
         } => emit_map_load_scalar(
             *buf,
+            outer_coords,
             *row_coord,
             *col_coord,
             *rows,
@@ -689,13 +755,24 @@ pub(crate) fn eval_map_expr_scalar(
                 out,
             );
             let rhs = eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out);
-            emit_cmp(
+            // The comparison yields a mask, and a mask is an element value like
+            // any other: `1.0` where it holds, `0.0` where it does not. Keeping
+            // the `i1` here would put a boolean in a tile of floats.
+            let mask = emit_cmp(
                 ctx,
                 out,
                 lower_float_cmp_pred(*op),
                 lhs,
                 rhs,
                 llvm_ir::Type::I1,
+            );
+            emit_select(
+                ctx,
+                out,
+                mask,
+                const_f32(1.0),
+                const_f32(0.0),
+                llvm_ir::Type::F32,
             )
         }
         TileMapExpr::Add { lhs, rhs } => {
@@ -750,36 +827,14 @@ pub(crate) fn eval_map_expr_scalar(
             let rhs = eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out);
             emit_bin(ctx, out, llvm_ir::BinOp::Div, lhs, rhs, llvm_ir::Type::F32)
         }
-        TileMapExpr::Neg { operand } => {
+        TileMapExpr::Unary { op, operand } => {
             let operand =
                 eval_map_expr_scalar(operand, row, col, ctx, tile_ir, fused_load_bases, out);
-            emit_bin(
-                ctx,
-                out,
-                llvm_ir::BinOp::Sub,
-                const_f32(0.0),
-                operand,
-                llvm_ir::Type::F32,
-            )
+            eval_unary_scalar(*op, operand, ctx, out)
         }
-        TileMapExpr::Exp { operand } => {
-            let operand =
-                eval_map_expr_scalar(operand, row, col, ctx, tile_ir, fused_load_bases, out);
-            emit_intrinsic(
-                ctx,
-                out,
-                llvm_ir::Intrinsic::Exp,
-                vec![operand],
-                llvm_ir::Type::F32,
-            )
-        }
-        TileMapExpr::Select {
-            cond,
-            on_true,
-            on_false,
-        } => {
-            let cond = eval_map_expr_scalar(
-                cond,
+        TileMapExpr::Rem { lhs, rhs } => {
+            let lhs = eval_map_expr_scalar(
+                lhs,
                 row.clone(),
                 col.clone(),
                 ctx,
@@ -787,6 +842,57 @@ pub(crate) fn eval_map_expr_scalar(
                 fused_load_bases,
                 out,
             );
+            let rhs = eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out);
+            emit_bin(ctx, out, llvm_ir::BinOp::Rem, lhs, rhs, llvm_ir::Type::F32)
+        }
+        TileMapExpr::Select {
+            cond,
+            on_true,
+            on_false,
+        } => {
+            // A comparison used as a condition is already a test. Reading the
+            // mask it would produce and then testing the mask costs two
+            // instructions and says the same thing, so the two sides of the
+            // comparison select directly.
+            let is_set = match cond.as_ref() {
+                TileMapExpr::Cmp { op, lhs, rhs } => {
+                    let lhs = eval_map_expr_scalar(
+                        lhs,
+                        row.clone(),
+                        col.clone(),
+                        ctx,
+                        tile_ir,
+                        fused_load_bases,
+                        out,
+                    );
+                    let rhs =
+                        eval_map_expr_scalar(rhs, row.clone(), col.clone(), ctx, tile_ir, fused_load_bases, out);
+                    emit_cmp(ctx, out, lower_float_cmp_pred(*op), lhs, rhs, llvm_ir::Type::I1)
+                }
+                cond => {
+                    let cond = eval_map_expr_scalar(
+                        cond,
+                        row.clone(),
+                        col.clone(),
+                        ctx,
+                        tile_ir,
+                        fused_load_bases,
+                        out,
+                    );
+                    // A comparison lowers to a tile of `0.0`/`1.0`, the way
+                    // `gt_tile` documents it. `select` tests it, so the test is
+                    // "greater than zero": a NaN mask is not set, and neither is
+                    // a cleared element.
+                    emit_cmp(
+                        ctx,
+                        out,
+                        llvm_ir::CmpPred::Ogt,
+                        cond,
+                        const_f32(0.0),
+                        llvm_ir::Type::I1,
+                    )
+                }
+            };
             let on_true = eval_map_expr_scalar(
                 on_true,
                 row.clone(),
@@ -798,7 +904,7 @@ pub(crate) fn eval_map_expr_scalar(
             );
             let on_false =
                 eval_map_expr_scalar(on_false, row, col, ctx, tile_ir, fused_load_bases, out);
-            emit_select(ctx, out, cond, on_true, on_false, llvm_ir::Type::F32)
+            emit_select(ctx, out, is_set, on_true, on_false, llvm_ir::Type::F32)
         }
         TileMapExpr::Broadcast {
             value,
@@ -809,12 +915,18 @@ pub(crate) fn eval_map_expr_scalar(
             let src_col = if *src_cols == 1 { const_i64(0) } else { col };
             eval_map_expr_scalar(value, src_row, src_col, ctx, tile_ir, fused_load_bases, out)
         }
+        // The transpose reads its operand at the coordinates of the element
+        // this walk is writing, exchanged.
+        TileMapExpr::Transpose { value } => {
+            eval_map_expr_scalar(value, col, row, ctx, tile_ir, fused_load_bases, out)
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn emit_map_load_scalar(
     buf: ValueId,
+    outer_coords: &[ValueId],
     row_coord: ValueId,
     col_coord: ValueId,
     rows: i64,
@@ -911,23 +1023,20 @@ fn emit_map_load_scalar(
             col,
             llvm_ir::Type::I64,
         );
-        let stride = emit_shape_dim(ctx, out, buf_operand.clone(), stride_shape_idx);
-        let row_offset = emit_bin(
+        let outer_operands: Vec<llvm_ir::Operand> = outer_coords
+            .iter()
+            .map(|coord| resolve_operand(*coord, ctx))
+            .collect();
+        emit_strided_element_index(
             ctx,
             out,
-            llvm_ir::BinOp::Mul,
+            buf_operand.clone(),
+            &outer_operands,
+            stride_shape_idx,
             src_row,
-            stride,
-            llvm_ir::Type::I64,
-        );
-        emit_bin(
-            ctx,
-            out,
-            llvm_ir::BinOp::Add,
-            row_offset,
             src_col,
-            llvm_ir::Type::I64,
         )
+        .0
     };
     let src_ptr = emit_gep(
         ctx,
@@ -1050,7 +1159,7 @@ fn collect_pointwise_tile_defs(
                 return false;
             }
         }
-        TileIrOp::NegF { operand, .. } | TileIrOp::Exp { operand, .. } => {
+        TileIrOp::UnaryF { operand, .. } => {
             if !collect_pointwise_tile_defs(
                 root,
                 *operand,
@@ -1064,15 +1173,19 @@ fn collect_pointwise_tile_defs(
             }
         }
         TileIrOp::Broadcast { value, .. } => {
-            if !collect_pointwise_tile_defs(
-                root,
-                *value,
-                defs,
-                tile_ir,
-                use_counts,
-                require_single_use_root,
-                pending_tiles,
-            ) {
+            // A broadcast of a scalar has nothing to collect: the source is the
+            // value itself, and the map reads it as an operand.
+            if defs.contains_key(value)
+                && !collect_pointwise_tile_defs(
+                    root,
+                    *value,
+                    defs,
+                    tile_ir,
+                    use_counts,
+                    require_single_use_root,
+                    pending_tiles,
+                )
+            {
                 return false;
             }
         }

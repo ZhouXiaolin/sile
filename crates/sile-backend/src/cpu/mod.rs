@@ -9,7 +9,15 @@ use tempfile::tempdir;
 use self::codegen::generate as generate_llvm_ir_kernel;
 use sile_core::{KernelArg, LaunchConfig, Result, Stream};
 
-type KernelFn = unsafe extern "C" fn(*const *const c_void, i64, i64, *const i64, i64);
+type KernelFn = unsafe extern "C" fn(
+    *const *const c_void,
+    i64,
+    i64,
+    *const i64,
+    i64,
+    *const f32,
+    *const i64,
+);
 
 pub struct CpuBackend;
 
@@ -50,6 +58,8 @@ impl CpuBackend {
         kernel_name: &str,
         c_code: &str,
         args: &[KernelArg<'_>],
+        scalars: &[f32],
+        scalars_i64: &[i64],
         launch: &LaunchConfig,
         llvm_ir_mode: bool,
     ) -> Result<()> {
@@ -134,6 +144,8 @@ impl CpuBackend {
                 threads_per_group,
                 shapes.as_ptr(),
                 shapes.len() as i64,
+                scalars.as_ptr(),
+                scalars_i64.as_ptr(),
             );
         }
 
@@ -144,10 +156,12 @@ impl CpuBackend {
         &self,
         func: &LlvmIrFunction,
         args: &[KernelArg<'_>],
+        scalars: &[f32],
+        scalars_i64: &[i64],
         launch: &LaunchConfig,
         _stream: &Stream,
     ) -> Result<()> {
         let c_code = Self::compile_llvm_ir_kernel(func)?;
-        self.execute_compiled_source(&func.name, &c_code, args, launch, true)
+        self.execute_compiled_source(&func.name, &c_code, args, scalars, scalars_i64, launch, true)
     }
 }

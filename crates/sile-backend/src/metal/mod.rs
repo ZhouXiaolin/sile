@@ -66,12 +66,22 @@ impl MetalBackend {
         func: &LlvmIrFunction,
         param_kinds: &[ParamKind],
         args: &[KernelArg<'_>],
+        scalars: &[f32],
+        scalars_i64: &[i64],
         launch: &LaunchConfig,
         _stream: &Stream,
     ) -> Result<()> {
         let source = generate_llvm_ir_metal(func)?;
         let launch = self.normalize_llvm_ir_launch(func, launch);
-        self.execute_source(&func.name, &source, param_kinds, args, &launch)
+        self.execute_source(
+            &func.name,
+            &source,
+            param_kinds,
+            args,
+            scalars,
+            scalars_i64,
+            &launch,
+        )
     }
 
     fn normalize_llvm_ir_launch(
@@ -79,25 +89,8 @@ impl MetalBackend {
         func: &LlvmIrFunction,
         launch: &LaunchConfig,
     ) -> LaunchConfig {
-        let output_rank = func
-            .params
-            .iter()
-            .rev()
-            .find_map(|param| {
-                let abi = param.abi.as_ref()?;
-                abi.tile.is_some().then_some(abi.rank)
-            })
-            .unwrap_or(1);
-        if output_rank <= 1 || launch.grid[1] <= 1 {
-            return *launch;
-        }
-
         LaunchConfig {
-            grid: [
-                launch.grid[0].saturating_mul(launch.grid[1]),
-                1,
-                launch.grid[2],
-            ],
+            grid: crate::emit::flatten_grid(func, launch),
         }
     }
 
@@ -107,6 +100,8 @@ impl MetalBackend {
         source: &str,
         param_kinds: &[ParamKind],
         args: &[KernelArg<'_>],
+        scalars: &[f32],
+        scalars_i64: &[i64],
         launch: &LaunchConfig,
     ) -> Result<()> {
         let library = self.compile_shader(source)?;
@@ -142,6 +137,37 @@ impl MetalBackend {
             std::ptr::copy_nonoverlapping(shapes.as_ptr(), shapes_ptr, shapes.len());
         }
         encoder.set_buffer(args.len() as u64, Some(&shapes_buf), 0);
+
+        // The scalar descriptor binds after the shape descriptor, matching the
+        // order the LLVM IR signature declares them. A kernel with no scalar
+        // argument still carries the parameter, so the slot is bound to an
+        // empty buffer rather than skipped.
+        let scalars_buf = self.device.new_buffer(
+            (scalars.len().max(1) * std::mem::size_of::<f32>()) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        if !scalars.is_empty() {
+            let scalars_ptr = scalars_buf.contents() as *mut f32;
+            unsafe {
+                std::ptr::copy_nonoverlapping(scalars.as_ptr(), scalars_ptr, scalars.len());
+            }
+        }
+        encoder.set_buffer((args.len() + 1) as u64, Some(&scalars_buf), 0);
+
+        // The integer scalar descriptor binds after the float one. A kernel
+        // that declares no integer scalar does not read the slot, and a bound
+        // buffer nothing reads costs a few bytes and no branch.
+        let scalars_i64_buf = self.device.new_buffer(
+            (scalars_i64.len().max(1) * std::mem::size_of::<i64>()) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        if !scalars_i64.is_empty() {
+            let ptr = scalars_i64_buf.contents() as *mut i64;
+            unsafe {
+                std::ptr::copy_nonoverlapping(scalars_i64.as_ptr(), ptr, scalars_i64.len());
+            }
+        }
+        encoder.set_buffer((args.len() + 2) as u64, Some(&scalars_i64_buf), 0);
 
         let grid_x = launch.grid[0] as u64;
         let grid_y = launch.grid[1] as u64;

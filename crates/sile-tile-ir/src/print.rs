@@ -2,6 +2,20 @@ use std::fmt::Write;
 
 use crate::ir::*;
 
+/// The name a unary float operation prints under. The name is the operation:
+/// `exp`, `log2`, and the rest are the spellings every target uses.
+fn unary_name(op: UnaryOp) -> &'static str {
+    match op {
+        UnaryOp::Neg => "negf",
+        UnaryOp::Exp => "exp",
+        UnaryOp::Exp2 => "exp2",
+        UnaryOp::Log => "log",
+        UnaryOp::Log2 => "log2",
+        UnaryOp::Sqrt => "sqrt",
+        UnaryOp::Rsqrt => "rsqrt",
+    }
+}
+
 pub fn format_tile_ir(func: &TileIrFunction) -> String {
     let mut out = String::new();
     writeln!(&mut out, "module {{").unwrap();
@@ -80,18 +94,31 @@ pub fn format_tile_ir(func: &TileIrFunction) -> String {
     out
 }
 
+/// The coordinates an access names, as a list.
+///
+/// The outer coordinates come first and the tile's own two come last, which is
+/// the order a kernel writes them in.
+fn format_coords(outer_coords: &[ValueId], row_coord: &ValueId, col_coord: &ValueId) -> String {
+    let mut parts: Vec<String> = outer_coords.iter().map(|coord| coord.to_string()).collect();
+    parts.push(row_coord.to_string());
+    parts.push(col_coord.to_string());
+    format!("[{}]", parts.join(", "))
+}
+
 fn format_tile_ir_op(op: &TileIrOp) -> String {
     match op {
         TileIrOp::LoadPtrTko {
             buf,
             row_coord,
             col_coord,
+            outer_coords,
             rows,
             cols,
             stride_shape_idx,
         } => {
             format!(
-                "load_ptr_tko {buf}, [{row_coord}, {col_coord}] {{shape = [{rows}, {cols}], stride_dim = {stride_shape_idx}}}"
+                "load_ptr_tko {buf}, {} {{shape = [{rows}, {cols}], stride_dim = {stride_shape_idx}}}",
+                format_coords(outer_coords, row_coord, col_coord)
             )
         }
         TileIrOp::StorePtrTko {
@@ -99,12 +126,14 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
             value,
             row_coord,
             col_coord,
+            outer_coords,
             rows,
             cols,
             stride_shape_idx,
         } => {
             format!(
-                "store_ptr_tko {buf}, {value}, [{row_coord}, {col_coord}] {{shape = [{rows}, {cols}], stride_dim = {stride_shape_idx}}}"
+                "store_ptr_tko {buf}, {value}, {} {{shape = [{rows}, {cols}], stride_dim = {stride_shape_idx}}}",
+                format_coords(outer_coords, row_coord, col_coord)
             )
         }
         TileIrOp::SileAtomicAdd {
@@ -112,10 +141,12 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
             value,
             row_coord,
             col_coord,
+            outer_coords,
             stride_shape_idx,
         } => {
             format!(
-                "sile.atomic_add {buf}, {value}, [{row_coord}, {col_coord}] {{stride_dim = {stride_shape_idx}}}"
+                "sile.atomic_add {buf}, {value}, {} {{stride_dim = {stride_shape_idx}}}",
+                format_coords(outer_coords, row_coord, col_coord)
             )
         }
         TileIrOp::Splat { value, .. } => {
@@ -125,8 +156,7 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
         TileIrOp::SubF { lhs, rhs, .. } => format!("subf {lhs}, {rhs}"),
         TileIrOp::MulF { lhs, rhs, .. } => format!("mulf {lhs}, {rhs}"),
         TileIrOp::DivF { lhs, rhs, .. } => format!("divf {lhs}, {rhs}"),
-        TileIrOp::NegF { operand, .. } => format!("negf {operand}"),
-        TileIrOp::Exp { operand, .. } => format!("exp {operand}"),
+        TileIrOp::UnaryF { op, operand, .. } => format!("{} {operand}", unary_name(*op)),
         TileIrOp::MmaF {
             a,
             b,
@@ -157,6 +187,16 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
                 "reduce {value} {{axis = {axis}, combiner = \"max\", input_shape = [{in_rows}, {in_cols}]}}"
             )
         }
+        TileIrOp::ReduceMin {
+            value,
+            axis,
+            in_rows,
+            in_cols,
+        } => {
+            format!(
+                "reduce {value} {{axis = {axis}, combiner = \"min\", input_shape = [{in_rows}, {in_cols}]}}"
+            )
+        }
         TileIrOp::Broadcast { value, rows, cols } => {
             format!("broadcast {value} {{shape = [{rows}, {cols}]}}")
         }
@@ -175,6 +215,9 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
         }
         TileIrOp::IBinary { op, lhs, rhs } => {
             format!("{} {lhs}, {rhs}", format_tile_binary_op(*op, false))
+        }
+        TileIrOp::FBinary { op, lhs, rhs } => {
+            format!("{} {lhs}, {rhs}", format_tile_binary_op(*op, true))
         }
         TileIrOp::ICmp { op, lhs, rhs } => {
             format!("cmpi \"{op}\" {lhs}, {rhs}")
@@ -198,11 +241,13 @@ fn format_tile_map_expr(expr: &TileMapExpr) -> String {
             buf,
             row_coord,
             col_coord,
+            outer_coords,
             rows,
             cols,
             stride_shape_idx,
         } => format!(
-            "load_ptr_tko({buf}, [{row_coord}, {col_coord}], shape=[{rows}, {cols}], stride_dim={stride_shape_idx})"
+            "load_ptr_tko({buf}, {}, shape=[{rows}, {cols}], stride_dim={stride_shape_idx})",
+            format_coords(outer_coords, row_coord, col_coord)
         ),
         TileMapExpr::Splat { value } => format!("constant({})", format_float_literal(*value)),
         TileMapExpr::Cmp { op, lhs, rhs } => {
@@ -240,8 +285,17 @@ fn format_tile_map_expr(expr: &TileMapExpr) -> String {
                 format_tile_map_expr(rhs)
             )
         }
-        TileMapExpr::Neg { operand } => format!("negf({})", format_tile_map_expr(operand)),
-        TileMapExpr::Exp { operand } => format!("exp({})", format_tile_map_expr(operand)),
+        TileMapExpr::Rem { lhs, rhs } => format!(
+            "rem({}, {})",
+            format_tile_map_expr(lhs),
+            format_tile_map_expr(rhs)
+        ),
+        TileMapExpr::Transpose { value } => {
+            format!("transpose({})", format_tile_map_expr(value))
+        }
+        TileMapExpr::Unary { op, operand } => {
+            format!("{}({})", unary_name(*op), format_tile_map_expr(operand))
+        }
         TileMapExpr::Select {
             cond,
             on_true,
@@ -317,6 +371,8 @@ fn format_tile_binary_op(op: BinOp, is_float: bool) -> &'static str {
         (BinOp::Sub, false) => "subi",
         (BinOp::Mul, false) => "muli",
         (BinOp::Div, false) => "divi",
+        (BinOp::Rem, true) => "remf",
+        (BinOp::Rem, false) => "remi",
     }
 }
 
@@ -346,6 +402,12 @@ fn format_param_attrs(param: &TileIrParam) -> String {
             format!(
                 "sym_name = \"{}\", kind = \"shape.desc\", source = {}",
                 param.name, source
+            )
+        }
+        TileIrParamKind::Scalar { index } => {
+            format!(
+                "sym_name = \"{}\", kind = \"scalar\", index = {}",
+                param.name, index
             )
         }
     }

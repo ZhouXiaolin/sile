@@ -4,8 +4,8 @@ pub mod print;
 
 pub use ir::{
     AddressSpace, BasicBlock, BinOp, BlockId, BlockParam, CastOp, CmpPred, Constant, Function,
-    Inst, InstOp, Intrinsic, Metadata, Operand, Param, ParamAbi, SyncScope, Terminator, Type,
-    ValueId,
+    Inst, InstOp, Intrinsic, Metadata, Operand, Param, ParamAbi, SCALARS_I64_PARAM_NAME,
+    SCALARS_PARAM_NAME, SHAPES_PARAM_NAME, SyncScope, Terminator, Type, ValueId,
 };
 pub use passes::{
     ACTIVE_PIPELINE as ACTIVE_LLVM_IR_PIPELINE, LlvmIrPassKind,

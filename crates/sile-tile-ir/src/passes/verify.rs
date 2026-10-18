@@ -57,6 +57,17 @@ pub fn verify_function(func: &TileIrFunction) -> Result<(), String> {
         return Err(format!("entry block {} does not exist", func.entry.0));
     }
 
+    let mut def_blocks = HashMap::new();
+    for block in &func.blocks {
+        for param in &block.params {
+            def_blocks.insert(*param, block.id);
+        }
+        for inst in &block.insts {
+            def_blocks.insert(inst.result, block.id);
+        }
+    }
+    let dominators = compute_dominators(func);
+
     for block in &func.blocks {
         for inst in &block.insts {
             for used in TileIrFunction::inst_uses(&inst.op) {
@@ -64,6 +75,18 @@ pub fn verify_function(func: &TileIrFunction) -> Result<(), String> {
                     return Err(format!(
                         "undefined value {} used in block {}",
                         used.0, block.id.0
+                    ));
+                }
+                // A function param has no defining block and is in scope
+                // everywhere. Any other value must be defined in a block that
+                // dominates this use, or the value is undefined on some path.
+                if let Some(def_block) = def_blocks.get(&used)
+                    && *def_block != block.id
+                    && !dominates(&dominators, *def_block, block.id)
+                {
+                    return Err(format!(
+                        "value {} is defined in block {}, which does not dominate its use in block {}",
+                        used.0, def_block.0, block.id.0
                     ));
                 }
             }
@@ -75,10 +98,83 @@ pub fn verify_function(func: &TileIrFunction) -> Result<(), String> {
             &block_ids,
             &block_param_counts,
             &value_defs,
+            &def_blocks,
+            &dominators,
         )?;
     }
 
     Ok(())
+}
+
+fn compute_dominators(func: &TileIrFunction) -> HashMap<BlockId, HashSet<BlockId>> {
+    let block_ids: Vec<BlockId> = func.blocks.iter().map(|block| block.id).collect();
+    let all: HashSet<BlockId> = block_ids.iter().copied().collect();
+    let mut predecessors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for block in &func.blocks {
+        for succ in successors(&block.terminator) {
+            predecessors.entry(succ).or_default().push(block.id);
+        }
+    }
+
+    let mut doms: HashMap<BlockId, HashSet<BlockId>> = block_ids
+        .iter()
+        .map(|block| {
+            if *block == func.entry {
+                (*block, HashSet::from([*block]))
+            } else {
+                (*block, all.clone())
+            }
+        })
+        .collect();
+
+    loop {
+        let mut changed = false;
+        for block_id in &block_ids {
+            if *block_id == func.entry {
+                continue;
+            }
+            let preds = predecessors.get(block_id).cloned().unwrap_or_default();
+            let mut new_set: HashSet<BlockId> = match preds.first() {
+                Some(first) => doms.get(first).cloned().unwrap_or_default(),
+                None => HashSet::new(),
+            };
+            for pred in preds.iter().skip(1) {
+                let pred_doms = doms.get(pred).cloned().unwrap_or_default();
+                new_set.retain(|block| pred_doms.contains(block));
+            }
+            new_set.insert(*block_id);
+            if doms.get(block_id) != Some(&new_set) {
+                doms.insert(*block_id, new_set);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    doms
+}
+
+fn successors(terminator: &TileIrTerminator) -> Vec<BlockId> {
+    match terminator {
+        TileIrTerminator::Jump { target, .. } => vec![*target],
+        TileIrTerminator::Branch {
+            true_target,
+            false_target,
+            ..
+        } => vec![*true_target, *false_target],
+        TileIrTerminator::Return => Vec::new(),
+    }
+}
+
+fn dominates(
+    dominators: &HashMap<BlockId, HashSet<BlockId>>,
+    definition: BlockId,
+    use_site: BlockId,
+) -> bool {
+    dominators
+        .get(&use_site)
+        .is_some_and(|doms| doms.contains(&definition))
 }
 
 fn verify_terminator(
@@ -87,12 +183,27 @@ fn verify_terminator(
     block_ids: &HashSet<BlockId>,
     block_param_counts: &HashMap<BlockId, usize>,
     value_defs: &HashSet<ValueId>,
+    def_blocks: &HashMap<ValueId, BlockId>,
+    dominators: &HashMap<BlockId, HashSet<BlockId>>,
 ) -> Result<(), String> {
+    let check = |value: ValueId| -> Result<(), String> {
+        verify_defined(value, block_id, value_defs)?;
+        if let Some(def_block) = def_blocks.get(&value)
+            && *def_block != block_id
+            && !dominates(dominators, *def_block, block_id)
+        {
+            return Err(format!(
+                "value {} is defined in block {}, which does not dominate its use in block {}",
+                value.0, def_block.0, block_id.0
+            ));
+        }
+        Ok(())
+    };
     match term {
         TileIrTerminator::Jump { target, args } => {
             verify_target_arity(*target, args.len(), block_ids, block_param_counts)?;
             for value in args {
-                verify_defined(*value, block_id, value_defs)?;
+                check(*value)?;
             }
         }
         TileIrTerminator::Branch {
@@ -102,7 +213,7 @@ fn verify_terminator(
             false_target,
             false_args,
         } => {
-            verify_defined(*cond, block_id, value_defs)?;
+            check(*cond)?;
             verify_target_arity(*true_target, true_args.len(), block_ids, block_param_counts)?;
             verify_target_arity(
                 *false_target,
@@ -111,7 +222,7 @@ fn verify_terminator(
                 block_param_counts,
             )?;
             for value in true_args.iter().chain(false_args.iter()) {
-                verify_defined(*value, block_id, value_defs)?;
+                check(*value)?;
             }
         }
         TileIrTerminator::Return => {}

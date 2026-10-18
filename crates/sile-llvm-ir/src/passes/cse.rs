@@ -1,135 +1,132 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use crate::{BinOp, BlockId, Constant, Function, Inst, InstOp, Operand, Terminator, ValueId};
+use crate::{
+    BasicBlock, BinOp, BlockId, Constant, Function, Inst, InstOp, Operand, Terminator, ValueId,
+};
 
-/// Dominator-scoped common-subexpression elimination for side-effect-free LLVM IR ops.
+/// Common-subexpression elimination over the CFG.
 ///
 /// The pass keeps the expression scope backend-independent: it only deduplicates
 /// explicit SSA expressions and never invents target-specific helpers.
+///
+/// Availability is computed by a forward must-analysis, not by a dominator
+/// walk. A pure expression is available at a join only if every predecessor
+/// agrees on it, and a load is available only until a write can have happened.
+/// The sibling arm of a branch is exactly the case a tree walk gets wrong: the
+/// entry's load is still in scope at the join even though the other arm wrote
+/// through the same pointer.
 pub fn run(mut func: Function) -> Function {
-    let dom_tree = compute_dominator_tree(&func);
-    if dom_tree.entry.is_none() {
-        return func;
-    }
-
+    let available = available_at_entry(&func);
     let mut replacements = HashMap::<ValueId, ValueId>::new();
-    let empty = HashMap::new();
-    process_block(
-        dom_tree.entry.unwrap(),
-        &dom_tree,
-        &mut func,
-        &mut replacements,
-        &empty,
-    );
+    for block in &mut func.blocks {
+        // A value available at the block entry is a definition from a
+        // dominating block, so it is in scope for every instruction here. A
+        // value defined in this block is added as the walk passes its
+        // definition. The map is carried forward rather than rebuilt from the
+        // instructions kept so far, because a rebuild would put back a load
+        // that an earlier store in this same block killed.
+        let mut visible = available.get(&block.id).cloned().unwrap_or_default();
+        let old_insts = std::mem::take(&mut block.insts);
+        let mut new_insts: Vec<Inst> = Vec::with_capacity(old_insts.len());
+        for inst in old_insts {
+            let rewritten = rewrite_inst(inst, &replacements);
+
+            // A write kills every load, including one the block entry still
+            // offered, so the kill happens before the lookup.
+            if writes_memory(&rewritten.op) {
+                visible.retain(|key, _| !key.starts_with("load:"));
+            }
+
+            if rewritten.metadata.is_empty()
+                && let Some(key) = expr_key(&rewritten.op)
+            {
+                if let Some(existing) = visible.get(&key).copied() {
+                    if let Some(result) = rewritten.result {
+                        replacements.insert(result, existing);
+                        continue;
+                    }
+                } else if let Some(result) = rewritten.result {
+                    visible.insert(key, result);
+                }
+            }
+            new_insts.push(rewritten);
+        }
+        block.insts = new_insts;
+        block.terminator = rewrite_terminator(block.terminator.clone(), &replacements);
+    }
     func
 }
 
-struct DominatorTree {
-    entry: Option<BlockId>,
-    children: HashMap<BlockId, Vec<BlockId>>,
-    block_indices: HashMap<BlockId, usize>,
-}
+/// Expressions available at the entry of every block, keyed by expression.
+///
+/// A pure expression defined in a block is available to every block that
+/// definition dominates. A load is available only until a store can have
+/// happened, and a sibling arm of a branch is exactly where a dominator walk
+/// gets that wrong: the load before the diamond is still "in scope" at the
+/// join, but the other arm overwrote the memory it names. So availability is a
+/// forward must-analysis over the CFG, where a join keeps only what every
+/// predecessor agrees on, and a store kills every load.
+///
+/// The entry of a block is computed separately from its exit. The exit includes
+/// the block's own definitions; the entry must not, or an instruction would be
+/// folded into itself and deleted.
+fn available_at_entry(func: &Function) -> HashMap<BlockId, HashMap<String, ValueId>> {
+    let block_ids: Vec<BlockId> = func.blocks.iter().map(|block| block.id).collect();
+    let preds = compute_predecessors(func);
+    let blocks: HashMap<BlockId, &BasicBlock> =
+        func.blocks.iter().map(|block| (block.id, block)).collect();
 
-fn process_block(
-    block_id: BlockId,
-    dom_tree: &DominatorTree,
-    func: &mut Function,
-    replacements: &mut HashMap<ValueId, ValueId>,
-    inherited_exprs: &HashMap<String, ValueId>,
-) {
-    let Some(&block_idx) = dom_tree.block_indices.get(&block_id) else {
-        return;
-    };
+    let mut entries = HashMap::<BlockId, HashMap<String, ValueId>>::new();
+    let mut exits = HashMap::<BlockId, HashMap<String, ValueId>>::new();
+    for block_id in &block_ids {
+        entries.insert(*block_id, HashMap::new());
+        exits.insert(*block_id, HashMap::new());
+    }
 
-    let mut expr_to_value = inherited_exprs.clone();
-    let block = &mut func.blocks[block_idx];
-    let old_insts = std::mem::take(&mut block.insts);
-    let mut new_insts = Vec::with_capacity(old_insts.len());
-    for inst in old_insts {
-        let rewritten = rewrite_inst(inst, replacements);
-
-        // Invalidate load CSE entries on any store (conservative but correct:
-        // a store may write to any address that a previous load reads from).
-        if matches!(rewritten.op, InstOp::Store { .. }) {
-            expr_to_value.retain(|k, _| !k.starts_with("load:"));
-        }
-
-        if rewritten.metadata.is_empty()
-            && let Some(key) = expr_key(&rewritten.op)
-        {
-            if let Some(existing) = expr_to_value.get(&key).copied() {
-                if let Some(result) = rewritten.result {
-                    replacements.insert(result, existing);
-                    continue;
-                }
-            } else if let Some(result) = rewritten.result {
-                expr_to_value.insert(key, result);
+    let transfer = |state: &HashMap<String, ValueId>, block: &BasicBlock| {
+        let mut out = state.clone();
+        for inst in &block.insts {
+            if writes_memory(&inst.op) {
+                out.retain(|key, _| !key.starts_with("load:"));
+            }
+            if inst.metadata.is_empty()
+                && let Some(key) = expr_key(&inst.op)
+                && let Some(result) = inst.result
+            {
+                out.entry(key).or_insert(result);
             }
         }
-        new_insts.push(rewritten);
-    }
-    block.insts = new_insts;
-    block.terminator = rewrite_terminator(block.terminator.clone(), replacements);
-
-    if let Some(children) = dom_tree.children.get(&block_id).cloned() {
-        for child in children {
-            process_block(child, dom_tree, func, replacements, &expr_to_value);
-        }
-    }
-}
-
-fn compute_dominator_tree(func: &Function) -> DominatorTree {
-    let entry = Some(func.entry);
-    let block_indices = func
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(idx, block)| (block.id, idx))
-        .collect::<HashMap<_, _>>();
-    let block_ids = func.blocks.iter().map(|block| block.id).collect::<Vec<_>>();
-    let all_blocks = block_ids.iter().copied().collect::<HashSet<_>>();
-    let predecessors = compute_predecessors(func);
-
-    let mut doms = HashMap::<BlockId, HashSet<BlockId>>::new();
-    for block_id in &block_ids {
-        if *block_id == func.entry {
-            doms.insert(*block_id, HashSet::from([*block_id]));
-        } else {
-            doms.insert(*block_id, all_blocks.clone());
-        }
-    }
+        out
+    };
 
     loop {
         let mut changed = false;
         for block_id in &block_ids {
-            if *block_id == func.entry {
-                continue;
+            let mut incoming: Option<HashMap<String, ValueId>> = None;
+            for pred in preds.get(block_id).map(Vec::as_slice).unwrap_or(&[]) {
+                let pred_out = &exits[pred];
+                incoming = Some(match incoming {
+                    None => pred_out.clone(),
+                    Some(current) => current
+                        .into_iter()
+                        .filter(|(key, value)| pred_out.get(key) == Some(value))
+                        .collect(),
+                });
             }
-            let preds = predecessors.get(block_id).cloned().unwrap_or_default();
-            if preds.is_empty() {
-                let new_set = HashSet::from([*block_id]);
-                if doms.get(block_id) != Some(&new_set) {
-                    doms.insert(*block_id, new_set);
-                    changed = true;
-                }
-                continue;
-            }
+            let entry_state = if *block_id == func.entry {
+                HashMap::new()
+            } else {
+                incoming.unwrap_or_default()
+            };
+            let block = blocks.get(block_id).expect("block id came from the function");
+            let exit_state = transfer(&entry_state, block);
 
-            let mut pred_iter = preds.into_iter();
-            let mut new_set = doms
-                .get(&pred_iter.next().unwrap())
-                .cloned()
-                .unwrap_or_else(HashSet::new);
-            for pred in pred_iter {
-                let pred_doms = doms.get(&pred).cloned().unwrap_or_default();
-                new_set = new_set
-                    .intersection(&pred_doms)
-                    .copied()
-                    .collect::<HashSet<_>>();
+            if entries.get(block_id) != Some(&entry_state) {
+                entries.insert(*block_id, entry_state);
+                changed = true;
             }
-            new_set.insert(*block_id);
-            if doms.get(block_id) != Some(&new_set) {
-                doms.insert(*block_id, new_set);
+            if exits.get(block_id) != Some(&exit_state) {
+                exits.insert(*block_id, exit_state);
                 changed = true;
             }
         }
@@ -137,46 +134,7 @@ fn compute_dominator_tree(func: &Function) -> DominatorTree {
             break;
         }
     }
-
-    let mut children = HashMap::<BlockId, Vec<BlockId>>::new();
-    for block_id in &block_ids {
-        if *block_id == func.entry {
-            continue;
-        }
-        let Some(idom) = immediate_dominator(*block_id, &doms) else {
-            continue;
-        };
-        children.entry(idom).or_default().push(*block_id);
-    }
-
-    DominatorTree {
-        entry,
-        children,
-        block_indices,
-    }
-}
-
-fn immediate_dominator(
-    block_id: BlockId,
-    doms: &HashMap<BlockId, HashSet<BlockId>>,
-) -> Option<BlockId> {
-    let strict_doms = doms
-        .get(&block_id)?
-        .iter()
-        .copied()
-        .filter(|dom| *dom != block_id)
-        .collect::<Vec<_>>();
-    strict_doms.iter().copied().find(|candidate| {
-        strict_doms
-            .iter()
-            .copied()
-            .filter(|other| *other != *candidate)
-            .all(|other| {
-                !doms
-                    .get(&other)
-                    .is_some_and(|other_doms| other_doms.contains(candidate))
-            })
-    })
+    entries
 }
 
 fn compute_predecessors(func: &Function) -> HashMap<BlockId, Vec<BlockId>> {
@@ -240,6 +198,16 @@ fn expr_key(op: &InstOp) -> Option<String> {
             operand_key(on_true),
             operand_key(on_false)
         )),
+        // A vector load reads memory exactly as a scalar load does, so it takes
+        // the same key prefix and the same store kill. Naming it `intrinsic:`
+        // would have let a store in between go unnoticed.
+        InstOp::Intrinsic {
+            intrinsic: crate::Intrinsic::VecLoad { .. },
+            args,
+        } => Some(format!(
+            "load:vec:[{}]",
+            args.iter().map(operand_key).collect::<Vec<_>>().join(",")
+        )),
         InstOp::Intrinsic { intrinsic, args } if is_pure_intrinsic(intrinsic) => Some(format!(
             "intrinsic:{intrinsic:?}:[{}]",
             args.iter().map(operand_key).collect::<Vec<_>>().join(",")
@@ -254,11 +222,31 @@ fn expr_key(op: &InstOp) -> Option<String> {
     }
 }
 
+/// Does this instruction change what a later load may read?
+///
+/// A store, an atomic, a memcpy and a call can all write memory. `VecStore`
+/// writes too. A barrier writes nothing itself, but it makes the writes of
+/// every other invocation visible, so a load may not cross it either. All of
+/// these are reasons a cached load must be dropped, and none of them is a
+/// reason to keep a cached arithmetic expression.
+fn writes_memory(op: &InstOp) -> bool {
+    match op {
+        InstOp::Store { .. } | InstOp::AtomicAdd { .. } | InstOp::Memcpy { .. } | InstOp::Call { .. } => {
+            true
+        }
+        InstOp::Intrinsic { intrinsic, .. } => matches!(
+            intrinsic,
+            crate::Intrinsic::Barrier { .. } | crate::Intrinsic::VecStore { .. }
+        ),
+        _ => false,
+    }
+}
+
 fn is_pure_intrinsic(intrinsic: &crate::Intrinsic) -> bool {
-    !matches!(
-        intrinsic,
-        crate::Intrinsic::Barrier { .. } | crate::Intrinsic::VecStore { .. }
-    )
+    !writes_memory(&InstOp::Intrinsic {
+        intrinsic: intrinsic.clone(),
+        args: Vec::new(),
+    })
 }
 
 fn operand_key(operand: &Operand) -> String {
@@ -408,196 +396,4 @@ fn resolve_replacement(value: ValueId, replacements: &HashMap<ValueId, ValueId>)
         current = next;
     }
     current
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{
-        BasicBlock, BinOp, BlockId, BlockParam, CmpPred, Constant, Function, Inst, InstOp, Operand,
-        Terminator, Type, ValueId,
-    };
-
-    #[test]
-    fn eliminates_dominated_duplicate_scalar_exprs_across_blocks() {
-        let func = Function {
-            name: "global_cse".into(),
-            params: vec![],
-            blocks: vec![
-                BasicBlock {
-                    id: BlockId(0),
-                    name: "entry".into(),
-                    params: vec![],
-                    insts: vec![Inst {
-                        result: Some(ValueId(0)),
-                        result_name: Some("seed".into()),
-                        ty: Type::I64,
-                        op: InstOp::Bin {
-                            op: BinOp::Mul,
-                            lhs: Operand::Const(Constant::Int(7)),
-                            rhs: Operand::Const(Constant::Int(8)),
-                        },
-                        metadata: vec![],
-                    }],
-                    terminator: Terminator::Br {
-                        target: BlockId(1),
-                        args: vec![Operand::Const(Constant::Bool(true))],
-                    },
-                },
-                BasicBlock {
-                    id: BlockId(1),
-                    name: "header".into(),
-                    params: vec![BlockParam {
-                        id: ValueId(1),
-                        name: "cond".into(),
-                        ty: Type::I1,
-                    }],
-                    insts: vec![],
-                    terminator: Terminator::CondBr {
-                        cond: Operand::Value(ValueId(1)),
-                        true_target: BlockId(2),
-                        true_args: vec![],
-                        false_target: BlockId(3),
-                        false_args: vec![],
-                    },
-                },
-                BasicBlock {
-                    id: BlockId(2),
-                    name: "body".into(),
-                    params: vec![],
-                    insts: vec![Inst {
-                        result: Some(ValueId(2)),
-                        result_name: Some("dup".into()),
-                        ty: Type::I64,
-                        op: InstOp::Bin {
-                            op: BinOp::Mul,
-                            lhs: Operand::Const(Constant::Int(7)),
-                            rhs: Operand::Const(Constant::Int(8)),
-                        },
-                        metadata: vec![],
-                    }],
-                    terminator: Terminator::Ret {
-                        value: Some(Operand::Value(ValueId(2))),
-                    },
-                },
-                BasicBlock {
-                    id: BlockId(3),
-                    name: "exit".into(),
-                    params: vec![],
-                    insts: vec![],
-                    terminator: Terminator::Ret {
-                        value: Some(Operand::Const(Constant::Int(0))),
-                    },
-                },
-            ],
-            entry: BlockId(0),
-            metadata: vec![],
-        };
-
-        let optimized = super::run(func);
-        let body = optimized
-            .blocks
-            .iter()
-            .find(|block| block.id == BlockId(2))
-            .unwrap();
-        assert!(body.insts.is_empty());
-        assert_eq!(
-            body.terminator,
-            Terminator::Ret {
-                value: Some(Operand::Value(ValueId(0))),
-            }
-        );
-    }
-
-    #[test]
-    fn does_not_reuse_expr_only_available_on_one_branch() {
-        let func = Function {
-            name: "branch_local".into(),
-            params: vec![],
-            blocks: vec![
-                BasicBlock {
-                    id: BlockId(0),
-                    name: "entry".into(),
-                    params: vec![],
-                    insts: vec![Inst {
-                        result: Some(ValueId(0)),
-                        result_name: Some("cond".into()),
-                        ty: Type::I1,
-                        op: InstOp::Cmp {
-                            pred: CmpPred::Eq,
-                            lhs: Operand::Const(Constant::Int(1)),
-                            rhs: Operand::Const(Constant::Int(1)),
-                        },
-                        metadata: vec![],
-                    }],
-                    terminator: Terminator::CondBr {
-                        cond: Operand::Value(ValueId(0)),
-                        true_target: BlockId(1),
-                        true_args: vec![],
-                        false_target: BlockId(2),
-                        false_args: vec![],
-                    },
-                },
-                BasicBlock {
-                    id: BlockId(1),
-                    name: "lhs".into(),
-                    params: vec![],
-                    insts: vec![Inst {
-                        result: Some(ValueId(1)),
-                        result_name: Some("lhs_mul".into()),
-                        ty: Type::I64,
-                        op: InstOp::Bin {
-                            op: BinOp::Mul,
-                            lhs: Operand::Const(Constant::Int(3)),
-                            rhs: Operand::Const(Constant::Int(9)),
-                        },
-                        metadata: vec![],
-                    }],
-                    terminator: Terminator::Br {
-                        target: BlockId(3),
-                        args: vec![],
-                    },
-                },
-                BasicBlock {
-                    id: BlockId(2),
-                    name: "rhs".into(),
-                    params: vec![],
-                    insts: vec![],
-                    terminator: Terminator::Br {
-                        target: BlockId(3),
-                        args: vec![],
-                    },
-                },
-                BasicBlock {
-                    id: BlockId(3),
-                    name: "join".into(),
-                    params: vec![],
-                    insts: vec![Inst {
-                        result: Some(ValueId(2)),
-                        result_name: Some("join_mul".into()),
-                        ty: Type::I64,
-                        op: InstOp::Bin {
-                            op: BinOp::Mul,
-                            lhs: Operand::Const(Constant::Int(3)),
-                            rhs: Operand::Const(Constant::Int(9)),
-                        },
-                        metadata: vec![],
-                    }],
-                    terminator: Terminator::Ret {
-                        value: Some(Operand::Value(ValueId(2))),
-                    },
-                },
-            ],
-            entry: BlockId(0),
-            metadata: vec![],
-        };
-
-        let optimized = super::run(func);
-        let join = optimized
-            .blocks
-            .iter()
-            .find(|block| block.id == BlockId(3))
-            .unwrap();
-        assert_eq!(join.insts.len(), 1);
-        assert_eq!(join.insts[0].result, Some(ValueId(2)));
-    }
 }

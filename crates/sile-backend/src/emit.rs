@@ -70,6 +70,7 @@ pub fn value_name(value_names: &HashMap<llvm_ir::ValueId, String>, id: llvm_ir::
 
 pub fn format_operand(
     value_names: &HashMap<llvm_ir::ValueId, String>,
+    float_literal: fn(f64) -> String,
     operand: &llvm_ir::Operand,
 ) -> String {
     match operand {
@@ -102,6 +103,7 @@ pub fn bin_op_symbol(op: llvm_ir::BinOp) -> &'static str {
         llvm_ir::BinOp::Sub => "-",
         llvm_ir::BinOp::Mul => "*",
         llvm_ir::BinOp::Div => "/",
+        llvm_ir::BinOp::Rem => "%",
         llvm_ir::BinOp::And => "&",
         llvm_ir::BinOp::Or => "|",
     }
@@ -118,7 +120,23 @@ pub fn cmp_pred_symbol(pred: llvm_ir::CmpPred) -> &'static str {
     }
 }
 
+/// A float as a C-family literal: `2.0f`, `INFINITY`, `NAN`.
+///
+/// A finite value is a decimal literal, which every target reads the same way.
+/// The three non-finite values are where the targets disagree, so a target
+/// whose standard library has no `INFINITY` or `NAN` overrides
+/// [`TargetDialect::float_literal`].
 pub fn float_literal(value: f64) -> String {
+    if value.is_nan() {
+        return "NAN".into();
+    }
+    if value.is_infinite() {
+        return if value.is_sign_negative() {
+            "(-INFINITY)".into()
+        } else {
+            "INFINITY".into()
+        };
+    }
     if value.fract() == 0.0 {
         format!("{value:.1}f")
     } else {
@@ -127,11 +145,38 @@ pub fn float_literal(value: f64) -> String {
 }
 
 /// The synthetic shape parameter every backend reads.
-pub const SHAPES_PARAM_NAME: &str = "__sile_shapes";
+pub const SHAPES_PARAM_NAME: &str = llvm_ir::SHAPES_PARAM_NAME;
+
+/// The synthetic scalar parameter, bound after the shape descriptor.
+///
+/// A scalar kernel argument travels as a load from here rather than as a
+/// function parameter, because WGSL cannot pass a value into an entry point.
+pub const SCALARS_PARAM_NAME: &str = llvm_ir::SCALARS_PARAM_NAME;
 
 /// True when the parameter is the shape descriptor, not a kernel buffer.
 pub fn is_shapes_param(param: &llvm_ir::Param) -> bool {
     param.name == SHAPES_PARAM_NAME
+}
+
+/// True when the parameter is the float scalar descriptor, not a kernel buffer.
+pub fn is_scalars_param(param: &llvm_ir::Param) -> bool {
+    param.name == SCALARS_PARAM_NAME
+}
+
+/// The synthetic integer scalar parameter, bound after the float one.
+pub const SCALARS_I64_PARAM_NAME: &str = llvm_ir::SCALARS_I64_PARAM_NAME;
+
+/// True when the parameter is the integer scalar descriptor.
+pub fn is_scalars_i64_param(param: &llvm_ir::Param) -> bool {
+    param.name == SCALARS_I64_PARAM_NAME
+}
+
+/// True when the parameter is a descriptor rather than a kernel buffer.
+///
+/// The descriptors are the synthetic trailing parameters, and every place that
+/// counts or picks kernel buffers has to skip all of them.
+pub fn is_descriptor_param(param: &llvm_ir::Param) -> bool {
+    is_shapes_param(param) || is_scalars_param(param) || is_scalars_i64_param(param)
 }
 
 /// The output buffer of a kernel, with the tile it is stored through.
@@ -145,20 +190,112 @@ pub struct OutputBuffer<'a> {
     pub cols: usize,
 }
 
-/// Last non-shape parameter carrying tile ABI metadata.
+/// Last output parameter, as the backend signature declares it.
+///
+/// The output is the last buffer the kernel writes, and the lowering numbers
+/// parameters in declaration order. The result is the same parameter whether
+/// or not it carries tile ABI metadata: a kernel that only atomic-adds one
+/// scalar per program has an output with no tile, and the launch grid still
+/// has to come from somewhere.
+pub fn find_output_param(func: &llvm_ir::Function) -> Option<&llvm_ir::Param> {
+    func.params
+        .iter()
+        .rev()
+        .find(|param| !is_descriptor_param(param))
+}
+
+/// Last non-descriptor parameter carrying tile ABI metadata.
 pub fn find_output_buffer(func: &llvm_ir::Function) -> Option<OutputBuffer<'_>> {
     func.params
         .iter()
         .rev()
         .find(|param| {
-            is_shapes_param(param) == false
-                && param.abi.as_ref().is_some_and(|abi| abi.tile.is_some())
+            !is_descriptor_param(param) && param.abi.as_ref().is_some_and(|abi| abi.tile.is_some())
         })
         .and_then(|param| {
             let abi = param.abi.as_ref()?;
             let (rows, cols) = abi.tile?;
             Some(OutputBuffer { param, rows, cols })
         })
+}
+
+/// The launch grid a backend that reads one flat index must dispatch.
+///
+/// A rank-2 output makes a kernel index its tiles by row and column. C and MSL
+/// read both from separate launch axes, so a driver that dispatches the grid as
+/// given leaves one of them unreachable when it has to be flat. WGSL reads the
+/// launch index from one axis only, so the two tile axes have to arrive
+/// multiplied together.
+///
+/// The rule lives here because the codegen and the runtime must agree: if the
+/// emitter assumes a flattened grid, the runtime has to send one, and neither
+/// side may decide alone.
+pub fn flatten_grid(func: &llvm_ir::Function, launch: &sile_core::LaunchConfig) -> [u32; 3] {
+    let output_rank = find_output_buffer(func)
+        .and_then(|output| output.param.abi.as_ref().map(|abi| abi.rank))
+        .unwrap_or(1);
+    match output_rank {
+        // A rank-1 output puts one tile on each grid slot, so the launch index
+        // is the tile index and the grid arrives as the caller wrote it.
+        0 | 1 => launch.grid,
+        // A rank-3 output addresses a plane of tiles, so all three axes arrive
+        // multiplied together and the emitter divides them back out.
+        3.. => [
+            launch.grid.iter().fold(1u32, |acc, dim| acc.saturating_mul(*dim)),
+            1,
+            1,
+        ],
+        // A rank-2 output addresses one tile with a row and a column. Those two
+        // arrive multiplied together; the third axis is not a tile axis and
+        // stays as it is.
+        _ if launch.grid[1] <= 1 => launch.grid,
+        _ => [
+            launch.grid[0].saturating_mul(launch.grid[1]),
+            1,
+            launch.grid[2],
+        ],
+    }
+}
+
+/// The extent of each logical grid axis, as source expressions.
+///
+/// The logical axes are the output buffer's axes that the tile does not cover,
+/// in declaration order. A rank-2 output addresses one tile with `(row, col)`,
+/// so its axes are a row count and a column count. A rank-3 output addresses a
+/// plane of tiles with `(plane, row, col)`, so a plane count comes first. A
+/// rank-1 output has one axis.
+///
+/// The tile covers the last two axes, so an axis the tile does cover is the
+/// buffer's extent divided by the tile's; an axis before those holds one tile
+/// per element, and its extent is the buffer's extent unchanged. Both come from
+/// the shape descriptor and the tile ABI, so the kernel needs no launch-time
+/// value to recover them.
+pub fn grid_axis_exprs(
+    abi: &llvm_ir::ParamAbi,
+    rows: usize,
+    cols: usize,
+    shapes: &str,
+) -> Vec<String> {
+    let rank = abi.rank.max(1);
+    let offset = abi.shape_offset;
+    let mut axes: Vec<String> = (0..rank.saturating_sub(2))
+        .map(|axis| format!("{shapes}[{}]", offset + axis))
+        .collect();
+    if rank >= 2 {
+        axes.push(format!("{shapes}[{}] / {}", offset + rank - 2, rows.max(1)));
+    }
+    axes.push(format!("{shapes}[{}] / {}", offset + rank - 1, cols.max(1)));
+    axes
+}
+
+/// The stride of logical grid axis `dim` in a flat launch index.
+///
+/// A flat launch index counts tiles with the last axis varying fastest, so the
+/// stride of an axis is the product of the extents after it.
+pub fn grid_axis_stride(axes: &[String], dim: usize) -> String {
+    axes.iter()
+        .skip(dim + 1)
+        .fold("1".to_string(), |acc, extent| format!("{acc} * {extent}"))
 }
 
 /// How a target spells address-taking and dereferencing.
@@ -208,24 +345,107 @@ fn select_expr(
     }
 }
 
+/// One Gep in the function: where it starts, its indices, and each index's stride.
+///
+/// The strides are what a pointer-free target needs. C and MSL write
+/// `a[i][j]` and let the type system apply the row width; WGSL flattens the
+/// storage to `array<f32, 16>`, so the same access has to spell
+/// `a[(i * 8) + j]` itself. An index into an outer dimension therefore carries
+/// the product of the dimensions after it, and an index into the innermost
+/// dimension carries one.
+#[derive(Clone, Debug)]
+pub struct GepLink {
+    pub base: llvm_ir::Operand,
+    pub indices: Vec<llvm_ir::Operand>,
+    pub strides: Vec<usize>,
+}
+
+/// The type of every value in the function, including an alloca's pointer.
+///
+/// A Gep's stride comes from the pointee of the value it indexes, so the table
+/// has to cover parameters, block parameters and instruction results.
+fn value_types(func: &llvm_ir::Function) -> HashMap<llvm_ir::ValueId, llvm_ir::Type> {
+    let mut types = HashMap::new();
+    for param in &func.params {
+        types.insert(param.id, param.ty.clone());
+    }
+    for block in &func.blocks {
+        for param in &block.params {
+            types.insert(param.id, param.ty.clone());
+        }
+        for inst in &block.insts {
+            let Some(id) = inst.result else {
+                continue;
+            };
+            // An alloca's result type is the pointer to the storage, which the
+            // instruction records as the allocation type.
+            let ty = match &inst.op {
+                llvm_ir::InstOp::Alloca {
+                    alloc_ty,
+                    addr_space,
+                } => llvm_ir::Type::ptr(addr_space.clone(), alloc_ty.clone()),
+                _ => inst.ty.clone(),
+            };
+            types.insert(id, ty);
+        }
+    }
+    types
+}
+
+/// How much one index of a Gep advances, in leaf elements.
+///
+/// Index `i` steps over the dimensions after it, so a row index of `[2 x [8 x
+/// f32]]` advances eight elements and the column index advances one.
+fn index_strides(pointee: &llvm_ir::Type, count: usize) -> Vec<usize> {
+    let dims = array_dims(pointee);
+    (0..count)
+        .map(|i| dims.get(i + 1..).map_or(1, |rest| rest.iter().product()))
+        .collect()
+}
+
 /// Collapse a pointer into the buffer it addresses and every index in its chain.
 ///
 /// A Gep's base can be a Gep, and each link offsets the same buffer by a number
-/// of elements, so one chain is one buffer and one summed index.
+/// of elements, so one chain is one buffer and one summed index. Each index
+/// keeps the stride of the link it came from, because a chain can cross array
+/// dimensions of different widths.
 pub fn walk_gep_chain<'g>(
     ptr: &llvm_ir::Operand,
-    gep_elements: &'g HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)>,
-) -> Option<(&'g llvm_ir::Operand, Vec<llvm_ir::Operand>)> {
+    gep_elements: &'g HashMap<llvm_ir::ValueId, GepLink>,
+) -> Option<(&'g llvm_ir::Operand, Vec<(llvm_ir::Operand, usize)>)> {
     let llvm_ir::Operand::Value(id) = ptr else {
         return None;
     };
-    let (base, indices) = gep_elements.get(id)?;
-    let (root, mut prefix) = match walk_gep_chain(base, gep_elements) {
+    let link = gep_elements.get(id)?;
+    let (root, mut prefix) = match walk_gep_chain(&link.base, gep_elements) {
         Some((root, prefix)) => (root, prefix),
-        None => (base, Vec::new()),
+        None => (&link.base, Vec::new()),
     };
-    prefix.extend(indices.iter().cloned());
+    prefix.extend(
+        link.indices
+            .iter()
+            .cloned()
+            .zip(link.strides.iter().copied()),
+    );
     Some((root, prefix))
+}
+
+/// One index of a flattened access, scaled by the width of the dimension it
+/// indexes into.
+pub fn scaled_index(
+    index: &llvm_ir::Operand,
+    stride: usize,
+    format_operand: &dyn Fn(&llvm_ir::Operand) -> String,
+) -> String {
+    if stride == 1 {
+        return format!("({})", format_operand(index));
+    }
+    // A constant index folds into the constant, so a tile access with literal
+    // coordinates stays one literal in the emitted source.
+    if let llvm_ir::Operand::Const(llvm_ir::Constant::Int(value)) = index {
+        return format!("({})", value * stride as i64);
+    }
+    format!("({}) * ({stride})", format_operand(index))
 }
 
 /// Spell the element a pointer names, for a target that has no pointers.
@@ -234,24 +454,20 @@ pub fn walk_gep_chain<'g>(
 /// same rule the shared load and store use, instead of a second spelling of it.
 pub fn element_operand(
     ptr: &llvm_ir::Operand,
-    gep_elements: &HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)>,
+    gep_elements: &HashMap<llvm_ir::ValueId, GepLink>,
     value_name: &dyn Fn(llvm_ir::ValueId) -> String,
     format_operand: &dyn Fn(&llvm_ir::Operand) -> String,
 ) -> String {
     match walk_gep_chain(ptr, gep_elements) {
         Some((root, indices)) => {
-            let terms: Vec<String> = indices.iter().map(|idx| format_operand(idx)).collect();
+            let terms: Vec<String> = indices
+                .iter()
+                .map(|(idx, stride)| scaled_index(idx, *stride, format_operand))
+                .collect();
             match terms.as_slice() {
                 [] => format!("{}[0]", format_operand(root)),
                 [one] => format!("{}[{one}]", format_operand(root)),
-                many => format!(
-                    "{}[{}]",
-                    format_operand(root),
-                    many.iter()
-                        .map(|term| format!("({term})"))
-                        .collect::<Vec<_>>()
-                        .join(" + ")
-                ),
+                many => format!("{}[{}]", format_operand(root), many.join(" + ")),
             }
         }
         None => match ptr {
@@ -261,22 +477,37 @@ pub fn element_operand(
     }
 }
 
-/// Every Gep in the function, as `(base, indices)`.
+/// Every Gep in the function, with the stride of each index.
 ///
 /// A target that has no pointers reads this table to spell the element a load or
 /// a store addresses, and a dialect needs the same table for an intrinsic
 /// argument. Both read the whole function, so both take it from one place
 /// instead of one of them re-deriving it during emission.
-pub fn collect_gep_elements(
-    func: &llvm_ir::Function,
-) -> HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)> {
+pub fn collect_gep_elements(func: &llvm_ir::Function) -> HashMap<llvm_ir::ValueId, GepLink> {
+    let types = value_types(func);
     let mut gep_elements = HashMap::new();
     for block in &func.blocks {
         for inst in &block.insts {
             if let llvm_ir::InstOp::Gep { base, indices } = &inst.op
                 && let Some(result) = inst.result
             {
-                gep_elements.insert(result, ((*base).clone(), indices.clone()));
+                let strides = match base {
+                    llvm_ir::Operand::Value(id) => match types.get(id) {
+                        Some(llvm_ir::Type::Ptr { pointee, .. }) => {
+                            index_strides(pointee, indices.len())
+                        }
+                        _ => vec![1; indices.len()],
+                    },
+                    llvm_ir::Operand::Const(_) => vec![1; indices.len()],
+                };
+                gep_elements.insert(
+                    result,
+                    GepLink {
+                        base: (*base).clone(),
+                        indices: indices.clone(),
+                        strides,
+                    },
+                );
             }
         }
     }
@@ -294,20 +525,14 @@ pub fn lower_common_inst_line_with<FValue, FOperand>(
     format_operand: FOperand,
     pointers: PointerSpelling,
     select: SelectSpelling,
-    gep_elements: &mut HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)>,
+    gep_elements: &mut HashMap<llvm_ir::ValueId, GepLink>,
 ) -> Option<String>
 where
     FValue: Fn(llvm_ir::ValueId) -> String,
     FOperand: Fn(&llvm_ir::Operand) -> String,
 {
-    // A Gep result names an element, not a value, so record it before anything
-    // asks. Only a pointer-free language needs the table.
-    if !pointers.has_address_of
-        && let Some(result) = inst.result
-        && let llvm_ir::InstOp::Gep { base, indices } = &inst.op
-    {
-        gep_elements.insert(result, ((*base).clone(), indices.clone()));
-    }
+    // The Gep table is collected once in `TargetEmitter::new` for a
+    // pointer-free target, so a Gep is already there when its use arrives.
 
     let element = |ptr: &llvm_ir::Operand| -> String {
         element_operand(ptr, gep_elements, &value_name, &format_operand)
@@ -466,6 +691,39 @@ pub trait TargetDialect {
         SHAPES_PARAM_NAME.to_string()
     }
 
+    /// Name this target uses for the scalar descriptor.
+    ///
+    /// Renamed for the same reason as the shape descriptor: the IR name is
+    /// shared across targets, and a target whose language reserves the leading
+    /// underscores has to spell it differently.
+    fn scalars_name(&self) -> String {
+        SCALARS_PARAM_NAME.to_string()
+    }
+
+    /// Name this target uses for the integer scalar descriptor.
+    fn scalars_i64_name(&self) -> String {
+        SCALARS_I64_PARAM_NAME.to_string()
+    }
+
+    /// The statement that gives a block parameter its incoming value.
+    ///
+    /// A target whose tiles are addresses must copy the elements; see
+    /// [`copy_assign`]. A target whose tiles are values assigns them.
+    fn param_assign(&self, _ty: &llvm_ir::Type, name: &str, arg: &str) -> String {
+        format!("{name} = {arg};")
+    }
+
+    /// How this target spells a floating-point constant.
+    ///
+    /// An associated function, not a method, because the shared operand
+    /// formatter needs the spelling without borrowing the dialect.
+    fn float_literal(value: f64) -> String
+    where
+        Self: Sized,
+    {
+        float_literal(value)
+    }
+
     /// A loop-carried hint the target wants before a simple loop, if any.
     ///
     /// `is_simple_body` reports that the loop has no inner control flow, which
@@ -510,18 +768,67 @@ pub trait TargetDialect {
 pub struct TargetEmitter<'a, D: TargetDialect> {
     pub func: &'a llvm_ir::Function,
     pub dialect: D,
-    /// Values an `alloca` defines, so a target can tell real storage apart from
-    /// a pointer into a driver buffer.
-    pub allocas: HashSet<llvm_ir::ValueId>,
+    /// Values that own storage, so a target can tell real storage apart from a
+    /// pointer into a driver buffer.
+    pub storage_values: HashSet<llvm_ir::ValueId>,
     pub value_names: HashMap<llvm_ir::ValueId, String>,
     pub declared_values: HashSet<llvm_ir::ValueId>,
     /// Gep results, which a pointer-free target spells as elements.
     ///
     /// Filled by [`lower_common_inst_line_with`], so the emitter must own it and
     /// pass it on every instruction.
-    pub gep_elements: HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)>,
+    pub gep_elements: HashMap<llvm_ir::ValueId, GepLink>,
     pub indent: usize,
     out: String,
+}
+
+/// The two extents of the storage a tile pointer addresses, when it addresses
+/// a tile at all.
+pub fn tile_storage_dims(ty: &llvm_ir::Type) -> Option<(usize, usize)> {
+    let llvm_ir::Type::Ptr { pointee, .. } = ty else {
+        return None;
+    };
+    let llvm_ir::Type::Array { len: rows, elem } = pointee.as_ref() else {
+        return None;
+    };
+    let llvm_ir::Type::Array { len: cols, .. } = elem.as_ref() else {
+        return None;
+    };
+    Some((*rows, *cols))
+}
+
+/// A statement that makes `name` hold the tile `arg` names.
+///
+/// A tile parameter owns storage and receives its value from storage the loop
+/// writes again on the next iteration. Taking the address would make the two
+/// names alias, and the parameter would lose the value it carried, so the
+/// elements are copied. A target whose tiles are values assigns them directly
+/// and never calls this.
+pub fn copy_assign(ty: &llvm_ir::Type, name: &str, arg: &str) -> String {
+    match tile_storage_dims(ty) {
+        Some((rows, 1)) => {
+            format!("for (int64_t i = 0; i < {rows}; i++) {name}[i][0] = {arg}[i][0];")
+        }
+        Some((rows, cols)) => format!(
+            "for (int64_t i = 0; i < {rows}; i++) \
+             for (int64_t j = 0; j < {cols}; j++) {name}[i][j] = {arg}[i][j];"
+        ),
+        None => format!("{name} = {arg};"),
+    }
+}
+
+/// Every value that owns storage: an `alloca`, and a tile block parameter,
+/// which is the slot the loop carries that tile in.
+pub fn collect_storage_values(func: &llvm_ir::Function) -> HashSet<llvm_ir::ValueId> {
+    let mut values = collect_alloca_results(func);
+    for block in &func.blocks {
+        for param in &block.params {
+            if tile_storage_dims(&param.ty).is_some() {
+                values.insert(param.id);
+            }
+        }
+    }
+    values
 }
 
 /// Every value an `alloca` defines, on any block.
@@ -549,10 +856,14 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
         let value_names = build_value_names(func)
             .into_iter()
             .map(|(id, name)| {
-                // The shape descriptor is the one IR name a target can reject,
-                // so it is the one name renamed here.
+                // The descriptors are the IR names a target can reject, so they
+                // are the names renamed here.
                 let name = if name == SHAPES_PARAM_NAME {
                     dialect.shapes_name()
+                } else if name == SCALARS_PARAM_NAME {
+                    dialect.scalars_name()
+                } else if name == SCALARS_I64_PARAM_NAME {
+                    dialect.scalars_i64_name()
                 } else {
                     name
                 };
@@ -562,7 +873,7 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
         Self {
             func,
             dialect,
-            allocas: collect_alloca_results(func),
+            storage_values: collect_storage_values(func),
             value_names,
             declared_values: HashSet::new(),
             gep_elements,
@@ -627,7 +938,7 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
                 let name = self.value_name(id);
                 let decl = self
                     .dialect
-                    .var_decl(&ty, &name, self.allocas.contains(&id));
+                    .var_decl(&ty, &name, self.storage_values.contains(&id));
                 if let Some(decl) = decl {
                     self.writeln(&decl);
                 }
@@ -640,7 +951,7 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
     }
 
     pub fn format_operand(&self, operand: &llvm_ir::Operand) -> String {
-        format_operand(&self.value_names, operand)
+        format_operand(&self.value_names, D::float_literal, operand)
     }
 
     pub fn writeln(&mut self, line: &str) {
@@ -693,6 +1004,10 @@ impl<D: TargetDialect> TextCodegen for TargetEmitter<'_, D> {
 }
 
 impl<D: TargetDialect> StructuredEmitter for TargetEmitter<'_, D> {
+    fn float_literal(value: f64) -> String {
+        D::float_literal(value)
+    }
+
     fn emit_block_insts(&mut self, block: &llvm_ir::BasicBlock) -> Result<()> {
         self.emit_block_insts_except(block, None)
     }
@@ -727,7 +1042,9 @@ impl<D: TargetDialect> StructuredEmitter for TargetEmitter<'_, D> {
                 continue;
             }
             let name = self.value_name(param.id);
-            self.writeln(&format!("{name} = {};", self.format_operand(arg)));
+            let arg = self.format_operand(arg);
+            let line = self.dialect.param_assign(&param.ty, &name, &arg);
+            self.writeln(&line);
         }
     }
 
@@ -783,7 +1100,7 @@ impl<D: TargetDialect> TargetEmitter<'_, D> {
             let lines = dialect.intrinsic_stmt(
                 inst.result,
                 |id| value_name(&value_names, id),
-                |op| format_operand(&value_names, op),
+                |op| format_operand(&value_names, D::float_literal, op),
                 intrinsic,
                 args,
             )?;
@@ -798,7 +1115,7 @@ impl<D: TargetDialect> TargetEmitter<'_, D> {
             lower_common_inst_line_with(
                 inst,
                 |id| value_name(&value_names, id),
-                |op| format_operand(&value_names, op),
+                |op| format_operand(&value_names, D::float_literal, op),
                 self.dialect.pointers(),
                 self.dialect.select(),
                 &mut self.gep_elements,
@@ -815,7 +1132,7 @@ impl<D: TargetDialect> TargetEmitter<'_, D> {
         let lines = self.dialect.extra_inst_stmt(
             inst,
             |id| value_name(&value_names, id),
-            |op| format_operand(&value_names, op),
+            |op| format_operand(&value_names, D::float_literal, op),
         )?;
         for line in lines {
             self.writeln(&line);
@@ -845,6 +1162,16 @@ pub trait StructuredEmitter {
         self.emit_block_param_assignments_skipping(target, args, &[]);
     }
     fn format_operand(&self, operand: &llvm_ir::Operand) -> String;
+
+    /// How this target spells a floating-point constant, for the branch
+    /// conditions this emitter formats outside its own name table.
+    fn float_literal(value: f64) -> String
+    where
+        Self: Sized,
+    {
+        float_literal(value)
+    }
+
     fn writeln(&mut self, line: &str);
     fn indent_inc(&mut self);
     fn indent_dec(&mut self);
@@ -1043,7 +1370,7 @@ fn emit_structured_if_else<E: StructuredEmitter>(
     let join = shared_branch_join(func, *true_target, *false_target)
         .ok_or_else(|| Error::Compile(messages.unsupported_cond_br.into()))?;
 
-    let (cond_expr, skip_result) = branch_condition_expr(func, block, cond, false);
+    let (cond_expr, skip_result) = branch_condition_expr::<E>(func, block, cond, false);
     emitter.emit_block_insts_except(block, skip_result)?;
     emitter.writeln(&format!("if ({cond_expr}) {{"));
     emitter.indent_inc();
@@ -1081,7 +1408,7 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
     false_args: &[llvm_ir::Operand],
     messages: StructuredCfgMessages,
 ) -> Result<llvm_ir::BlockId> {
-    let optimized_loop = branch_condition_expr(func, header, cond, true);
+    let optimized_loop = branch_condition_expr::<E>(func, header, cond, true);
     match optimized_loop {
         (cond_expr, skip_result @ Some(_))
             if header_only_contains_skipped_cmp(header, skip_result) =>
@@ -1105,8 +1432,15 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
                 let step_expr = induction_step_expr(&induction_name, for_loop.step);
                 // Only C has this directive, and a target without one keeps
                 // the loop as it is.
-                let vectorize =
-                    emitter.vectorize_hint(is_simple_loop_body(func, true_target, header.id));
+                //
+                // OpenMP requires the loop's initializer to be `var = init`
+                // in the `for` header. When the preheader is inside a branch,
+                // the induction value is assigned before the loop and the
+                // header is empty, so the directive would make the C compiler
+                // reject the whole file. The loop is still correct without it.
+                let vectorize = (!init_expr.is_empty())
+                    .then(|| emitter.vectorize_hint(is_simple_loop_body(func, true_target, header.id)))
+                    .flatten();
                 if let Some(vectorize) = vectorize {
                     emitter.writeln(&vectorize);
                 }
@@ -1330,14 +1664,16 @@ fn is_simple_loop_body(
             return false;
         };
         for inst in &block.insts {
-            if matches!(
-                &inst.op,
-                llvm_ir::InstOp::Call { .. }
-                    | llvm_ir::InstOp::Intrinsic {
-                        intrinsic: llvm_ir::Intrinsic::Exp,
-                        ..
-                    }
-            ) {
+            // A call, and a float function the target may implement as one,
+            // keep the body out of the vectorized form.
+            let calls_a_function = match &inst.op {
+                llvm_ir::InstOp::Call { .. } => true,
+                llvm_ir::InstOp::Intrinsic { intrinsic, .. } => {
+                    intrinsic.float_function().is_some()
+                }
+                _ => false,
+            };
+            if calls_a_function {
                 return false;
             }
         }
@@ -1445,35 +1781,35 @@ fn block_reaches(
     reaches
 }
 
-fn branch_condition_expr(
+fn branch_condition_expr<E: StructuredEmitter>(
     func: &llvm_ir::Function,
     block: &llvm_ir::BasicBlock,
     cond: &llvm_ir::Operand,
     require_header_only: bool,
 ) -> (String, Option<llvm_ir::ValueId>) {
     let Some(cond_id) = operand_value_id(cond) else {
-        return (format_operand_with_function(func, cond), None);
+        return (format_operand_with_function::<E>(func, cond), None);
     };
     let Some(inst) = get_inst_by_result(func, cond_id) else {
-        return (format_operand_with_function(func, cond), None);
+        return (format_operand_with_function::<E>(func, cond), None);
     };
     if !matches!(inst.op, llvm_ir::InstOp::Cmp { .. }) {
-        return (format_operand_with_function(func, cond), None);
+        return (format_operand_with_function::<E>(func, cond), None);
     }
     if require_header_only && !header_only_contains_skipped_cmp(block, Some(cond_id)) {
-        return (format_operand_with_function(func, cond), None);
+        return (format_operand_with_function::<E>(func, cond), None);
     }
     match &inst.op {
         llvm_ir::InstOp::Cmp { pred, lhs, rhs } => (
             format!(
                 "{} {} {}",
-                format_operand_with_function(func, lhs),
+                format_operand_with_function::<E>(func, lhs),
                 cmp_pred_symbol(*pred),
-                format_operand_with_function(func, rhs)
+                format_operand_with_function::<E>(func, rhs)
             ),
             Some(cond_id),
         ),
-        _ => (format_operand_with_function(func, cond), None),
+        _ => (format_operand_with_function::<E>(func, cond), None),
     }
 }
 
@@ -1497,9 +1833,12 @@ fn operand_value_id(operand: &llvm_ir::Operand) -> Option<llvm_ir::ValueId> {
     }
 }
 
-fn format_operand_with_function(func: &llvm_ir::Function, operand: &llvm_ir::Operand) -> String {
+fn format_operand_with_function<E: StructuredEmitter>(
+    func: &llvm_ir::Function,
+    operand: &llvm_ir::Operand,
+) -> String {
     let value_names = build_value_names(func);
-    format_operand(&value_names, operand)
+    format_operand(&value_names, E::float_literal, operand)
 }
 
 fn predecessor_count(func: &llvm_ir::Function, target: llvm_ir::BlockId) -> usize {

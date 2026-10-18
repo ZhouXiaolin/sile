@@ -111,11 +111,41 @@ impl Tensor<f32> {
         _tile_shape: [i64; N],
         _indices: [i64; M],
     ) -> Tile<f32> {
-        Tile::new(_tile_shape.iter().copied().collect())
+        Tile::new(_tile_shape)
     }
 
     pub fn dim(&self, idx: usize) -> i64 {
         self.shape[idx]
+    }
+
+    /// `x.partition(shape)`: a tiled view of this buffer.
+    ///
+    /// The view holds no data. The macro reads the tile extent from this call,
+    /// so a later `part.load([i, j])` lowers to the same load `load_tile`
+    /// produces without repeating the shape.
+    pub fn partition<const N: usize>(&self, _shape: [i64; N]) -> Partition<f32> {
+        Partition {
+            shape: _shape.iter().copied().collect(),
+            _elem: std::marker::PhantomData,
+        }
+    }
+
+    /// `x.partition_mut(shape)`: the same view, opened for writing.
+    pub fn partition_mut<const N: usize>(&mut self, _shape: [i64; N]) -> Partition<f32> {
+        Partition {
+            shape: _shape.iter().copied().collect(),
+            _elem: std::marker::PhantomData,
+        }
+    }
+
+    /// `x.load_like(y)`: a tile shaped like `y` at this program's coordinates.
+    pub fn load_like(&self, y: &Tensor<f32>) -> Tile<f32> {
+        Tile::new(y.shape())
+    }
+
+    /// `x.load()`: a tile shaped like this buffer.
+    pub fn load(&self) -> Tile<f32> {
+        Tile::new(self.shape.clone())
     }
 
     pub fn load_tile_like_2d(&self, _target: &Tensor<f32>) -> Tile<f32> {
@@ -127,6 +157,32 @@ impl Tensor<f32> {
     }
 
     pub fn atomic_add(&mut self, _index: usize, _value: f32) {
+        // no-op in host context; handled by codegen
+    }
+}
+
+/// A tiled view of a buffer, as `x.partition(shape)` returns it.
+///
+/// It carries the tile extent and nothing else. The macro lowers it away: the
+/// value a `load` receives is the buffer, and the extent comes from the type.
+#[derive(Clone, Debug)]
+pub struct Partition<T> {
+    pub shape: Vec<i64>,
+    pub _elem: std::marker::PhantomData<T>,
+}
+
+impl<T> Partition<T> {
+    pub fn shape(&self) -> &[i64] {
+        &self.shape
+    }
+
+    /// `part.load([i, j])`: the tile at the given partition coordinates.
+    pub fn load<const N: usize>(&self, _index: [i64; N]) -> Tile<T> {
+        Tile::new(self.shape.clone())
+    }
+
+    /// `part.store(tile, [i, j])`: write a tile at the given coordinates.
+    pub fn store<const N: usize>(&mut self, _tile: Tile<T>, _index: [i64; N]) {
         // no-op in host context; handled by codegen
     }
 }

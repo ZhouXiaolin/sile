@@ -582,10 +582,11 @@ impl CanonicalMatmulPlan {
                 buf,
                 row_coord,
                 col_coord,
+                outer_coords,
                 rows,
                 cols,
                 stride_shape_idx: 1,
-            } => (*buf, *row_coord, *col_coord, *rows, *cols),
+            } if outer_coords.is_empty() => (*buf, *row_coord, *col_coord, *rows, *cols),
             _ => return None,
         };
         let b_load_inst = find_inst(body, b_tile)?;
@@ -594,10 +595,11 @@ impl CanonicalMatmulPlan {
                 buf,
                 row_coord,
                 col_coord,
+                outer_coords,
                 rows,
                 cols,
                 stride_shape_idx: 1,
-            } => (*buf, *row_coord, *col_coord, *rows, *cols),
+            } if outer_coords.is_empty() => (*buf, *row_coord, *col_coord, *rows, *cols),
             _ => return None,
         };
         if a_buf_loaded != a_buf
@@ -629,10 +631,11 @@ impl CanonicalMatmulPlan {
                     value,
                     row_coord,
                     col_coord,
+                    outer_coords,
                     rows,
                     cols,
                     stride_shape_idx: 1,
-                } => (*buf, *value, *row_coord, *col_coord, *rows, *cols),
+                } if outer_coords.is_empty() => (*buf, *value, *row_coord, *col_coord, *rows, *cols),
                 _ => return None,
             };
         if store_value != exit_acc
@@ -673,7 +676,9 @@ fn shape_desc_source(tile_ir: &TileIrFunction, value: ValueId) -> Option<ValueId
     let param = tile_ir.params.iter().find(|param| param.value == value)?;
     match &param.kind {
         TileIrParamKind::ShapeDesc { source } => Some(*source),
-        TileIrParamKind::Buffer | TileIrParamKind::LaunchIndex { .. } => None,
+        TileIrParamKind::Buffer
+        | TileIrParamKind::LaunchIndex { .. }
+        | TileIrParamKind::Scalar { .. } => None,
     }
 }
 

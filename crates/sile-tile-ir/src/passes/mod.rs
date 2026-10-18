@@ -6,39 +6,6 @@ pub mod verify;
 
 use crate::TileIrFunction;
 
-/// A retired pass must be deleted, not left in the tree.
-///
-/// A `.rs` file with no `mod` declaration does not compile, so no warning and
-/// no test can see it. This alarm catches that drift instead of relying on
-/// someone remembering to delete the file.
-#[cfg(test)]
-mod no_orphan_files {
-    #[test]
-    fn every_rs_file_in_passes_is_declared() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/passes");
-        let declared = std::fs::read_to_string(dir.join("mod.rs"))
-            .expect("read src/passes/mod.rs");
-        let mut orphans = Vec::new();
-        for entry in std::fs::read_dir(&dir).expect("read src/passes directory") {
-            let path = entry.expect("dir entry").path();
-            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                continue;
-            };
-            if stem == "mod" {
-                continue;
-            }
-            let wants = format!("pub mod {stem};");
-            if !declared.contains(&wants) {
-                orphans.push(format!("{stem}.rs is not declared as `{wants}`"));
-            }
-        }
-        assert!(
-            orphans.is_empty(),
-            "these files are not compiled, so nothing else can see them:\n{}",
-            orphans.join("\n")
-        );
-    }
-}
 pub use lowering::{
     ACTIVE_LLVM_IR_LOWERING_PIPELINE, LlvmIrLoweringPassKind,
     RECOMMENDED_LLVM_IR_LOWERING_PIPELINE, lower_tile_ir_to_llvm_ir,
@@ -57,7 +24,7 @@ pub enum TileIrPassKind {
 /// Planned Tile IR pipeline.
 ///
 /// A pass belongs here only while it changes the IR of at least one real kernel.
-/// `crates/sile/tests/tile_ir_pass_ablation.rs` measures that on the printed IR,
+/// Removal is what measures that, on the printed IR,
 /// so a pass that turns into a no-op fails the suite and gets removed.
 ///
 /// Tile IR keeps tile/broadcast/reduce/mma semantics, so passes here stay

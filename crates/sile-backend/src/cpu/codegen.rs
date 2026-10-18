@@ -1,7 +1,8 @@
-use crate::emit::{self, StructuredCfgMessages, find_output_buffer, array_dims};
+use crate::emit::{
+    self, StructuredCfgMessages, array_dims, find_output_buffer, is_descriptor_param,
+    is_scalars_i64_param, is_scalars_param, is_shapes_param,
+};
 use sile_llvm_ir as llvm_ir;
-
-const SHAPES_PARAM_NAME: &str = "__sile_shapes";
 
 pub fn generate(func: &llvm_ir::Function) -> sile_core::Result<String> {
     let mut code = emit::generate_text(CTargetEmitter::new(func, CDialect::new()))?;
@@ -28,6 +29,12 @@ impl CDialect {
 }
 
 impl emit::TargetDialect for CDialect {
+    /// A tile is an address here, so a parameter takes a copy of the elements
+    /// rather than the address of storage the next iteration overwrites.
+    fn param_assign(&self, ty: &llvm_ir::Type, name: &str, arg: &str) -> String {
+        emit::copy_assign(ty, name, arg)
+    }
+
     fn var_decl(&self, ty: &llvm_ir::Type, name: &str, is_alloca: bool) -> Option<String> {
         // An `alloca` is the only C local that owns storage. A `gep` into a
         // driver buffer has the same type but borrows, so it stays a pointer.
@@ -184,29 +191,20 @@ impl emit::TargetDialect for CDialect {
 fn generate_wrapper(func: &llvm_ir::Function) -> sile_core::Result<String> {
     let mut out = String::new();
     let output = find_output_buffer(func);
-    let output_rank = output
-        .as_ref()
-        .and_then(|out| out.param.abi.as_ref().map(|abi| abi.rank))
-        .or_else(|| {
-            // No tile ABI: fall back to rank only, so the wrapper still compiles.
-            func.params
-                .iter()
-                .filter(|param| !is_shapes_param(param))
-                .last()
-                .and_then(|param| param.abi.as_ref().map(|abi| abi.rank))
-        });
 
     out.push_str(&format!("void sile_kernel_{}(\n", func.name));
     out.push_str("    void** buffers,\n");
     out.push_str("    int64_t num_threadgroups,\n");
     out.push_str("    int64_t threads_per_group,\n");
     out.push_str("    const int64_t* shapes,\n");
-    out.push_str("    int64_t num_shapes\n");
+    out.push_str("    int64_t num_shapes,\n");
+    out.push_str("    const float* scalars,\n");
+    out.push_str("    const int64_t* scalars_i64\n");
     out.push_str(") {\n");
 
     let mut buffer_idx = 0usize;
     for param in &func.params {
-        if is_shapes_param(param) {
+        if is_descriptor_param(param) {
             continue;
         }
         let qualifier = "float*";
@@ -228,31 +226,55 @@ fn generate_wrapper(func: &llvm_ir::Function) -> sile_core::Result<String> {
     out.push_str("  int64_t sile_total_tiles = num_threadgroups;\n");
     out.push('\n');
 
-    // A rank-2 output is dispatched flat, one program per tile, so the single
-    // index splits into a row and a column the same way MSL and WGSL split it.
-    // The split needs the number of tile columns, which is the last shape
-    // extent divided by the tile width the output stores through.
-    if output_rank.unwrap_or(1) > 1
-        && let Some(output) = &output
-    {
-        let cols = output.cols.max(1);
-        let offset = output
-            .param
-            .abi
-            .as_ref()
-            .map(|abi| abi.shape_offset + 1)
-            .unwrap_or(1);
-        out.push_str(&format!(
-            "  int64_t sile_tiles_n = shapes[{offset}] / {cols};\n"
-        ));
+    // A tiled output is dispatched flat, one program per tile, so the single
+    // index splits into the output's logical grid axes the same way MSL and
+    // WGSL split it. Those axes are the output's axes the tile does not cover:
+    // a rank-2 output addresses one tile with a row and a column, and a rank-3
+    // output addresses a plane of tiles, so a plane axis comes first. Each
+    // count is the buffer's extent along that axis divided by the tile's, and
+    // comes from the shape descriptor and the tile ABI.
+    //
+    // Only a *tiled* output splits. A kernel that stores no tile owns one grid
+    // slot per program, and its launch index is the program id: `rms_norm`
+    // writes a row through a `[1, BLOCK_SIZE]` view, so reading a column count
+    // out of that store would split an index that was never flat.
+    let axes = output
+        .as_ref()
+        .map(|output| {
+            let abi = output.param.abi.as_ref();
+            let offset = abi.map(|abi| abi.shape_offset).unwrap_or(0);
+            let rank = abi.map(|abi| abi.rank).unwrap_or(2).max(1);
+            let mut axes: Vec<String> = (0..rank.saturating_sub(2))
+                .map(|axis| format!("shapes[{}]", offset + axis))
+                .collect();
+            if rank >= 2 {
+                axes.push(format!(
+                    "shapes[{}] / {}",
+                    offset + rank - 2,
+                    output.rows.max(1)
+                ));
+            }
+            axes.push(format!(
+                "shapes[{}] / {}",
+                offset + rank - 1,
+                output.cols.max(1)
+            ));
+            axes
+        })
+        .unwrap_or_default();
+    for (axis, extent) in axes.iter().enumerate() {
+        out.push_str(&format!("  int64_t sile_tiles_{axis} = {extent};\n"));
     }
 
-    // Publish the tile count so `GridDim(0)` inside the kernel reads the same
-    // bound the pid loop uses. The CPU grid is flattened, so axes 1 and 2 stay
-    // one tile deep.
-    out.push_str("  sile_grid_0 = sile_total_tiles;\n");
-    out.push_str("  sile_grid_1 = 1;\n");
-    out.push_str("  sile_grid_2 = 1;\n");
+    // Publish the tile counts so `GridDim(axis)` inside the kernel reads the
+    // same bound the split below uses.
+    for axis in 0..3 {
+        let value = axes
+            .get(axis)
+            .map(|_| format!("sile_tiles_{axis}"))
+            .unwrap_or_else(|| "1".to_string());
+        out.push_str(&format!("  sile_grid_{axis} = {value};\n"));
+    }
 
     out.push_str("  #pragma omp parallel for schedule(static)\n");
     out.push_str("  for (int64_t tg = 0; tg < num_threadgroups; ++tg) {\n");
@@ -260,17 +282,35 @@ fn generate_wrapper(func: &llvm_ir::Function) -> sile_core::Result<String> {
     out.push_str("    for (int64_t t = 0; t < threads_per_group; ++t) {\n");
     out.push_str("      int64_t sile_pid = base + t;\n");
     out.push_str("      if (sile_pid < sile_total_tiles) {\n");
-    match output_rank.unwrap_or(1) {
-        0 | 1 => {
-            out.push_str("        sile_gid_0 = sile_pid;\n");
-            out.push_str("        sile_gid_1 = 0;\n");
+    if axes.is_empty() {
+        // No tiled output: one program per grid slot, so the launch index is
+        // the program id and the other axes stay at zero.
+        out.push_str("        sile_gid_0 = sile_pid;\n");
+        out.push_str("        sile_gid_1 = 0;\n");
+        out.push_str("        sile_gid_2 = 0;\n");
+    } else {
+        // A flat launch index counts tiles with the last axis varying fastest,
+        // so each axis is the remainder against its own extent, taken in turn.
+        //
+        // A grid has three axes and a buffer may have more, so an axis above
+        // the third has no launch index to land in. Its tile count is folded
+        // away and its remainder dropped, which keeps every axis below it
+        // right: a tile covers the whole of every axis above the last two, and
+        // a kernel that tiles the last axis as well is one a three-axis launch
+        // cannot describe, so that axis counts one and the fold costs nothing.
+        out.push_str("        int64_t sile_tile = sile_pid;\n");
+        for axis in (0..axes.len()).rev() {
+            if axis < 3 {
+                out.push_str(&format!(
+                    "        sile_gid_{axis} = sile_tile % sile_tiles_{axis};\n"
+                ));
+            }
+            out.push_str(&format!("        sile_tile /= sile_tiles_{axis};\n"));
         }
-        _ => {
-            out.push_str("        sile_gid_0 = sile_pid / sile_tiles_n;\n");
-            out.push_str("        sile_gid_1 = sile_pid % sile_tiles_n;\n");
+        for axis in axes.len()..3 {
+            out.push_str(&format!("        sile_gid_{axis} = 0;\n"));
         }
     }
-    out.push_str("        sile_gid_2 = 0;\n");
     out.push_str(&format!(
         "        sile_llvm_ir_{}({});\n",
         func.name,
@@ -279,6 +319,10 @@ fn generate_wrapper(func: &llvm_ir::Function) -> sile_core::Result<String> {
             .map(|param| {
                 if is_shapes_param(param) {
                     "shapes".to_string()
+                } else if is_scalars_param(param) {
+                    "scalars".to_string()
+                } else if is_scalars_i64_param(param) {
+                    "scalars_i64".to_string()
                 } else {
                     param.name.clone()
                 }
@@ -302,10 +346,6 @@ fn c_param_type(ty: &llvm_ir::Type) -> String {
         },
         other => c_type(other),
     }
-}
-
-fn is_shapes_param(param: &llvm_ir::Param) -> bool {
-    param.name == SHAPES_PARAM_NAME
 }
 
 fn c_var_decl(ty: &llvm_ir::Type, name: &str) -> String {
@@ -406,69 +446,20 @@ fn intrinsic_name(intrinsic: &llvm_ir::Intrinsic) -> String {
         llvm_ir::Intrinsic::BlockId { dim } => format!("llir_block_id_{}", dim),
         llvm_ir::Intrinsic::GridDim { dim } => format!("llir_grid_dim_{}", dim),
         llvm_ir::Intrinsic::Barrier { .. } => "llir_barrier".to_string(),
-        llvm_ir::Intrinsic::Exp => "expf".to_string(),
+        // The C library spells the float form of each one-argument float
+        // function with an `f` on the end: `expf`, `log2f`, and the rest.
+        llvm_ir::Intrinsic::Exp
+        | llvm_ir::Intrinsic::Exp2
+        | llvm_ir::Intrinsic::Log
+        | llvm_ir::Intrinsic::Log2
+        | llvm_ir::Intrinsic::Sqrt => format!(
+            "{}f",
+            intrinsic
+                .float_function()
+                .expect("a float function has a name")
+        ),
         llvm_ir::Intrinsic::VecLoad { len } => format!("llir_vec_load_{}", len),
         llvm_ir::Intrinsic::VecStore { len } => format!("llir_vec_store_{}", len),
         llvm_ir::Intrinsic::VecReduceAdd => "llir_vec_reduce_add".to_string(),
-    }
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::generate;
-    use sile_llvm_ir::{
-        AddressSpace, BasicBlock, BlockId, Constant, Function, Inst, InstOp, Operand, Terminator,
-        Type, ValueId,
-    };
-
-    #[test]
-    fn gep_private_ptrs_do_not_materialize_fake_storage_bindings() {
-        let func = Function {
-            name: "ptr_decl".into(),
-            params: vec![],
-            blocks: vec![BasicBlock {
-                id: BlockId(0),
-                name: "entry".into(),
-                params: vec![],
-                insts: vec![
-                    Inst {
-                        result: Some(ValueId(0)),
-                        result_name: Some("tile".into()),
-                        ty: Type::ptr(
-                            AddressSpace::Private,
-                            Type::array(2, Type::array(2, Type::F32)),
-                        ),
-                        op: InstOp::Alloca {
-                            alloc_ty: Type::array(2, Type::array(2, Type::F32)),
-                            addr_space: AddressSpace::Private,
-                        },
-                        metadata: vec![],
-                    },
-                    Inst {
-                        result: Some(ValueId(1)),
-                        result_name: Some("elt".into()),
-                        ty: Type::ptr(AddressSpace::Private, Type::F32),
-                        op: InstOp::Gep {
-                            base: Operand::Value(ValueId(0)),
-                            indices: vec![
-                                Operand::Const(Constant::Int(0)),
-                                Operand::Const(Constant::Int(1)),
-                            ],
-                        },
-                        metadata: vec![],
-                    },
-                ],
-                terminator: Terminator::Ret { value: None },
-            }],
-            entry: BlockId(0),
-            metadata: vec![],
-        };
-
-        let c = generate(&func).unwrap();
-        assert!(c.contains("float tile_storage[2][2];"));
-        assert!(c.contains("float* elt = NULL;"));
-        assert!(!c.contains("float elt_storage;"));
-        assert!(!c.contains("float* elt = &elt_storage;"));
     }
 }

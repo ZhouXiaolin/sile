@@ -1,4 +1,7 @@
-use crate::emit::{self, StructuredCfgMessages, TargetDialect, array_dims, find_output_buffer, OutputBuffer};
+use crate::emit::{
+    self, OutputBuffer, StructuredCfgMessages, TargetDialect, array_dims, find_output_buffer,
+    find_output_param,
+};
 use sile_llvm_ir as llvm_ir;
 
 const SHAPES_PARAM_NAME: &str = "__sile_shapes";
@@ -16,6 +19,9 @@ pub fn generate(func: &llvm_ir::Function) -> sile_core::Result<String> {
 struct MetalDialect<'a> {
     func: &'a llvm_ir::Function,
     output: Option<OutputBuffer<'a>>,
+    /// The output even when it stores no tile, so the launch index still has a
+    /// place to come from.
+    output_param: Option<&'a llvm_ir::Param>,
 }
 
 impl<'a> MetalDialect<'a> {
@@ -23,6 +29,7 @@ impl<'a> MetalDialect<'a> {
         Ok(Self {
             func,
             output: find_output_buffer(func),
+            output_param: find_output_param(func),
         })
     }
 
@@ -39,17 +46,19 @@ impl<'a> MetalDialect<'a> {
             })
     }
 
-    /// Extent of grid axis `dim`, reconstructed from the output buffer's shape.
+    /// Extent of logical grid axis `dim`.
     ///
-    /// Metal dispatches one thread per tile, so axis 0 spans every tile in the
-    /// output, and axes 1 and 2 are always one tile deep.
+    /// Metal dispatches one thread per tile, so the axes are the tile counts
+    /// along the output's axes. The count comes from the shape descriptor and
+    /// the tile ABI, so no launch-time value is needed.
     fn grid_dim_expr(&self, dim: u8) -> sile_core::Result<String> {
-        if dim != 0 {
-            return Ok("1".to_string());
-        }
         let Some(output) = self.output.as_ref() else {
-            // No output ABI: one thread per grid slot.
-            return Ok("(int64_t)gid.x".to_string());
+            // The output has no tile, so one program owns one grid slot and
+            // the grid is the flat launch size.
+            return Ok(match dim {
+                0 => "(int64_t)gid.x".to_string(),
+                _ => "1".to_string(),
+            });
         };
         let Some(abi) = output.param.abi.as_ref() else {
             return Err(sile_core::Error::Compile(
@@ -57,22 +66,19 @@ impl<'a> MetalDialect<'a> {
             ));
         };
         let shapes = self.shapes_param_name()?;
-        if abi.rank <= 1 {
-            return Ok(format!("({shapes}[{}] / {})", abi.shape_offset, output.cols));
-        }
-        Ok(format!(
-            "(({shapes}[{}] / {}) * (({shapes}[{}] / {}))",
-            abi.shape_offset,
-            output.rows,
-            abi.shape_offset + 1,
-            output.cols,
-        ))
+        let axes = emit::grid_axis_exprs(abi, output.rows, output.cols, &shapes);
+        Ok(axes
+            .get(dim as usize)
+            .cloned()
+            .unwrap_or_else(|| "1".to_string()))
     }
 
-    /// Program index along `dim`, read from the flat thread position.
+    /// Program index along logical grid axis `dim`.
     ///
-    /// A rank-2 output uses one thread per element tile, so the flat index
-    /// splits into a row and a column count.
+    /// One thread owns one tile, so the thread's flat position in the grid
+    /// counts tiles with the last axis varying fastest. Dividing by the strides
+    /// after `dim` and taking the remainder recovers the index along `dim`,
+    /// whether the output has one axis, two or three.
     fn logical_block_id_expr(&self, dim: u8) -> sile_core::Result<String> {
         let index = |dim: u8| -> String {
             match dim {
@@ -82,13 +88,27 @@ impl<'a> MetalDialect<'a> {
                 _ => unreachable!("guarded by the caller"),
             }
         };
-        let Some(output) = self.output.as_ref() else {
+        // A kernel whose output has no tile (an atomic accumulation, for
+        // example) dispatches one program per grid slot, so the launch index is
+        // the program id. Splitting it by the output's extent would put every
+        // program on the same row.
+        if self.output_param.is_none() {
             return Ok(index(dim));
+        }
+        let Some(output) = self.output.as_ref() else {
+            // The output stores no tile: it is written one element at a time,
+            // so one program owns one grid slot.
+            return Ok(match dim {
+                0 => index(0),
+                1 | 2 => "0".into(),
+                _ => index(dim),
+            });
         };
+        // The axes and the rank come from the buffer that stores the tile, not
+        // from the last parameter: a kernel whose last parameter is an input
+        // has that input's shape where the output's belongs.
         let Some(abi) = output.param.abi.as_ref() else {
-            return Err(sile_core::Error::Compile(
-                "missing output ABI for Metal codegen".into(),
-            ));
+            return Ok(index(dim));
         };
         if abi.rank <= 1 {
             return Ok(match dim {
@@ -102,21 +122,22 @@ impl<'a> MetalDialect<'a> {
             });
         }
         let shapes = self.shapes_param_name()?;
-        let tiles_n = format!("({shapes}[{}] / {})", abi.shape_offset + 1, output.cols);
-        Ok(match dim {
-            0 => format!("((int64_t)gid.x / {tiles_n})"),
-            1 => format!("((int64_t)gid.x % {tiles_n})"),
-            2 => "0".into(),
-            _ => {
-                return Err(sile_core::Error::Compile(format!(
-                    "unsupported block_id dimension in Metal codegen: {dim}"
-                )));
-            }
-        })
+        let axes = emit::grid_axis_exprs(abi, output.rows, output.cols, &shapes);
+        let Some(extent) = axes.get(dim as usize) else {
+            return Ok("0".to_string());
+        };
+        let stride = emit::grid_axis_stride(&axes, dim as usize);
+        Ok(format!("((int64_t)gid.x / ({stride}) % ({extent}))"))
     }
 }
 
 impl TargetDialect for MetalDialect<'_> {
+    /// A tile is an address here, so a parameter takes a copy of the elements
+    /// rather than the address of storage the next iteration overwrites.
+    fn param_assign(&self, ty: &llvm_ir::Type, name: &str, arg: &str) -> String {
+        emit::copy_assign(ty, name, arg)
+    }
+
     fn var_decl(
         &self,
         ty: &llvm_ir::Type,
@@ -205,13 +226,20 @@ impl TargetDialect for MetalDialect<'_> {
                     "barrier intrinsic is not yet supported in LLVM IR Metal codegen".into(),
                 ));
             }
-            llvm_ir::Intrinsic::Exp => {
+            llvm_ir::Intrinsic::Exp
+            | llvm_ir::Intrinsic::Exp2
+            | llvm_ir::Intrinsic::Log
+            | llvm_ir::Intrinsic::Log2
+            | llvm_ir::Intrinsic::Sqrt => {
                 let [arg] = args else {
                     return Err(sile_core::Error::Compile(
-                        "exp intrinsic expects one argument".into(),
+                        "a float function takes one argument".into(),
                     ));
                 };
-                format!("{} = metal::exp({});", name(), format_operand(arg))
+                let function = intrinsic
+                    .float_function()
+                    .expect("a float function has a name");
+                format!("{} = metal::{}({});", name(), function, format_operand(arg))
             }
             llvm_ir::Intrinsic::VecLoad { len } => {
                 let [ptr, offset] = args else {

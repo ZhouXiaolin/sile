@@ -122,7 +122,7 @@ pub fn compile_to_llvm_ir(typed: &TypedKernel) -> Result<(TileIrFunction, LlvmIr
 }
 
 pub fn compile_kernel_to_llvm_ir(
-    kernel: &'static Kernel,
+    kernel: &Kernel,
 ) -> Result<(TypedKernel, TileIrFunction, LlvmIrFunction)> {
     let (typed, tile_ir) = run_hir_pipeline(kernel, ACTIVE_HIR_PIPELINE)?;
     let tile_to_llvm = compose_tile_ir_to_llvm_ir_pipeline(ACTIVE_TILE_IR_PIPELINE);
@@ -132,7 +132,7 @@ pub fn compile_kernel_to_llvm_ir(
 }
 
 pub fn run_hir_pipeline(
-    kernel: &'static Kernel,
+    kernel: &Kernel,
     pipeline: &[HirPassKind],
 ) -> Result<(TypedKernel, TileIrFunction)> {
     let mut typed = None;
@@ -197,7 +197,7 @@ pub fn compile_to_backend_source(
 }
 
 pub fn compile_kernel_to_backend_source(
-    kernel: &'static Kernel,
+    kernel: &Kernel,
     target: CodegenTarget,
 ) -> Result<(TypedKernel, TileIrFunction, LlvmIrFunction, BackendArtifact)> {
     let (typed, tile_ir) = run_hir_pipeline(kernel, ACTIVE_HIR_PIPELINE)?;

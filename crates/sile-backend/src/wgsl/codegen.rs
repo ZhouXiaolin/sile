@@ -16,6 +16,16 @@ use sile_llvm_ir::{Operand, ValueId};
 /// tile, so the invocation id is the tile index.
 const LAUNCH_INDEX: &str = "sile_launch_index";
 
+/// WGSL spelling of the scalar descriptor.
+///
+/// The IR name `__sile_scalars` starts with a double underscore, which WGSL
+/// reserves, so the binding is declared under a legal name and the emitter
+/// renames the parameter through [`TargetDialect::scalars_name`].
+const SCALARS_NAME: &str = "sile_scalars";
+
+/// WGSL spelling of the integer scalar descriptor.
+const SCALARS_I64_NAME: &str = "sile_scalars_i64";
+
 pub fn generate(func: &llvm_ir::Function) -> Result<String> {
     let dialect = WgslDialect::new(func)?;
     emit::generate_text(emit::TargetEmitter::new(func, dialect))
@@ -52,7 +62,7 @@ struct WgslDialect<'a> {
     /// sees as a pointer is an element here. The rule that spells it lives once
     /// in the shared emitter as `element_operand`, and this table is the input
     /// it reads.
-    gep_elements: HashMap<ValueId, (Operand, Vec<Operand>)>,
+    gep_elements: HashMap<ValueId, emit::GepLink>,
     /// Number of float atomic sites emitted so far.
     ///
     /// Each site names its own compare-exchange locals, and WGSL declares them
@@ -161,7 +171,7 @@ impl<'a> WgslDialect<'a> {
             emit::walk_gep_chain(ptr, &self.gep_elements).unwrap_or((ptr, Vec::new()));
         let index = indices
             .iter()
-            .map(|index| format_operand(index))
+            .map(|(index, stride)| emit::scaled_index(index, *stride, &format_operand))
             .collect::<Vec<_>>()
             .join(" + ");
         // The alias binding is named after the kernel parameter it covers, so
@@ -185,32 +195,40 @@ impl<'a> WgslDialect<'a> {
 
     /// Binding index of one parameter.
     ///
-    /// Kernel buffers bind from zero in parameter order, and the shape
-    /// descriptor binds after all of them, so a kernel's bindings stay stable
-    /// however many shapes it carries.
+    /// Kernel buffers bind from zero in parameter order, and the two
+    /// descriptors bind after all of them, the shapes first and the scalars
+    /// second, so a kernel's bindings stay stable however many shapes or
+    /// scalars it carries.
     fn binding_index(&self, param: &llvm_ir::Param) -> usize {
+        let buffers = self
+            .func
+            .params
+            .iter()
+            .filter(|other| !emit::is_descriptor_param(other))
+            .count();
         if emit::is_shapes_param(param) {
-            return self
-                .func
-                .params
-                .iter()
-                .filter(|other| !emit::is_shapes_param(other))
-                .count();
+            return buffers;
+        }
+        if emit::is_scalars_param(param) {
+            return buffers + 1;
+        }
+        if emit::is_scalars_i64_param(param) {
+            return buffers + 2;
         }
         self.func
             .params
             .iter()
-            .filter(|other| !emit::is_shapes_param(other))
+            .filter(|other| !emit::is_descriptor_param(other))
             .position(|other| other.id == param.id)
             .unwrap_or(0)
     }
 
     /// `array<f32>` with the address space WGSL requires for this parameter.
     ///
-    /// A read-only buffer is `read`, a mutable one is `read_write`, and the
-    /// shape descriptor is read-only.
+    /// A read-only buffer is `read`, a mutable one is `read_write`, and both
+    /// descriptors are read-only.
     fn storage_decl(&self, param: &llvm_ir::Param) -> String {
-        let access = if emit::is_shapes_param(param) {
+        let access = if emit::is_descriptor_param(param) {
             "read"
         } else {
             "read_write"
@@ -221,24 +239,30 @@ impl<'a> WgslDialect<'a> {
         };
         let name = if emit::is_shapes_param(param) {
             self.shapes_name.clone()
+        } else if emit::is_scalars_param(param) {
+            SCALARS_NAME.to_string()
+        } else if emit::is_scalars_i64_param(param) {
+            SCALARS_I64_NAME.to_string()
         } else {
             param.name.clone()
         };
         format!("var<storage, {access}> {name}: array<{elem}>;")
     }
 
-    /// Program index along `dim`.
+    /// Program index along logical grid axis `dim`.
     ///
-    /// A rank-1 output puts one workgroup item on each tile, so the launch
-    /// index along x is the tile index directly. A rank-2 output is dispatched
-    /// flat, one workgroup item per tile, so the x component carries both axes
-    /// and splits into a row count and a column count exactly as in C and MSL.
+    /// One workgroup item owns one tile, and the dispatch flattens the grid
+    /// onto the x axis of the invocation id. Dividing the flat index by the
+    /// strides after `dim` and taking the remainder recovers the index along
+    /// `dim`, whether the output has one axis, two or three. Reading `y` here
+    /// instead would make every program of a rank-2 kernel the same row:
+    /// `dispatch_workgroups(n, 1, 1)` leaves y at zero.
     fn block_id_expr(&self, dim: u8) -> String {
         let flat = format!("i64({LAUNCH_INDEX}.x)");
         let Some(output) = self.output.as_ref() else {
             return match dim {
                 0 => flat,
-                _ => "0".to_string(),
+                _ => "i64(0)".to_string(),
             };
         };
         let Some(abi) = output.param.abi.as_ref() else {
@@ -247,51 +271,36 @@ impl<'a> WgslDialect<'a> {
         if abi.rank <= 1 {
             return match dim {
                 0 => flat,
-                _ => "0".to_string(),
+                _ => "i64(0)".to_string(),
             };
         }
-        let tiles_n = format!(
-            "({shapes}[{}] / {})",
-            abi.shape_offset + 1,
-            output.cols.max(1),
-            shapes = self.shapes_name
-        );
-        match dim {
-            0 => format!("({flat} / {tiles_n})"),
-            1 => format!("({flat} % {tiles_n})"),
-            _ => "0".to_string(),
-        }
+        let axes = emit::grid_axis_exprs(abi, output.rows, output.cols, &self.shapes_name);
+        let Some(extent) = axes.get(dim as usize) else {
+            return "i64(0)".to_string();
+        };
+        let stride = emit::grid_axis_stride(&axes, dim as usize);
+        format!("(({flat} / ({stride})) % ({extent}))")
     }
 
-    /// Grid extent along `dim`, reconstructed from the output buffer's shape.
+    /// Extent of logical grid axis `dim`.
     ///
-    /// One workgroup item owns one tile, so axis 0 spans the output's tile count
-    /// and the other axes stay one deep.
+    /// One workgroup item owns one tile, so the axis is the output's tile count
+    /// along it. The count comes from the shape descriptor and the tile ABI.
     fn grid_dim_expr(&self, dim: u8) -> Result<String> {
-        if dim != 0 {
-            return Ok("1".to_string());
-        }
         let Some(output) = self.output.as_ref() else {
-            return Ok(format!("i64({LAUNCH_INDEX}.x)"));
+            return Ok(match dim {
+                0 => format!("i64({LAUNCH_INDEX}.x)"),
+                _ => "i64(1)".to_string(),
+            });
         };
         let abi = output.param.abi.as_ref().ok_or_else(|| {
             sile_core::Error::Compile("missing output ABI for WGSL grid_dim".into())
         })?;
-        let offset = abi.shape_offset;
-        if abi.rank <= 1 {
-            return Ok(format!(
-                "({SHAPES}[{offset}] / {})",
-                output.cols.max(1),
-                SHAPES = self.shapes_name
-            ));
-        }
-        Ok(format!(
-            "(({SHAPES}[{offset}] / {rows}) * ({SHAPES}[{}] / {cols}))",
-            offset + 1,
-            SHAPES = self.shapes_name,
-            rows = output.rows.max(1),
-            cols = output.cols.max(1)
-        ))
+        let axes = emit::grid_axis_exprs(abi, output.rows, output.cols, &self.shapes_name);
+        Ok(axes
+            .get(dim as usize)
+            .cloned()
+            .unwrap_or_else(|| "i64(1)".to_string()))
     }
 }
 
@@ -341,8 +350,26 @@ fn array_element_count(ty: &llvm_ir::Type) -> usize {
 }
 
 impl TargetDialect for WgslDialect<'_> {
+    /// WGSL has no infinity and no NaN constant, so a non-finite value is the
+    /// bit pattern it stands for. `bitcast` is a constant expression, so this
+    /// stays a literal wherever a literal is allowed.
+    fn float_literal(value: f64) -> String {
+        if value.is_finite() {
+            return emit::float_literal(value);
+        }
+        format!("bitcast<f32>({:#010x}u)", (value as f32).to_bits())
+    }
+
     fn shapes_name(&self) -> String {
         self.shapes_name.clone()
+    }
+
+    fn scalars_name(&self) -> String {
+        SCALARS_NAME.to_string()
+    }
+
+    fn scalars_i64_name(&self) -> String {
+        SCALARS_I64_NAME.to_string()
     }
 
     fn var_decl(&self, ty: &llvm_ir::Type, name: &str, _is_alloca: bool) -> Option<String> {
@@ -374,10 +401,10 @@ impl TargetDialect for WgslDialect<'_> {
 
     fn prelude_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
-        // Kernel buffers bind first, then the shapes descriptor, so a kernel's
-        // bindings stay stable no matter how many shapes it carries.
+        // Kernel buffers bind first, then the two descriptors, so a kernel's
+        // bindings stay stable no matter how many shapes or scalars it carries.
         for param in &self.func.params {
-            if emit::is_shapes_param(param) {
+            if emit::is_descriptor_param(param) {
                 continue;
             }
             lines.push(format!(
@@ -387,7 +414,7 @@ impl TargetDialect for WgslDialect<'_> {
             ));
         }
         for param in &self.func.params {
-            if emit::is_shapes_param(param) {
+            if emit::is_descriptor_param(param) {
                 lines.push(format!(
                     "@group(0) @binding({}) {}",
                     self.binding_index(param),
@@ -456,13 +483,20 @@ impl TargetDialect for WgslDialect<'_> {
                 format!("let {} = {};", name(), self.grid_dim_expr(*dim)?)
             }
             llvm_ir::Intrinsic::Barrier { .. } => "workgroupBarrier();".to_string(),
-            llvm_ir::Intrinsic::Exp => {
+            llvm_ir::Intrinsic::Exp
+            | llvm_ir::Intrinsic::Exp2
+            | llvm_ir::Intrinsic::Log
+            | llvm_ir::Intrinsic::Log2
+            | llvm_ir::Intrinsic::Sqrt => {
                 let [arg] = args else {
                     return Err(sile_core::Error::Compile(
-                        "WGSL exp intrinsic expects one argument".into(),
+                        "a float function takes one argument".into(),
                     ));
                 };
-                format!("let {} = exp({});", name(), format_operand(arg))
+                let function = intrinsic
+                    .float_function()
+                    .expect("a float function has a name");
+                format!("let {} = {}({});", name(), function, format_operand(arg))
             }
             llvm_ir::Intrinsic::VecLoad { len } => {
                 let [ptr, offset] = args else {
