@@ -624,20 +624,21 @@ impl CanonicalMatmulPlan {
         let [store_inst] = exit.insts.as_slice() else {
             return None;
         };
-        let (c_buf, store_value, store_row, store_col, store_rows, store_cols) =
-            match &store_inst.op {
-                TileIrOp::StorePtrTko {
-                    buf,
-                    value,
-                    row_coord,
-                    col_coord,
-                    outer_coords,
-                    rows,
-                    cols,
-                    stride_shape_idx: 1,
-                } if outer_coords.is_empty() => (*buf, *value, *row_coord, *col_coord, *rows, *cols),
-                _ => return None,
-            };
+        let (c_buf, store_value, store_row, store_col, store_rows, store_cols) = match &store_inst
+            .op
+        {
+            TileIrOp::StorePtrTko {
+                buf,
+                value,
+                row_coord,
+                col_coord,
+                outer_coords,
+                rows,
+                cols,
+                stride_shape_idx: 1,
+            } if outer_coords.is_empty() => (*buf, *value, *row_coord, *col_coord, *rows, *cols),
+            _ => return None,
+        };
         if store_value != exit_acc
             || store_row != row_launch
             || store_col != col_launch

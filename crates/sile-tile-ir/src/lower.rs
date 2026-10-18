@@ -46,12 +46,20 @@ pub fn lower_to_tile_ir(typed: &TypedKernel) -> TileIrFunction {
 
     // Lower body statements. A `continue` cannot reach here: the checker
     // rejects one outside a loop, and a loop body lowers its own statements.
+    // A `return` seals the block it sits in, so the statements after it — and
+    // the trailing return below — have nothing to lower.
+    let mut returned = false;
     for stmt in &typed.kernel.body {
-        let _ = lower_stmt(stmt, &mut ctx);
+        if lower_stmt(stmt, &mut ctx) == Flow::Returned {
+            returned = true;
+            break;
+        }
     }
 
     // Seal the current block with return
-    ctx.seal_block(TileIrTerminator::Return);
+    if !returned {
+        ctx.seal_block(TileIrTerminator::Return);
+    }
 
     ctx.finish()
 }
@@ -74,6 +82,9 @@ struct LowerCtx<'a> {
     next_block: u32,
     /// Pending block params for an exit block that hasn't been sealed yet
     pending_exit_params: Option<(BlockId, Vec<ValueId>)>,
+    /// The enclosing loops, innermost last. A `break` or a `continue` jumps
+    /// to the one on top.
+    loop_targets: Vec<LoopTarget>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -93,6 +104,7 @@ impl<'a> LowerCtx<'a> {
             next_value: 0,
             next_block: 0,
             pending_exit_params: None,
+            loop_targets: Vec::new(),
         }
     }
 
@@ -225,11 +237,51 @@ impl<'a> LowerCtx<'a> {
 /// do not run, so the body stops lowering there and the loop's existing back
 /// edge to its header becomes the `continue`. Every other statement lets the
 /// next one follow it.
+///
+/// A `break` and a `return` end the path too, and each has sealed the current
+/// block itself — with the jump back to the loop header carrying a set done
+/// flag, or with the kernel's return — so the statement loop that reads the
+/// flow must stop without sealing anything of its own.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Flow {
     Next,
     Continue,
+    Break,
+    Returned,
 }
+
+/// The loop a `break` or a `continue` inside the block being lowered names.
+///
+/// The stack holds the enclosing loops, innermost last, so a jump always reads
+/// the one it belongs to. A jump's arguments are the values the loop's header
+/// reads on the next pass, and where they come from is what the variants say.
+enum LoopTarget {
+    /// A `while` or a `loop`. Its header reads the done flag first — one where
+    /// a `break` jumps, zero where a `continue` or the body's end does — and
+    /// then the loop-carried values. The flag lives under a name no kernel can
+    /// spell, so the body reads it the way it reads any local.
+    Done {
+        header: BlockId,
+        /// The carried names, with the done flag's name first.
+        carried: Vec<String>,
+    },
+    /// A `for` lowered as a CFG loop. Its header reads the next induction
+    /// value first, which a `continue` computes from the body's variable and
+    /// the step.
+    ForCfg {
+        header: BlockId,
+        var: String,
+        step: ValueId,
+        carried: Vec<String>,
+    },
+    /// A `for` whose bounds are constants small enough to unroll. It has no
+    /// header to jump to, so a `continue` only ends this copy of the body.
+    ForUnrolled,
+}
+
+/// The name the done flag travels under. A `\0` prefix cannot collide with a
+/// kernel identifier.
+const DONE_LOCAL: &str = "\0done";
 
 fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx<'_>) -> Flow {
     match stmt {
@@ -255,9 +307,36 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx<'_>) -> Flow {
             var,
             start,
             end,
+            step,
             body,
         } => {
-            lower_for_loop(var, start, end, body, ctx);
+            return lower_for_loop(var, start, end, step.as_ref(), body, ctx);
+        }
+        Stmt::While { cond, body } => {
+            return lower_while(Some(cond), body, ctx);
+        }
+        Stmt::Loop { body } => {
+            return lower_while(None, body, ctx);
+        }
+        // A `break` seals the jump to its loop's header with the done flag
+        // set, which is what makes the next test end the loop. The checker
+        // rejects one inside a `for`, whose header reads an induction value a
+        // break has no value for.
+        Stmt::Break => {
+            if let Some(LoopTarget::Done { header, carried }) = ctx.loop_targets.last() {
+                let header = *header;
+                let carried = carried.clone();
+                let args = loop_back_args(&carried, true, ctx);
+                ctx.seal_block(TileIrTerminator::Jump {
+                    target: header,
+                    args,
+                });
+            }
+            return Flow::Break;
+        }
+        Stmt::Return => {
+            ctx.seal_block(TileIrTerminator::Return);
+            return Flow::Returned;
         }
         Stmt::If {
             cond,
@@ -266,9 +345,85 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx<'_>) -> Flow {
         } => {
             return lower_if(cond, then_body, else_body, ctx);
         }
-        Stmt::Continue => return Flow::Continue,
+        // A `continue` ends the pass. A `while` or a `loop` takes its jump
+        // right here — the header's arguments are the values the loop holds at
+        // this point — and a `for` lowered as a loop does too, with the next
+        // induction value in the first slot. An unrolled `for` has no header,
+        // so the body's statement loop ends and the next unrolled copy runs.
+        Stmt::Continue => {
+            if let Some(target) = ctx.loop_targets.last() {
+                match target {
+                    LoopTarget::Done { header, carried } => {
+                        let header = *header;
+                        let carried = carried.clone();
+                        let args = loop_back_args(&carried, false, ctx);
+                        ctx.seal_block(TileIrTerminator::Jump {
+                            target: header,
+                            args,
+                        });
+                    }
+                    LoopTarget::ForCfg {
+                        header,
+                        var,
+                        step,
+                        carried,
+                    } => {
+                        let header = *header;
+                        let step = *step;
+                        let var = var.clone();
+                        let carried = carried.clone();
+                        let k = ctx
+                            .locals
+                            .get(&var)
+                            .copied()
+                            .expect("for loop induction variable");
+                        let k_next = ctx.emit(
+                            TileIrOp::IBinary {
+                                op: BinOp::Add,
+                                lhs: k,
+                                rhs: step,
+                            },
+                            TileIrType::I64,
+                        );
+                        let mut args = vec![k_next];
+                        for name in &carried {
+                            args.push(ctx.locals.get(name).copied().expect("carried value"));
+                        }
+                        ctx.seal_block(TileIrTerminator::Jump {
+                            target: header,
+                            args,
+                        });
+                    }
+                    LoopTarget::ForUnrolled => {}
+                }
+            }
+            return Flow::Continue;
+        }
     }
     Flow::Next
+}
+
+/// The values a jump back to a `while` or `loop` header carries.
+///
+/// The first slot is the done flag: one when a `break` jumps, the flag as the
+/// body holds it otherwise. The rest are the loop-carried names, read at the
+/// point the jump leaves — inside a branch, the values the branch's own
+/// parameters hold.
+fn loop_back_args(carried: &[String], broken: bool, ctx: &mut LowerCtx<'_>) -> Vec<ValueId> {
+    let mut args = Vec::with_capacity(carried.len());
+    for (i, name) in carried.iter().enumerate() {
+        if broken && i == 0 {
+            args.push(ctx.emit(TileIrOp::ConstI64(1), TileIrType::I64));
+        } else {
+            args.push(
+                ctx.locals
+                    .get(name)
+                    .copied()
+                    .expect("loop flag or carried value"),
+            );
+        }
+    }
+    args
 }
 
 /// `if cond { .. } else { .. }`.
@@ -289,8 +444,12 @@ fn lower_if(cond: &Expr, then_body: &[Stmt], else_body: &[Stmt], ctx: &mut Lower
     // nothing at all when it passes zero.
     if let Some(taken) = try_eval_cond(cond, ctx) {
         for stmt in if taken { then_body } else { else_body } {
-            if lower_stmt(stmt, ctx) == Flow::Continue {
-                return Flow::Continue;
+            match lower_stmt(stmt, ctx) {
+                Flow::Next => {}
+                // The arm ended itself — a `continue` or a `break` sealed its
+                // jump, a `return` sealed the kernel's — so this branch ends
+                // where the arm did.
+                flow => return flow,
             }
         }
         return Flow::Next;
@@ -321,8 +480,14 @@ fn lower_if(cond: &Expr, then_body: &[Stmt], else_body: &[Stmt], ctx: &mut Lower
 
     let then_args = lower_branch(then_id, then_body, &init, join_id, ctx);
     let else_args = lower_branch(else_id, else_body, &init, join_id, ctx);
-    debug_assert_eq!(then_args.len(), init.len());
-    debug_assert_eq!(else_args.len(), init.len());
+
+    // An arm that ended itself — with a `return`, or with a jump a `break` or
+    // a `continue` sealed — has no edge to the join. When both arms ended that
+    // way the join has no predecessor at all: every path left the statement
+    // sequence here, so the caller stops lowering and seals nothing.
+    if then_args.is_none() && else_args.is_none() {
+        return Flow::Continue;
+    }
 
     // ── Join block ──
     //
@@ -351,13 +516,19 @@ fn lower_if(cond: &Expr, then_body: &[Stmt], else_body: &[Stmt], ctx: &mut Lower
 /// The arm receives every carried name as a block parameter, so it reads and
 /// writes the names the enclosing scope had. A name the arm does not assign
 /// keeps its parameter, and that value is what the arm passes on.
+///
+/// `None` says the arm ended itself — with a `return`, or with a jump a
+/// `break` or a `continue` sealed — and has no edge to the join. An arm that
+/// runs to its end returns the values it passes, which are the carried names
+/// even when the arm assigns none of them: an empty list is a real argument
+/// list then, not a sign that the arm ended early.
 fn lower_branch(
     block_id: BlockId,
     body: &[Stmt],
     init: &[(String, ValueId)],
     join_id: BlockId,
     ctx: &mut LowerCtx<'_>,
-) -> Vec<ValueId> {
+) -> Option<Vec<ValueId>> {
     ctx.current_block = block_id;
     let arm_params: Vec<ValueId> = init
         .iter()
@@ -370,10 +541,18 @@ fn lower_branch(
         })
         .collect();
     for stmt in body {
-        // A `continue` cannot reach here: the checker rejects one inside a
-        // branch, because the arm it sits in would end somewhere the other arm
-        // does not.
-        let _ = lower_stmt(stmt, ctx);
+        // An arm ends where its statements leave it: a plain sequence runs to
+        // the jump to the join, and a `return`, a `break` or a `continue`
+        // sealed its own end, so this arm has no edge to the join and nothing
+        // follows it. The arm's block is in the list either way, and it takes
+        // the parameters its incoming edge passes by id.
+        match lower_stmt(stmt, ctx) {
+            Flow::Next => {}
+            Flow::Continue | Flow::Break | Flow::Returned => {
+                ctx.set_block_params(block_id, arm_params);
+                return None;
+            }
+        }
     }
     // The arm ends where the statements left it, which is a nested construct's
     // join when the arm ends with one.
@@ -388,7 +567,7 @@ fn lower_branch(
     // The arm's own block takes the same parameters. The seal above may have
     // sealed a nested construct's join instead, so the parameters go on by id.
     ctx.set_block_params(block_id, arm_params);
-    args
+    Some(args)
 }
 
 /// The predicate a branch tests.
@@ -459,9 +638,23 @@ fn try_eval_cond(expr: &Expr, ctx: &LowerCtx<'_>) -> Option<bool> {
     try_eval_i64(expr, ctx).map(|value| value != 0)
 }
 
-fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut LowerCtx<'_>) {
+fn lower_for_loop(
+    var: &str,
+    start: &Expr,
+    end: &Expr,
+    step: Option<&Expr>,
+    body: &[Stmt],
+    ctx: &mut LowerCtx<'_>,
+) -> Flow {
     let start_const = try_eval_i64(start, ctx);
     let end_const = try_eval_i64(end, ctx);
+    // A plain range steps by one; `step_by(k)` names its own step. Unrolling
+    // needs the step as a constant, and the checker has already rejected a
+    // `step_by` the compiler cannot fold.
+    let step_const = match step {
+        Some(expr) => try_eval_i64(expr, ctx),
+        None => Some(1),
+    };
 
     // Bindings made inside the body are local to the loop, so the locals map
     // is restored when the loop ends. The type checker already rejects a use
@@ -470,32 +663,46 @@ fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut 
     let outer_locals = ctx.locals.clone();
 
     // If bounds are compile-time known and small, unroll.
-    if let (Some(start_val), Some(end_val)) = (start_const, end_const) {
-        if end_val - start_val <= 32 {
-            for i in start_val..end_val {
-                let const_val = ctx.emit(TileIrOp::ConstI64(i), TileIrType::I64);
-                ctx.locals.insert(var.to_string(), const_val);
-                for inner in body {
-                    // An unrolled `continue` ends this copy of the body, so the
-                    // remaining statements of this iteration do not run and the
-                    // next constant follows.
-                    if lower_stmt(inner, ctx) == Flow::Continue {
-                        break;
+    if let (Some(start_val), Some(end_val), Some(step_val)) = (start_const, end_const, step_const)
+        && step_val > 0
+        && end_val > start_val
+        && (end_val - start_val + step_val - 1) / step_val <= 32
+    {
+        ctx.loop_targets.push(LoopTarget::ForUnrolled);
+        let mut i = start_val;
+        while i < end_val {
+            let const_val = ctx.emit(TileIrOp::ConstI64(i), TileIrType::I64);
+            ctx.locals.insert(var.to_string(), const_val);
+            for inner in body {
+                // An unrolled `continue` ends this copy of the body, so the
+                // remaining statements of this iteration do not run and the
+                // next constant follows. A `return` ends the kernel, so no
+                // further copy runs either. A `break` cannot reach here: the
+                // checker rejects one inside a `for`.
+                match lower_stmt(inner, ctx) {
+                    Flow::Next => {}
+                    Flow::Continue => break,
+                    Flow::Returned => {
+                        ctx.loop_targets.pop();
+                        return Flow::Returned;
                     }
+                    Flow::Break => unreachable!("the checker rejects a `break` inside a `for`"),
                 }
             }
-            // An unrolled body still assigns to outer names, so their final
-            // values stay. Names the body introduced are dropped.
-            let outer_names: Vec<String> = outer_locals.keys().cloned().collect();
-            let mut restored = outer_locals;
-            for name in outer_names {
-                if let Some(value) = ctx.locals.get(&name).copied() {
-                    restored.insert(name, value);
-                }
-            }
-            ctx.locals = restored;
-            return;
+            i += step_val;
         }
+        ctx.loop_targets.pop();
+        // An unrolled body still assigns to outer names, so their final
+        // values stay. Names the body introduced are dropped.
+        let outer_names: Vec<String> = outer_locals.keys().cloned().collect();
+        let mut restored = outer_locals;
+        for name in outer_names {
+            if let Some(value) = ctx.locals.get(&name).copied() {
+                restored.insert(name, value);
+            }
+        }
+        ctx.locals = restored;
+        return Flow::Next;
     }
 
     // Otherwise: generate CFG loop with block parameters
@@ -551,6 +758,12 @@ fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut 
     let start_v = match start_const {
         Some(value) => ctx.emit(TileIrOp::ConstI64(value), TileIrType::I64),
         None => lower_expr(start, ctx),
+    };
+    // The step the header's next induction value adds. A folded one is a
+    // constant; otherwise the step expression lowers like any value.
+    let step_v = match step_const {
+        Some(value) => ctx.emit(TileIrOp::ConstI64(value), TileIrType::I64),
+        None => lower_expr(step.expect("a step the checker already folded"), ctx),
     };
     let mut jump_args = vec![start_v];
     jump_args.extend(init_carried.iter().map(|(_, v)| *v));
@@ -626,41 +839,68 @@ fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut 
         })
         .collect();
 
-    // Execute loop body. A `continue` stops the body here, and the back edge
-    // below carries the values the loop holds at that point, which is what a
-    // `continue` does: it ends this pass through the body and starts the next.
+    // Name the loop's jump target before the body lowers. A `continue` inside
+    // it — even one a branch holds — seals the jump back to this header right
+    // where the statement sits, with the next induction value in the first
+    // slot, so the body below adds no back edge of its own in that case.
+    ctx.loop_targets.push(LoopTarget::ForCfg {
+        header: header_id,
+        var: var.to_string(),
+        step: step_v,
+        carried: carried_names,
+    });
+
+    // Execute loop body. A `continue` ends the pass and has sealed its own
+    // jump; a `return` sealed the kernel's end; both leave the header fed by
+    // its other edges, so only a body that runs to its end seals the back
+    // edge here.
+    let mut ended_early = false;
+    let mut body_returned = false;
     for inner in body {
-        if lower_stmt(inner, ctx) == Flow::Continue {
-            break;
+        match lower_stmt(inner, ctx) {
+            Flow::Next => {}
+            Flow::Continue => {
+                ended_early = true;
+                break;
+            }
+            Flow::Returned => {
+                ended_early = true;
+                body_returned = true;
+                break;
+            }
+            Flow::Break => unreachable!("the checker rejects a `break` inside a `for`"),
         }
     }
 
-    // k_next = k + 1
-    let one = ctx.emit(TileIrOp::ConstI64(1), TileIrType::I64);
-    let k_next = ctx.emit(
-        TileIrOp::IBinary {
-            op: BinOp::Add,
-            lhs: body_k_param,
-            rhs: one,
-        },
-        TileIrType::I64,
-    );
-
-    // Collect new carried values (after body execution updated locals)
-    let mut back_args = vec![k_next];
-    for (name, _) in &carried_params {
-        let current = ctx.locals.get(name).copied().unwrap_or(k_next);
-        back_args.push(current);
-    }
+    ctx.loop_targets.pop();
 
     // Body block params
     let mut body_block_params = vec![body_k_param];
     body_block_params.extend(body_carried_params.iter().map(|(_, v)| *v));
 
-    ctx.seal_block(TileIrTerminator::Jump {
-        target: header_id,
-        args: back_args,
-    });
+    if !ended_early {
+        // k_next = k + step
+        let k_next = ctx.emit(
+            TileIrOp::IBinary {
+                op: BinOp::Add,
+                lhs: body_k_param,
+                rhs: step_v,
+            },
+            TileIrType::I64,
+        );
+
+        // Collect new carried values (after body execution updated locals)
+        let mut back_args = vec![k_next];
+        for (name, _) in &carried_params {
+            let current = ctx.locals.get(name).copied().unwrap_or(k_next);
+            back_args.push(current);
+        }
+
+        ctx.seal_block(TileIrTerminator::Jump {
+            target: header_id,
+            args: back_args,
+        });
+    }
 
     // Store body block params
     ctx.set_block_params(body_id, body_block_params);
@@ -719,6 +959,13 @@ fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut 
     // Simpler approach: just track that exit block has these params,
     // and when we seal it, inject them.
     ctx.pending_exit_params = Some((exit_id, placeholder.params));
+
+    // A `return` inside the body ended the kernel: the statements after the
+    // loop have nowhere to run, and the caller seals nothing.
+    if ended_early && body_returned {
+        return Flow::Returned;
+    }
+    Flow::Next
 }
 
 /// Find variables that are assigned within the bodies and already exist
@@ -727,6 +974,232 @@ fn lower_for_loop(var: &str, start: &Expr, end: &Expr, body: &[Stmt], ctx: &mut 
 /// A `let` in a body is not one of them: it is a fresh binding, so it has no
 /// value to carry in. Treating it as carried made the loop read a value from
 /// before the loop and write it back as if the body had assigned it.
+/// `while cond { .. }`, and `loop { .. }` as the `while` without a condition.
+///
+/// The header tests two things in one: the condition, and a done flag the loop
+/// carries with everything else. A `break` jumps back to the header with the
+/// flag set, so the next test ends the loop. The flag is what lets a break
+/// reach the header instead of needing its own edge to the exit, which keeps
+/// the exit a block with one predecessor and the loop one back edge.
+///
+/// The flag and the condition combine in one select: go on where the flag is
+/// clear and the condition holds. Both sides are masks of ones and zeroes in
+/// the condition's kind — counts or floats alike — so the select converts
+/// nothing.
+fn lower_while(cond: Option<&Expr>, body: &[Stmt], ctx: &mut LowerCtx<'_>) -> Flow {
+    // Bindings made inside the body are local to it, as in a `for`.
+    let outer_locals = ctx.locals.clone();
+    let carried_names = find_carried_vars(&[body], ctx);
+    let init_carried: Vec<(String, ValueId)> = carried_names
+        .iter()
+        .filter_map(|name| ctx.locals.get(name).map(|v| (name.clone(), *v)))
+        .collect();
+
+    let header_id = ctx.new_block();
+    let body_id = ctx.new_block();
+    let exit_id = ctx.new_block();
+
+    // The flag enters clear, and every carried name enters at its value here.
+    let zero_i = ctx.emit(TileIrOp::ConstI64(0), TileIrType::I64);
+    let done_param = ctx.fresh_value();
+    ctx.types.insert(done_param, TileIrType::I64);
+    let carried_params: Vec<(String, ValueId)> = init_carried
+        .iter()
+        .map(|(name, init_val)| {
+            let param = ctx.fresh_value();
+            let ty = ctx.types.get(init_val).cloned().unwrap_or(TileIrType::Void);
+            ctx.types.insert(param, ty);
+            (name.clone(), param)
+        })
+        .collect();
+    let mut jump_args = vec![zero_i];
+    jump_args.extend(init_carried.iter().map(|(_, v)| *v));
+    ctx.seal_block(TileIrTerminator::Jump {
+        target: header_id,
+        args: jump_args,
+    });
+
+    // ── Header ──
+    // The flag and the carried names arrive as parameters, and the names read
+    // them for the rest of the loop.
+    ctx.current_block = header_id;
+    ctx.locals.insert(DONE_LOCAL.to_string(), done_param);
+    for (name, param) in &carried_params {
+        ctx.locals.insert(name.clone(), *param);
+    }
+
+    let go = match cond {
+        Some(cond) => {
+            let cond_v = lower_expr(cond, ctx);
+            let cond_zero = if is_float_operand(cond_v, ctx) {
+                ctx.emit(TileIrOp::ConstF64(0.0), TileIrType::F32)
+            } else {
+                zero_i
+            };
+            // The condition as a mask, in the condition's own kind.
+            let cond_set = lower_compare(CmpOp::Ne, cond_v, cond_zero, ctx);
+            let set_zero = if is_float_operand(cond_set, ctx) {
+                ctx.emit(TileIrOp::ConstF64(0.0), TileIrType::F32)
+            } else {
+                zero_i
+            };
+            ctx.emit(
+                TileIrOp::Map {
+                    expr: TileMapExpr::Select {
+                        cond: Box::new(TileMapExpr::Cmp {
+                            op: CmpOp::Eq,
+                            lhs: Box::new(TileMapExpr::Value(done_param)),
+                            rhs: Box::new(TileMapExpr::Value(zero_i)),
+                        }),
+                        on_true: Box::new(TileMapExpr::Value(cond_set)),
+                        on_false: Box::new(TileMapExpr::Value(set_zero)),
+                    },
+                    rows: 1,
+                    cols: 1,
+                },
+                ctx.types.get(&cond_set).cloned().unwrap_or(TileIrType::I64),
+            )
+        }
+        None => ctx.emit(
+            TileIrOp::ICmp {
+                op: CmpOp::Eq,
+                lhs: done_param,
+                rhs: zero_i,
+            },
+            TileIrType::I64,
+        ),
+    };
+    // A `loop`'s test is a comparison already — the flag against zero — so it
+    // is the predicate itself. A `while`'s is a mask or a count, and the test
+    // reads it as "not zero".
+    let go_test = if cond.is_some() {
+        test_nonzero(go, ctx)
+    } else {
+        go
+    };
+
+    let through_args: Vec<ValueId> = std::iter::once(done_param)
+        .chain(carried_params.iter().map(|(_, v)| *v))
+        .collect();
+
+    let mut header_params = vec![done_param];
+    header_params.extend(carried_params.iter().map(|(_, v)| *v));
+
+    ctx.seal_block(TileIrTerminator::Branch {
+        cond: go_test,
+        true_target: body_id,
+        true_args: through_args.clone(),
+        false_target: exit_id,
+        false_args: through_args,
+    });
+    ctx.set_block_params(header_id, header_params);
+
+    // ── Body ──
+    ctx.current_block = body_id;
+    let body_done = ctx.fresh_value();
+    ctx.types.insert(body_done, TileIrType::I64);
+    ctx.locals.insert(DONE_LOCAL.to_string(), body_done);
+    let body_carried_params: Vec<(String, ValueId)> = carried_params
+        .iter()
+        .map(|(name, _)| {
+            let param = ctx.fresh_value();
+            let ty = init_carried
+                .iter()
+                .find(|(n, _)| n == name)
+                .and_then(|(_, v)| ctx.types.get(v))
+                .cloned()
+                .unwrap_or(TileIrType::Void);
+            ctx.types.insert(param, ty);
+            ctx.locals.insert(name.clone(), param);
+            (name.clone(), param)
+        })
+        .collect();
+
+    // The jump target goes in before the body lowers: a `break` seals its own
+    // jump with the flag set, and a `continue` seals one with it clear, both
+    // from wherever in the body they sit — a branch included.
+    ctx.loop_targets.push(LoopTarget::Done {
+        header: header_id,
+        carried: std::iter::once(DONE_LOCAL.to_string())
+            .chain(carried_params.iter().map(|(name, _)| name.clone()))
+            .collect(),
+    });
+
+    let mut flow = Flow::Next;
+    for inner in body {
+        flow = lower_stmt(inner, ctx);
+        if flow != Flow::Next {
+            break;
+        }
+    }
+    ctx.loop_targets.pop();
+
+    // A body that runs to its end takes the ordinary back edge, flag clear.
+    let mut returned = false;
+    match flow {
+        Flow::Next => {
+            let mut back_args = vec![body_done];
+            for (name, _) in &carried_params {
+                let current = ctx.locals.get(name).copied().unwrap_or(body_done);
+                back_args.push(current);
+            }
+            ctx.seal_block(TileIrTerminator::Jump {
+                target: header_id,
+                args: back_args,
+            });
+        }
+        // A `return` inside the body ended the kernel.
+        Flow::Returned => returned = true,
+        // A `break` or a `continue` sealed its own jump already.
+        Flow::Break | Flow::Continue => {}
+    }
+
+    // The body block takes the parameters its incoming edges pass. The seal
+    // above may have sealed a nested construct's join instead, so the
+    // parameters go on by id, as in a `for`.
+    let mut body_block_params = vec![body_done];
+    body_block_params.extend(body_carried_params.iter().map(|(_, v)| *v));
+    ctx.set_block_params(body_id, body_block_params);
+
+    // ── Exit ──
+    //
+    // The exit reads the final carried values, so it takes them as parameters
+    // and stays open for the statements after the loop, like a `for`'s exit.
+    ctx.current_block = exit_id;
+    let exit_done = ctx.fresh_value();
+    ctx.types.insert(exit_done, TileIrType::I64);
+    let exit_params: Vec<(String, ValueId)> = carried_params
+        .iter()
+        .map(|(name, _)| {
+            let param = ctx.fresh_value();
+            let ty = init_carried
+                .iter()
+                .find(|(n, _)| n == name)
+                .and_then(|(_, v)| ctx.types.get(v))
+                .cloned()
+                .unwrap_or(TileIrType::Void);
+            ctx.types.insert(param, ty);
+            ctx.locals.insert(name.clone(), param);
+            (name.clone(), param)
+        })
+        .collect();
+    ctx.locals = outer_locals;
+    for (name, param) in &exit_params {
+        ctx.locals.insert(name.clone(), *param);
+    }
+    let mut exit_block_params = vec![exit_done];
+    exit_block_params.extend(exit_params.iter().map(|(_, v)| *v));
+    ctx.pending_exit_params = Some((exit_id, exit_block_params));
+
+    if returned {
+        // The return inside the body is the kernel's end, and this exit is
+        // where the loop would have fallen through to it.
+        ctx.seal_block(TileIrTerminator::Return);
+        return Flow::Returned;
+    }
+    Flow::Next
+}
+
 fn find_carried_vars(bodies: &[&[Stmt]], ctx: &LowerCtx<'_>) -> Vec<String> {
     let mut vars = Vec::new();
     for body in bodies {
@@ -749,6 +1222,9 @@ fn collect_carried_names(body: &[Stmt], ctx: &LowerCtx<'_>, vars: &mut Vec<Strin
                 }
             }
             Stmt::ForLoop { body, .. } => collect_carried_names(body, ctx, vars),
+            Stmt::While { body, .. } | Stmt::Loop { body } => {
+                collect_carried_names(body, ctx, vars)
+            }
             Stmt::If {
                 then_body,
                 else_body,
@@ -757,7 +1233,12 @@ fn collect_carried_names(body: &[Stmt], ctx: &LowerCtx<'_>, vars: &mut Vec<Strin
                 collect_carried_names(then_body, ctx, vars);
                 collect_carried_names(else_body, ctx, vars);
             }
-            Stmt::Let { .. } | Stmt::Store { .. } | Stmt::AtomicAdd { .. } | Stmt::Continue => {}
+            Stmt::Let { .. }
+            | Stmt::Store { .. }
+            | Stmt::AtomicAdd { .. }
+            | Stmt::Break
+            | Stmt::Return
+            | Stmt::Continue => {}
         }
     }
 }
@@ -794,13 +1275,19 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
             // `program_id(axis)` names its axis; the historical `id()` spelling
             // reached here through `ShapeDim`, which carries the same axis in
             // its second argument.
-            let dim = args.first().and_then(|arg| try_eval_i64(arg, ctx)).unwrap_or(0);
+            let dim = args
+                .first()
+                .and_then(|arg| try_eval_i64(arg, ctx))
+                .unwrap_or(0);
             ctx.get_or_create_program_id_param(dim)
         }
         BuiltinOp::NumPrograms => {
             // num_programs(axis): the launch extent. Taken from the axis index
             // argument when it is a literal.
-            let dim = args.first().and_then(|arg| try_eval_i64(arg, ctx)).unwrap_or(0);
+            let dim = args
+                .first()
+                .and_then(|arg| try_eval_i64(arg, ctx))
+                .unwrap_or(0);
             ctx.emit(TileIrOp::GridDim { dim }, TileIrType::I64)
         }
         BuiltinOp::NumTiles => {
@@ -880,7 +1367,9 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
             let _ = ctx.get_or_create_shape_desc_param(base);
             let tile_shape = partition_tile_extent(&args[0], ctx);
             let tile_shape = if tile_shape.is_empty() {
-                args.first().and_then(|arg| expr_shape(arg, ctx)).unwrap_or_default()
+                args.first()
+                    .and_then(|arg| expr_shape(arg, ctx))
+                    .unwrap_or_default()
             } else {
                 tile_shape
             };
@@ -1172,12 +1661,23 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 BuiltinOp::Shr => BinOp::Shr,
                 _ => unreachable!("the arm names the operations it reads"),
             };
-            ctx.emit(TileIrOp::IBinary { op: bin_op, lhs, rhs }, TileIrType::I64)
+            ctx.emit(
+                TileIrOp::IBinary {
+                    op: bin_op,
+                    lhs,
+                    rhs,
+                },
+                TileIrType::I64,
+            )
         }
         // A comparison yields `0.0`/`1.0` per element, so it is a map too. The
         // select that consumes it reads the same coordinates, which is what
         // makes `select(gt_tile(a, b), a, b)` a pointwise maximum.
-        BuiltinOp::Gt | BuiltinOp::Lt | BuiltinOp::Ge | BuiltinOp::Le | BuiltinOp::Eq
+        BuiltinOp::Gt
+        | BuiltinOp::Lt
+        | BuiltinOp::Ge
+        | BuiltinOp::Le
+        | BuiltinOp::Eq
         | BuiltinOp::Ne => {
             let lhs = lower_expr(&args[0], ctx);
             let rhs = lower_expr(&args[1], ctx);
@@ -1252,7 +1752,10 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
         // its result is a float. `let n: f32 = convert_scalar(N);` is how CuTile
         // writes a count into an arithmetic expression.
         BuiltinOp::ConvertScalar => {
-            let value = args.first().and_then(|arg| try_eval_i64(arg, ctx)).unwrap_or(0);
+            let value = args
+                .first()
+                .and_then(|arg| try_eval_i64(arg, ctx))
+                .unwrap_or(0);
             ctx.emit(TileIrOp::ConstF64(value as f64), TileIrType::F32)
         }
         // `reduce_min` is the same reduction with the other combiner. The tile
@@ -1482,10 +1985,30 @@ fn lower_arith(op: BinOp, lhs: ValueId, rhs: ValueId, ctx: &mut LowerCtx<'_>) ->
         );
     }
     let op = match op {
-        BinOp::Add => TileIrOp::AddF { lhs, rhs, rows, cols },
-        BinOp::Sub => TileIrOp::SubF { lhs, rhs, rows, cols },
-        BinOp::Mul => TileIrOp::MulF { lhs, rhs, rows, cols },
-        BinOp::Div => TileIrOp::DivF { lhs, rhs, rows, cols },
+        BinOp::Add => TileIrOp::AddF {
+            lhs,
+            rhs,
+            rows,
+            cols,
+        },
+        BinOp::Sub => TileIrOp::SubF {
+            lhs,
+            rhs,
+            rows,
+            cols,
+        },
+        BinOp::Mul => TileIrOp::MulF {
+            lhs,
+            rhs,
+            rows,
+            cols,
+        },
+        BinOp::Div => TileIrOp::DivF {
+            lhs,
+            rhs,
+            rows,
+            cols,
+        },
         BinOp::Rem => unreachable!("a remainder rides the map node"),
         BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Shl | BinOp::Shr => {
             unreachable!("a bitwise operation is not a tile operation")
@@ -1918,11 +2441,7 @@ fn load_tile_extent_for_buffer(buf: ValueId, axis: usize, ctx: &LowerCtx<'_>) ->
     };
     // One buffer normally uses a single tile shape; take the largest extent so a
     // tile count is never inflated by a smaller probe load.
-    shapes
-        .iter()
-        .map(|dims| extent(dims))
-        .max()
-        .unwrap_or(1)
+    shapes.iter().map(|dims| extent(dims)).max().unwrap_or(1)
 }
 
 /// Append the tile shapes `buf_name` is loaded with anywhere in `stmt`.
@@ -1937,6 +2456,11 @@ fn collect_buffer_tile_shapes(
             collect_tile_shapes_in_expr(expr, buf_name, ctx, out);
         }
         sile_hir::Stmt::ForLoop { body, .. } => {
+            for inner in body {
+                collect_buffer_tile_shapes(inner, buf_name, ctx, out);
+            }
+        }
+        sile_hir::Stmt::While { body, .. } | sile_hir::Stmt::Loop { body } => {
             for inner in body {
                 collect_buffer_tile_shapes(inner, buf_name, ctx, out);
             }
@@ -1957,7 +2481,7 @@ fn collect_buffer_tile_shapes(
             collect_tile_shapes_in_expr(index, buf_name, ctx, out);
             collect_tile_shapes_in_expr(value, buf_name, ctx, out);
         }
-        sile_hir::Stmt::Continue => {}
+        sile_hir::Stmt::Break | sile_hir::Stmt::Return | sile_hir::Stmt::Continue => {}
     }
 }
 

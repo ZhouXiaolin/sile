@@ -157,10 +157,7 @@ fn run_llvm_ir_lowering_pipeline_inner(
                     params.push(llvm_ir::Param {
                         id: scalars_i64_id,
                         name: SCALARS_I64_PARAM_NAME.into(),
-                        ty: llvm_ir::Type::ptr(
-                            llvm_ir::AddressSpace::Constant,
-                            llvm_ir::Type::I64,
-                        ),
+                        ty: llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, llvm_ir::Type::I64),
                         abi: None,
                     });
                 }
@@ -353,10 +350,7 @@ fn build_prologue_block(
                     insts.push(llvm_ir::Inst {
                         result: Some(id),
                         result_name: Some(name),
-                        ty: llvm_ir::Type::ptr(
-                            llvm_ir::AddressSpace::Constant,
-                            elem.clone(),
-                        ),
+                        ty: llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, elem.clone()),
                         op: llvm_ir::InstOp::Gep {
                             base: scalars_operand,
                             indices: vec![llvm_ir::Operand::Const(llvm_ir::Constant::Int(

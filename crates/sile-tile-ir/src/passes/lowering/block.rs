@@ -8,17 +8,17 @@ use super::block_scalar::lower_scalar_inst;
 use super::block_terminator::lower_terminator;
 use super::core::{BlockLowerer, LowerLlvmIrCtx, llvm_ir_block, llvm_ir_type, llvm_ir_value};
 use super::tile_compute::{
-    FusedAccInit, FusedTileLoad, LoadReduceFusion, MapReduceFusion, lower_fused_load_reduce_inst,
-    lower_fused_map_reduce_inst, lower_fused_tile_mma_inst, lower_tile_mma_inst,
-    ReduceCombiner, lower_tile_reduce_inst,
+    FusedAccInit, FusedTileLoad, LoadReduceFusion, MapReduceFusion, ReduceCombiner,
+    lower_fused_load_reduce_inst, lower_fused_map_reduce_inst, lower_fused_tile_mma_inst,
+    lower_tile_mma_inst, lower_tile_reduce_inst,
 };
 use super::tile_expr::{
     PointwiseTileDefs, build_pointwise_tile_defs, lower_pointwise_rank1_store_inst,
     lower_pointwise_rank1_store_map_inst, lower_tile_expr_inst, lower_tile_map_inst,
 };
 use super::tile_memory::{
-    lower_tile_constant_inst, lower_tile_load_inst, lower_tile_reshape_inst,
-    lower_tile_store_inst, lower_tile_uninit_inst,
+    lower_tile_constant_inst, lower_tile_load_inst, lower_tile_reshape_inst, lower_tile_store_inst,
+    lower_tile_uninit_inst,
 };
 
 pub(crate) fn lower_block(

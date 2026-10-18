@@ -218,6 +218,50 @@ fn rewrite_stmt(stmt: &syn::Stmt) -> syn::Stmt {
             });
         }
         syn::Stmt::Expr(expr, semi) => {
+            // A `while` or a `loop` in the host body runs its statements once.
+            // The loop's result is device work the host body never reads, and
+            // an unbounded loop would never return, so the iteration is what
+            // the stub keeps and the condition and the back edge are not.
+            if let syn::Expr::While(while_expr) = &*expr {
+                let body = rewrite_block(&while_expr.body);
+                return syn::Stmt::Expr(
+                    syn::Expr::Block(syn::ExprBlock {
+                        attrs: Vec::new(),
+                        label: None,
+                        block: body,
+                    }),
+                    *semi,
+                );
+            }
+            if let syn::Expr::Loop(loop_expr) = &*expr {
+                let body = rewrite_block(&loop_expr.body);
+                return syn::Stmt::Expr(
+                    syn::Expr::Block(syn::ExprBlock {
+                        attrs: Vec::new(),
+                        label: None,
+                        block: body,
+                    }),
+                    *semi,
+                );
+            }
+            // A `break`, a `continue`, or a `return` ends a pass the host
+            // body does not run. The return cannot stay either: this function
+            // hands back a launcher, so a bare `return` would skip it.
+            if matches!(
+                &*expr,
+                syn::Expr::Break(_)
+                    | syn::Expr::Continue(_)
+                    | syn::Expr::Return(syn::ExprReturn { expr: None, .. })
+            ) {
+                return syn::Stmt::Expr(
+                    syn::Expr::Tuple(syn::ExprTuple {
+                        attrs: Vec::new(),
+                        elems: syn::punctuated::Punctuated::new(),
+                        paren_token: Default::default(),
+                    }),
+                    *semi,
+                );
+            }
             let rewritten = rewrite_expr(expr);
             syn::Stmt::Expr(rewritten, *semi)
         }
@@ -326,10 +370,7 @@ pub fn kernel(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 if let Some(rank) = frontend::parse::const_array_rank(&c.ty) {
                     let dims: Vec<_> = (0..rank)
                         .map(|dim| {
-                            let name = syn::Ident::new(
-                                &format!("{}_{}", ident, dim),
-                                ident.span(),
-                            );
+                            let name = syn::Ident::new(&format!("{}_{}", ident, dim), ident.span());
                             quote::quote! { const #name: i64 }
                         })
                         .collect();

@@ -54,7 +54,6 @@ impl emit::TargetDialect for CDialect {
         }
     }
 
-
     fn param_decl(&self, ty: &llvm_ir::Type, _name: &str) -> String {
         c_param_type(ty)
     }
@@ -86,7 +85,9 @@ impl emit::TargetDialect for CDialect {
             lines.push(format!("static _Thread_local int64_t sile_gid_{axis} = 0;"));
         }
         for axis in 0..3 {
-            lines.push(format!("static _Thread_local int64_t sile_grid_{axis} = 1;"));
+            lines.push(format!(
+                "static _Thread_local int64_t sile_grid_{axis} = 1;"
+            ));
         }
         lines.push(String::new());
         lines.push("#define llir_block_id_0() (sile_gid_0)".to_string());
@@ -102,7 +103,10 @@ impl emit::TargetDialect for CDialect {
         lines.push(String::new());
         // Vector load/reduce helpers, used by the vectorized reduce loops.
         lines.push("typedef struct { float v[4]; } llir_float4;".to_string());
-        lines.push("static inline llir_float4 llir_vec_load_4(const float* ptr, int64_t offset) {".to_string());
+        lines.push(
+            "static inline llir_float4 llir_vec_load_4(const float* ptr, int64_t offset) {"
+                .to_string(),
+        );
         lines.push("    llir_float4 r;".to_string());
         lines.push(
             "    r.v[0] = ptr[offset]; r.v[1] = ptr[offset+1]; r.v[2] = ptr[offset+2]; r.v[3] = ptr[offset+3];"
@@ -380,7 +384,6 @@ fn c_var_decl(ty: &llvm_ir::Type, name: &str) -> String {
     }
 }
 
-
 fn c_storage_decl(ty: &llvm_ir::Type, name: &str) -> String {
     match ty {
         llvm_ir::Type::Array { len, elem } => match elem.as_ref() {
@@ -417,7 +420,6 @@ fn c_ptr_decl(pointee: &llvm_ir::Type, name: &str) -> String {
         format!("{} (*{}){} = NULL", base, name, suffix)
     }
 }
-
 
 fn c_ptr_storage_bind_decl(pointee: &llvm_ir::Type, name: &str, storage_name: &str) -> String {
     let dims = array_dims(pointee);

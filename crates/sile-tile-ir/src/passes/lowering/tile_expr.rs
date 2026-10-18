@@ -803,7 +803,8 @@ pub(crate) fn eval_map_expr_scalar(
                 out,
                 count,
             );
-            let rhs = eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
+            let rhs =
+                eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
             // The comparison yields a mask, and a mask is a value like any
             // other: one where it holds, zero where it does not. Keeping the
             // `i1` here would put a boolean in a tile of floats, and a mask of
@@ -830,7 +831,8 @@ pub(crate) fn eval_map_expr_scalar(
                 out,
                 count,
             );
-            let rhs = eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
+            let rhs =
+                eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
             emit_bin(ctx, out, llvm_ir::BinOp::Add, lhs, rhs, scalar_ty(count))
         }
         TileMapExpr::Sub { lhs, rhs } => {
@@ -844,7 +846,8 @@ pub(crate) fn eval_map_expr_scalar(
                 out,
                 count,
             );
-            let rhs = eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
+            let rhs =
+                eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
             emit_bin(ctx, out, llvm_ir::BinOp::Sub, lhs, rhs, scalar_ty(count))
         }
         TileMapExpr::Mul { lhs, rhs } => {
@@ -858,7 +861,8 @@ pub(crate) fn eval_map_expr_scalar(
                 out,
                 count,
             );
-            let rhs = eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
+            let rhs =
+                eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
             emit_bin(ctx, out, llvm_ir::BinOp::Mul, lhs, rhs, scalar_ty(count))
         }
         TileMapExpr::Div { lhs, rhs } => {
@@ -872,7 +876,8 @@ pub(crate) fn eval_map_expr_scalar(
                 out,
                 count,
             );
-            let rhs = eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
+            let rhs =
+                eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
             emit_bin(ctx, out, llvm_ir::BinOp::Div, lhs, rhs, scalar_ty(count))
         }
         // Pow and atan2 are the two binary functions the targets spell as
@@ -888,7 +893,8 @@ pub(crate) fn eval_map_expr_scalar(
                 out,
                 count,
             );
-            let rhs = eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
+            let rhs =
+                eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
             emit_intrinsic(
                 ctx,
                 out,
@@ -908,7 +914,8 @@ pub(crate) fn eval_map_expr_scalar(
                 out,
                 count,
             );
-            let rhs = eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
+            let rhs =
+                eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
             emit_intrinsic(
                 ctx,
                 out,
@@ -918,8 +925,16 @@ pub(crate) fn eval_map_expr_scalar(
             )
         }
         TileMapExpr::Unary { op, operand } => {
-            let operand =
-                eval_map_expr_scalar(operand, row, col, ctx, tile_ir, fused_load_bases, out, count);
+            let operand = eval_map_expr_scalar(
+                operand,
+                row,
+                col,
+                ctx,
+                tile_ir,
+                fused_load_bases,
+                out,
+                count,
+            );
             eval_unary_scalar(*op, operand, ctx, out, count)
         }
         TileMapExpr::Rem { lhs, rhs } => {
@@ -933,7 +948,8 @@ pub(crate) fn eval_map_expr_scalar(
                 out,
                 count,
             );
-            let rhs = eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
+            let rhs =
+                eval_map_expr_scalar(rhs, row, col, ctx, tile_ir, fused_load_bases, out, count);
             emit_bin(ctx, out, llvm_ir::BinOp::Rem, lhs, rhs, scalar_ty(count))
         }
         TileMapExpr::Select {
@@ -958,8 +974,16 @@ pub(crate) fn eval_map_expr_scalar(
                         out,
                         count,
                     );
-                    let rhs =
-                        eval_map_expr_scalar(rhs, row.clone(), col.clone(), ctx, tile_ir, fused_load_bases, out, count);
+                    let rhs = eval_map_expr_scalar(
+                        rhs,
+                        row.clone(),
+                        col.clone(),
+                        ctx,
+                        tile_ir,
+                        fused_load_bases,
+                        out,
+                        count,
+                    );
                     emit_cmp(
                         ctx,
                         out,
@@ -998,8 +1022,16 @@ pub(crate) fn eval_map_expr_scalar(
                 out,
                 count,
             );
-            let on_false =
-                eval_map_expr_scalar(on_false, row, col, ctx, tile_ir, fused_load_bases, out, count);
+            let on_false = eval_map_expr_scalar(
+                on_false,
+                row,
+                col,
+                ctx,
+                tile_ir,
+                fused_load_bases,
+                out,
+                count,
+            );
             emit_select(ctx, out, is_set, on_true, on_false, scalar_ty(count))
         }
         TileMapExpr::Broadcast {
@@ -1009,7 +1041,16 @@ pub(crate) fn eval_map_expr_scalar(
         } => {
             let src_row = if *src_rows == 1 { const_i64(0) } else { row };
             let src_col = if *src_cols == 1 { const_i64(0) } else { col };
-            eval_map_expr_scalar(value, src_row, src_col, ctx, tile_ir, fused_load_bases, out, count)
+            eval_map_expr_scalar(
+                value,
+                src_row,
+                src_col,
+                ctx,
+                tile_ir,
+                fused_load_bases,
+                out,
+                count,
+            )
         }
         // The transpose reads its operand at the coordinates of the element
         // this walk is writing, exchanged.
@@ -1019,13 +1060,7 @@ pub(crate) fn eval_map_expr_scalar(
         // A sequence is the coordinate the walk stands on. CuTile names it for
         // a rank-one shape, which is one row of N columns here, so the column is
         // the element and the conversion makes it an element value.
-        TileMapExpr::Iota => emit_cast(
-            ctx,
-            out,
-            llvm_ir::CastOp::Sitofp,
-            col,
-            llvm_ir::Type::F32,
-        ),
+        TileMapExpr::Iota => emit_cast(ctx, out, llvm_ir::CastOp::Sitofp, col, llvm_ir::Type::F32),
     }
 }
 
@@ -1043,7 +1078,13 @@ fn element_operand(
     let is_count = matches!(tile_ir.types.get(&value), Some(TileIrType::I64));
     let operand = resolve_operand(value, ctx);
     if is_count {
-        return emit_cast(ctx, out, llvm_ir::CastOp::Sitofp, operand, llvm_ir::Type::F32);
+        return emit_cast(
+            ctx,
+            out,
+            llvm_ir::CastOp::Sitofp,
+            operand,
+            llvm_ir::Type::F32,
+        );
     }
     operand
 }

@@ -1,8 +1,8 @@
 use sile_llvm_ir as llvm_ir;
 
 use super::core::{
-    LowerLlvmIrCtx, comparison_pred, const_i64, emit_gep, emit_load, llvm_ir_type,
-    llvm_ir_value, load_tile_scalar_dynamic, lower_bin_op, resolve_operand,
+    LowerLlvmIrCtx, comparison_pred, const_i64, emit_gep, emit_load, llvm_ir_type, llvm_ir_value,
+    load_tile_scalar_dynamic, lower_bin_op, resolve_operand,
 };
 use crate::ir::*;
 use crate::passes::lowering::tile_memory::emit_strided_element_index;

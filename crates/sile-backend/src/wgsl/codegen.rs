@@ -238,9 +238,7 @@ impl<'a> WgslDialect<'a> {
             // Every parameter the lowering produces is a pointer: a buffer or
             // one of the descriptors. A plain value here would mean the ABI
             // grew a parameter kind this declaration cannot spell.
-            other => panic!(
-                "a WGSL storage parameter holds a buffer pointer, not {other:?}"
-            ),
+            other => panic!("a WGSL storage parameter holds a buffer pointer, not {other:?}"),
         };
         let name = if emit::is_shapes_param(param) {
             self.shapes_name.clone()

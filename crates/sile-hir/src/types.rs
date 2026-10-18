@@ -36,8 +36,14 @@ pub enum ValueCategory {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Type {
-    Tensor { elem: ElemType, shape: ShapeExpr },
-    Tile { elem: ElemType, shape: ShapeExpr },
+    Tensor {
+        elem: ElemType,
+        shape: ShapeExpr,
+    },
+    Tile {
+        elem: ElemType,
+        shape: ShapeExpr,
+    },
     /// A tiled view of a buffer: `x.partition(shape)`.
     ///
     /// It holds no data. It names the buffer and the tile extent, so a later

@@ -13,9 +13,7 @@ use crate::emit::{flatten_grid, is_descriptor_param};
 
 /// Bytes of a typed slice, which is the only way `write_buffer` takes data.
 fn as_bytes<T>(data: &[T]) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
-    }
+    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
 }
 
 /// `request_device` reports its failure as one enum, and the sile error type
@@ -51,23 +49,23 @@ impl WgpuBackend {
         .or_else(|| {
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
         })
-        .ok_or_else(|| {
-            sile_core::Error::UnsupportedBackend("no WGPU adapter found")
-        })?;
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("sile wgpu device"),
-                // The lowering makes every index an i64, which is an optional
-                // WGSL capability rather than a default. Metal, Vulkan and DX12
-                // all have it, so the kernel asks for it instead of narrowing
-                // every index to 32 bits.
-                required_features: adapter
-                    .features()
-                    .intersection(wgpu::Features::SHADER_INT64),
-                ..Default::default()
-            },
-            None,
-        ))
+        .ok_or_else(|| sile_core::Error::UnsupportedBackend("no WGPU adapter found"))?;
+        let (device, queue) = pollster::block_on(
+            adapter.request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("sile wgpu device"),
+                    // The lowering makes every index an i64, which is an optional
+                    // WGSL capability rather than a default. Metal, Vulkan and DX12
+                    // all have it, so the kernel asks for it instead of narrowing
+                    // every index to 32 bits.
+                    required_features: adapter
+                        .features()
+                        .intersection(wgpu::Features::SHADER_INT64),
+                    ..Default::default()
+                },
+                None,
+            ),
+        )
         .map_err(|e| sile_core::Error::UnsupportedBackend(request_device_error(e)))?;
         Ok(Self { device, queue })
     }
@@ -95,7 +93,9 @@ impl WgpuBackend {
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("sile kernel buffer"),
                 size: (data.len() * std::mem::size_of::<f32>()) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             self.queue.write_buffer(&buffer, 0, as_bytes(data));
@@ -113,7 +113,9 @@ impl WgpuBackend {
         let shapes_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sile shapes"),
             size: (shapes.len().max(1) * std::mem::size_of::<i64>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         self.queue
@@ -126,7 +128,9 @@ impl WgpuBackend {
         let scalars_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sile scalars"),
             size: (scalars.len().max(1) * std::mem::size_of::<f32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         if !scalars.is_empty() {
@@ -228,10 +232,12 @@ impl WgpuBackend {
                 bind_group_layouts: &[&layout],
                 push_constant_ranges: &[],
             });
-        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("sile wgsl"),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("sile wgsl"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
         let pipeline = self
             .device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

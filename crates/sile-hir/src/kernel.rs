@@ -198,8 +198,23 @@ pub enum Stmt {
         var: String,
         start: Expr,
         end: Expr,
+        /// `(a..b).step_by(k)` names the step; a plain range steps by one.
+        step: Option<Expr>,
         body: Vec<Stmt>,
     },
+    /// `while cond { .. }`: test the condition, run the body, repeat.
+    While {
+        cond: Expr,
+        body: Vec<Stmt>,
+    },
+    /// `loop { .. }`: a while whose condition is always true.
+    Loop {
+        body: Vec<Stmt>,
+    },
+    /// `break`: leave the enclosing `while` or `loop`.
+    Break,
+    /// `return;`: leave the kernel.
+    Return,
     /// `if cond { .. } else { .. }`: a branch on a scalar condition.
     ///
     /// A branch is control flow, so its condition has one truth value for the
@@ -234,7 +249,10 @@ pub enum Expr {
     /// index is a computed value, and collapsing the two drops any arithmetic
     /// the index carries.
     TileIndex(Vec<Expr>),
-    Builtin { op: BuiltinOp, args: Vec<Expr> },
+    Builtin {
+        op: BuiltinOp,
+        args: Vec<Expr>,
+    },
 }
 
 impl Param {

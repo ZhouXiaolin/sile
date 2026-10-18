@@ -470,8 +470,12 @@ pub struct TileIrParam {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TileIrParamKind {
     Buffer,
-    LaunchIndex { dim: i64 },
-    ShapeDesc { source: ValueId },
+    LaunchIndex {
+        dim: i64,
+    },
+    ShapeDesc {
+        source: ValueId,
+    },
     /// A scalar kernel argument, read from slot `index` of the scalar
     /// descriptor.
     ///
@@ -480,7 +484,9 @@ pub enum TileIrParamKind {
     /// descriptor rather than a function parameter is what lets all three
     /// targets share one LLVM IR signature, because WGSL has no way to pass a
     /// value into an entry point.
-    Scalar { index: usize },
+    Scalar {
+        index: usize,
+    },
 }
 
 #[derive(Clone, Debug)]

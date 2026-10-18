@@ -244,7 +244,10 @@ pub fn flatten_grid(func: &llvm_ir::Function, launch: &sile_core::LaunchConfig) 
         // A rank-3 output addresses a plane of tiles, so all three axes arrive
         // multiplied together and the emitter divides them back out.
         3.. => [
-            launch.grid.iter().fold(1u32, |acc, dim| acc.saturating_mul(*dim)),
+            launch
+                .grid
+                .iter()
+                .fold(1u32, |acc, dim| acc.saturating_mul(*dim)),
             1,
             1,
         ],
@@ -1276,7 +1279,8 @@ pub fn emit_structured_from<E: StructuredEmitter>(
         }
 
         if matches!(block.terminator, llvm_ir::Terminator::CondBr { .. }) {
-            current = emit_structured_if_else(emitter, func, &block, messages)?;
+            current =
+                emit_structured_if_else(emitter, func, &block, stop_skip_params.clone(), messages)?;
             if stop_targets.contains(&current) {
                 return Ok(Some(current));
             }
@@ -1390,6 +1394,7 @@ fn emit_structured_if_else<E: StructuredEmitter>(
     emitter: &mut E,
     func: &llvm_ir::Function,
     block: &llvm_ir::BasicBlock,
+    stop_skip_params: Option<(llvm_ir::BlockId, Vec<llvm_ir::ValueId>)>,
     messages: StructuredCfgMessages,
 ) -> Result<llvm_ir::BlockId> {
     let llvm_ir::Terminator::CondBr {
@@ -1402,28 +1407,41 @@ fn emit_structured_if_else<E: StructuredEmitter>(
     else {
         return Err(Error::Compile(messages.unsupported_cond_br.into()));
     };
-    let join =
-        branch_join(func, block.id).ok_or_else(|| Error::Compile(messages.unsupported_cond_br.into()))?;
+    let join = branch_join(func, block.id)
+        .ok_or_else(|| Error::Compile(messages.unsupported_cond_br.into()))?;
 
     let (cond_expr, skip_result) = branch_condition_expr::<E>(func, block, cond, false);
     emitter.emit_block_insts_except(block, skip_result)?;
     emitter.writeln(&format!("if ({cond_expr}) {{"));
     emitter.indent_inc();
     emitter.emit_block_param_assignments(*true_target, true_args);
-    if emit_structured_from(emitter, func, *true_target, &[join], None, None, messages)?
-        != Some(join)
-    {
-        return Err(Error::Compile(messages.unsupported_cond_br.into()));
-    }
+    // An arm may end in a `return`, which leaves it no edge to the join —
+    // the arm's text is complete either way, and the join still holds for
+    // the arm that reaches it. The skips pass through because an arm can
+    // also end on the enclosing loop's header — a `continue` — and a `for`
+    // writes its induction step itself, so the arm must not write it too.
+    emit_structured_from(
+        emitter,
+        func,
+        *true_target,
+        &[join],
+        stop_skip_params.clone(),
+        None,
+        messages,
+    )?;
     emitter.indent_dec();
     emitter.writeln("} else {");
     emitter.indent_inc();
     emitter.emit_block_param_assignments(*false_target, false_args);
-    if emit_structured_from(emitter, func, *false_target, &[join], None, None, messages)?
-        != Some(join)
-    {
-        return Err(Error::Compile(messages.unsupported_cond_br.into()));
-    }
+    emit_structured_from(
+        emitter,
+        func,
+        *false_target,
+        &[join],
+        stop_skip_params,
+        None,
+        messages,
+    )?;
     emitter.indent_dec();
     emitter.writeln("}");
 
@@ -1474,7 +1492,9 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
                 // header is empty, so the directive would make the C compiler
                 // reject the whole file. The loop is still correct without it.
                 let vectorize = (!init_expr.is_empty())
-                    .then(|| emitter.vectorize_hint(is_simple_loop_body(func, true_target, header.id)))
+                    .then(|| {
+                        emitter.vectorize_hint(is_simple_loop_body(func, true_target, header.id))
+                    })
                     .flatten();
                 if let Some(vectorize) = vectorize {
                     emitter.writeln(&vectorize);
@@ -1776,6 +1796,40 @@ fn is_loop_header(func: &llvm_ir::Function, block: &llvm_ir::BasicBlock) -> bool
 /// block both arms reach would name a block inside an arm instead, because the
 /// loop that encloses the branch reaches the arm's blocks too.
 fn branch_join(func: &llvm_ir::Function, block_id: llvm_ir::BlockId) -> Option<llvm_ir::BlockId> {
+    if let Some(join) = branch_join_post_dominator(func, block_id) {
+        return Some(join);
+    }
+    // A branch whose arm returns has a join that does not post-dominate it:
+    // the path through the returning arm never reaches the join, so the set
+    // arithmetic above finds nothing. The join is still readable off the
+    // arms — an arm that continues names it, and an arm that returns names
+    // nothing, so the continuing arm's target is the join. Two continuing
+    // arms must name the same one, or the CFG is not structured.
+    let llvm_ir::Terminator::CondBr {
+        true_target,
+        false_target,
+        ..
+    } = &get_block(func, block_id)?.terminator
+    else {
+        return None;
+    };
+    let arm_target = |id: &llvm_ir::BlockId| {
+        get_block(func, *id).and_then(|arm| match &arm.terminator {
+            llvm_ir::Terminator::Br { target, .. } => Some(*target),
+            _ => None,
+        })
+    };
+    match (arm_target(true_target), arm_target(false_target)) {
+        (Some(join), None) | (None, Some(join)) => Some(join),
+        (Some(a), Some(b)) if a == b => Some(a),
+        _ => None,
+    }
+}
+
+fn branch_join_post_dominator(
+    func: &llvm_ir::Function,
+    block_id: llvm_ir::BlockId,
+) -> Option<llvm_ir::BlockId> {
     let post_dominators = compute_post_dominators(func);
     // A block closer to the branch post-dominates a farther one, so it has the
     // larger set: the join is the closest, which is the largest.
@@ -1801,9 +1855,8 @@ fn branch_join(func: &llvm_ir::Function, block_id: llvm_ir::BlockId) -> Option<l
 fn compute_post_dominators(
     func: &llvm_ir::Function,
 ) -> HashMap<llvm_ir::BlockId, HashSet<llvm_ir::BlockId>> {
-    let returns = |block: &llvm_ir::BasicBlock| {
-        matches!(block.terminator, llvm_ir::Terminator::Ret { .. })
-    };
+    let returns =
+        |block: &llvm_ir::BasicBlock| matches!(block.terminator, llvm_ir::Terminator::Ret { .. });
     if !func.blocks.iter().any(returns) {
         // Nothing returns, so no path ends and no block post-dominates another.
         return func
@@ -1835,10 +1888,7 @@ fn compute_post_dominators(
             }
             let mut new_set: Option<HashSet<llvm_ir::BlockId>> = None;
             for successor in terminator_successors(&block.terminator) {
-                let successor_set = post_dominators
-                    .get(&successor)
-                    .cloned()
-                    .unwrap_or_default();
+                let successor_set = post_dominators.get(&successor).cloned().unwrap_or_default();
                 new_set = Some(match new_set {
                     None => successor_set,
                     Some(current) => current.intersection(&successor_set).copied().collect(),
@@ -1866,9 +1916,7 @@ fn terminator_successors(terminator: &llvm_ir::Terminator) -> Vec<llvm_ir::Block
             false_target,
             ..
         } => vec![*true_target, *false_target],
-        llvm_ir::Terminator::Switch {
-            default, cases, ..
-        } => {
+        llvm_ir::Terminator::Switch { default, cases, .. } => {
             let mut targets = vec![*default];
             targets.extend(cases.iter().map(|(_, target)| *target));
             targets

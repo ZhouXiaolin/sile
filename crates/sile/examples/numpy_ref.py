@@ -152,6 +152,68 @@ def main():
         m, d = (int(s) for s in scalars[:2])
         qk_scale = float(scalars[2])
         expected = flash_attention(q, k, v, m, d, qk_scale, 0, False)
+    elif op == "cf_while_acc":
+        # while i < 5: acc += i; i += 1 — the sum of 0..5.
+        acc = np.float32(0.0)
+        i = np.float32(0.0)
+        while i < np.float32(5.0):
+            acc = acc + i
+            i = i + np.float32(1.0)
+        expected = np.full(16, acc, dtype="<f4")
+    elif op == "cf_while_skip":
+        # Passes past three skip the add, but the pass variable still moves.
+        acc = np.float32(0.0)
+        i = np.float32(0.0)
+        while i < np.float32(6.0):
+            if i > np.float32(3.0):
+                i = i + np.float32(1.0)
+                continue
+            acc = acc + i
+            i = i + np.float32(1.0)
+        expected = np.full(16, acc, dtype="<f4")
+    elif op == "cf_loop_break":
+        # loop { acc += i; i += 1; if i >= 4 { break } } — the sum of 1..=4.
+        acc = np.float32(0.0)
+        i = np.float32(0.0)
+        while True:
+            acc = acc + i
+            i = i + np.float32(1.0)
+            if i >= np.float32(4.0):
+                break
+        expected = np.full(16, acc, dtype="<f4")
+    elif op == "cf_for_steps":
+        # 0+3+6 by step_by, then 0..=6 over a runtime bound, then 7×(0+…+36)
+        # by a stepped range too long to unroll.
+        acc = np.float32(0.0)
+        acc += sum(np.float32(v) for v in range(0, 8, 3))
+        acc += sum(np.float32(v) for v in range(7))
+        acc += sum(np.float32(7 * v) for v in range((256 + 6) // 7))
+        expected = np.full(16, acc, dtype="<f4")
+    elif op == "cf_early_return":
+        # One block runs, so the branch never returns and the second store
+        # overwrites the first.
+        x, = read_inputs(count, lengths)
+        expected = x[16:32] + np.float32(1.0)
+    elif op == "cf_nested_loops":
+        # A while holding a for, both carrying the accumulator, with an extra
+        # add once the round count reaches two.
+        acc = np.float32(0.0)
+        r = np.float32(0.0)
+        while r < np.float32(3.0):
+            for j in range(4):
+                acc = acc + np.float32(j)
+            r = r + np.float32(1.0)
+            if r >= np.float32(2.0):
+                acc = acc + np.float32(100.0)
+        expected = np.full(16, acc, dtype="<f4")
+    elif op == "cf_for_continue":
+        # One pass out of eight adds nothing.
+        acc = np.float32(0.0)
+        for i in range(8):
+            if i == 3:
+                continue
+            acc = acc + np.float32(i)
+        expected = np.full(16, acc, dtype="<f4")
     elif op == "flash_attention_causal":
         q, k, v = read_inputs(count, lengths)
         m, d = (int(s) for s in scalars[:2])

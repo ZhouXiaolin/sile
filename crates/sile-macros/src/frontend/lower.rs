@@ -1,7 +1,9 @@
 use quote::quote;
 use syn::spanned::Spanned;
 
-use super::ast::{BinOpKind, ConstParam, KernelDecl, KernelExpr, KernelShapeDim, KernelStmt, ScalarType};
+use super::ast::{
+    BinOpKind, ConstParam, KernelDecl, KernelExpr, KernelShapeDim, KernelStmt, ScalarType,
+};
 
 /// Lower the parsed kernel to the HIR constructor.
 ///
@@ -185,21 +187,49 @@ fn lower_stmt(
             var,
             start,
             end,
+            step,
             body,
         } => {
             let var_name = var.to_string();
             let start_val = lower_expr(start, const_params)?;
             let end_val = lower_expr(end, const_params)?;
+            let step_val = step
+                .as_ref()
+                .map(|step| lower_expr(step, const_params))
+                .transpose()?
+                .map(|step| quote! { Some(#step) })
+                .unwrap_or_else(|| quote! { None });
             let body_stmts = lower_stmts(body, const_params)?;
             quote! {
                 ::sile::hir::Stmt::ForLoop {
                     var: #var_name.to_string(),
                     start: #start_val,
                     end: #end_val,
+                    step: #step_val,
                     body: vec![#(#body_stmts),*],
                 }
             }
         }
+        KernelStmt::While { cond, body } => {
+            let cond = lower_expr(cond, const_params)?;
+            let body_stmts = lower_stmts(body, const_params)?;
+            quote! {
+                ::sile::hir::Stmt::While {
+                    cond: #cond,
+                    body: vec![#(#body_stmts),*],
+                }
+            }
+        }
+        KernelStmt::Loop { body } => {
+            let body_stmts = lower_stmts(body, const_params)?;
+            quote! {
+                ::sile::hir::Stmt::Loop {
+                    body: vec![#(#body_stmts),*],
+                }
+            }
+        }
+        KernelStmt::Break => quote! { ::sile::hir::Stmt::Break },
+        KernelStmt::Return => quote! { ::sile::hir::Stmt::Return },
         KernelStmt::If {
             cond,
             then_body,
@@ -381,9 +411,9 @@ fn lower_expr(
             quote! { ::sile::hir::Expr::ScalarI64(#val) }
         }
         KernelExpr::FloatLit(lit) => {
-            let val: f32 = lit.base10_parse().map_err(|_| {
-                syn::Error::new(lit.span(), "float literal does not fit in f32")
-            })?;
+            let val: f32 = lit
+                .base10_parse()
+                .map_err(|_| syn::Error::new(lit.span(), "float literal does not fit in f32"))?;
             quote! { ::sile::hir::Expr::ScalarF32(#val) }
         }
         // A float constant is emitted by name rather than as a token: the
@@ -679,10 +709,7 @@ fn lower_compare_call(
         match comparison_predicate(arg)? {
             Some(op) if predicate.is_none() => predicate = Some(op),
             Some(_) => {
-                return Err(syn::Error::new(
-                    func.span(),
-                    "cmpi takes one predicate",
-                ));
+                return Err(syn::Error::new(func.span(), "cmpi takes one predicate"));
             }
             None if arg.is_mode() => {}
             None => operands.push(arg),
@@ -1025,7 +1052,11 @@ fn lower_shape_macro(
     let tokens = &mac.mac.tokens;
     let elems = syn::parse::Parser::parse(
         syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated,
-        tokens.clone().into_iter().collect::<proc_macro2::TokenStream>().into(),
+        tokens
+            .clone()
+            .into_iter()
+            .collect::<proc_macro2::TokenStream>()
+            .into(),
     )
     .map_err(|err| syn::Error::new(mac.span(), format!("malformed shape: {err}")))?;
     let mut array: syn::ExprArray = syn::parse_quote! { [] };
@@ -1068,15 +1099,17 @@ fn lower_array(
     let shape_elems = arr
         .elems
         .iter()
-        .map(|elem| match (shape_literal_dim(elem), shape_literal_symbol(elem)) {
-            (Some(dim), _) => Ok(quote! { ::sile::hir::ShapeExpr::constant(#dim) }),
-            // A bare name is kept as a symbol here. Whether it is a shape
-            // dimension (a const parameter) or a runtime tile index (a local)
-            // depends on the position the array appears in, which the callee
-            // knows; the type checker resolves that.
-            (None, Some(name)) => Ok(quote! { ::sile::hir::ShapeExpr::symbol(#name) }),
-            (None, None) => unreachable!("the array was checked to hold only shape dimensions"),
-        })
+        .map(
+            |elem| match (shape_literal_dim(elem), shape_literal_symbol(elem)) {
+                (Some(dim), _) => Ok(quote! { ::sile::hir::ShapeExpr::constant(#dim) }),
+                // A bare name is kept as a symbol here. Whether it is a shape
+                // dimension (a const parameter) or a runtime tile index (a local)
+                // depends on the position the array appears in, which the callee
+                // knows; the type checker resolves that.
+                (None, Some(name)) => Ok(quote! { ::sile::hir::ShapeExpr::symbol(#name) }),
+                (None, None) => unreachable!("the array was checked to hold only shape dimensions"),
+            },
+        )
         .collect::<syn::Result<Vec<_>>>()?;
     Ok(quote! {
         ::sile::hir::Expr::Shape(

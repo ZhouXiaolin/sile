@@ -1,5 +1,5 @@
-pub mod lowering;
 pub mod dce;
+pub mod lowering;
 pub mod pointwise_fusion;
 pub mod tile_expr_cse;
 pub mod verify;

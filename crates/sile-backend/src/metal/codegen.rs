@@ -138,12 +138,7 @@ impl TargetDialect for MetalDialect<'_> {
         emit::copy_assign(ty, name, arg)
     }
 
-    fn var_decl(
-        &self,
-        ty: &llvm_ir::Type,
-        name: &str,
-        _is_alloca: bool,
-    ) -> Option<String> {
+    fn var_decl(&self, ty: &llvm_ir::Type, name: &str, _is_alloca: bool) -> Option<String> {
         // MSL has no function-local pointer storage, so a private pointer binds
         // to a `thread` local array. Unlike C, every private pointer behaves the
         // same way here, whether it came from an `alloca` or a `gep`.
@@ -170,9 +165,7 @@ impl TargetDialect for MetalDialect<'_> {
     fn signature(&self, name: &str, params: &[(String, String)]) -> String {
         let mut out = format!("kernel void sile_kernel_{name}(\n");
         for (idx, (ty, param_name)) in params.iter().enumerate() {
-            out.push_str(&format!(
-                "    {ty} {param_name} [[buffer({idx})]],\n"
-            ));
+            out.push_str(&format!("    {ty} {param_name} [[buffer({idx})]],\n"));
         }
         out.push_str("    uint3 gid [[thread_position_in_grid]]) {\n");
         out
@@ -318,8 +311,15 @@ impl TargetDialect for MetalDialect<'_> {
         // become explicit loops or an error.
         match &inst.op {
             llvm_ir::InstOp::Memcpy { dst, src, size } => Ok(vec![
-                format!("for (int64_t copy_i = 0; copy_i < {}; ++copy_i) {{", format_operand(size)),
-                format!("{}[copy_i] = {}[copy_i];", format_operand(dst), format_operand(src)),
+                format!(
+                    "for (int64_t copy_i = 0; copy_i < {}; ++copy_i) {{",
+                    format_operand(size)
+                ),
+                format!(
+                    "{}[copy_i] = {}[copy_i];",
+                    format_operand(dst),
+                    format_operand(src)
+                ),
                 "}".to_string(),
             ]),
             llvm_ir::InstOp::AtomicAdd { ptr, value } => Ok(vec![format!(
@@ -364,7 +364,6 @@ impl TargetDialect for MetalDialect<'_> {
         }
     }
 }
-
 
 fn metal_var_decl(ty: &llvm_ir::Type, name: &str) -> String {
     match ty {

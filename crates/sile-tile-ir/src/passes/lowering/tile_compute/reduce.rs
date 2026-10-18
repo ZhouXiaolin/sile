@@ -37,14 +37,7 @@ pub(crate) fn reduce_combine(
         ReduceCombiner::Max => llvm_ir::CmpPred::Ogt,
         ReduceCombiner::Min => llvm_ir::CmpPred::Olt,
     };
-    let is_better = emit_cmp(
-        ctx,
-        out,
-        pred,
-        next.clone(),
-        acc.clone(),
-        llvm_ir::Type::I1,
-    );
+    let is_better = emit_cmp(ctx, out, pred, next.clone(), acc.clone(), llvm_ir::Type::I1);
     emit_select(ctx, out, is_better, next, acc, llvm_ir::Type::F32)
 }
 

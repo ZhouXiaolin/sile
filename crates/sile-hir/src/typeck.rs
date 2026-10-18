@@ -72,7 +72,7 @@ pub fn check_kernel(kernel: &Kernel) -> Result<TypedKernel, TypeError> {
         locals.insert(name.clone(), Type::Scalar(ElemType::F32));
     }
 
-    check_block(&kernel.body, &mut locals, kernel, Scope::Kernel)?;
+    check_block(&kernel.body, &mut locals, kernel, Scope::kernel())?;
 
     Ok(TypedKernel {
         kernel: kernel.clone(),
@@ -80,29 +80,45 @@ pub fn check_kernel(kernel: &Kernel) -> Result<TypedKernel, TypeError> {
     })
 }
 
-/// What a `continue` in the block being checked would continue.
+/// What a `continue` or a `break` in the block being checked would jump to.
 ///
 /// A `continue` is the back edge of a loop, and the lowering writes that edge
-/// after the loop body. A branch has its own terminator, so a `continue` inside
-/// one would leave the other arm without an edge to the join point. The checker
-/// rejects it there rather than lower a kernel whose arms disagree about where
-/// the iteration ends.
+/// after the loop body. A branch inside a loop body ends at the same edge, so a
+/// `continue` there is the branch's own terminator and lowers the same way. A
+/// `break` leaves the loop; a `for` has no exit its body can name, which is the
+/// one thing CuTile's `for` and its `while` spell apart, so the flag says which
+/// loop the block sits in.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Scope {
-    /// The kernel body, which has no iteration to end.
-    Kernel,
-    /// A loop body: a `continue` ends this pass and starts the next.
-    Loop,
-    /// A branch, which the lowering seals with a jump to its join point.
-    Branch,
+struct Scope {
+    /// `Some(break_allowed)` inside a loop body, where a `continue` ends the
+    /// pass; `None` outside any loop.
+    loop_break: Option<bool>,
 }
 
 impl Scope {
+    /// The scope of the kernel body.
+    fn kernel() -> Self {
+        Self { loop_break: None }
+    }
+
+    /// The scope of a `for` body: a `continue` is fine, a `break` is not.
+    fn for_body() -> Self {
+        Self {
+            loop_break: Some(false),
+        }
+    }
+
+    /// The scope of a `while` or `loop` body: both jumps name an exit.
+    fn loop_body() -> Self {
+        Self {
+            loop_break: Some(true),
+        }
+    }
+
     /// The scope a statement inside a branch of this block is checked in.
     fn inside_branch(self) -> Self {
-        match self {
-            Self::Loop => Self::Branch,
-            other => other,
+        Self {
+            loop_break: self.loop_break,
         }
     }
 }
@@ -156,7 +172,8 @@ fn check_block(
                 let stored_name = match &target_ty {
                     Type::Tensor { .. } => target.clone(),
                     Type::Partition {
-                        source: Some(source), ..
+                        source: Some(source),
+                        ..
                     } => source.clone(),
                     _ => {
                         return Err(TypeError::invalid_kernel(format!(
@@ -239,15 +256,19 @@ fn check_block(
                 var,
                 start,
                 end,
+                step,
                 body,
             } => {
                 infer_expr(start, locals)?;
                 infer_expr(end, locals)?;
+                if let Some(step) = step {
+                    infer_expr(step, locals)?;
+                }
                 // The induction variable is a scalar inside the body only, so
                 // it is scoped here rather than left in the kernel's locals.
                 let outer = locals.clone();
                 locals.insert(var.clone(), Type::Scalar(ElemType::F32));
-                let result = check_block(body, locals, kernel, Scope::Loop);
+                let result = check_block(body, locals, kernel, Scope::for_body());
                 // A `let` in the body is a fresh binding on each iteration. It
                 // is not a loop-carried value, and it does not exist after the
                 // loop. Leaving it in scope made the body's `let t = ...`
@@ -256,6 +277,46 @@ fn check_block(
                 *locals = outer;
                 result?;
             }
+            Stmt::While { cond, body } => {
+                let cond_ty = infer_expr(cond, locals)?;
+                if !matches!(cond_ty, Type::Scalar(_)) {
+                    return Err(TypeError::invalid_kernel(format!(
+                        "a `while` condition must be a scalar, got {:?}",
+                        cond_ty.category()
+                    )));
+                }
+                // The names the body binds are its own, the way a `for` body's
+                // are; a name it assigns that exists outside is the carried
+                // value the loop leaves behind.
+                let outer = locals.clone();
+                let result = check_block(body, locals, kernel, Scope::loop_body());
+                *locals = outer;
+                result?;
+            }
+            Stmt::Loop { body } => {
+                let outer = locals.clone();
+                let result = check_block(body, locals, kernel, Scope::loop_body());
+                *locals = outer;
+                result?;
+            }
+            // A `break` and a `return` have no type and nothing to infer. A
+            // `break` has to be inside the kind of loop that has an exit its
+            // body can name.
+            Stmt::Break => match scope.loop_break {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(TypeError::invalid_kernel(
+                        "`break` leaves a `while` or a `loop`; a `for` body has no exit to name"
+                            .to_string(),
+                    ));
+                }
+                None => {
+                    return Err(TypeError::invalid_kernel(
+                        "`break` is only meaningful inside a `while` or a `loop`".to_string(),
+                    ));
+                }
+            },
+            Stmt::Return => {}
             // A branch is control flow over a scalar, so its condition has one
             // truth value. A tile condition is a per-element choice, which is
             // what `select` is for, and lowering it as a branch would test the
@@ -285,18 +346,13 @@ fn check_block(
                 else_result?;
             }
             // `continue` has no type, so it has nothing to infer. It does have
-            // to be inside a loop: outside one there is no iteration to end, and
-            // the lowering would have no header to branch to.
-            Stmt::Continue => match scope {
-                Scope::Loop => {}
-                Scope::Kernel => {
+            // to be inside a loop: outside one there is no iteration to end,
+            // and the lowering would have no header to branch to.
+            Stmt::Continue => match scope.loop_break {
+                Some(_) => {}
+                None => {
                     return Err(TypeError::invalid_kernel(
                         "`continue` is only meaningful inside a loop".to_string(),
-                    ));
-                }
-                Scope::Branch => {
-                    return Err(TypeError::invalid_kernel(
-                        "`continue` inside a branch is not supported: write it after the branch, or use a loop condition".to_string(),
                     ));
                 }
             },
@@ -355,10 +411,7 @@ fn infer_builtin(
         BuiltinOp::ProgramId | BuiltinOp::NumPrograms | BuiltinOp::NumTiles => {
             Ok(Type::Scalar(ElemType::F32))
         }
-        BuiltinOp::LoadTile => Ok(Type::tile(
-            ElemType::F32,
-            declared_shape(args, 1, locals),
-        )),
+        BuiltinOp::LoadTile => Ok(Type::tile(ElemType::F32, declared_shape(args, 1, locals))),
         BuiltinOp::LoadLike => Ok(Type::tile(
             ElemType::F32,
             // `load_tile_mut(z)` names only the buffer, so the tile shape is
@@ -406,10 +459,7 @@ fn infer_builtin(
         }
         // A transpose exchanges the two axes of its operand, so its shape is
         // the operand's with the last two extents swapped.
-        BuiltinOp::Transpose => Ok(Type::tile(
-            ElemType::F32,
-            transpose_shape(&tile_shape(0)),
-        )),
+        BuiltinOp::Transpose => Ok(Type::tile(ElemType::F32, transpose_shape(&tile_shape(0)))),
         BuiltinOp::ReduceMax | BuiltinOp::ReduceMin | BuiltinOp::ReduceSum => Ok(Type::tile(
             ElemType::F32,
             reduce_shape(&tile_shape(0), reduce_axis(args)),
@@ -506,14 +556,12 @@ fn infer_builtin(
         // Reading one element of a tile yields a scalar; reading an element of
         // anything else has no meaning in this DSL and would lower to an
         // extract from a non-tile.
-        BuiltinOp::Index => {
-            match arg_types.first() {
-                Some(Type::Tile { .. }) => Ok(Type::Scalar(ElemType::F32)),
-                _ => Err(TypeError::invalid_kernel(
-                    "an element read expects a tile".to_string(),
-                )),
-            }
-        }
+        BuiltinOp::Index => match arg_types.first() {
+            Some(Type::Tile { .. }) => Ok(Type::Scalar(ElemType::F32)),
+            _ => Err(TypeError::invalid_kernel(
+                "an element read expects a tile".to_string(),
+            )),
+        },
         // `shape()` is a shape, not a number. Treating it as a scalar let
         // `let s = a.shape();` bind a value that lowering turns into zero.
         // `x.shape()` is a shape expression whose dimensions are the buffer's.
@@ -592,7 +640,11 @@ fn check_arity(op: BuiltinOp, actual: usize) -> Result<(), TypeError> {
         | BuiltinOp::Rem
         | BuiltinOp::CeilDiv => (2, 2),
         BuiltinOp::Unary(_) => (1, 1),
-        BuiltinOp::Gt | BuiltinOp::Lt | BuiltinOp::Ge | BuiltinOp::Le | BuiltinOp::Eq
+        BuiltinOp::Gt
+        | BuiltinOp::Lt
+        | BuiltinOp::Ge
+        | BuiltinOp::Le
+        | BuiltinOp::Eq
         | BuiltinOp::Ne => (2, 2),
         BuiltinOp::Select => (3, 3),
         BuiltinOp::TileToScalar => (1, 1),

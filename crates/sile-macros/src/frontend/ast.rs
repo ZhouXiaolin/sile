@@ -26,12 +26,7 @@ impl ConstParam {
         match self.array_rank {
             None => vec![self.ident.clone()],
             Some(rank) => (0..rank)
-                .map(|dim| {
-                    syn::Ident::new(
-                        &format!("{}_{}", self.ident, dim),
-                        self.ident.span(),
-                    )
-                })
+                .map(|dim| syn::Ident::new(&format!("{}_{}", self.ident, dim), self.ident.span()))
                 .collect(),
         }
     }
@@ -89,8 +84,25 @@ pub enum KernelStmt {
         var: syn::Ident,
         start: KernelExpr,
         end: KernelExpr,
+        /// `(a..b).step_by(k)` names the step; a plain range steps by one.
+        step: Option<KernelExpr>,
         body: Vec<KernelStmt>,
     },
+    /// `while cond { .. }`.
+    While {
+        cond: KernelExpr,
+        body: Vec<KernelStmt>,
+    },
+    /// `loop { .. }`: a while whose condition is always true, which is to say
+    /// a loop that only a `break` leaves.
+    Loop {
+        body: Vec<KernelStmt>,
+    },
+    /// `break`: leave the enclosing `while` or `loop`.
+    Break,
+    /// `return;`: leave the kernel. A kernel returns nothing, so the form
+    /// carries no value.
+    Return,
     /// `if cond { .. } else { .. }`.
     ///
     /// `else if` reaches here as an `if` statement in the else body, so one

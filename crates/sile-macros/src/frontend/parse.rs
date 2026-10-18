@@ -93,6 +93,42 @@ fn parse_stmt(stmt: &syn::Stmt, body: &mut Vec<KernelStmt>) -> syn::Result<()> {
                 parse_for_loop(for_loop, body)?;
                 return Ok(());
             }
+            if let syn::Expr::While(while_expr) = expr {
+                let cond = parse_expr(&while_expr.cond)?;
+                let loop_body = parse_block(&while_expr.body)?;
+                body.push(KernelStmt::While {
+                    cond,
+                    body: loop_body,
+                });
+                return Ok(());
+            }
+            if let syn::Expr::Loop(loop_expr) = expr {
+                let loop_body = parse_block(&loop_expr.body)?;
+                body.push(KernelStmt::Loop { body: loop_body });
+                return Ok(());
+            }
+            if let syn::Expr::Break(break_expr) = expr {
+                if let Some(value) = break_expr.expr.as_ref() {
+                    return Err(syn::Error::new_spanned(
+                        value,
+                        "`break` takes no value in a kernel",
+                    ));
+                }
+                body.push(KernelStmt::Break);
+                return Ok(());
+            }
+            if let syn::Expr::Return(ret) = expr {
+                // A kernel returns nothing, so a bare `return` ends the body
+                // and a value has no place to go.
+                if let Some(value) = ret.expr.as_ref() {
+                    return Err(syn::Error::new_spanned(
+                        value,
+                        "a kernel returns nothing; write `return;`",
+                    ));
+                }
+                body.push(KernelStmt::Return);
+                return Ok(());
+            }
             if let syn::Expr::If(if_expr) = expr {
                 body.push(parse_if(if_expr)?);
                 return Ok(());
@@ -133,9 +169,7 @@ fn parse_stmt(stmt: &syn::Stmt, body: &mut Vec<KernelStmt>) -> syn::Result<()> {
             {
                 let mut args = call.args.iter();
                 let target = match args.next() {
-                    Some(syn::Expr::Path(path)) => {
-                        path.path.segments.last().unwrap().ident.clone()
-                    }
+                    Some(syn::Expr::Path(path)) => path.path.segments.last().unwrap().ident.clone(),
                     _ => {
                         return Err(syn::Error::new_spanned(
                             &call.func,
@@ -152,7 +186,11 @@ fn parse_stmt(stmt: &syn::Stmt, body: &mut Vec<KernelStmt>) -> syn::Result<()> {
                         "store_tile expects a buffer and a value",
                     ));
                 }
-                body.push(KernelStmt::Store { target, value, index: None });
+                body.push(KernelStmt::Store {
+                    target,
+                    value,
+                    index: None,
+                });
                 return Ok(());
             }
             // `unsafe { ... }` marks an operation whose contract the caller
@@ -194,9 +232,10 @@ fn parse_store(call: &syn::ExprMethodCall) -> syn::Result<KernelStmt> {
         }
     };
     let mut args = call.args.iter();
-    let value = parse_expr(args.next().ok_or_else(|| {
-        syn::Error::new_spanned(call, "store requires a value")
-    })?)?;
+    let value = parse_expr(
+        args.next()
+            .ok_or_else(|| syn::Error::new_spanned(call, "store requires a value"))?,
+    )?;
     let index = args.next().map(parse_expr).transpose()?;
     if args.next().is_some() {
         return Err(syn::Error::new_spanned(
@@ -222,12 +261,14 @@ fn parse_atomic_add(call: &syn::ExprMethodCall) -> syn::Result<KernelStmt> {
         }
     };
     let mut args = call.args.iter();
-    let index = parse_expr(args.next().ok_or_else(|| {
-        syn::Error::new_spanned(call, "atomic_add requires index argument")
-    })?)?;
-    let value = parse_expr(args.next().ok_or_else(|| {
-        syn::Error::new_spanned(call, "atomic_add requires value argument")
-    })?)?;
+    let index = parse_expr(
+        args.next()
+            .ok_or_else(|| syn::Error::new_spanned(call, "atomic_add requires index argument"))?,
+    )?;
+    let value = parse_expr(
+        args.next()
+            .ok_or_else(|| syn::Error::new_spanned(call, "atomic_add requires value argument"))?,
+    )?;
     if args.next().is_some() {
         return Err(syn::Error::new_spanned(
             call,
@@ -303,12 +344,25 @@ fn rewrite_block_id_fields(body: &mut [KernelStmt], block_ids: &[syn::Ident]) {
                 rewrite_block_id_expr(value, block_ids);
             }
             KernelStmt::ForLoop {
-                start, end, body, ..
+                start,
+                end,
+                step,
+                body,
+                ..
             } => {
                 rewrite_block_id_expr(start, block_ids);
                 rewrite_block_id_expr(end, block_ids);
+                if let Some(step) = step {
+                    rewrite_block_id_expr(step, block_ids);
+                }
                 rewrite_block_id_fields(body, block_ids);
             }
+            KernelStmt::While { cond, body } => {
+                rewrite_block_id_expr(cond, block_ids);
+                rewrite_block_id_fields(body, block_ids);
+            }
+            KernelStmt::Loop { body } => rewrite_block_id_fields(body, block_ids),
+            KernelStmt::Break | KernelStmt::Return => {}
             KernelStmt::If {
                 cond,
                 then_body,
@@ -449,43 +503,91 @@ fn parse_for_loop(for_loop: &syn::ExprForLoop, body: &mut Vec<KernelStmt>) -> sy
             ));
         }
     };
-    let (start, end) = match for_loop.expr.as_ref() {
-        syn::Expr::Range(range) => {
-            let start_expr = range.start.as_ref().ok_or_else(|| {
-                syn::Error::new_spanned(range, "for loop range must have a start")
-            })?;
-            let end_expr = range
-                .end
-                .as_ref()
-                .ok_or_else(|| syn::Error::new_spanned(range, "for loop range must have an end"))?;
-            let start = parse_expr(start_expr)?;
-            let end = parse_expr(end_expr)?;
-            // `a..=b` includes `b`, so the exclusive bound the HIR compares
-            // against is one past it. Rewriting here keeps one loop form.
-            match range.limits {
-                syn::RangeLimits::Closed(_) => (
-                    start,
-                    KernelExpr::BinaryOp {
-                        left: Box::new(end),
-                        op: BinOpKind::Add,
-                        right: Box::new(KernelExpr::Lit(syn::LitInt::new("1", range.limits.span()))),
-                    },
-                ),
-                syn::RangeLimits::HalfOpen(_) => (start, end),
+    let (start, end, step) =
+        match for_loop.expr.as_ref() {
+            syn::Expr::Range(range) => {
+                let start_expr = range.start.as_ref().ok_or_else(|| {
+                    syn::Error::new_spanned(range, "for loop range must have a start")
+                })?;
+                let end_expr = range.end.as_ref().ok_or_else(|| {
+                    syn::Error::new_spanned(range, "for loop range must have an end")
+                })?;
+                let start = parse_expr(start_expr)?;
+                let end = parse_expr(end_expr)?;
+                // `a..=b` includes `b`, so the exclusive bound the HIR compares
+                // against is one past it. Rewriting here keeps one loop form.
+                match range.limits {
+                    syn::RangeLimits::Closed(_) => (
+                        start,
+                        KernelExpr::BinaryOp {
+                            left: Box::new(end),
+                            op: BinOpKind::Add,
+                            right: Box::new(KernelExpr::Lit(syn::LitInt::new(
+                                "1",
+                                range.limits.span(),
+                            ))),
+                        },
+                        None,
+                    ),
+                    syn::RangeLimits::HalfOpen(_) => (start, end, None),
+                }
             }
-        }
-        _ => {
-            return Err(syn::Error::new_spanned(
-                &for_loop.expr,
-                "for loop expression must be a range",
-            ));
-        }
-    };
+            // `(a..b).step_by(k)` names a range with a step. The method is Rust's
+            // iterator adapter, and the step is the only thing it adds here.
+            syn::Expr::MethodCall(call) if call.method == "step_by" => {
+                // The range may wear parentheses, which syn keeps as its own node.
+                let receiver = match call.receiver.as_ref() {
+                    syn::Expr::Paren(paren) => paren.expr.as_ref(),
+                    other => other,
+                };
+                let syn::Expr::Range(range) = receiver else {
+                    return Err(syn::Error::new_spanned(
+                        &call.receiver,
+                        "step_by must follow a range",
+                    ));
+                };
+                let start_expr = range.start.as_ref().ok_or_else(|| {
+                    syn::Error::new_spanned(range, "for loop range must have a start")
+                })?;
+                let end_expr = range.end.as_ref().ok_or_else(|| {
+                    syn::Error::new_spanned(range, "for loop range must have an end")
+                })?;
+                let start = parse_expr(start_expr)?;
+                let end = parse_expr(end_expr)?;
+                let step = parse_expr(
+                    call.args
+                        .first()
+                        .ok_or_else(|| syn::Error::new_spanned(call, "step_by needs a step"))?,
+                )?;
+                match range.limits {
+                    syn::RangeLimits::Closed(_) => (
+                        start,
+                        KernelExpr::BinaryOp {
+                            left: Box::new(end),
+                            op: BinOpKind::Add,
+                            right: Box::new(KernelExpr::Lit(syn::LitInt::new(
+                                "1",
+                                range.limits.span(),
+                            ))),
+                        },
+                        Some(step),
+                    ),
+                    syn::RangeLimits::HalfOpen(_) => (start, end, Some(step)),
+                }
+            }
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    &for_loop.expr,
+                    "for loop expression must be a range",
+                ));
+            }
+        };
     let loop_body = parse_block(&for_loop.body)?;
     body.push(KernelStmt::ForLoop {
         var,
         start,
         end,
+        step,
         body: loop_body,
     });
     Ok(())
@@ -586,7 +688,12 @@ fn float_constant(path: &syn::Path) -> Option<f32> {
         .iter()
         .map(|segment| segment.ident.to_string())
         .collect();
-    match names.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+    match names
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
         ["f32", "NEG_INFINITY"] => Some(f32::NEG_INFINITY),
         ["f32", "INFINITY"] => Some(f32::INFINITY),
         ["f32", "NAN"] => Some(f32::NAN),
@@ -684,7 +791,8 @@ fn buffer_element_spelling(ty: &syn::Type) -> Option<String> {
     elem.path.get_ident().map(|ident| ident.to_string())
 }
 
-fn extract_shape_from_type(ty: &syn::Type) -> Option<Vec<KernelShapeDim>> {    let syn::Type::Path(type_path) = ty else {
+fn extract_shape_from_type(ty: &syn::Type) -> Option<Vec<KernelShapeDim>> {
+    let syn::Type::Path(type_path) = ty else {
         return None;
     };
     let last_seg = type_path.path.segments.last()?;
