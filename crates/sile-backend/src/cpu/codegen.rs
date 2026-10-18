@@ -172,7 +172,24 @@ impl emit::TargetDialect for CDialect {
                     None => format!("{func}({joined});"),
                 }])
             }
-            _ => Ok(vec![]),
+            // An intrinsic never reaches here: the shared emitter dispatches it
+            // to `intrinsic_stmt` before this match is consulted.
+            llvm_ir::InstOp::Intrinsic { .. } => Err(sile_core::Error::Compile(
+                "LLVM IR C codegen cannot spell an intrinsic in extra_inst_stmt".into(),
+            )),
+            // The shared lowering spells these the same way on every target. A
+            // result-less operator reaching here would otherwise be dropped,
+            // and the kernel would read an undefined name.
+            llvm_ir::InstOp::Bin { .. }
+            | llvm_ir::InstOp::Cmp { .. }
+            | llvm_ir::InstOp::Cast { .. }
+            | llvm_ir::InstOp::Gep { .. }
+            | llvm_ir::InstOp::Load { .. }
+            | llvm_ir::InstOp::Select { .. }
+            | llvm_ir::InstOp::Store { .. } => Err(sile_core::Error::Compile(format!(
+                "LLVM IR C codegen cannot spell the instruction {:?}; the shared lowering was expected to take it",
+                inst.op
+            ))),
         }
     }
 

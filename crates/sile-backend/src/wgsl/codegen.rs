@@ -235,7 +235,12 @@ impl<'a> WgslDialect<'a> {
         };
         let elem = match &param.ty {
             llvm_ir::Type::Ptr { pointee, .. } => wgsl_type(pointee.as_ref()),
-            _ => "f32".to_string(),
+            // Every parameter the lowering produces is a pointer: a buffer or
+            // one of the descriptors. A plain value here would mean the ABI
+            // grew a parameter kind this declaration cannot spell.
+            other => panic!(
+                "a WGSL storage parameter holds a buffer pointer, not {other:?}"
+            ),
         };
         let name = if emit::is_shapes_param(param) {
             self.shapes_name.clone()
@@ -450,8 +455,21 @@ impl TargetDialect for WgslDialect<'_> {
     }
 
     fn select(&self) -> emit::SelectSpelling {
-        // WGSL has no conditional expression; a choice is a call.
-        emit::SelectSpelling::Function
+        // WGSL has no conditional expression; a choice is a call. A bare
+        // integer argument resolves to `i32` before the context is seen, so
+        // the constants of an `i64` choice carry their type.
+        emit::SelectSpelling::Function {
+            int_const: |value| format!("i64({value})"),
+        }
+    }
+
+    fn cast_expr(op: llvm_ir::CastOp, to: &llvm_ir::Type, value: String) -> String {
+        // WGSL has no implicit conversion, so a conversion names the type it
+        // produces. A bitcast reinterprets the bits instead of converting them.
+        match op {
+            llvm_ir::CastOp::Bitcast => format!("bitcast<{}>({value})", wgsl_type(to)),
+            _ => format!("{}({value})", wgsl_type(to)),
+        }
     }
 
     fn vectorize_hint(&self, _is_simple_body: bool) -> Option<String> {
@@ -597,7 +615,26 @@ impl TargetDialect for WgslDialect<'_> {
             llvm_ir::InstOp::Call { func, .. } => Err(sile_core::Error::Compile(format!(
                 "LLVM IR WGSL codegen does not support call instructions: {func}"
             ))),
-            _ => Ok(vec![]),
+            // An intrinsic never reaches here: the shared emitter dispatches it
+            // to `intrinsic_stmt` before this match is consulted.
+            llvm_ir::InstOp::Intrinsic { .. } => Err(sile_core::Error::Compile(
+                "LLVM IR WGSL codegen cannot spell an intrinsic in extra_inst_stmt".into(),
+            )),
+            // An alloca is the `var` declaration the emitter already wrote, and
+            // a `gep` is spelled at its use: neither leaves a statement here.
+            llvm_ir::InstOp::Alloca { .. } | llvm_ir::InstOp::Gep { .. } => Ok(vec![]),
+            // The shared lowering spells these the same way on every target. A
+            // result-less operator reaching here would otherwise be dropped,
+            // and the kernel would read an undefined name.
+            llvm_ir::InstOp::Bin { .. }
+            | llvm_ir::InstOp::Cmp { .. }
+            | llvm_ir::InstOp::Cast { .. }
+            | llvm_ir::InstOp::Load { .. }
+            | llvm_ir::InstOp::Select { .. }
+            | llvm_ir::InstOp::Store { .. } => Err(sile_core::Error::Compile(format!(
+                "LLVM IR WGSL codegen cannot spell the instruction {:?}; the shared lowering was expected to take it",
+                inst.op
+            ))),
         }
     }
 
