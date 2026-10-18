@@ -56,7 +56,10 @@ def main():
     scalars = lengths[count:]
     lengths = lengths[:count]
 
-    if op == "saxpy":
+    if op == "vec_add":
+        a, b = read_inputs(count, lengths)
+        expected = a + b
+    elif op == "saxpy":
         x, y = read_inputs(count, lengths)
         alpha = np.float32(float(scalars[0]))
         expected = alpha * x + y

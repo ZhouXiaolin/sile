@@ -4,4 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+flume.workspace = true
+pollster.workspace = true
 thiserror.workspace = true

@@ -97,6 +97,12 @@ impl Tensor<f32> {
     pub fn to_vec(&self, _stream: &sile_core::Stream) -> Result<Vec<f32>> {
         Ok(self.data.clone())
     }
+
+    /// The values back, consuming the buffer: the move the async chain makes
+    /// when the last stage copies to the host.
+    pub fn into_vec(self) -> Vec<f32> {
+        self.data
+    }
     pub fn device(&self) -> &Device {
         &self.device
     }

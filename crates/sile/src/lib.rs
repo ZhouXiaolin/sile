@@ -150,7 +150,10 @@ pub mod schedule {
 }
 
 pub mod kernel_launcher;
+pub mod op;
 pub use kernel_launcher::KernelLauncher;
+pub use op::DeviceOp;
+pub use sile_core::DeviceFuture;
 
 pub fn reduce_max(tile: Tile<f32>, axis: i64) -> Tile<f32> {
     tile.reduced_shape(axis)
