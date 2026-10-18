@@ -206,6 +206,74 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
                 "reduce {value} {{axis = {axis}, combiner = \"min\", input_shape = [{in_rows}, {in_cols}]}}"
             )
         }
+        TileIrOp::ReduceProd {
+            value,
+            axis,
+            in_rows,
+            in_cols,
+        } => {
+            format!(
+                "reduce {value} {{axis = {axis}, combiner = \"prod\", input_shape = [{in_rows}, {in_cols}]}}"
+            )
+        }
+        TileIrOp::Scan {
+            value,
+            axis,
+            in_rows,
+            in_cols,
+            reverse,
+            combiner,
+            ..
+        } => {
+            let combiner = match combiner {
+                crate::ir::ReduceCombiner::Sum => "sum",
+                crate::ir::ReduceCombiner::Prod => "prod",
+                crate::ir::ReduceCombiner::Max => "max",
+                crate::ir::ReduceCombiner::Min => "min",
+            };
+            format!(
+                "scan {value} {{axis = {axis}, combiner = \"{combiner}\", reverse = {reverse}, input_shape = [{in_rows}, {in_cols}]}}"
+            )
+        }
+        TileIrOp::Cat {
+            lhs,
+            rhs,
+            axis,
+            lhs_rows,
+            lhs_cols,
+            rhs_rows,
+            rhs_cols,
+        } => {
+            format!(
+                "cat {lhs}, {rhs} {{axis = {axis}, lhs_shape = [{lhs_rows}, {lhs_cols}], rhs_shape = [{rhs_rows}, {rhs_cols}]}}"
+            )
+        }
+        TileIrOp::ExtractSlice {
+            source,
+            row_idx,
+            col_idx,
+            in_rows,
+            in_cols,
+            out_rows,
+            out_cols,
+        } => {
+            format!(
+                "extract {source} {{index = [{row_idx}, {col_idx}], input_shape = [{in_rows}, {in_cols}], result_shape = [{out_rows}, {out_cols}]}}"
+            )
+        }
+        TileIrOp::InsertSlice {
+            source,
+            destination,
+            row_idx,
+            col_idx,
+            in_rows,
+            in_cols,
+            ..
+        } => {
+            format!(
+                "insert {source} into {destination} {{index = [{row_idx}, {col_idx}], subtile_shape = [{in_rows}, {in_cols}]}}"
+            )
+        }
         TileIrOp::Broadcast { value, rows, cols } => {
             format!("broadcast {value} {{shape = [{rows}, {cols}]}}")
         }

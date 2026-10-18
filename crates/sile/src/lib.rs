@@ -25,8 +25,10 @@ pub mod ct {
     };
     pub use crate::{
         broadcast_scalar, ceil_div, constant, convert_scalar, eq_tile, exp, exp2, ge_tile, gt_tile,
-        iota, le_tile, log, log2, lt_tile, mma, ne_tile, reduce_max, reduce_min, reduce_sum,
-        rsqrt, scalar_to_tile, select, sqrt, tile_to_scalar, true_div,
+        iota, le_tile, log, log2, lt_tile, mma, ne_tile, reduce_max, reduce_min, reduce_prod,
+        reduce_sum,
+        cat, extract, insert, permute, rsqrt, scalar_to_tile, scan, scan_sum, select, sqrt,
+        tile_to_scalar, true_div,
     };
     // CuTile writes a tile operation with a `_tile` suffix and the scalar one
     // without. Both names reach the same operation here.
@@ -153,6 +155,55 @@ pub fn reduce_sum(tile: Tile<f32>, axis: i64) -> Tile<f32> {
 
 pub fn reduce_min(tile: Tile<f32>, axis: i64) -> Tile<f32> {
     tile.reduced_shape(axis)
+}
+
+pub fn reduce_prod(tile: Tile<f32>, axis: i64) -> Tile<f32> {
+    tile.reduced_shape(axis)
+}
+
+/// `cat(lhs, rhs, dim)`: the host stub keeps the call site type-correct; the
+/// kernel body compiles from the macro's own lowering of the same call.
+pub fn cat(lhs: Tile<f32>, _rhs: Tile<f32>, _dim: i64) -> Tile<f32> {
+    lhs
+}
+
+/// `extract(src, [i, j], shape![R, C])`: the same stub convention.
+pub fn extract(source: Tile<f32>, _indices: [i64; 2], _shape: [i64; 2]) -> Tile<f32> {
+    source
+}
+
+/// `insert(sub, dst, [i, j])`: the same stub convention.
+pub fn insert(_sub: Tile<f32>, destination: Tile<f32>, _indices: [i64; 2]) -> Tile<f32> {
+    destination
+}
+
+/// `permute(t, [1, 0])`: the host stub keeps the call site type-correct; the
+/// kernel body compiles from the macro's own lowering of the same call.
+pub fn permute(tile: Tile<f32>, _permutation: [i64; 2]) -> Tile<f32> {
+    tile
+}
+
+/// `scan_sum(t, dim, reverse, identity)` and `scan(..., |a, b| a + b)`: the
+/// host stub keeps the call site type-correct; the kernel body compiles from
+/// the macro's own lowering of the same call.
+pub fn scan_sum<V>(_tile: Tile<f32>, _axis: i64, _identity: V) -> Tile<f32>
+where
+    V: Into<f32>,
+{
+    Tile::new([0i64; 2])
+}
+
+/// `scan(t, dim, reverse, identity, combiner)` with `+` or `*` as the combiner.
+pub fn scan<V>(
+    _tile: Tile<f32>,
+    _axis: i64,
+    _identity: V,
+    _combiner: impl FnMut(f32, f32) -> f32,
+) -> Tile<f32>
+where
+    V: Into<f32>,
+{
+    Tile::new([0i64; 2])
 }
 
 pub fn sqrt(tile: Tile<f32>) -> Tile<f32> {

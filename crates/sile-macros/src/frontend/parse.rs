@@ -971,6 +971,35 @@ fn parse_expr(expr: &syn::Expr) -> syn::Result<KernelExpr> {
             )),
         },
         syn::Expr::Array(arr) => Ok(KernelExpr::Array(arr.clone())),
+        // `|a, b| <one expression>`: the combiner a `scan` folds with. Two
+        // plain names and one expression is the whole shape; anything else —
+        // a typed parameter, a statement body, a different arity — is a
+        // combiner this front end cannot carry.
+        syn::Expr::Closure(closure) => {
+            let mut params = Vec::new();
+            for input in &closure.inputs {
+                match input {
+                    syn::Pat::Ident(pat) => params.push(pat.ident.clone()),
+                    other => {
+                        return Err(syn::Error::new_spanned(
+                            other,
+                            "a scan combiner's parameters must be plain names",
+                        ));
+                    }
+                }
+            }
+            let body = parse_expr(&closure.body)?;
+            if params.len() != 2 {
+                return Err(syn::Error::new_spanned(
+                    closure,
+                    "a scan combiner takes two parameters",
+                ));
+            }
+            Ok(KernelExpr::Closure {
+                params,
+                body: Box::new(body),
+            })
+        }
         // CuTile writes a compile-time shape as a macro call, because the rank
         // is part of the type there. The rank is already in the argument list
         // here, so the macro is syntax: it lowers to the same shape expression

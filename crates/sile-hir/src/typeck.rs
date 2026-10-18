@@ -460,10 +460,53 @@ fn infer_builtin(
         // A transpose exchanges the two axes of its operand, so its shape is
         // the operand's with the last two extents swapped.
         BuiltinOp::Transpose => Ok(Type::tile(ElemType::F32, transpose_shape(&tile_shape(0)))),
-        BuiltinOp::ReduceMax | BuiltinOp::ReduceMin | BuiltinOp::ReduceSum => Ok(Type::tile(
+        BuiltinOp::ReduceMax | BuiltinOp::ReduceMin | BuiltinOp::ReduceSum | BuiltinOp::ReduceProd => Ok(Type::tile(
             ElemType::F32,
             reduce_shape(&tile_shape(0), reduce_axis(args)),
         )),
+        // A scan folds along one axis but keeps every element, so the result
+        // is the operand's own shape.
+        BuiltinOp::ScanSum | BuiltinOp::ScanProd => {
+            Ok(Type::tile(ElemType::F32, tile_shape(0)))
+        }
+        // A cat joins the two tiles along one axis and leaves the other equal,
+        // so the joined extent is the sum and the other one carries over.
+        BuiltinOp::Cat => {
+            let axis = cat_axis(args);
+            let (lhs, rhs) = (tile_shape(0), tile_shape(1));
+            match (&lhs, &rhs) {
+                (
+                    ShapeExpr::Tuple(lhs_dims),
+                    ShapeExpr::Tuple(rhs_dims),
+                ) if lhs_dims.len() == rhs_dims.len() => {
+                    let joined = ShapeExpr::Constant(
+                        constant_dim(&lhs_dims[1 - axis as usize])
+                            + constant_dim(&rhs_dims[1 - axis as usize]),
+                    );
+                    let carried = if constant_dim(&lhs_dims[axis as usize])
+                        == constant_dim(&rhs_dims[axis as usize])
+                    {
+                        lhs_dims[axis as usize].clone()
+                    } else {
+                        ShapeExpr::symbol("S")
+                    };
+                    let dims: Vec<ShapeExpr> = if axis == 1 {
+                        vec![carried, joined]
+                    } else {
+                        vec![joined, carried]
+                    };
+                    Ok(Type::tile(ElemType::F32, ShapeExpr::Tuple(dims)))
+                }
+                _ => Ok(Type::tile(ElemType::F32, ShapeExpr::symbol("S"))),
+            }
+        }
+        // An extract names its subtile extent with a shape argument, so the
+        // result is that extent.
+        BuiltinOp::ExtractSlice => {
+            Ok(Type::tile(ElemType::F32, declared_shape(args, 3, locals)))
+        }
+        // An insert returns the destination it names.
+        BuiltinOp::InsertSlice => Ok(Type::tile(ElemType::F32, tile_shape(1))),
         // Pointwise operations keep the operand's shape. When neither operand
         // is a tile the result is a scalar, not a tile: treating every
         // arithmetic result as a tile let a scalar expression be stored into an
@@ -650,7 +693,11 @@ fn check_arity(op: BuiltinOp, actual: usize) -> Result<(), TypeError> {
         BuiltinOp::TileToScalar => (1, 1),
         BuiltinOp::ScalarToTile => (1, 1),
         BuiltinOp::ConvertScalar => (1, 1),
-        BuiltinOp::ReduceMax | BuiltinOp::ReduceMin | BuiltinOp::ReduceSum => (1, 2),
+        BuiltinOp::ReduceMax | BuiltinOp::ReduceMin | BuiltinOp::ReduceSum | BuiltinOp::ReduceProd => (1, 2),
+        BuiltinOp::ScanSum | BuiltinOp::ScanProd => (4, 4),
+        BuiltinOp::Cat => (3, 3),
+        BuiltinOp::ExtractSlice => (4, 4),
+        BuiltinOp::InsertSlice => (4, 4),
         BuiltinOp::Reshape | BuiltinOp::Broadcast => (2, 2),
         BuiltinOp::Transpose => (1, 1),
         BuiltinOp::ShapeOf | BuiltinOp::ShapeDim => (1, 2),
@@ -751,6 +798,21 @@ fn partition_source(args: &[Expr], index: usize) -> String {
 ///
 /// `reduce_sum(t)` with no axis reduces the innermost dimension, which is the
 /// same default the lowering uses.
+fn cat_axis(args: &[Expr]) -> i64 {
+    match args.get(2) {
+        Some(Expr::ScalarI64(axis)) => *axis,
+        _ => 1,
+    }
+}
+
+/// The extent a shape dimension names, when it names a constant.
+fn constant_dim(dim: &ShapeExpr) -> i64 {
+    match dim {
+        ShapeExpr::Constant(value) => *value,
+        _ => 0,
+    }
+}
+
 fn reduce_axis(args: &[Expr]) -> i64 {
     match args.get(1) {
         Some(Expr::ScalarI64(axis)) => *axis,

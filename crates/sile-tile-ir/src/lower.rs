@@ -1784,7 +1784,7 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 },
             )
         }
-        BuiltinOp::ReduceMax | BuiltinOp::ReduceSum => {
+        BuiltinOp::ReduceMax | BuiltinOp::ReduceSum | BuiltinOp::ReduceProd => {
             let value = lower_expr(&args[0], ctx);
             let (in_rows, in_cols) = tile_shape_of(value, ctx).unwrap_or((1, 1));
             let requested_axis = args.get(1).map(|arg| eval_i64(arg, ctx)).unwrap_or(1);
@@ -1808,10 +1808,134 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                     in_rows,
                     in_cols,
                 },
+                BuiltinOp::ReduceProd => TileIrOp::ReduceProd {
+                    value,
+                    axis,
+                    in_rows,
+                    in_cols,
+                },
                 _ => unreachable!(),
             };
             ctx.emit(
                 reduce_op,
+                TileIrType::Tile {
+                    rows: out_rows,
+                    cols: out_cols,
+                },
+            )
+        }
+        BuiltinOp::ScanSum | BuiltinOp::ScanProd => {
+            let value = lower_expr(&args[0], ctx);
+            let identity = lower_expr(&args[3], ctx);
+            let (in_rows, in_cols) = tile_shape_of(value, ctx).unwrap_or((1, 1));
+            let requested_axis = args.get(1).map(|arg| eval_i64(arg, ctx)).unwrap_or(1);
+            // 1D tiles are lowered as 1xN, so their only logical axis maps to cols.
+            let axis = if in_rows == 1 { 1 } else { requested_axis };
+            // The reverse argument is the `reverse::` path the macro frontend
+            // spelled as a 0/1 constant.
+            let reverse = args.get(2).map(|arg| eval_i64(arg, ctx)).unwrap_or(0) != 0;
+            let combiner = match op {
+                BuiltinOp::ScanSum => crate::ir::ReduceCombiner::Sum,
+                _ => crate::ir::ReduceCombiner::Prod,
+            };
+            ctx.emit(
+                TileIrOp::Scan {
+                    value,
+                    identity,
+                    axis,
+                    in_rows,
+                    in_cols,
+                    reverse,
+                    combiner,
+                },
+                TileIrType::Tile {
+                    rows: in_rows,
+                    cols: in_cols,
+                },
+            )
+        }
+        BuiltinOp::Cat => {
+            let lhs = lower_expr(&args[0], ctx);
+            let rhs = lower_expr(&args[1], ctx);
+            let (l_rows, l_cols) = tile_shape_of(lhs, ctx).unwrap_or((1, 1));
+            let (r_rows, r_cols) = tile_shape_of(rhs, ctx).unwrap_or((1, 1));
+            let axis = args.get(2).map(|arg| eval_i64(arg, ctx)).unwrap_or(1);
+            // The joined extent is the sum; the other extent must be equal on
+            // both sides, or the result would not be one tile.
+            let (out_rows, out_cols) = if axis == 1 {
+                assert!(
+                    l_rows == r_rows,
+                    "cat along axis 1 needs equal rows, got {l_rows} and {r_rows}"
+                );
+                (l_rows, l_cols + r_cols)
+            } else {
+                assert!(
+                    l_cols == r_cols,
+                    "cat along axis 0 needs equal columns, got {l_cols} and {r_cols}"
+                );
+                (l_rows + r_rows, l_cols)
+            };
+            ctx.emit(
+                TileIrOp::Cat {
+                    lhs,
+                    rhs,
+                    axis,
+                    lhs_rows: l_rows,
+                    lhs_cols: l_cols,
+                    rhs_rows: r_rows,
+                    rhs_cols: r_cols,
+                },
+                TileIrType::Tile { rows: out_rows, cols: out_cols },
+            )
+        }
+        // `extract(src, [i, j], shape![R, C])`: the subtile extent travels as a
+        // shape argument, and the block indices are plain values.
+        BuiltinOp::ExtractSlice => {
+            let source = lower_expr(&args[0], ctx);
+            let row_idx = lower_expr(&args[1], ctx);
+            let col_idx = lower_expr(&args[2], ctx);
+            let (in_rows, in_cols) = tile_shape_of(source, ctx).unwrap_or((1, 1));
+            let shape = args
+                .get(3)
+                .map(|arg| extract_const_shape(arg, ctx))
+                .unwrap_or_default();
+            let (out_rows, out_cols) = shape_to_2d(&shape);
+            ctx.emit(
+                TileIrOp::ExtractSlice {
+                    source,
+                    row_idx,
+                    col_idx,
+                    in_rows,
+                    in_cols,
+                    out_rows,
+                    out_cols,
+                },
+                TileIrType::Tile {
+                    rows: out_rows,
+                    cols: out_cols,
+                },
+            )
+        }
+        // `insert(sub, dst, [i, j])`: the subtile extent comes from the source
+        // and the destination extent from the tile it is written into.
+        BuiltinOp::InsertSlice => {
+            let source = lower_expr(&args[0], ctx);
+            let destination = lower_expr(&args[1], ctx);
+            let row_idx = lower_expr(&args[2], ctx);
+            let col_idx = lower_expr(&args[3], ctx);
+            let (in_rows, in_cols) = tile_shape_of(source, ctx).unwrap_or((1, 1));
+            let (out_rows, out_cols) = tile_shape_of(destination, ctx).unwrap_or((1, 1));
+            ctx.emit(
+                TileIrOp::InsertSlice {
+                    source,
+                    destination,
+                    row_idx,
+                    col_idx,
+                    in_rows,
+                    in_cols,
+                    out_rows,
+                    out_cols,
+                },
                 TileIrType::Tile {
                     rows: out_rows,
                     cols: out_cols,

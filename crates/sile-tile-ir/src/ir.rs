@@ -290,6 +290,60 @@ pub enum TileIrOp {
         in_rows: i64,
         in_cols: i64,
     },
+    /// `cuda_tile.reduce` with prod combiner
+    ReduceProd {
+        value: ValueId,
+        axis: i64,
+        in_rows: i64,
+        in_cols: i64,
+    },
+    /// `cuda_tile.scan_sum` and a `scan` with an add or a multiply combiner:
+    /// the running fold along one axis. Unlike a reduce, every element of the
+    /// output keeps the accumulated value up to and including itself, so the
+    /// output is the operand's own extent.
+    Scan {
+        value: ValueId,
+        /// The value the fold starts from: `out[0]` is `combine(identity, in[0])`.
+        identity: ValueId,
+        axis: i64,
+        in_rows: i64,
+        in_cols: i64,
+        reverse: bool,
+        combiner: ReduceCombiner,
+    },
+    /// `cuda_tile.cat`: the two tiles joined along one axis.
+    Cat {
+        lhs: ValueId,
+        rhs: ValueId,
+        axis: i64,
+        lhs_rows: i64,
+        lhs_cols: i64,
+        rhs_rows: i64,
+        rhs_cols: i64,
+    },
+    /// `cuda_tile.extract`: the subtile of the source at a block index. The
+    /// block index is a value per axis; the subtile extent is static.
+    ExtractSlice {
+        source: ValueId,
+        row_idx: ValueId,
+        col_idx: ValueId,
+        in_rows: i64,
+        in_cols: i64,
+        out_rows: i64,
+        out_cols: i64,
+    },
+    /// `cuda_tile.insert`: the destination with the subtile written at a
+    /// block index.
+    InsertSlice {
+        source: ValueId,
+        destination: ValueId,
+        row_idx: ValueId,
+        col_idx: ValueId,
+        in_rows: i64,
+        in_cols: i64,
+        out_rows: i64,
+        out_cols: i64,
+    },
     /// `cuda_tile.broadcast`
     Broadcast {
         value: ValueId,
@@ -362,6 +416,15 @@ pub enum TileIrOp {
         dim: usize,
         tile_extent: i64,
     },
+}
+
+/// Which combiner a fold applies to the elements it carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReduceCombiner {
+    Sum,
+    Max,
+    Min,
+    Prod,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -555,7 +618,25 @@ impl TileIrFunction {
             TileIrOp::MmaF { a, b, acc, .. } => vec![*a, *b, *acc],
             TileIrOp::ReduceSum { value, .. }
             | TileIrOp::ReduceMax { value, .. }
-            | TileIrOp::ReduceMin { value, .. } => vec![*value],
+            | TileIrOp::ReduceMin { value, .. }
+            | TileIrOp::ReduceProd { value, .. } => vec![*value],
+            TileIrOp::Scan {
+                value, identity, ..
+            } => vec![*value, *identity],
+            TileIrOp::Cat { lhs, rhs, .. } => vec![*lhs, *rhs],
+            TileIrOp::ExtractSlice {
+                source,
+                row_idx,
+                col_idx,
+                ..
+            } => vec![*source, *row_idx, *col_idx],
+            TileIrOp::InsertSlice {
+                source,
+                destination,
+                row_idx,
+                col_idx,
+                ..
+            } => vec![*source, *destination, *row_idx, *col_idx],
             TileIrOp::Broadcast { value, .. } => vec![*value],
             TileIrOp::Reshape { value, .. } => vec![*value],
             TileIrOp::Map { expr, .. } => tile_map_expr_uses(expr),

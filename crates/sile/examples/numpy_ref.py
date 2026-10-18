@@ -214,6 +214,48 @@ def main():
                 continue
             acc = acc + np.float32(i)
         expected = np.full(16, acc, dtype="<f4")
+    elif op == "rs_reduce_prod_1d":
+        (x,) = read_inputs(count, lengths)
+        expected = np.prod(x, dtype="<f4").reshape(1).astype("<f4")
+    elif op == "rs_reduce_prod_2d":
+        (x,) = read_inputs(count, lengths)
+        x2 = x.reshape(4, 8)
+        expected = np.prod(x2, axis=1, dtype="<f4").astype("<f4")
+    elif op == "rs_scan_sum_fwd":
+        (x,) = read_inputs(count, lengths)
+        expected = np.cumsum(x, dtype="<f4")
+    elif op == "rs_scan_sum_rev":
+        (x,) = read_inputs(count, lengths)
+        expected = np.cumsum(x[::-1], dtype="<f4")[::-1]
+    elif op == "rs_scan_prod_fwd":
+        (x,) = read_inputs(count, lengths)
+        expected = np.cumprod(x, dtype="<f4")
+    elif op == "rs_scan_2d_axis1":
+        (x,) = read_inputs(count, lengths)
+        expected = np.cumsum(x.reshape(4, 8), axis=1, dtype="<f4").ravel()
+    elif op == "rs_scan_2d_axis0":
+        (x,) = read_inputs(count, lengths)
+        expected = np.cumsum(x.reshape(4, 8), axis=0, dtype="<f4").ravel()
+    elif op == "rs_cat_cols":
+        x, y = read_inputs(count, lengths)
+        expected = np.concatenate([x.reshape(4, 8), y.reshape(4, 8)], axis=1).ravel()
+    elif op == "rs_cat_rows":
+        x, y = read_inputs(count, lengths)
+        expected = np.concatenate([x.reshape(4, 8), y.reshape(4, 8)], axis=0).ravel()
+    elif op == "rs_extract_block":
+        (x,) = read_inputs(count, lengths)
+        expected = x.reshape(4, 8)[2:4, 4:8].ravel()
+    elif op == "rs_insert_block":
+        x, sub = read_inputs(count, lengths)
+        out = x.reshape(4, 8).copy()
+        out[2:4, 4:8] = sub.reshape(2, 4)
+        expected = out.ravel()
+    elif op == "rs_permute_transpose":
+        (x,) = read_inputs(count, lengths)
+        expected = x.reshape(4, 8).T.ravel()
+    elif op == "rs_permute_identity":
+        (x,) = read_inputs(count, lengths)
+        expected = x
     elif op == "flash_attention_causal":
         q, k, v = read_inputs(count, lengths)
         m, d = (int(s) for s in scalars[:2])

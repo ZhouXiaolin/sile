@@ -9,7 +9,7 @@ use crate::passes::lowering::core::{
     emit_bin, emit_cmp, emit_gep, emit_load, emit_store, lower_nested_tile_loop,
     lower_reduce_extent_loop, lower_reduce_extent_loop_step, resolve_operand,
 };
-use crate::passes::lowering::tile_compute::reduce::reduce_combine;
+use crate::passes::lowering::tile_compute::reduce::{ReduceCombiner, reduce_combine};
 use crate::passes::lowering::tile_expr::{collect_map_load_bases, eval_map_expr_scalar};
 use crate::passes::lowering::tile_memory::{
     BufferIndexBase, build_buffer_index_base, emit_buffer_element_ptr, emit_buffer_linear_index,
@@ -23,7 +23,7 @@ pub(crate) struct LoadReduceFusion {
     pub(crate) src_rows: i64,
     pub(crate) src_cols: i64,
     pub(crate) stride_shape_idx: usize,
-    pub(crate) is_max: bool,
+    pub(crate) combiner: ReduceCombiner,
     pub(crate) axis: i64,
     pub(crate) in_rows: i64,
     pub(crate) in_cols: i64,
@@ -74,12 +74,12 @@ pub(crate) fn lower_fused_load_reduce_inst(
             let index_base = index_base.clone();
             let dst_tile = dst_tile.clone();
             let axis = fusion.axis;
-            let is_max = fusion.is_max;
+            let combiner = fusion.combiner;
 
             move |ctx, _, out, row, col| {
                 // Use vectorized path for sum-reduce along axis=1
                 // (contiguous memory), when extent >= 4.
-                let use_vec = !is_max && axis == 1 && reduce_extent >= 4;
+                let use_vec = combiner == ReduceCombiner::Sum && axis == 1 && reduce_extent >= 4;
 
                 let acc = if use_vec {
                     let vec_chunks = (reduce_extent / 4) as usize;
@@ -146,7 +146,7 @@ pub(crate) fn lower_fused_load_reduce_inst(
                             next_c,
                         );
                         let next = emit_load(ctx, out, next_ptr, llvm_ir::Type::F32);
-                        a = reduce_combine(ctx, out, a, next, is_max);
+                        a = reduce_combine(ctx, out, a, next, combiner);
                     }
                     a
                 };
@@ -170,7 +170,7 @@ pub(crate) fn lower_fused_load_reduce_inst(
             out_cols,
             reduce_extent,
             fusion.axis,
-            fusion.is_max,
+            fusion.combiner,
             buf_operand,
             index_base,
             dst_tile,
@@ -182,7 +182,7 @@ pub(crate) struct MapReduceFusion {
     pub(crate) expr: TileMapExpr,
     pub(crate) src_rows: i64,
     pub(crate) src_cols: i64,
-    pub(crate) is_max: bool,
+    pub(crate) combiner: ReduceCombiner,
     pub(crate) axis: i64,
     pub(crate) in_rows: i64,
     pub(crate) in_cols: i64,
@@ -227,7 +227,7 @@ pub(crate) fn lower_fused_map_reduce_inst(
             let expr = fusion.expr.clone();
             let dst_tile = dst_tile.clone();
             let axis = fusion.axis;
-            let is_max = fusion.is_max;
+            let combiner = fusion.combiner;
             let fused_load_bases = fused_load_bases.clone();
 
             move |ctx, tile_ir, out, row, col| {
@@ -265,7 +265,7 @@ pub(crate) fn lower_fused_map_reduce_inst(
                         out,
                         false,
                     );
-                    acc = reduce_combine(ctx, out, acc, next, is_max);
+                    acc = reduce_combine(ctx, out, acc, next, combiner);
                 }
 
                 let dst_ptr = emit_gep(
@@ -287,7 +287,7 @@ pub(crate) fn lower_fused_map_reduce_inst(
             out_cols,
             reduce_extent,
             fusion.axis,
-            fusion.is_max,
+            fusion.combiner,
             &fusion.expr,
             &fused_load_bases,
             dst_tile,
@@ -303,7 +303,7 @@ fn lower_fused_load_reduce_loop(
     out_cols: i64,
     reduce_extent: i64,
     axis: i64,
-    is_max: bool,
+    combiner: ReduceCombiner,
     buf_operand: llvm_ir::Operand,
     index_base: BufferIndexBase,
     dst_tile: llvm_ir::Operand,
@@ -315,7 +315,7 @@ fn lower_fused_load_reduce_loop(
             out_cols,
             reduce_extent,
             axis,
-            is_max,
+            combiner,
             buf_operand,
             index_base,
             dst_tile,
@@ -327,7 +327,7 @@ fn lower_fused_load_reduce_loop(
             out_rows,
             reduce_extent,
             axis,
-            is_max,
+            combiner,
             buf_operand,
             index_base,
             dst_tile,
@@ -340,7 +340,7 @@ fn lower_fused_load_reduce_loop(
             out_cols,
             reduce_extent,
             axis,
-            is_max,
+            combiner,
             buf_operand,
             index_base,
             dst_tile,
@@ -354,7 +354,7 @@ fn lower_single_col_fused_load_reduce_loop(
     cols: i64,
     reduce_extent: i64,
     axis: i64,
-    is_max: bool,
+    combiner: ReduceCombiner,
     buf_operand: llvm_ir::Operand,
     index_base: BufferIndexBase,
     dst_tile: llvm_ir::Operand,
@@ -406,7 +406,7 @@ fn lower_single_col_fused_load_reduce_loop(
         &reduce_prefix,
         reduce_extent,
         axis,
-        is_max,
+        combiner,
         &buf_operand,
         &index_base,
         row.clone(),
@@ -446,7 +446,7 @@ fn lower_single_col_fused_load_reduce_loop(
                     if axis == 1 { reduce_idx } else { col.clone() },
                 );
                 let next = emit_load(ctx, out, ptr, llvm_ir::Type::F32);
-                reduce_combine(ctx, out, acc, next, is_max)
+                reduce_combine(ctx, out, acc, next, combiner)
             },
         )
     };
@@ -483,7 +483,7 @@ fn lower_single_row_fused_load_reduce_loop(
     rows: i64,
     reduce_extent: i64,
     axis: i64,
-    is_max: bool,
+    combiner: ReduceCombiner,
     buf_operand: llvm_ir::Operand,
     index_base: BufferIndexBase,
     dst_tile: llvm_ir::Operand,
@@ -535,7 +535,7 @@ fn lower_single_row_fused_load_reduce_loop(
         &reduce_prefix,
         reduce_extent,
         axis,
-        is_max,
+        combiner,
         &buf_operand,
         &index_base,
         row.clone(),
@@ -575,7 +575,7 @@ fn lower_single_row_fused_load_reduce_loop(
                     if axis == 1 { reduce_idx } else { col.clone() },
                 );
                 let next = emit_load(ctx, out, ptr, llvm_ir::Type::F32);
-                reduce_combine(ctx, out, acc, next, is_max)
+                reduce_combine(ctx, out, acc, next, combiner)
             },
         )
     };
@@ -613,7 +613,7 @@ fn lower_full_2d_fused_load_reduce_loop(
     cols: i64,
     reduce_extent: i64,
     axis: i64,
-    is_max: bool,
+    combiner: ReduceCombiner,
     buf_operand: llvm_ir::Operand,
     index_base: BufferIndexBase,
     dst_tile: llvm_ir::Operand,
@@ -703,7 +703,7 @@ fn lower_full_2d_fused_load_reduce_loop(
         &reduce_prefix,
         reduce_extent,
         axis,
-        is_max,
+        combiner,
         &buf_operand,
         &index_base,
         if axis == 1 {
@@ -759,7 +759,7 @@ fn lower_full_2d_fused_load_reduce_loop(
                     },
                 );
                 let next = emit_load(ctx, out, ptr, llvm_ir::Type::F32);
-                reduce_combine(ctx, out, acc, next, is_max)
+                reduce_combine(ctx, out, acc, next, combiner)
             },
         )
     };
@@ -817,7 +817,7 @@ fn lower_fused_map_reduce_loop(
     out_cols: i64,
     reduce_extent: i64,
     axis: i64,
-    is_max: bool,
+    combiner: ReduceCombiner,
     expr: &TileMapExpr,
     fused_load_bases: &HashMap<ValueId, llvm_ir::Operand>,
     dst_tile: llvm_ir::Operand,
@@ -829,7 +829,7 @@ fn lower_fused_map_reduce_loop(
             out_cols,
             reduce_extent,
             axis,
-            is_max,
+            combiner,
             expr,
             fused_load_bases,
             dst_tile,
@@ -841,7 +841,7 @@ fn lower_fused_map_reduce_loop(
             out_rows,
             reduce_extent,
             axis,
-            is_max,
+            combiner,
             expr,
             fused_load_bases,
             dst_tile,
@@ -854,7 +854,7 @@ fn lower_fused_map_reduce_loop(
             out_cols,
             reduce_extent,
             axis,
-            is_max,
+            combiner,
             expr,
             fused_load_bases,
             dst_tile,
@@ -868,7 +868,7 @@ fn lower_single_col_fused_map_reduce_loop(
     cols: i64,
     reduce_extent: i64,
     axis: i64,
-    is_max: bool,
+    combiner: ReduceCombiner,
     expr: &TileMapExpr,
     fused_load_bases: &HashMap<ValueId, llvm_ir::Operand>,
     dst_tile: llvm_ir::Operand,
@@ -949,7 +949,7 @@ fn lower_single_col_fused_map_reduce_loop(
                 out,
                 false,
             );
-            reduce_combine(ctx, out, acc, next, is_max)
+            reduce_combine(ctx, out, acc, next, combiner)
         },
     );
 
@@ -985,7 +985,7 @@ fn lower_single_row_fused_map_reduce_loop(
     rows: i64,
     reduce_extent: i64,
     axis: i64,
-    is_max: bool,
+    combiner: ReduceCombiner,
     expr: &TileMapExpr,
     fused_load_bases: &HashMap<ValueId, llvm_ir::Operand>,
     dst_tile: llvm_ir::Operand,
@@ -1066,7 +1066,7 @@ fn lower_single_row_fused_map_reduce_loop(
                 out,
                 false,
             );
-            reduce_combine(ctx, out, acc, next, is_max)
+            reduce_combine(ctx, out, acc, next, combiner)
         },
     );
 
@@ -1181,7 +1181,7 @@ fn emit_vec_sum_reduce(
 
 /// Emit a vectorized sum-reduce loop for a fused load+reduce path.
 ///
-/// When `!is_max && axis == 1 && reduce_extent >= 4`, this generates:
+/// When the combiner is a sum and `axis == 1 && reduce_extent >= 4`, this generates:
 /// 1. A step-4 reduce loop that loads 4 contiguous f32 via VecLoad4,
 ///    reduces each to scalar with VecReduceAdd, and accumulates.
 /// 2. A scalar reduce loop for the remaining tail elements.
@@ -1192,13 +1192,13 @@ fn emit_vec_reduce_loop(
     prefix: &str,
     reduce_extent: i64,
     axis: i64,
-    is_max: bool,
+    combiner: ReduceCombiner,
     buf_operand: &llvm_ir::Operand,
     index_base: &BufferIndexBase,
     row: llvm_ir::Operand,
 ) -> Option<llvm_ir::Operand> {
-    // Only vectorize: sum-reduce (!is_max), axis==1 (contiguous), extent >= 4
-    if is_max || axis != 1 || reduce_extent < 4 {
+    // Only vectorize: sum-reduce, axis==1 (contiguous), extent >= 4
+    if combiner != ReduceCombiner::Sum || axis != 1 || reduce_extent < 4 {
         return None;
     }
 
@@ -1270,7 +1270,7 @@ fn lower_full_2d_fused_map_reduce_loop(
     cols: i64,
     reduce_extent: i64,
     axis: i64,
-    is_max: bool,
+    combiner: ReduceCombiner,
     expr: &TileMapExpr,
     fused_load_bases: &HashMap<ValueId, llvm_ir::Operand>,
     dst_tile: llvm_ir::Operand,
@@ -1401,7 +1401,7 @@ fn lower_full_2d_fused_map_reduce_loop(
                 out,
                 false,
             );
-            reduce_combine(ctx, out, acc, next, is_max)
+            reduce_combine(ctx, out, acc, next, combiner)
         },
     );
 

@@ -127,7 +127,12 @@ fn expr_key(op: &TileIrOp) -> Option<String> {
         | TileIrOp::MmaF { .. }
         | TileIrOp::ReduceSum { .. }
         | TileIrOp::ReduceMax { .. }
-        | TileIrOp::ReduceMin { .. } => None,
+        | TileIrOp::ReduceMin { .. }
+        | TileIrOp::ReduceProd { .. }
+        | TileIrOp::Scan { .. }
+        | TileIrOp::Cat { .. }
+        | TileIrOp::ExtractSlice { .. }
+        | TileIrOp::InsertSlice { .. } => None,
     }
 }
 
@@ -297,6 +302,51 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             in_rows,
             in_cols,
         },
+        TileIrOp::Scan {
+            value,
+            identity,
+            axis,
+            in_rows,
+            in_cols,
+            reverse,
+            combiner,
+        } => TileIrOp::Scan {
+            value: rewrite(value),
+            identity: rewrite(identity),
+            axis,
+            in_rows,
+            in_cols,
+            reverse,
+            combiner,
+        },
+        TileIrOp::Cat {
+            lhs,
+            rhs,
+            axis,
+            lhs_rows,
+            lhs_cols,
+            rhs_rows,
+            rhs_cols,
+        } => TileIrOp::Cat {
+            lhs: rewrite(lhs),
+            rhs: rewrite(rhs),
+            axis,
+            lhs_rows,
+            lhs_cols,
+            rhs_rows,
+            rhs_cols,
+        },
+        TileIrOp::ReduceProd {
+            value,
+            axis,
+            in_rows,
+            in_cols,
+        } => TileIrOp::ReduceProd {
+            value: rewrite(value),
+            axis,
+            in_rows,
+            in_cols,
+        },
         TileIrOp::Broadcast { value, rows, cols } => TileIrOp::Broadcast {
             value: rewrite(value),
             rows,
@@ -320,6 +370,42 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             tile: rewrite(tile),
             row_coord: rewrite(row_coord),
             col_coord: rewrite(col_coord),
+        },
+        TileIrOp::ExtractSlice {
+            source,
+            row_idx,
+            col_idx,
+            in_rows,
+            in_cols,
+            out_rows,
+            out_cols,
+        } => TileIrOp::ExtractSlice {
+            source: rewrite(source),
+            row_idx: rewrite(row_idx),
+            col_idx: rewrite(col_idx),
+            in_rows,
+            in_cols,
+            out_rows,
+            out_cols,
+        },
+        TileIrOp::InsertSlice {
+            source,
+            destination,
+            row_idx,
+            col_idx,
+            in_rows,
+            in_cols,
+            out_rows,
+            out_cols,
+        } => TileIrOp::InsertSlice {
+            source: rewrite(source),
+            destination: rewrite(destination),
+            row_idx: rewrite(row_idx),
+            col_idx: rewrite(col_idx),
+            in_rows,
+            in_cols,
+            out_rows,
+            out_cols,
         },
         TileIrOp::IBinary { op, lhs, rhs } => TileIrOp::IBinary {
             op,

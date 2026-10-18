@@ -10,7 +10,8 @@ use super::core::{BlockLowerer, LowerLlvmIrCtx, llvm_ir_block, llvm_ir_type, llv
 use super::tile_compute::{
     FusedAccInit, FusedTileLoad, LoadReduceFusion, MapReduceFusion, ReduceCombiner,
     lower_fused_load_reduce_inst, lower_fused_map_reduce_inst, lower_fused_tile_mma_inst,
-    lower_tile_mma_inst, lower_tile_reduce_inst,
+    lower_tile_cat_inst, lower_tile_extract_slice_inst, lower_tile_insert_slice_inst,
+    lower_tile_mma_inst, lower_tile_reduce_inst, lower_tile_scan_inst,
 };
 use super::tile_expr::{
     PointwiseTileDefs, build_pointwise_tile_defs, lower_pointwise_rank1_store_inst,
@@ -259,6 +260,106 @@ pub(crate) fn lower_block(
                     &mut builder,
                 );
             }
+            TileIrOp::ReduceProd {
+                value,
+                axis,
+                in_rows,
+                in_cols,
+            } => {
+                lower_tile_reduce_inst(
+                    inst.result,
+                    *value,
+                    ReduceCombiner::Prod,
+                    *axis,
+                    *in_rows,
+                    *in_cols,
+                    &mut builder,
+                );
+            }
+            TileIrOp::Cat {
+                lhs,
+                rhs,
+                axis,
+                lhs_rows,
+                lhs_cols,
+                rhs_rows,
+                rhs_cols,
+            } => {
+                lower_tile_cat_inst(
+                    inst.result,
+                    *lhs,
+                    *rhs,
+                    *axis,
+                    *lhs_rows,
+                    *lhs_cols,
+                    *rhs_rows,
+                    *rhs_cols,
+                    &mut builder,
+                );
+            }
+            TileIrOp::ExtractSlice {
+                source,
+                row_idx,
+                col_idx,
+                out_rows,
+                out_cols,
+                ..
+            } => {
+                lower_tile_extract_slice_inst(
+                    inst.result,
+                    *source,
+                    *row_idx,
+                    *col_idx,
+                    *out_rows,
+                    *out_cols,
+                    &mut builder,
+                );
+            }
+            TileIrOp::InsertSlice {
+                source,
+                destination,
+                row_idx,
+                col_idx,
+                in_rows,
+                in_cols,
+                out_rows,
+                out_cols,
+                ..
+            } => {
+                lower_tile_insert_slice_inst(
+                    inst.result,
+                    *source,
+                    *destination,
+                    *row_idx,
+                    *col_idx,
+                    *in_rows,
+                    *in_cols,
+                    *out_rows,
+                    *out_cols,
+                    &mut builder,
+                );
+            }
+            TileIrOp::Scan {
+                value,
+                identity,
+                axis,
+                in_rows,
+                in_cols,
+                reverse,
+                combiner,
+            } => {
+                lower_tile_scan_inst(
+                    inst.result,
+                    *value,
+                    *identity,
+                    *combiner,
+                    *axis,
+                    *in_rows,
+                    *in_cols,
+                    *reverse,
+                    &mut builder,
+                );
+            }
             _ => {
                 builder.with_current_insts(|ctx, tile_ir, out| {
                     lower_scalar_inst(inst, tile_ir, ctx, out)
@@ -467,19 +568,31 @@ impl PointwiseLoweringPlan {
             if skipped_values.contains(&inst.result) {
                 continue;
             }
-            let (value, is_max, axis, in_rows, in_cols) = match &inst.op {
+            let (value, combiner, axis, in_rows, in_cols) = match &inst.op {
                 TileIrOp::ReduceSum {
                     value,
                     axis,
                     in_rows,
                     in_cols,
-                } => (*value, false, *axis, *in_rows, *in_cols),
+                } => (*value, ReduceCombiner::Sum, *axis, *in_rows, *in_cols),
                 TileIrOp::ReduceMax {
                     value,
                     axis,
                     in_rows,
                     in_cols,
-                } => (*value, true, *axis, *in_rows, *in_cols),
+                } => (*value, ReduceCombiner::Max, *axis, *in_rows, *in_cols),
+                TileIrOp::ReduceMin {
+                    value,
+                    axis,
+                    in_rows,
+                    in_cols,
+                } => (*value, ReduceCombiner::Min, *axis, *in_rows, *in_cols),
+                TileIrOp::ReduceProd {
+                    value,
+                    axis,
+                    in_rows,
+                    in_cols,
+                } => (*value, ReduceCombiner::Prod, *axis, *in_rows, *in_cols),
                 _ => continue,
             };
             // Try Load-Reduce fusion first (safe even with multiple consumers
@@ -504,7 +617,7 @@ impl PointwiseLoweringPlan {
                         src_rows: *rows,
                         src_cols: *cols,
                         stride_shape_idx: *stride_shape_idx,
-                        is_max,
+                        combiner,
                         axis,
                         in_rows,
                         in_cols,
@@ -532,7 +645,7 @@ impl PointwiseLoweringPlan {
                             expr: expr.clone(),
                             src_rows: *rows,
                             src_cols: *cols,
-                            is_max,
+                            combiner,
                             axis,
                             in_rows,
                             in_cols,

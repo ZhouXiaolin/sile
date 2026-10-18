@@ -203,6 +203,11 @@ pub(crate) fn lower_scalar_inst(
         | TileIrOp::ReduceSum { .. }
         | TileIrOp::ReduceMax { .. }
         | TileIrOp::ReduceMin { .. }
+        | TileIrOp::ReduceProd { .. }
+        | TileIrOp::Scan { .. }
+        | TileIrOp::Cat { .. }
+        | TileIrOp::ExtractSlice { .. }
+        | TileIrOp::InsertSlice { .. }
         | TileIrOp::Broadcast { .. }
         | TileIrOp::Reshape { .. }
         | TileIrOp::Map { .. } => {

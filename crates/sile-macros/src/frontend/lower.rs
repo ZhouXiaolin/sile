@@ -279,6 +279,7 @@ const BUILTIN_FUNCTIONS: &[&str] = &[
     "reduce_max",
     "reduce_sum",
     "reduce_min",
+    "reduce_prod",
     "transpose",
     "exp",
     "exp2",
@@ -351,6 +352,16 @@ const BUILTIN_FUNCTIONS: &[&str] = &[
     "ftof",
     // The free-function spelling of the tensor tile load.
     "load_tile",
+    // The fold spellings the scan and permute calls route to their own
+    // lowering before the generic operand filter sees them.
+    "scan_sum",
+    "scan",
+    "permute",
+    // The tile-shape spellings; extract and insert route to their own
+    // lowering before the generic operand filter sees them.
+    "cat",
+    "extract",
+    "insert",
 ];
 
 const BUILTIN_METHODS: &[&str] = &[
@@ -365,6 +376,7 @@ const BUILTIN_METHODS: &[&str] = &[
     "reduce_max",
     "reduce_sum",
     "reduce_min",
+    "reduce_prod",
     "exp",
     "sqrt",
     "rsqrt",
@@ -501,6 +513,12 @@ fn lower_expr(
                 "a mode or scope is not a value; it may only be passed as a call argument",
             ));
         }
+        KernelExpr::Closure { .. } => {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "a closure is only meaningful as a scan's combiner: `scan(t, dim, reverse, id, |a, b| a + b)`",
+            ));
+        }
     })
 }
 
@@ -523,6 +541,15 @@ fn lower_call(
     if func_name == "cmpi" || func_name == "cmpf" {
         return lower_compare_call(func, args, const_params);
     }
+    if func_name == "scan_sum" || func_name == "scan" {
+        return lower_scan_call(func, args, const_params);
+    }
+    if func_name == "permute" {
+        return lower_permute_call(func, args, const_params);
+    }
+    if func_name == "extract" || func_name == "insert" {
+        return lower_slice_call(func, args, const_params);
+    }
     let args = call_operands(args);
     let args_exprs = args
         .iter()
@@ -540,6 +567,8 @@ fn lower_call(
         "ceil_div" => quote! { ::sile::hir::BuiltinOp::CeilDiv },
         "iota" => quote! { ::sile::hir::BuiltinOp::Iota },
         "reduce_max" => quote! { ::sile::hir::BuiltinOp::ReduceMax },
+        "reduce_prod" => quote! { ::sile::hir::BuiltinOp::ReduceProd },
+        "cat" => quote! { ::sile::hir::BuiltinOp::Cat },
         "reduce_sum" => quote! { ::sile::hir::BuiltinOp::ReduceSum },
         // A minimum is a maximum with the operands swapped and the predicate
         // inverted, so it needs no op of its own.
@@ -694,6 +723,196 @@ fn lower_call(
     })
 }
 
+/// `extract(src, [i, j], shape![R, C])` and `insert(sub, dst, [i, j])` move a
+/// subtile by its block index. The index array names one value per axis, so
+/// the array is spread into flat arguments and the shapes travel beside them.
+fn lower_slice_call(
+    func: &syn::Ident,
+    args: &[KernelExpr],
+    const_params: &[ConstParam],
+) -> syn::Result<proc_macro2::TokenStream> {
+    if args.len() != 3 {
+        return Err(syn::Error::new(
+            func.span(),
+            format!("{func} takes three arguments"),
+        ));
+    }
+    let lowered_indices = |arg: &KernelExpr| -> syn::Result<Vec<proc_macro2::TokenStream>> {
+        let KernelExpr::Array(arr) = arg else {
+            return Err(syn::Error::new(
+                func.span(),
+                "a subtile index names one value for each of the two axes, like `[i, j]`",
+            ));
+        };
+        if arr.elems.len() != 2 {
+            return Err(syn::Error::new(
+                func.span(),
+                "a subtile index names one value for each of the two axes, like `[i, j]`",
+            ));
+        }
+        // The parser stored the array as syntax, so each element returns
+        // through the expression parser on its way down.
+        let elems = arr
+            .elems
+            .iter()
+            .map(super::parse::parse_expr_pub)
+            .collect::<syn::Result<Vec<_>>>()?;
+        elems.iter().map(|e| lower_expr(e, const_params)).collect()
+    };
+    if func == "extract" {
+        let source = lower_expr(&args[0], const_params)?;
+        let indices = lowered_indices(&args[1])?;
+        let [row_idx, col_idx] = indices.as_slice() else {
+            unreachable!("the index array was checked to hold two elements");
+        };
+        let shape = lower_expr(&args[2], const_params)?;
+        Ok(quote! {
+            ::sile::hir::Expr::Builtin {
+                op: ::sile::hir::BuiltinOp::ExtractSlice,
+                args: vec![#source, #row_idx, #col_idx, #shape],
+            }
+        })
+    } else {
+        let source = lower_expr(&args[0], const_params)?;
+        let destination = lower_expr(&args[1], const_params)?;
+        let indices = lowered_indices(&args[2])?;
+        let [row_idx, col_idx] = indices.as_slice() else {
+            unreachable!("the index array was checked to hold two elements");
+        };
+        Ok(quote! {
+            ::sile::hir::Expr::Builtin {
+                op: ::sile::hir::BuiltinOp::InsertSlice,
+                args: vec![#source, #destination, #row_idx, #col_idx],
+            }
+        })
+    }
+}
+
+/// `permute(t, [1, 0])` renames the two axes of a tile. A tile here has two
+/// axes, so the only permutations are the identity and the transpose; a longer
+/// array or an index out of range is a kernel error, not a silent drop.
+fn lower_permute_call(
+    func: &syn::Ident,
+    args: &[KernelExpr],
+    const_params: &[ConstParam],
+) -> syn::Result<proc_macro2::TokenStream> {
+    if args.len() != 2 {
+        return Err(syn::Error::new(func.span(), "permute takes a tile and a permutation"));
+    }
+    let KernelExpr::Array(perm) = &args[1] else {
+        return Err(syn::Error::new(
+            func.span(),
+            "permute takes a permutation array, like `[1, 0]`",
+        ));
+    };
+    let indices: Vec<i64> = perm
+        .elems
+        .iter()
+        .map(|elem| match elem {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Int(lit),
+                ..
+            }) => lit.base10_parse(),
+            _ => Err(syn::Error::new(
+                func.span(),
+                "a permutation is an array of integer constants",
+            )),
+        })
+        .collect::<syn::Result<_>>()?;
+    let source = lower_expr(&args[0], const_params)?;
+    match indices.as_slice() {
+        [0, 1] => Ok(quote! { #source }),
+        [1, 0] => Ok(quote! {
+            ::sile::hir::Expr::Builtin {
+                op: ::sile::hir::BuiltinOp::Transpose,
+                args: vec![#source],
+            }
+        }),
+        _ => Err(syn::Error::new(
+            func.span(),
+            "a tile has two axes, so the only permutations are `[0, 1]` and `[1, 0]`",
+        )),
+    }
+}
+
+/// `scan_sum(t, dim, reverse::Forward, identity)` and
+/// `scan(t, dim, reverse, identity, |a, b| a + b)` fold a running value
+/// across one axis. The reverse path names a direction, which is a real
+/// operand here, so it is read before the mode filter drops the qualified
+/// paths a call carries.
+fn lower_scan_call(
+    func: &syn::Ident,
+    args: &[KernelExpr],
+    const_params: &[ConstParam],
+) -> syn::Result<proc_macro2::TokenStream> {
+    let scan_sum = func.to_string() == "scan_sum";
+    let arity = if scan_sum { 4 } else { 5 };
+    if args.len() != arity {
+        return Err(syn::Error::new(
+            func.span(),
+            format!("{func} takes {arity} arguments"),
+        ));
+    }
+    let operand = lower_expr(&args[0], const_params)?;
+    let dim = lower_expr(&args[1], const_params)?;
+    let reverse = scan_reverse(&args[2])?;
+    let identity = lower_expr(&args[3], const_params)?;
+    // The combiner closure names the fold: `|a, b| a + b` is scan_sum's add
+    // and `|a, b| a * b` is the product. The top operation is what matters —
+    // the names the closure binds carry no meaning of their own.
+    let variant = if scan_sum {
+        "ScanSum"
+    } else {
+        match &args[4] {
+            KernelExpr::Closure { params: _, body } => match body.as_ref() {
+                KernelExpr::BinaryOp {
+                    op: BinOpKind::Add, ..
+                } => "ScanSum",
+                KernelExpr::BinaryOp {
+                    op: BinOpKind::Mul, ..
+                } => "ScanProd",
+                _ => {
+                    return Err(syn::Error::new(
+                        func.span(),
+                        "a scan combiner must be `|a, b| a + b` or `|a, b| a * b`",
+                    ));
+                }
+            },
+            _ => {
+                return Err(syn::Error::new(
+                    func.span(),
+                    "a scan combiner must be `|a, b| a + b` or `|a, b| a * b`",
+                ));
+            }
+        }
+    };
+    let variant: proc_macro2::TokenStream = variant.parse().expect("a variant names itself");
+    Ok(quote! {
+        ::sile::hir::Expr::Builtin {
+            op: ::sile::hir::BuiltinOp::#variant,
+            args: vec![#operand, #dim, ::sile::hir::Expr::ScalarI64(#reverse as i64), #identity],
+        }
+    })
+}
+
+/// The direction a scan walks: `reverse::Forward`, or `reverse::Reverse`.
+fn scan_reverse(arg: &KernelExpr) -> syn::Result<bool> {
+    let KernelExpr::ModePath(path) = arg else {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "scan takes a `reverse::Forward` or a `reverse::Reverse`",
+        ));
+    };
+    match path.segments.last().map(|segment| segment.ident.to_string()) {
+        Some(name) if name == "Forward" => Ok(false),
+        Some(name) if name == "Reverse" => Ok(true),
+        _ => Err(syn::Error::new_spanned(
+            path,
+            "scan takes a `reverse::Forward` or a `reverse::Reverse`",
+        )),
+    }
+}
+
 /// `cmpi(a, b, predicate::LessThan)` and `cmpf` name their comparison with a
 /// predicate value, not with the function name. The predicate is the
 /// operation, so it selects one of the six comparisons; the ordering `cmpf`
@@ -830,6 +1049,8 @@ fn lower_method_call(
         "broadcast" => quote! { ::sile::hir::BuiltinOp::Broadcast },
         "transpose" => quote! { ::sile::hir::BuiltinOp::Transpose },
         "reduce_max" => quote! { ::sile::hir::BuiltinOp::ReduceMax },
+        "reduce_prod" => quote! { ::sile::hir::BuiltinOp::ReduceProd },
+        "cat" => quote! { ::sile::hir::BuiltinOp::Cat },
         "reduce_sum" => quote! { ::sile::hir::BuiltinOp::ReduceSum },
         "reduce_min" => quote! { ::sile::hir::BuiltinOp::ReduceMin },
         "exp" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Exp) },

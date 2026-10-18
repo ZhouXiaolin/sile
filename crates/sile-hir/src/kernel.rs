@@ -90,6 +90,25 @@ pub enum BuiltinOp {
     ReduceMax,
     ReduceMin,
     ReduceSum,
+    ReduceProd,
+    /// `cat(lhs, rhs, dim)`: the two tiles joined along one axis, the other
+    /// axis equal on both sides. The axis is a compile-time constant because
+    /// the joined shape is part of the result's type.
+    Cat,
+    /// `extract(src, [i, j], shape![R, C])`: the `R×C` subtile of `src` at the
+    /// block index `(i, j)`. The block indices are values, the subtile extent
+    /// is a shape, and the source extent must be a multiple of it on each axis.
+    ExtractSlice,
+    /// `insert(sub, dst, [i, j])`: `dst` with the `sub` tile written at the
+    /// block index `(i, j)`. The subtile extent must divide the destination's
+    /// on each axis.
+    InsertSlice,
+    /// `scan_sum(t, dim, reverse, id)` and a `scan` whose combiner is `+`:
+    /// the running prefix fold along one axis, carrying the accumulated value.
+    ScanSum,
+    /// `scan(t, dim, reverse, id, |a, b| a * b)`: the prefix fold with a
+    /// multiplicative combiner.
+    ScanProd,
     Reshape,
     Broadcast,
     /// `t.transpose()`: the same elements, with the two tile axes exchanged.

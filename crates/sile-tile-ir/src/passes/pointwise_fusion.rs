@@ -224,7 +224,17 @@ fn tile_shape_for_op(op: &TileIrOp) -> (i64, i64) {
         | TileIrOp::UnaryF { rows, cols, .. }
         | TileIrOp::Broadcast { rows, cols, .. }
         | TileIrOp::Reshape { rows, cols, .. }
-        | TileIrOp::Map { rows, cols, .. } => (*rows, *cols),
+        | TileIrOp::Map { rows, cols, .. }
+        | TileIrOp::ExtractSlice {
+            out_rows: rows,
+            out_cols: cols,
+            ..
+        }
+        | TileIrOp::InsertSlice {
+            out_rows: rows,
+            out_cols: cols,
+            ..
+        } => (*rows, *cols),
         TileIrOp::ReduceSum {
             axis,
             in_rows,
@@ -232,6 +242,12 @@ fn tile_shape_for_op(op: &TileIrOp) -> (i64, i64) {
             ..
         }
         | TileIrOp::ReduceMax {
+            axis,
+            in_rows,
+            in_cols,
+            ..
+        }
+        | TileIrOp::ReduceProd {
             axis,
             in_rows,
             in_cols,

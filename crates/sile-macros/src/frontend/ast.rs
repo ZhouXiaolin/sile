@@ -171,6 +171,15 @@ pub enum KernelExpr {
     /// it holds and `0.0` where it does not. That is the encoding `gt_tile`
     /// produces and `select` tests, so a boolean constant needs no second type.
     BoolLit(syn::LitBool),
+    /// `|a, b| <one expression>`: the combiner a `scan` folds with.
+    ///
+    /// Only this shape parses. The two names are the running value and the
+    /// next element, and the body is the one expression that joins them; a
+    /// statement body would be a loop the combiner cannot name.
+    Closure {
+        params: Vec<syn::Ident>,
+        body: Box<KernelExpr>,
+    },
 }
 
 impl KernelExpr {
@@ -205,6 +214,10 @@ impl KernelExpr {
             Self::ShapeMacro(mac) => mac.span(),
             Self::ModePath(path) => path.span(),
             Self::BoolLit(lit) => lit.span(),
+            Self::Closure { params, .. } => params
+                .first()
+                .map(syn::Ident::span)
+                .unwrap_or_else(proc_macro2::Span::call_site),
         }
     }
 }
