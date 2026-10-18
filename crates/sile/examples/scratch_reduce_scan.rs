@@ -48,6 +48,26 @@ fn scan_prod_fwd(x: &Tensor<f32, { [32] }>, out: &mut Tensor<f32, { [32] }>) {
     out.store(s);
 }
 
+/// `reduce` with a closure: the same running fold, spelled the way CuTile
+/// names it.
+#[sile::kernel]
+fn reduce_closure(x: &Tensor<f32, { [32] }>, out: &mut Tensor<f32, { [32] }>) {
+    let t = x.load_like(out);
+    let s = reduce(t, 1i64, 0.0_f32, |a, b| a + b);
+    out.store(s);
+}
+
+/// The float power alias, spelled the CuTile way. The exponent is one, so
+/// the value the check reads is the identity each target computes exactly —
+/// this kernel proves the alias lowers to the power op, which the math
+/// scratch checks numerically on every target.
+#[sile::kernel]
+fn alias_lanes(a: &Tensor<f32, { [8] }>, b: &Tensor<f32, { [8] }>, out: &mut Tensor<f32, { [8] }>) {
+    let ta = a.load();
+    let p = fpowf(ta, broadcast_scalar(1.0, shape![8]));
+    out.store(p);
+}
+
 /// The running sum down the columns of a 2D tile, one row at a time.
 #[sile::kernel]
 fn scan_2d_axis1(x: &Tensor<f32, { [4, 8] }>, out: &mut Tensor<f32, { [4, 8] }>) {
@@ -112,6 +132,27 @@ fn permute_transpose(x: &Tensor<f32, { [4, 8] }>, out: &mut Tensor<f32, { [8, 4]
 fn permute_identity(x: &Tensor<f32, { [4, 8] }>, out: &mut Tensor<f32, { [4, 8] }>) {
     let t = x.load();
     out.store(permute(t, [0, 1]));
+}
+
+/// The assume family, one link per spelling: a promise about JIT-constant
+/// predicates, and this lowering relies on none of it, so the lanes the
+/// check reads are the source's own.
+#[sile::kernel]
+fn assume_lanes(x: &Tensor<f32, { [4, 8] }>, out: &mut Tensor<f32, { [4, 8] }>) {
+    let t = x.load();
+    let a = unsafe { assume_div_by::<_, 8>(t) };
+    let b = unsafe { assume_div_by_raw(a, 8u64, None, None) };
+    let c = unsafe { assume_div_by_every_along::<_, 2, 4, 1>(b) };
+    let d = unsafe { assume_bounds::<_, 0, 32>(c) };
+    let e = unsafe { assume_bounds_lower::<_, 0>(d) };
+    let f = unsafe { assume_bounds_upper::<_, 32>(e) };
+    let g = unsafe { assume_bounds_raw(f, Some(0), Some(32)) };
+    let h = unsafe { assume_same_elements_1d::<_, 8>(g) };
+    let i = unsafe { assume_same_elements_2d::<_, 2, 4>(h) };
+    let j = unsafe { assume_same_elements_3d::<_, 2, 2, 2>(i) };
+    let k = unsafe { assume_same_elements_4d::<_, 2, 2, 2, 1>(j) };
+    let m = unsafe { assume_same_elements_raw(k, [2i64, 2i64]) };
+    out.store(m);
 }
 
 fn device() -> Result<(Device, sile::Stream)> {
@@ -193,6 +234,22 @@ fn main() -> Result<()> {
     compare_exact(&out.to_vec(&stream)?, &expected, "rs_scan_2d_axis0");
     println!("rs_scan_2d_axis0 ok");
 
+    let mut out = Tensor::zeros([32], &device)?;
+    reduce_closure(&x, &mut out)
+        .grid((1, 1, 1))
+        .apply(&stream)?;
+    let expected = common::numpy("rs_reduce_closure", &[], &[&x_data]);
+    compare_exact(&out.to_vec(&stream)?, &expected, "rs_reduce_closure");
+    println!("rs_reduce_closure ok");
+
+    let mut out = Tensor::zeros([8], &device)?;
+    alias_lanes(&x, &x, &mut out)
+        .grid((1, 1, 1))
+        .apply(&stream)?;
+    let expected = common::numpy("rs_alias_lanes", &[], &[&x_data]);
+    compare_exact(&out.to_vec(&stream)?, &expected, "rs_alias_lanes");
+    println!("rs_alias_lanes ok");
+
     let mut out = Tensor::zeros([4, 16], &device)?;
     cat_cols(&x2, &x2, &mut out).grid((1, 1, 1)).apply(&stream)?;
     let expected = common::numpy("rs_cat_cols", &[], &[&x2_data, &x2_data]);
@@ -238,6 +295,14 @@ fn main() -> Result<()> {
     let expected = common::numpy("rs_permute_identity", &[], &[&x2_data]);
     compare_exact(&out.to_vec(&stream)?, &expected, "rs_permute_identity");
     println!("rs_permute_identity ok");
+
+    let mut out = Tensor::zeros([4, 8], &device)?;
+    assume_lanes(&x2, &mut out)
+        .grid((1, 1, 1))
+        .apply(&stream)?;
+    let expected = common::numpy("rs_assume_lanes", &[], &[&x2_data]);
+    compare_exact(&out.to_vec(&stream)?, &expected, "rs_assume_lanes");
+    println!("rs_assume_lanes ok");
 
     Ok(())
 }

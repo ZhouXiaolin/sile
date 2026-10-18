@@ -251,6 +251,13 @@ def main():
         base = np.float32(1.0)
         # A tile of ones plus itself three times: four ones in f32.
         expected = np.full(x.shape, np.float32(4.0), dtype="<f4")
+    elif op == "rs_reduce_closure":
+        (x,) = read_inputs(count, lengths)
+        expected = np.cumsum(x, dtype="<f4")
+    elif op == "rs_alias_lanes":
+        (x,) = read_inputs(count, lengths)
+        # The exponent is one, so the reference is the value itself.
+        expected = x * np.float32(1.0)
     elif op == "rs_cat_cols":
         x, y = read_inputs(count, lengths)
         expected = np.concatenate([x.reshape(4, 8), y.reshape(4, 8)], axis=1).ravel()
@@ -269,6 +276,11 @@ def main():
         (x,) = read_inputs(count, lengths)
         expected = x.reshape(4, 8).T.ravel()
     elif op == "rs_permute_identity":
+        (x,) = read_inputs(count, lengths)
+        expected = x
+    elif op == "rs_assume_lanes":
+        # The assume family is the identity: the lowering relies on none of
+        # the promises, so the lanes the kernel writes are the source's own.
         (x,) = read_inputs(count, lengths)
         expected = x
     elif op == "flash_attention_causal":

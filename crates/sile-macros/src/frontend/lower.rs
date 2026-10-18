@@ -357,17 +357,41 @@ const BUILTIN_FUNCTIONS: &[&str] = &[
     "scan_sum",
     "scan",
     "permute",
-    // The tile-shape spellings; extract and insert route to their own
-    // lowering before the generic operand filter sees them.
+    // The tile-shape spellings; extract, insert and the closure folds route
+    // to their own lowering before the generic operand filter sees them.
     "cat",
     "extract",
     "insert",
+    "reduce",
+    // The mma spellings: the float one names the same tile shapes, and the
+    // fast-accumulator one carries a mode this IR drops.
+    "mmaf",
+    "mmaf_with_fast_acc",
+    "fpowf",
+    // The method spelling of the shaped load.
+    "load_tile_like",
+    // The assume family: a promise about JIT-constant predicates. This
+    // lowering relies on none of it, so each spelling rides along as its
+    // subject; see lower_assume_call.
+    "assume_bounds",
+    "assume_bounds_lower",
+    "assume_bounds_raw",
+    "assume_bounds_upper",
+    "assume_div_by",
+    "assume_div_by_every_along",
+    "assume_div_by_raw",
+    "assume_same_elements_1d",
+    "assume_same_elements_2d",
+    "assume_same_elements_3d",
+    "assume_same_elements_4d",
+    "assume_same_elements_raw",
 ];
 
 const BUILTIN_METHODS: &[&str] = &[
     "load_tile",
     "load",
     "load_like",
+    "load_tile_like",
     "load_tile_mut",
     "partition",
     "partition_mut",
@@ -541,7 +565,7 @@ fn lower_call(
     if func_name == "cmpi" || func_name == "cmpf" {
         return lower_compare_call(func, args, const_params);
     }
-    if func_name == "scan_sum" || func_name == "scan" {
+    if func_name == "scan_sum" || func_name == "scan" || func_name == "reduce" {
         return lower_scan_call(func, args, const_params);
     }
     if func_name == "permute" {
@@ -550,6 +574,23 @@ fn lower_call(
     if func_name == "extract" || func_name == "insert" {
         return lower_slice_call(func, args, const_params);
     }
+    if matches!(
+        func_name.as_str(),
+        "assume_bounds"
+            | "assume_bounds_lower"
+            | "assume_bounds_raw"
+            | "assume_bounds_upper"
+            | "assume_div_by"
+            | "assume_div_by_every_along"
+            | "assume_div_by_raw"
+            | "assume_same_elements_1d"
+            | "assume_same_elements_2d"
+            | "assume_same_elements_3d"
+            | "assume_same_elements_4d"
+            | "assume_same_elements_raw"
+    ) {
+        return lower_assume_call(args, const_params);
+    }
     let args = call_operands(args);
     let args_exprs = args
         .iter()
@@ -557,7 +598,9 @@ fn lower_call(
         .collect::<syn::Result<Vec<_>>>()?;
 
     let op = match func_name.as_str() {
-        "load_like" | "load_tile_mut" => quote! { ::sile::hir::BuiltinOp::LoadLike },
+        "load_like" | "load_tile_like" | "load_tile_mut" => {
+            quote! { ::sile::hir::BuiltinOp::LoadLike }
+        }
         "constant" => quote! { ::sile::hir::BuiltinOp::Constant },
         "mma" => quote! { ::sile::hir::BuiltinOp::Mma },
         // A tile spelling and a scalar spelling of the same operation: the
@@ -569,6 +612,9 @@ fn lower_call(
         "reduce_max" => quote! { ::sile::hir::BuiltinOp::ReduceMax },
         "reduce_prod" => quote! { ::sile::hir::BuiltinOp::ReduceProd },
         "cat" => quote! { ::sile::hir::BuiltinOp::Cat },
+        "mmaf" | "mmaf_with_fast_acc" => quote! { ::sile::hir::BuiltinOp::Mma },
+        // A power with a float exponent is the power this IR carries.
+        "fpowf" => quote! { ::sile::hir::BuiltinOp::Pow },
         "reduce_sum" => quote! { ::sile::hir::BuiltinOp::ReduceSum },
         // A minimum is a maximum with the operands swapped and the predicate
         // inverted, so it needs no op of its own.
@@ -840,13 +886,35 @@ fn lower_permute_call(
 /// across one axis. The reverse path names a direction, which is a real
 /// operand here, so it is read before the mode filter drops the qualified
 /// paths a call carries.
+// An assume call is a promise the program makes to the compiler: the lanes
+// satisfy a predicate whose arguments are all JIT constants. This lowering
+// relies on none of it, so the promise rides along as its subject and the
+// predicate arguments are dropped — a conservative reading of the contract.
+fn lower_assume_call(
+    args: &[KernelExpr],
+    const_params: &[ConstParam],
+) -> syn::Result<proc_macro2::TokenStream> {
+    let operands = call_operands(args);
+    let [subject, ..] = operands.as_slice() else {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "an assume call takes its subject as the first argument",
+        ));
+    };
+    lower_expr(subject, const_params)
+}
+
 fn lower_scan_call(
     func: &syn::Ident,
     args: &[KernelExpr],
     const_params: &[ConstParam],
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let scan_sum = func.to_string() == "scan_sum";
-    let arity = if scan_sum { 4 } else { 5 };
+    let name = func.to_string();
+    let scan_sum = name == "scan_sum";
+    // `reduce` folds with a closure and no direction; `scan` names the
+    // direction and the closure; `scan_sum` names only the direction.
+    let reduce = name == "reduce";
+    let arity = if name == "scan" { 5 } else { 4 };
     if args.len() != arity {
         return Err(syn::Error::new(
             func.span(),
@@ -855,15 +923,22 @@ fn lower_scan_call(
     }
     let operand = lower_expr(&args[0], const_params)?;
     let dim = lower_expr(&args[1], const_params)?;
-    let reverse = scan_reverse(&args[2])?;
-    let identity = lower_expr(&args[3], const_params)?;
+    let (reverse, identity_arg, combiner_arg) = if reduce {
+        (false, 2, Some(3))
+    } else if scan_sum {
+        (scan_reverse(&args[2])?, 3, None)
+    } else {
+        (scan_reverse(&args[2])?, 3, Some(4))
+    };
+    let identity = lower_expr(&args[identity_arg], const_params)?;
     // The combiner closure names the fold: `|a, b| a + b` is scan_sum's add
     // and `|a, b| a * b` is the product. The top operation is what matters —
     // the names the closure binds carry no meaning of their own.
     let variant = if scan_sum {
         "ScanSum"
     } else {
-        match &args[4] {
+        let combiner = &args[combiner_arg.expect("scan and reduce carry a closure")];
+        match combiner {
             KernelExpr::Closure { params: _, body } => match body.as_ref() {
                 KernelExpr::BinaryOp {
                     op: BinOpKind::Add, ..
@@ -1044,13 +1119,18 @@ fn lower_method_call(
         // decides whether the store through the view is legal.
         "partition_mut" => quote! { ::sile::hir::BuiltinOp::PartitionMut },
         // `x.load_like(y)` takes its tile shape from `y`.
-        "load_like" | "load_tile_mut" => quote! { ::sile::hir::BuiltinOp::LoadLike },
+        "load_like" | "load_tile_like" | "load_tile_mut" => {
+            quote! { ::sile::hir::BuiltinOp::LoadLike }
+        }
         "reshape" => quote! { ::sile::hir::BuiltinOp::Reshape },
         "broadcast" => quote! { ::sile::hir::BuiltinOp::Broadcast },
         "transpose" => quote! { ::sile::hir::BuiltinOp::Transpose },
         "reduce_max" => quote! { ::sile::hir::BuiltinOp::ReduceMax },
         "reduce_prod" => quote! { ::sile::hir::BuiltinOp::ReduceProd },
         "cat" => quote! { ::sile::hir::BuiltinOp::Cat },
+        "mmaf" | "mmaf_with_fast_acc" => quote! { ::sile::hir::BuiltinOp::Mma },
+        // A power with a float exponent is the power this IR carries.
+        "fpowf" => quote! { ::sile::hir::BuiltinOp::Pow },
         "reduce_sum" => quote! { ::sile::hir::BuiltinOp::ReduceSum },
         "reduce_min" => quote! { ::sile::hir::BuiltinOp::ReduceMin },
         "exp" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Exp) },

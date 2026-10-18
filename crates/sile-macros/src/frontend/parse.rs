@@ -1057,6 +1057,21 @@ fn parse_expr(expr: &syn::Expr) -> syn::Result<KernelExpr> {
         }
         syn::Expr::Reference(reference) => parse_expr(&reference.expr),
         syn::Expr::Paren(paren) => parse_expr(&paren.expr),
+        // An `unsafe` block in value position — `let a = unsafe {
+        // assume_div_by::<_, 8>(t) };` — marks a promise about the operation
+        // it wraps, and a promise is a property of the program rather than of
+        // the instruction stream. The block contributes its one expression
+        // and nothing else; statement position strips the same marker.
+        syn::Expr::Unsafe(unsafe_block) => {
+            let message = "an `unsafe` block in a kernel holds one expression";
+            let [only] = unsafe_block.block.stmts.as_slice() else {
+                return Err(syn::Error::new_spanned(&unsafe_block.block, message));
+            };
+            let syn::Stmt::Expr(expr, None) = only else {
+                return Err(syn::Error::new_spanned(only, message));
+            };
+            parse_expr(expr)
+        }
         syn::Expr::Index(index) => {
             let target = parse_expr(&index.expr)?;
             let idx = parse_expr(&index.index)?;

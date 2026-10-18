@@ -27,8 +27,15 @@ pub mod ct {
         broadcast_scalar, ceil_div, constant, convert_scalar, eq_tile, exp, exp2, ge_tile, gt_tile,
         iota, le_tile, log, log2, lt_tile, mma, ne_tile, reduce_max, reduce_min, reduce_prod,
         reduce_sum,
-        cat, extract, insert, permute, rsqrt, scalar_to_tile, scan, scan_sum, select, sqrt,
-        tile_to_scalar, true_div,
+        cat, extract, fpowf, insert, mmaf, mmaf_with_fast_acc, permute, reduce, rsqrt,
+        scalar_to_tile, scan, scan_sum, select, sqrt, tile_to_scalar, true_div,
+    };
+    // The assume family, each the identity on its subject.
+    pub use crate::{
+        assume_bounds, assume_bounds_lower, assume_bounds_raw, assume_bounds_upper, assume_div_by,
+        assume_div_by_every_along, assume_div_by_raw, assume_same_elements_1d,
+        assume_same_elements_2d, assume_same_elements_3d, assume_same_elements_4d,
+        assume_same_elements_raw,
     };
     // CuTile writes a tile operation with a `_tile` suffix and the scalar one
     // without. Both names reach the same operation here.
@@ -175,6 +182,99 @@ pub fn extract(source: Tile<f32>, _indices: [i64; 2], _shape: [i64; 2]) -> Tile<
 /// `insert(sub, dst, [i, j])`: the same stub convention.
 pub fn insert(_sub: Tile<f32>, destination: Tile<f32>, _indices: [i64; 2]) -> Tile<f32> {
     destination
+}
+
+/// `mmaf(a, b, acc)` and `mmaf_with_fast_acc(a, b, acc, fast_acc::Mode)`:
+/// the mma spellings; the fast-accumulator mode rides along as a mode.
+pub fn mmaf(a: Tile<f32>, b: Tile<f32>, c: Tile<f32>) -> Tile<f32> {
+    mma(a, b, c)
+}
+
+pub fn mmaf_with_fast_acc(a: Tile<f32>, b: Tile<f32>, c: Tile<f32>, _fast: impl Into<f32>) -> Tile<f32> {
+    mma(a, b, c)
+}
+
+/// `fpowf(base, exponent)`: a power with a float exponent is the power.
+pub fn fpowf(base: Tile<f32>, exponent: Tile<f32>) -> Tile<f32> {
+    base * exponent
+}
+
+/// The `assume_*` family: a promise the program makes to the compiler about
+/// lanes whose predicate arguments are all JIT constants. This lowering
+/// relies on none of it, so every spelling is the identity on its subject —
+/// on the host as here, and in the kernel through the macro's own lowering.
+pub fn assume_bounds<T, const LOWER: i32, const UPPER: i32>(x: T) -> T {
+    x
+}
+
+pub fn assume_bounds_lower<T, const LOWER: i32>(x: T) -> T {
+    x
+}
+
+pub fn assume_bounds_upper<T, const UPPER: i32>(x: T) -> T {
+    x
+}
+
+pub fn assume_bounds_raw<T>(x: T, _lower: Option<i64>, _upper: Option<i64>) -> T {
+    x
+}
+
+pub fn assume_div_by<T, const DIVISOR: i32>(x: T) -> T {
+    x
+}
+
+pub fn assume_div_by_every_along<T, const DIVISOR: i32, const EVERY: i32, const ALONG: i32>(
+    x: T,
+) -> T {
+    x
+}
+
+pub fn assume_div_by_raw<T>(x: T, _divisor: u64, _every: Option<i64>, _along: Option<i64>) -> T {
+    x
+}
+
+pub fn assume_same_elements_1d<T, const GROUP0: i32>(x: T) -> T {
+    x
+}
+
+pub fn assume_same_elements_2d<T, const GROUP0: i32, const GROUP1: i32>(x: T) -> T {
+    x
+}
+
+pub fn assume_same_elements_3d<T, const GROUP0: i32, const GROUP1: i32, const GROUP2: i32>(
+    x: T,
+) -> T {
+    x
+}
+
+pub fn assume_same_elements_4d<
+    T,
+    const GROUP0: i32,
+    const GROUP1: i32,
+    const GROUP2: i32,
+    const GROUP3: i32,
+>(
+    x: T,
+) -> T {
+    x
+}
+
+pub fn assume_same_elements_raw<T, const N: usize>(x: T, _groups: [i64; N]) -> T {
+    x
+}
+
+/// `reduce(t, dim, identity, combiner)` with `+` or `*` as the combiner: the
+/// host stub convention the scan stubs keep.
+pub fn reduce<V>(
+    _tile: Tile<f32>,
+    _axis: i64,
+    _identity: V,
+    _combiner: impl FnMut(f32, f32) -> f32,
+) -> Tile<f32>
+where
+    V: Into<f32>,
+{
+    Tile::new([0i64; 2])
 }
 
 /// `permute(t, [1, 0])`: the host stub keeps the call site type-correct; the
