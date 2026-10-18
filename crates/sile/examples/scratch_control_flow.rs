@@ -6,126 +6,134 @@
 
 mod common;
 
-use sile::ct::*;
 use sile::{Device, Result, Tensor};
+use kernels::{
+    early_return, for_continue, for_steps, loop_break, nested_loops, while_acc, while_skip,
+};
 
 const TILE: i64 = 16;
 const LEN: i64 = 32;
 
-/// A `while` that carries a scalar: the sum of the counts it walks through.
-#[sile::kernel]
-fn while_acc(out: &mut Tensor<f32, { [16] }>) {
-    let mut n = 5.0;
-    let mut acc = 0.0;
-    let mut i = 0.0;
-    while i < n {
-        acc = acc + i;
-        i = i + 1.0;
-    }
-    let t = broadcast_scalar(acc, shape![16]);
-    out.store(t);
-}
+#[sile::module]
+mod kernels {
+    use sile::ct::*;
+    use sile::Tensor;
 
-/// A `continue` a branch holds: the passes past three contribute nothing, and
-/// the pass variable still moves, or the loop would never end.
-#[sile::kernel]
-fn while_skip(out: &mut Tensor<f32, { [16] }>) {
-    let mut acc = broadcast_scalar(0.0, shape![16]);
-    let mut i = 0.0;
-    let mut n = 6.0;
-    while i < n {
-        if i > 3.0 {
+    /// A `while` that carries a scalar: the sum of the counts it walks through.
+    #[sile::entry]
+    pub fn while_acc(out: &mut Tensor<f32, { [16] }>) {
+        let mut n = 5.0;
+        let mut acc = 0.0;
+        let mut i = 0.0;
+        while i < n {
+            acc = acc + i;
             i = i + 1.0;
-            continue;
         }
-        acc = acc + broadcast_scalar(i, shape![16]);
-        i = i + 1.0;
+        let t = broadcast_scalar(acc, shape![16]);
+        out.store(t);
     }
-    out.store(acc);
-}
 
-/// A `loop` with a `break` at its end: the sum of 1..=4.
-#[sile::kernel]
-fn loop_break(out: &mut Tensor<f32, { [16] }>) {
-    let mut acc = broadcast_scalar(0.0, shape![16]);
-    let mut i = 0.0;
-    loop {
-        acc = acc + broadcast_scalar(i, shape![16]);
-        i = i + 1.0;
-        if i >= 4.0 {
-            break;
+    /// A `continue` a branch holds: the passes past three contribute nothing, and
+    /// the pass variable still moves, or the loop would never end.
+    #[sile::entry]
+    pub fn while_skip(out: &mut Tensor<f32, { [16] }>) {
+        let mut acc = broadcast_scalar(0.0, shape![16]);
+        let mut i = 0.0;
+        let mut n = 6.0;
+        while i < n {
+            if i > 3.0 {
+                i = i + 1.0;
+                continue;
+            }
+            acc = acc + broadcast_scalar(i, shape![16]);
+            i = i + 1.0;
         }
+        out.store(acc);
     }
-    out.store(acc);
-}
 
-/// A `for` in its three lowering shapes: a small stepped range unrolls, a
-/// range over a runtime bound lowers to a loop, and a stepped range too long
-/// to unroll lowers to a loop with the step in its back edge. The sum is
-/// 0+3+6, plus 0..=6, plus 7×(0+1+…+36).
-#[sile::kernel]
-fn for_steps(out: &mut Tensor<f32, { [16] }>) {
-    let mut acc = broadcast_scalar(0.0, shape![16]);
-    for i in (0..8).step_by(3) {
-        acc = acc + broadcast_scalar(i, shape![16]);
+    /// A `loop` with a `break` at its end: the sum of 1..=4.
+    #[sile::entry]
+    pub fn loop_break(out: &mut Tensor<f32, { [16] }>) {
+        let mut acc = broadcast_scalar(0.0, shape![16]);
+        let mut i = 0.0;
+        loop {
+            acc = acc + broadcast_scalar(i, shape![16]);
+            i = i + 1.0;
+            if i >= 4.0 {
+                break;
+            }
+        }
+        out.store(acc);
     }
-    let mut n = 7;
-    for j in 0..n {
-        acc = acc + broadcast_scalar(j, shape![16]);
-    }
-    for k in (0..256).step_by(7) {
-        acc = acc + broadcast_scalar(k, shape![16]);
-    }
-    out.store(acc);
-}
 
-/// An early `return` in a branch. One block runs, so the branch is never
-/// taken and the second store runs; the lowered control flow still has to
-/// hold both paths apart.
-#[sile::kernel]
-fn early_return(x: &Tensor<f32, { [32] }>, out: &mut Tensor<f32, { [16] }>) {
-    let pid = get_tile_block_id().0;
-    let t0 = x.load_tile([16], [0]);
-    out.store(t0);
-    if pid > 0 {
-        return;
-    }
-    let t1 = x.load_tile([16], [1]);
-    out.store(t1 + broadcast_scalar(1.0, shape![16]));
-}
-
-/// Loops nested in both directions: a `while` whose body holds a `for`, both
-/// carrying the same accumulator, and a branch the `while` carries past.
-#[sile::kernel]
-fn nested_loops(out: &mut Tensor<f32, { [16] }>) {
-    let mut acc = broadcast_scalar(0.0, shape![16]);
-    let mut r = 0.0;
-    let mut rounds = 3.0;
-    while r < rounds {
-        for j in 0..4 {
+    /// A `for` in its three lowering shapes: a small stepped range unrolls, a
+    /// range over a runtime bound lowers to a loop, and a stepped range too long
+    /// to unroll lowers to a loop with the step in its back edge. The sum is
+    /// 0+3+6, plus 0..=6, plus 7×(0+1+…+36).
+    #[sile::entry]
+    pub fn for_steps(out: &mut Tensor<f32, { [16] }>) {
+        let mut acc = broadcast_scalar(0.0, shape![16]);
+        for i in (0..8).step_by(3) {
+            acc = acc + broadcast_scalar(i, shape![16]);
+        }
+        let mut n = 7;
+        for j in 0..n {
             acc = acc + broadcast_scalar(j, shape![16]);
         }
-        r = r + 1.0;
-        if r >= 2.0 {
-            acc = acc + broadcast_scalar(100.0, shape![16]);
+        for k in (0..256).step_by(7) {
+            acc = acc + broadcast_scalar(k, shape![16]);
         }
+        out.store(acc);
     }
-    out.store(acc);
-}
 
-/// A `continue` a branch holds inside a `for`: one pass out of eight adds
-/// nothing, and the loop still walks every value.
-#[sile::kernel]
-fn for_continue(out: &mut Tensor<f32, { [16] }>) {
-    let mut acc = broadcast_scalar(0.0, shape![16]);
-    let mut n = 8;
-    for i in 0..n {
-        if i == 3 {
-            continue;
+    /// An early `return` in a branch. One block runs, so the branch is never
+    /// taken and the second store runs; the lowered control flow still has to
+    /// hold both paths apart.
+    #[sile::entry]
+    pub fn early_return(x: &Tensor<f32, { [32] }>, out: &mut Tensor<f32, { [16] }>) {
+        let pid = get_tile_block_id().0;
+        let t0 = x.load_tile([16], [0]);
+        out.store(t0);
+        if pid > 0 {
+            return;
         }
-        acc = acc + broadcast_scalar(i, shape![16]);
+        let t1 = x.load_tile([16], [1]);
+        out.store(t1 + broadcast_scalar(1.0, shape![16]));
     }
-    out.store(acc);
+
+    /// Loops nested in both directions: a `while` whose body holds a `for`, both
+    /// carrying the same accumulator, and a branch the `while` carries past.
+    #[sile::entry]
+    pub fn nested_loops(out: &mut Tensor<f32, { [16] }>) {
+        let mut acc = broadcast_scalar(0.0, shape![16]);
+        let mut r = 0.0;
+        let mut rounds = 3.0;
+        while r < rounds {
+            for j in 0..4 {
+                acc = acc + broadcast_scalar(j, shape![16]);
+            }
+            r = r + 1.0;
+            if r >= 2.0 {
+                acc = acc + broadcast_scalar(100.0, shape![16]);
+            }
+        }
+        out.store(acc);
+    }
+
+    /// A `continue` a branch holds inside a `for`: one pass out of eight adds
+    /// nothing, and the loop still walks every value.
+    #[sile::entry]
+    pub fn for_continue(out: &mut Tensor<f32, { [16] }>) {
+        let mut acc = broadcast_scalar(0.0, shape![16]);
+        let mut n = 8;
+        for i in 0..n {
+            if i == 3 {
+                continue;
+            }
+            acc = acc + broadcast_scalar(i, shape![16]);
+        }
+        out.store(acc);
+    }
 }
 
 fn device() -> Result<(Device, sile::Stream)> {

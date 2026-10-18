@@ -10,20 +10,29 @@
 //! uses, and the tile covers the whole of the last axis, so its column
 //! coordinate is zero.
 
-use sile::ct::*;
 use sile::{Device, Tensor};
+use kernels::scale_rank4;
 
-#[sile::kernel]
-fn scale_rank4<const BM: i64, const D: i64>(
-    out: &mut Tensor<f32, { [1, 1, BM, D] }>,
-    x: &Tensor<f32, { [-1, -1, -1, -1] }>,
-    factor: f32,
-) {
-    let pid = get_tile_block_id();
-    let part = x.partition(shape![1, 1, BM, D]);
-    let tile = part.load([pid.0, pid.1, pid.2, 0i64]).reshape(shape![BM, D]);
-    let scale = factor.broadcast(shape![BM, D]);
-    out.store((tile * scale).reshape(shape![1, 1, BM, D]));
+#[path = "common/mod.rs"]
+mod common;
+
+#[sile::module]
+mod kernels {
+    use sile::ct::*;
+    use sile::Tensor;
+
+    #[sile::entry]
+    pub fn scale_rank4<const BM: i64, const D: i64>(
+        out: &mut Tensor<f32, { [1, 1, BM, D] }>,
+        x: &Tensor<f32, { [-1, -1, -1, -1] }>,
+        factor: f32,
+    ) {
+        let pid = get_tile_block_id();
+        let part = x.partition(shape![1, 1, BM, D]);
+        let tile = part.load([pid.0, pid.1, pid.2, 0i64]).reshape(shape![BM, D]);
+        let scale = factor.broadcast(shape![BM, D]);
+        out.store((tile * scale).reshape(shape![1, 1, BM, D]));
+    }
 }
 
 fn main() -> sile::Result<()> {

@@ -269,14 +269,6 @@ fn rewrite_stmt(stmt: &syn::Stmt) -> syn::Stmt {
     }
 }
 
-#[proc_macro_attribute]
-pub fn kernel(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input = syn::parse_macro_input!(item as syn::ItemFn);
-    expand_kernel_fn(&input)
-        .unwrap_or_else(|err| err.to_compile_error())
-        .into()
-}
-
 /// The entry keys a `#[sile::entry(...)]` accepts. They all name a compiler
 /// behavior of the CUDA front end — diagnostics, proofs, tuning — and none of
 /// them changes the program this front end builds, so each one is accepted by
@@ -481,9 +473,9 @@ pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
         .into()
 }
 
-/// Expands a `#[sile::module]`: the entry functions become launchers, exactly
-/// what `#[sile::kernel]` builds, and every device function stays a plain
-/// function whose calls the entries inlined at their call sites.
+/// Expands a `#[sile::module]`: the entry functions become launchers, and
+/// every device function stays a plain function whose calls the entries
+/// inlined at their call sites.
 fn expand_module(input: &syn::ItemMod) -> syn::Result<proc_macro2::TokenStream> {
     use std::collections::HashMap;
 

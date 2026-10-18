@@ -6,23 +6,32 @@
 //! the integer division of row three is one and its product with the group is
 //! two, while a float division would give three back.
 
-use sile::ct::*;
 use sile::{Device, Tensor};
+use kernels::pick_row;
 
-#[sile::kernel]
-fn pick_row<const N: i64>(
-    out: &mut Tensor<f32, { [1, N] }>,
-    x: &Tensor<f32, { [-1, -1] }>,
-    group: i64,
-) {
-    let pid = get_tile_block_id();
-    // The group index of this row, and the row its group starts at.
-    let group_of_row: i64 = pid.0 / group;
-    let in_group: i64 = pid.0 % group;
-    let row: i64 = group_of_row * group + in_group;
+#[path = "common/mod.rs"]
+mod common;
 
-    let part = x.partition(shape![1, N]);
-    out.store(part.load([row, 0i64]));
+#[sile::module]
+mod kernels {
+    use sile::ct::*;
+    use sile::Tensor;
+
+    #[sile::entry]
+    pub fn pick_row<const N: i64>(
+        out: &mut Tensor<f32, { [1, N] }>,
+        x: &Tensor<f32, { [-1, -1] }>,
+        group: i64,
+    ) {
+        let pid = get_tile_block_id();
+        // The group index of this row, and the row its group starts at.
+        let group_of_row: i64 = pid.0 / group;
+        let in_group: i64 = pid.0 % group;
+        let row: i64 = group_of_row * group + in_group;
+
+        let part = x.partition(shape![1, N]);
+        out.store(part.load([row, 0i64]));
+    }
 }
 
 fn main() -> sile::Result<()> {

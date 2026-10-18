@@ -1,22 +1,31 @@
 //! A check that `transpose` exchanges the two tile axes, and that the result
 //! still feeds a matrix multiply.
 
-use sile::ct::*;
 use sile::{Device, Tensor};
+use kernels::at_b_transposed;
 
-/// `c = a @ b^T` where `b` is transposed on the device. The multiply reads the
-/// transposed tile, so a transpose that is wrong anywhere shows up in `c`.
-#[sile::kernel]
-fn at_b_transposed<const BM: i64, const BN: i64, const BK: i64>(
-    a: &Tensor<f32, { [BM, BK] }>,
-    b: &Tensor<f32, { [BN, BK] }>,
-    out: &mut Tensor<f32, { [BM, BN] }>,
-) {
-    let ta = a.load_like(out);
-    let tb = b.load_like(out);
-    let tb_t = tb.transpose();
-    let acc = constant(0.0f32, shape![BM, BN]);
-    out.store(mma(ta, tb_t, acc));
+#[path = "common/mod.rs"]
+mod common;
+
+#[sile::module]
+mod kernels {
+    use sile::ct::*;
+    use sile::Tensor;
+
+    /// `c = a @ b^T` where `b` is transposed on the device. The multiply reads the
+    /// transposed tile, so a transpose that is wrong anywhere shows up in `c`.
+    #[sile::entry]
+    pub fn at_b_transposed<const BM: i64, const BN: i64, const BK: i64>(
+        a: &Tensor<f32, { [BM, BK] }>,
+        b: &Tensor<f32, { [BN, BK] }>,
+        out: &mut Tensor<f32, { [BM, BN] }>,
+    ) {
+        let ta = a.load_like(out);
+        let tb = b.load_like(out);
+        let tb_t = tb.transpose();
+        let acc = constant(0.0f32, shape![BM, BN]);
+        out.store(mma(ta, tb_t, acc));
+    }
 }
 
 fn main() -> sile::Result<()> {

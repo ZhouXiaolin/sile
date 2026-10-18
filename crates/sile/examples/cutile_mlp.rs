@@ -4,53 +4,59 @@
 //! contraction axis, and an in-place ReLU. The host compares the result with a
 //! numpy reference.
 
-use sile::ct::*;
 use sile::{Device, Tensor};
+use kernels::{gemm, matvec, relu};
 
 #[path = "common/mod.rs"]
 mod common;
 
-#[sile::kernel]
-fn gemm<const BM: i64, const BN: i64, const BK: i64>(
-    z: &mut Tensor<f32, { [BM, BN] }>,
-    x: &Tensor<f32, { [-1, -1] }>,
-    y: &Tensor<f32, { [-1, -1] }>,
-) {
-    let part_x = x.partition(shape![BM, BK]);
-    let part_y = y.partition(shape![BK, BN]);
-    let pid = get_tile_block_id();
-    let mut tile_z = load_tile_mut(z);
-    for i in 0i64..(x.shape()[1] / BK) {
-        let tile_x = part_x.load([pid.0, i]);
-        let tile_y = part_y.load([i, pid.1]);
-        tile_z = mma(tile_x, tile_y, tile_z);
-    }
-    z.store(tile_z);
-}
+#[sile::module]
+mod kernels {
+    use sile::ct::*;
+    use sile::Tensor;
 
-#[sile::kernel]
-fn matvec<const BM: i64, const BK: i64>(
-    z: &mut Tensor<f32, { [BM] }>,
-    x: &Tensor<f32, { [-1, -1] }>,
-    y: &Tensor<f32, { [-1] }>,
-) {
-    let part_x = x.partition(shape![BM, BK]);
-    let pid = get_tile_block_id();
-    let mut acc = constant(0.0f32, const_shape![BM]);
-    for k in 0i64..(x.shape()[1] / BK) {
-        let tile_x = part_x.load([pid.0, k]);
-        let tile_y = y.load_tile([BK], [k]);
-        let tile_y = tile_y.broadcast(shape![BM, BK]);
-        acc = acc + reduce_sum(tile_x * tile_y, 1i64);
+    #[sile::entry]
+    pub fn gemm<const BM: i64, const BN: i64, const BK: i64>(
+        z: &mut Tensor<f32, { [BM, BN] }>,
+        x: &Tensor<f32, { [-1, -1] }>,
+        y: &Tensor<f32, { [-1, -1] }>,
+    ) {
+        let part_x = x.partition(shape![BM, BK]);
+        let part_y = y.partition(shape![BK, BN]);
+        let pid = get_tile_block_id();
+        let mut tile_z = load_tile_mut(z);
+        for i in 0i64..(x.shape()[1] / BK) {
+            let tile_x = part_x.load([pid.0, i]);
+            let tile_y = part_y.load([i, pid.1]);
+            tile_z = mma(tile_x, tile_y, tile_z);
+        }
+        z.store(tile_z);
     }
-    z.store(acc);
-}
 
-#[sile::kernel]
-fn relu<const D: i64>(z: &mut Tensor<f32, { [D] }>) {
-    let zero = constant(0.0f32, const_shape![D]);
-    let data = z.load();
-    z.store(max_tile(zero, data));
+    #[sile::entry]
+    pub fn matvec<const BM: i64, const BK: i64>(
+        z: &mut Tensor<f32, { [BM] }>,
+        x: &Tensor<f32, { [-1, -1] }>,
+        y: &Tensor<f32, { [-1] }>,
+    ) {
+        let part_x = x.partition(shape![BM, BK]);
+        let pid = get_tile_block_id();
+        let mut acc = constant(0.0f32, const_shape![BM]);
+        for k in 0i64..(x.shape()[1] / BK) {
+            let tile_x = part_x.load([pid.0, k]);
+            let tile_y = y.load_tile([BK], [k]);
+            let tile_y = tile_y.broadcast(shape![BM, BK]);
+            acc = acc + reduce_sum(tile_x * tile_y, 1i64);
+        }
+        z.store(acc);
+    }
+
+    #[sile::entry]
+    pub fn relu<const D: i64>(z: &mut Tensor<f32, { [D] }>) {
+        let zero = constant(0.0f32, const_shape![D]);
+        let data = z.load();
+        z.store(max_tile(zero, data));
+    }
 }
 
 fn main() -> sile::Result<()> {

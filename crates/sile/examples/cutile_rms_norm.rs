@@ -10,46 +10,52 @@
 //! the row it owns. The `i32` annotations of the original are `i64` here,
 //! because a kernel's const generics are `i64` in this front end.
 
-use sile::ct::*;
 use sile::{Device, Tensor};
+use kernels::rms_norm;
 
 #[path = "common/mod.rs"]
 mod common;
 
-#[sile::kernel]
-fn rms_norm<const N: i64, const BLOCK_SIZE: i64>(
-    x: &Tensor<f32, { [-1, N] }>,
-    w: &Tensor<f32, { [N] }>,
-    out: &mut Tensor<f32, { [1, N] }>,
-    eps: f32,
-) {
-    let tile_shape: Shape = shape![1, BLOCK_SIZE];
-    let num_tiles: i64 = N / BLOCK_SIZE;
-    let pid: (i64, i64, i64) = get_tile_block_id();
-    let row = pid.0;
+#[sile::module]
+mod kernels {
+    use sile::ct::*;
+    use sile::Tensor;
 
-    let x_part = x.partition(tile_shape);
-    let mut rms = constant(0.0, tile_shape);
-    for j in 0i64..num_tiles {
-        let tx = x_part.load([row, j]);
-        rms = rms + tx * tx;
-    }
-    let rms = reduce_sum(rms, 1i64);
-    let rms = rms.reshape(shape![]);
-    let rms = tile_to_scalar(rms);
-    let n = convert_scalar(N);
-    let rms = 1.0f32 / (rms / n + eps);
-    let rms = sqrt(scalar_to_tile(rms), rounding::NegativeInf, ftz::Disabled);
-    let rms = tile_to_scalar(rms);
-    let rms = rms.broadcast(tile_shape);
+    #[sile::entry]
+    pub fn rms_norm<const N: i64, const BLOCK_SIZE: i64>(
+        x: &Tensor<f32, { [-1, N] }>,
+        w: &Tensor<f32, { [N] }>,
+        out: &mut Tensor<f32, { [1, N] }>,
+        eps: f32,
+    ) {
+        let tile_shape: Shape = shape![1, BLOCK_SIZE];
+        let num_tiles: i64 = N / BLOCK_SIZE;
+        let pid: (i64, i64, i64) = get_tile_block_id();
+        let row = pid.0;
 
-    let w_part = w.partition(shape![BLOCK_SIZE]);
-    let mut out_part = out.partition_mut(tile_shape);
-    for j in 0i64..num_tiles {
-        let tx = x_part.load([row, j]);
-        let tw = w_part.load([j]).reshape(tile_shape);
-        let tout = tx * rms * tw;
-        out_part.store(tout, [row, j]);
+        let x_part = x.partition(tile_shape);
+        let mut rms = constant(0.0, tile_shape);
+        for j in 0i64..num_tiles {
+            let tx = x_part.load([row, j]);
+            rms = rms + tx * tx;
+        }
+        let rms = reduce_sum(rms, 1i64);
+        let rms = rms.reshape(shape![]);
+        let rms = tile_to_scalar(rms);
+        let n = convert_scalar(N);
+        let rms = 1.0f32 / (rms / n + eps);
+        let rms = sqrt(scalar_to_tile(rms), rounding::NegativeInf, ftz::Disabled);
+        let rms = tile_to_scalar(rms);
+        let rms = rms.broadcast(tile_shape);
+
+        let w_part = w.partition(shape![BLOCK_SIZE]);
+        let mut out_part = out.partition_mut(tile_shape);
+        for j in 0i64..num_tiles {
+            let tx = x_part.load([row, j]);
+            let tw = w_part.load([j]).reshape(tile_shape);
+            let tout = tx * rms * tw;
+            out_part.store(tout, [row, j]);
+        }
     }
 }
 

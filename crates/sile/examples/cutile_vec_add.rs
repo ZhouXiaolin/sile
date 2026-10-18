@@ -2,22 +2,28 @@
 //!
 //! `program_id(axis)` is one scalar, which is what CuTile's spelling returns.
 
-use sile::ct::*;
 use sile::{Device, Tensor};
+use kernels::vec_add;
 
 #[path = "common/mod.rs"]
 mod common;
 
-#[sile::kernel]
-fn vec_add<const TILE: i64>(
-    c: &mut Tensor<f32, { [TILE] }>,
-    a: &Tensor<f32, { [-1] }>,
-    b: &Tensor<f32, { [-1] }>,
-) {
-    let pid = program_id(0);
-    let tile_a = a.load_tile([TILE], [pid]);
-    let tile_b = b.load_tile([TILE], [pid]);
-    c.store(tile_a + tile_b);
+#[sile::module]
+mod kernels {
+    use sile::ct::*;
+    use sile::Tensor;
+
+    #[sile::entry]
+    pub fn vec_add<const TILE: i64>(
+        c: &mut Tensor<f32, { [TILE] }>,
+        a: &Tensor<f32, { [-1] }>,
+        b: &Tensor<f32, { [-1] }>,
+    ) {
+        let pid = program_id(0);
+        let tile_a = a.load_tile([TILE], [pid]);
+        let tile_b = b.load_tile([TILE], [pid]);
+        c.store(tile_a + tile_b);
+    }
 }
 
 fn main() -> sile::Result<()> {

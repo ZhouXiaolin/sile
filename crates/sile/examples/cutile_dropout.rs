@@ -3,29 +3,35 @@
 //! The kernel exercises the comparison-and-select pair: `gt_tile` produces a
 //! tile of `0.0`/`1.0` and `select` picks between two tiles element by element.
 
-use sile::ct::*;
 use sile::{Device, Tensor};
+use kernels::dropout;
 
 #[path = "common/mod.rs"]
 mod common;
 
-#[sile::kernel]
-fn dropout<const BM: i64>(
-    p: f32,
-    x: &Tensor<f32, { [-1] }>,
-    x_keep: &Tensor<f32, { [-1] }>,
-    out: &mut Tensor<f32, { [BM] }>,
-) {
-    let zeros = constant(0.0, out.shape());
-    let ones = constant(1.0, out.shape());
-    let p_tile = p.broadcast(out.shape());
-    let x_keep_tile = x_keep.load_like(out);
-    let x_tile = x.load_like(out);
-    // `x_keep` is the probability of keeping a value: a draw above `p` keeps it.
-    let keep = gt_tile(x_keep_tile, p_tile);
-    let out_tile = select(keep, x_tile, zeros);
-    // Rescale the kept values so the expected value does not change.
-    out.store(out_tile / (ones - p_tile));
+#[sile::module]
+mod kernels {
+    use sile::ct::*;
+    use sile::Tensor;
+
+    #[sile::entry]
+    pub fn dropout<const BM: i64>(
+        p: f32,
+        x: &Tensor<f32, { [-1] }>,
+        x_keep: &Tensor<f32, { [-1] }>,
+        out: &mut Tensor<f32, { [BM] }>,
+    ) {
+        let zeros = constant(0.0, out.shape());
+        let ones = constant(1.0, out.shape());
+        let p_tile = p.broadcast(out.shape());
+        let x_keep_tile = x_keep.load_like(out);
+        let x_tile = x.load_like(out);
+        // `x_keep` is the probability of keeping a value: a draw above `p` keeps it.
+        let keep = gt_tile(x_keep_tile, p_tile);
+        let out_tile = select(keep, x_tile, zeros);
+        // Rescale the kept values so the expected value does not change.
+        out.store(out_tile / (ones - p_tile));
+    }
 }
 
 fn main() -> sile::Result<()> {

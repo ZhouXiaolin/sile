@@ -6,35 +6,41 @@
 //! tile is the last two of them. CuTile spells that `pid.0` for the batch, and
 //! the grid is `(batch, m / BM, n / BN)`.
 
-use sile::ct::*;
 use sile::{Device, Tensor};
+use kernels::batch_matmul;
 
 #[path = "common/mod.rs"]
 mod common;
 
-#[sile::kernel]
-fn batch_matmul<const BM: i64, const BN: i64, const BK: i64>(
-    c: &mut Tensor<f32, { [1, BM, BN] }>,
-    a: &Tensor<f32, { [-1, -1, -1] }>,
-    b: &Tensor<f32, { [-1, -1, -1] }>,
-) {
-    let pid = get_tile_block_id();
-    let batch_idx = pid.0;
-    let m_idx = pid.1;
-    let n_idx = pid.2;
+#[sile::module]
+mod kernels {
+    use sile::ct::*;
+    use sile::Tensor;
 
-    let a_part = a.partition(shape![1, BM, BK]);
-    let b_part = b.partition(shape![1, BK, BN]);
+    #[sile::entry]
+    pub fn batch_matmul<const BM: i64, const BN: i64, const BK: i64>(
+        c: &mut Tensor<f32, { [1, BM, BN] }>,
+        a: &Tensor<f32, { [-1, -1, -1] }>,
+        b: &Tensor<f32, { [-1, -1, -1] }>,
+    ) {
+        let pid = get_tile_block_id();
+        let batch_idx = pid.0;
+        let m_idx = pid.1;
+        let n_idx = pid.2;
 
-    let zero: f32 = convert_scalar(0i64);
-    let mut acc = broadcast_scalar(zero, shape![BM, BN]);
-    let k_tiles: i64 = a.shape()[2] / BK;
-    for k_idx in 0i64..k_tiles {
-        let a_tile = a_part.load([batch_idx, m_idx, k_idx]).reshape(shape![BM, BK]);
-        let b_tile = b_part.load([batch_idx, k_idx, n_idx]).reshape(shape![BK, BN]);
-        acc = mma(a_tile, b_tile, acc);
+        let a_part = a.partition(shape![1, BM, BK]);
+        let b_part = b.partition(shape![1, BK, BN]);
+
+        let zero: f32 = convert_scalar(0i64);
+        let mut acc = broadcast_scalar(zero, shape![BM, BN]);
+        let k_tiles: i64 = a.shape()[2] / BK;
+        for k_idx in 0i64..k_tiles {
+            let a_tile = a_part.load([batch_idx, m_idx, k_idx]).reshape(shape![BM, BK]);
+            let b_tile = b_part.load([batch_idx, k_idx, n_idx]).reshape(shape![BK, BN]);
+            acc = mma(a_tile, b_tile, acc);
+        }
+        c.store(acc.reshape(shape![1, BM, BN]));
     }
-    c.store(acc.reshape(shape![1, BM, BN]));
 }
 
 fn main() -> sile::Result<()> {

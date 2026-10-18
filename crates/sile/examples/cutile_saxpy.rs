@@ -4,22 +4,28 @@
 //! expression, so it exercises the scalar descriptor, the broadcast of a scalar
 //! and both load spellings.
 
-use sile::ct::*;
 use sile::{Device, Tensor};
+use kernels::saxpy;
 
 #[path = "common/mod.rs"]
 mod common;
 
-#[sile::kernel]
-fn saxpy<const BM: i64, const BN: i64>(
-    y: &mut Tensor<f32, { [BM, BN] }>,
-    a: f32,
-    x: &Tensor<f32, { [-1, -1] }>,
-) {
-    let tile_a = a.broadcast(y.shape());
-    let tile_x = x.load_like(y);
-    let tile_y = y.load();
-    y.store(tile_a * tile_x + tile_y);
+#[sile::module]
+mod kernels {
+    use sile::ct::*;
+    use sile::Tensor;
+
+    #[sile::entry]
+    pub fn saxpy<const BM: i64, const BN: i64>(
+        y: &mut Tensor<f32, { [BM, BN] }>,
+        a: f32,
+        x: &Tensor<f32, { [-1, -1] }>,
+    ) {
+        let tile_a = a.broadcast(y.shape());
+        let tile_x = x.load_like(y);
+        let tile_y = y.load();
+        y.store(tile_a * tile_x + tile_y);
+    }
 }
 
 fn main() -> sile::Result<()> {

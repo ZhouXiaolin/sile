@@ -4,18 +4,24 @@
 //! into the output atomically, so the answer is a sum over the launch rather
 //! than over one program.
 
-use sile::ct::*;
 use sile::{Device, Tensor};
+use kernels::parallel_reduce;
 
 #[path = "common/mod.rs"]
 mod common;
 
-#[sile::kernel]
-fn parallel_reduce<const TILE: i64>(a: &Tensor<f32, { [-1] }>, out: &mut Tensor<f32, { [1] }>) {
-    let pid = get_tile_block_id();
-    let tile_a = a.load_tile([TILE], [pid.0]);
-    let sum_tile = reduce_sum(tile_a, 0i64);
-    out.atomic_add(0, sum_tile[0]);
+#[sile::module]
+mod kernels {
+    use sile::ct::*;
+    use sile::Tensor;
+
+    #[sile::entry]
+    pub fn parallel_reduce<const TILE: i64>(a: &Tensor<f32, { [-1] }>, out: &mut Tensor<f32, { [1] }>) {
+        let pid = get_tile_block_id();
+        let tile_a = a.load_tile([TILE], [pid.0]);
+        let sum_tile = reduce_sum(tile_a, 0i64);
+        out.atomic_add(0, sum_tile[0]);
+    }
 }
 
 fn main() -> sile::Result<()> {

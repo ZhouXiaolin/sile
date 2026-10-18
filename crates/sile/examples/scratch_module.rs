@@ -78,8 +78,8 @@ mod scratch_module_kernels {
         out.store(t);
     }
 
-    /// The softmax a `#[sile::kernel]` writes, as a module: the two helpers
-    /// are device functions, and the entry reads like the cutile spelling.
+    /// The softmax the fold examples write, as a module: the two helpers are
+    /// device functions, and the entry reads like the cutile spelling.
     fn shifted_exp(x: Tile<f32>, peak: Tile<f32>) -> Tile<f32> {
         exp(x - peak)
     }

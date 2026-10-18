@@ -3,24 +3,30 @@
 //! The reductions name an `i32` axis, and the two broadcasts take their target
 //! shape from the output buffer. Both are syntax the ported kernel keeps.
 
-use sile::ct::*;
 use sile::{Device, Tensor};
+use kernels::softmax;
 
 #[path = "common/mod.rs"]
 mod common;
 
-#[sile::kernel]
-fn softmax<const BM: i64, const BN: i64>(
-    y: &mut Tensor<f32, { [BM, BN] }>,
-    x: &Tensor<f32, { [-1, -1] }>,
-) {
-    let tile_x = x.load_like(y);
-    let tile_x_max = reduce_max(tile_x.clone(), 1i64);
-    let tile_x_max = tile_x_max.reshape(shape![BM, 1]).broadcast(y.shape());
-    let num = exp(tile_x - tile_x_max);
-    let denom = reduce_sum(num.clone(), 1i64);
-    let denom = denom.reshape(shape![BM, 1]).broadcast(y.shape());
-    y.store(num / denom);
+#[sile::module]
+mod kernels {
+    use sile::ct::*;
+    use sile::Tensor;
+
+    #[sile::entry]
+    pub fn softmax<const BM: i64, const BN: i64>(
+        y: &mut Tensor<f32, { [BM, BN] }>,
+        x: &Tensor<f32, { [-1, -1] }>,
+    ) {
+        let tile_x = x.load_like(y);
+        let tile_x_max = reduce_max(tile_x.clone(), 1i64);
+        let tile_x_max = tile_x_max.reshape(shape![BM, 1]).broadcast(y.shape());
+        let num = exp(tile_x - tile_x_max);
+        let denom = reduce_sum(num.clone(), 1i64);
+        let denom = denom.reshape(shape![BM, 1]).broadcast(y.shape());
+        y.store(num / denom);
+    }
 }
 
 fn main() -> sile::Result<()> {
