@@ -3,9 +3,9 @@
 //! The kernel takes the scalar `a` by value and reads it inside a tile
 //! expression, so it exercises the scalar descriptor, the broadcast of a scalar
 //! and both load spellings. The host side matches the original: `arange(32)`
-//! reshaped to (4, 8), `a = 2.0`, and the (2, 2) tile that puts the launch on a
-//! (2, 4) grid. What differs is only where the reference comes from: the
-//! original asserts against host arithmetic, this one against
+//! reshaped to (4, 8), `a = 2.0`, and the (2, 2) tile whose partition counts
+//! are the launch grid. What differs is only where the reference comes from:
+//! the original asserts against host arithmetic, this one against
 //! `numpy_ref.py saxpy`.
 
 use sile::{Device, Tensor};
@@ -44,16 +44,15 @@ fn main() -> sile::Result<()> {
     let values: Vec<f32> = (0..m * n).map(|i| i as f32).collect();
     let x = Tensor::from_vec(values.clone(), [m, n], &device)?;
     let mut y = Tensor::from_vec(values.clone(), [m, n], &device)?;
+    let mut y_part = y.partition_mut([BM, BN]);
 
     // The kernel updates y in place, so the reference reads y as it is here,
     // before the launch.
     let y_host = values.clone();
 
-    saxpy::<BM, BN>(&mut y, a, &x)
-        .grid(((m / BM) as u32, (n / BN) as u32, 1))
-        .apply(&stream)?;
+    saxpy::<BM, BN>(&mut y_part, a, &x).apply(&stream)?;
 
-    let out = y.to_vec(&stream)?;
+    let out = y_part.unpartition().to_vec(&stream)?;
     let expected = common::numpy("saxpy", &[a.to_string()], &[&values, &y_host]);
     for (i, (got, expected)) in out.iter().zip(&expected).enumerate() {
         let answer = a * values[i] + y_host[i];

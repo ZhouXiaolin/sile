@@ -50,12 +50,11 @@ fn main() -> sile::Result<()> {
     let x = Tensor::from_vec(x_data.clone(), [len], &device)?;
     let keep = Tensor::from_vec(keep_data.clone(), [len], &device)?;
     let mut out = Tensor::zeros([len], &device)?;
+    let mut out_part = out.partition_mut([BM]);
 
-    dropout::<BM>(p, &x, &keep, &mut out)
-        .grid(((len / BM) as u32, 1, 1))
-        .apply(&stream)?;
+    dropout::<BM>(p, &x, &keep, &mut out_part).apply(&stream)?;
 
-    let got = out.to_vec(&stream)?;
+    let got = out_part.unpartition().to_vec(&stream)?;
     let expected = common::numpy("dropout", &[p.to_string()], &[&x_data, &keep_data]);
     for i in 0..len as usize {
         assert!(

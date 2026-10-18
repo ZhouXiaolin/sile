@@ -88,11 +88,85 @@ impl<'a> KernelLauncher<'a> {
         &self.kernel
     }
 
+    /// The grid this launch runs on: the one `.grid()` named, or the one the
+    /// kernel's output shapes derive.
+    ///
+    /// A kernel whose output names every extent — `z: Tensor<f32, [BM, BN]>` —
+    /// tiles its buffer, and the launch is one program per tile: the grid is
+    /// the buffer extent over the declared extent, per axis. This is the check
+    /// CuTile runs on a host partition, derived from the same two shapes; a
+    /// kernel with a dynamic output still names its grid by hand.
+    fn resolve_grid(&self, kernel: &Kernel) -> Result<[u32; 3]> {
+        let constants: HashMap<&str, i64> = kernel
+            .const_params
+            .iter()
+            .map(|(name, value)| (name.as_str(), *value))
+            .collect();
+        // Scalars do not travel in `args`, so the buffer parameters are the
+        // non-scalar ones, in order — the same rule the backends bind by.
+        let buffer_params = kernel
+            .params
+            .iter()
+            .filter(|param| !matches!(param.ty, sile_hir::Type::Scalar(_)));
+        let mut derived: Option<[u32; 3]> = None;
+        for (param, arg) in buffer_params.zip(&self.args) {
+            if param.kind != sile_hir::ParamKind::Output {
+                continue;
+            }
+            let sile_hir::Type::Tensor { shape, .. } = &param.ty else {
+                continue;
+            };
+            let Some(dims) = constant_dims(shape, &constants) else {
+                continue;
+            };
+            if dims.len() != arg.shape.len() {
+                return Err(sile_core::Error::Shape(format!(
+                    "kernel output `{}` declares rank {}, but the buffer passed has rank {}",
+                    param.name,
+                    dims.len(),
+                    arg.shape.len()
+                )));
+            }
+            let mut candidate = [1u32; 3];
+            for (axis, (extent, declared)) in arg.shape.iter().zip(&dims).enumerate() {
+                if extent % declared != 0 {
+                    return Err(sile_core::Error::Shape(format!(
+                        "kernel output `{}`: buffer extent {extent} is not divisible by the \
+                         declared extent {declared} on axis {axis}",
+                        param.name
+                    )));
+                }
+                candidate[axis] = (extent / declared) as u32;
+            }
+            if let Some(previous) = derived {
+                if previous != candidate {
+                    return Err(sile_core::Error::Shape(format!(
+                        "two outputs derive different grids: {previous:?} and {candidate:?}"
+                    )));
+                }
+            }
+            derived = Some(candidate);
+        }
+
+        match (self.grid, derived) {
+            (Some(explicit), Some(derived)) if explicit != derived => Err(
+                sile_core::Error::Shape(format!(
+                    "grid {explicit:?} disagrees with the one the output shapes derive, {derived:?}"
+                )),
+            ),
+            (Some(explicit), _) => Ok(explicit),
+            (None, Some(derived)) => Ok(derived),
+            (None, None) => Err(sile_core::Error::Shape(
+                "grid not set and no output names every extent, so the grid cannot be derived; \
+                 pass `.grid(...)`"
+                    .into(),
+            )),
+        }
+    }
+
     pub fn apply(self, stream: &Stream) -> Result<()> {
         let launch = LaunchConfig {
-            grid: self
-                .grid
-                .ok_or_else(|| sile_core::Error::Shape("grid not set".into()))?,
+            grid: self.resolve_grid(&self.kernel)?,
         };
 
         let parts = compiled_parts(&self.kernel)?;
@@ -162,6 +236,32 @@ impl<'a> KernelLauncher<'a> {
 
 fn should_print(env: &str) -> bool {
     std::env::var_os(env).is_some()
+}
+
+/// The dimensions of a shape, when every one of them is a known constant.
+///
+/// A shape dimension is a literal, a const parameter, or `-1` for the dynamic
+/// extent a kernel reads off the buffer. The first two resolve to a number
+/// here; the last one and any unresolved name leave the shape unable to name
+/// a grid, which is what `None` reports.
+fn constant_dims(shape: &sile_hir::ShapeExpr, constants: &HashMap<&str, i64>) -> Option<Vec<i64>> {
+    let dims = match shape {
+        sile_hir::ShapeExpr::Tuple(dims) => dims,
+        sile_hir::ShapeExpr::Constant(value) => return Some(vec![*value]),
+        sile_hir::ShapeExpr::Symbol(name) => return constants.get(name.as_str()).copied().map(|v| vec![v]),
+        sile_hir::ShapeExpr::Dynamic => return None,
+    };
+    let mut resolved = Vec::with_capacity(dims.len());
+    for dim in dims {
+        match dim {
+            sile_hir::ShapeExpr::Constant(value) => resolved.push(*value),
+            sile_hir::ShapeExpr::Symbol(name) => {
+                resolved.push(*constants.get(name.as_str())?)
+            }
+            sile_hir::ShapeExpr::Dynamic | sile_hir::ShapeExpr::Tuple(_) => return None,
+        }
+    }
+    Some(resolved)
 }
 
 fn maybe_print_backend_source(

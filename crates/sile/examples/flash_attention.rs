@@ -124,12 +124,11 @@ fn main() -> sile::Result<()> {
     let k = Tensor::from_vec(k_data.clone(), [b, hkv, m, d], &device)?;
     let v = Tensor::from_vec(v_data.clone(), [b, hkv, m, d], &device)?;
     let mut out = Tensor::zeros([b * h, m, d], &device)?;
+    let mut out_part = out.partition_mut([1, bm, d]);
 
-    fmha::<4, 4, 8>(&mut out, &q, &k, &v, qk_scale, h / hkv)
-        .grid(((b * h) as u32, (m / bm) as u32, 1))
-        .apply(&stream)?;
+    fmha::<4, 4, 8>(&mut out_part, &q, &k, &v, qk_scale, h / hkv).apply(&stream)?;
 
-    let got = out.to_vec(&stream)?;
+    let got = out_part.unpartition().to_vec(&stream)?;
     // The GQA group comes from the array sizes on the python side: the q plane
     // count over the kv plane count, with the batch folded into the planes.
     let expected = common::numpy(

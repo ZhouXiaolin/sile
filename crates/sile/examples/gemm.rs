@@ -49,25 +49,23 @@ fn main() -> Result<(), sile::Error> {
     let mut z = Tensor::zeros([m, n], &device)?;
     let x = Tensor::ones([m, K], &device)?;
     let y = Tensor::ones([K, n], &device)?;
-
-    gemm::<BM, BN, BK, K>(&mut z, &x, &y)
-        .grid(((m / BM) as u32, (n / BN) as u32, 1))
-        .apply(&stream)?;
-
-    let z_host = z.to_vec(&stream)?;
     let x_host = x.to_vec(&stream)?;
     let y_host = y.to_vec(&stream)?;
+    let mut z_part = z.partition_mut([BM, BN]);
+
+    gemm::<BM, BN, BK, K>(&mut z_part, &x, &y).apply(&stream)?;
+
+    let z_host = z_part.unpartition().to_vec(&stream)?;
     let expected = common::numpy(
         "matmul",
         &[m.to_string(), K.to_string(), n.to_string()],
         &[&x_host, &y_host],
     );
-    for (i, value) in z_host.iter().enumerate().take(10) {
+    for (i, (value, expected)) in z_host.iter().zip(&expected).enumerate() {
         println!("z_host[{i}] = {value} answer = {K}");
         assert!(
-            (value - expected[i]).abs() < 1e-3,
-            "z[{i}] = {value}, want {}",
-            expected[i]
+            (value - expected).abs() < 1e-3,
+            "z[{i}] = {value}, want {expected}"
         );
     }
     println!("cutile gemm {m}x{n}x{K} ok on {:?}", device);

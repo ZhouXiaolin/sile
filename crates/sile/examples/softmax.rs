@@ -41,12 +41,11 @@ fn main() -> sile::Result<()> {
     let data: Vec<f32> = (0..m * n).map(|v| v as f32).collect();
     let x = Tensor::from_vec(data.clone(), [m, n], &device)?;
     let mut y = Tensor::zeros([m, n], &device)?;
+    let mut y_part = y.partition_mut([bm, bn]);
 
-    softmax::<2, 8>(&mut y, &x)
-        .grid(((m / bm) as u32, (n / bn) as u32, 1))
-        .apply(&stream)?;
+    softmax::<2, 8>(&mut y_part, &x).apply(&stream)?;
 
-    let y_host = y.to_vec(&stream)?;
+    let y_host = y_part.unpartition().to_vec(&stream)?;
     for i in 0..m as usize {
         let row = &y_host[i * n as usize..(i + 1) * n as usize];
         let sum: f32 = row.iter().sum();

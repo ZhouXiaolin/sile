@@ -180,16 +180,16 @@ fn run(causal: bool, device: &Device) -> sile::Result<()> {
     let k = Tensor::from_vec(k_data.clone(), [b, hkv, m, d], device)?;
     let v = Tensor::from_vec(v_data.clone(), [b, hkv, m, d], device)?;
     let mut out = Tensor::zeros([b * h, m, d], device)?;
+    let mut out_part = out.partition_mut([1, bm, d]);
 
-    let grid = ((b * h) as u32, (m / bm) as u32, 1);
     let launcher = if causal {
-        fmha::<32, 32, 32, 8, 1, 1>(&mut out, &q, &k, &v, qk_scale, input_pos, h / hkv)
+        fmha::<32, 32, 32, 8, 1, 1>(&mut out_part, &q, &k, &v, qk_scale, input_pos, h / hkv)
     } else {
-        fmha::<32, 32, 32, 8, 0, 1>(&mut out, &q, &k, &v, qk_scale, input_pos, h / hkv)
+        fmha::<32, 32, 32, 8, 0, 1>(&mut out_part, &q, &k, &v, qk_scale, input_pos, h / hkv)
     };
-    launcher.grid(grid).apply(&stream)?;
+    launcher.apply(&stream)?;
 
-    let got = out.to_vec(&stream)?;
+    let got = out_part.unpartition().to_vec(&stream)?;
     let op = if causal {
         "flash_attention_causal"
     } else {

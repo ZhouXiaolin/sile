@@ -10,7 +10,7 @@ pub use sile_hir::{
 pub mod tensor;
 pub mod tile;
 
-pub use tensor::{Partition, Tensor};
+pub use tensor::{Partition, PartitionMut, Tensor};
 pub use tile::Tile;
 
 /// The CuTile core vocabulary, re-exported under one name.

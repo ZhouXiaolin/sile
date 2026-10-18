@@ -72,12 +72,11 @@ fn main() -> sile::Result<()> {
     let x = Tensor::from_vec(x_data.clone(), [m, n], &device)?;
     let w = Tensor::from_vec(w_data.clone(), [n], &device)?;
     let mut out = Tensor::zeros([m, n], &device)?;
+    let mut out_part = out.partition_mut([1, n]);
 
-    rms_norm::<8, BLOCK_SIZE>(&x, &w, &mut out, eps)
-        .grid((m as u32, 1, 1))
-        .apply(&stream)?;
+    rms_norm::<8, BLOCK_SIZE>(&x, &w, &mut out_part, eps).apply(&stream)?;
 
-    let got = out.to_vec(&stream)?;
+    let got = out_part.unpartition().to_vec(&stream)?;
     let expected = common::numpy(
         "rms_norm",
         &[m.to_string(), n.to_string(), eps.to_string()],

@@ -50,18 +50,37 @@ pub fn num_programs(_axis: i64) -> i64 {
 /// CuTile's `num_tiles` accepts a tensor and a partition alike, because a
 /// partition names the buffer it views. The host stub needs one name that covers
 /// both, and this is that name.
-pub trait TileView {}
+pub trait TileView {
+    /// The tile count along one axis. A whole buffer is one tile of itself; a
+    /// partition divides the buffer by the tile it was built with.
+    fn tile_count(&self, axis: i64) -> i64;
+}
 
-impl<T> TileView for crate::tensor::Tensor<T> {}
-impl<T> TileView for crate::tensor::Partition<T> {}
+impl<T> TileView for crate::tensor::Tensor<T> {
+    fn tile_count(&self, _axis: i64) -> i64 {
+        1
+    }
+}
+
+impl<T> TileView for crate::tensor::Partition<'_, T> {
+    fn tile_count(&self, axis: i64) -> i64 {
+        crate::tensor::Partition::tile_count(self, axis)
+    }
+}
+
+impl<T> TileView for crate::tensor::PartitionMut<'_, T> {
+    fn tile_count(&self, axis: i64) -> i64 {
+        crate::tensor::PartitionMut::tile_count(self, axis)
+    }
+}
 
 /// Tile count along one axis of a buffer or a view of one.
 ///
 /// Matches CuTile Rust `num_tiles(partition, axis)`. The tile extent comes from
 /// the partition the buffer is used with, so the count is a property of the
 /// kernel and not of the launch.
-pub fn num_tiles<V: TileView>(_view: &V, _axis: i64) -> i64 {
-    0
+pub fn num_tiles<V: TileView>(view: &V, axis: i64) -> i64 {
+    view.tile_count(axis)
 }
 
 /// The current tile program's block id, as `(x, y, z)`.

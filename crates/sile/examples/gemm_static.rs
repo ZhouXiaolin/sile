@@ -66,12 +66,11 @@ fn main() -> sile::Result<()> {
     let y = Tensor::ones([K, N], &device)?;
     let x_host = x.to_vec(&stream)?;
     let y_host = y.to_vec(&stream)?;
+    let mut z_part = z.partition_mut([BM, BN]);
 
-    gemm::<BM, BN, BK, M, N, K>(&mut z, &x, &y)
-        .grid(((M / BM) as u32, (N / BN) as u32, 1))
-        .apply(&stream)?;
+    gemm::<BM, BN, BK, M, N, K>(&mut z_part, &x, &y).apply(&stream)?;
 
-    let z_host = z.to_vec(&stream)?;
+    let z_host = z_part.unpartition().to_vec(&stream)?;
     let expected = common::numpy(
         "matmul",
         &[M.to_string(), K.to_string(), N.to_string()],

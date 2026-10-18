@@ -62,12 +62,11 @@ fn main() -> sile::Result<()> {
     let mut c = Tensor::zeros([batch, m, n], &device)?;
     let a_host = a.to_vec(&stream)?;
     let b_host = b.to_vec(&stream)?;
+    let mut c_part = c.partition_mut([1, BM, BN]);
 
-    batch_matmul::<BM, BN, BK, K>(&mut c, &a, &b)
-        .grid((batch as u32, (m / BM) as u32, (n / BN) as u32))
-        .apply(&stream)?;
+    batch_matmul::<BM, BN, BK, K>(&mut c_part, &a, &b).apply(&stream)?;
 
-    let c_host = c.to_vec(&stream)?;
+    let c_host = c_part.unpartition().to_vec(&stream)?;
     let expected = common::numpy(
         "batch_matmul",
         &[
