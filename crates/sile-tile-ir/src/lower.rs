@@ -833,7 +833,16 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 let dim = eval_i64(&args[1], ctx);
                 ctx.get_or_create_program_id_param(dim)
             } else {
-                let base = lower_expr(&args[0], ctx);
+                // `get_shape_dim(x.shape(), 0)` hands the dim the ShapeOf
+                // wrapper, and a shape is metadata: the buffer the wrapper
+                // names is the source a shape descriptor reads.
+                let base = match &args[0] {
+                    Expr::Builtin {
+                        op: BuiltinOp::ShapeOf,
+                        args: inner,
+                    } => lower_expr(&inner[0], ctx),
+                    other => lower_expr(other, ctx),
+                };
                 let dim = eval_i64(&args[1], ctx) as usize;
                 let shape = ctx.get_or_create_shape_desc_param(base);
                 ctx.emit(TileIrOp::ShapeDim { shape, dim }, TileIrType::I64)
@@ -1109,10 +1118,9 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
             let operand = lower_expr(&args[0], ctx);
             let operand_shape = tile_shape_of(operand, ctx);
             let (rows, cols) = operand_shape.unwrap_or((1, 1));
-            let ty = match operand_shape {
-                Some(_) => TileIrType::Tile { rows, cols },
-                None => TileIrType::F32,
-            };
+            // A count operand keeps its kind through a negation: `negi(k)` is
+            // one subtraction of counts, not a float.
+            let ty = pointwise_result_ty(operand_shape, &[operand], ctx);
             ctx.emit(
                 TileIrOp::Map {
                     expr: TileMapExpr::Unary {

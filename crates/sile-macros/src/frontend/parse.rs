@@ -121,6 +121,40 @@ fn parse_stmt(stmt: &syn::Stmt, body: &mut Vec<KernelStmt>) -> syn::Result<()> {
                     return Ok(());
                 }
             }
+            // `store_tile(y, t)` is the free-function spelling of `y.store(t)`:
+            // the buffer is the first argument instead of the receiver.
+            if let syn::Expr::Call(call) = expr
+                && let syn::Expr::Path(func_path) = call.func.as_ref()
+                && func_path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "store_tile")
+            {
+                let mut args = call.args.iter();
+                let target = match args.next() {
+                    Some(syn::Expr::Path(path)) => {
+                        path.path.segments.last().unwrap().ident.clone()
+                    }
+                    _ => {
+                        return Err(syn::Error::new_spanned(
+                            &call.func,
+                            "store_tile target must be an ident",
+                        ));
+                    }
+                };
+                let value = parse_expr(args.next().ok_or_else(|| {
+                    syn::Error::new_spanned(call, "store_tile requires a value")
+                })?)?;
+                if args.next().is_some() {
+                    return Err(syn::Error::new_spanned(
+                        call,
+                        "store_tile expects a buffer and a value",
+                    ));
+                }
+                body.push(KernelStmt::Store { target, value, index: None });
+                return Ok(());
+            }
             // `unsafe { ... }` marks an operation whose contract the caller
             // promises to keep. That promise is a property of the program, not
             // of the instruction stream, so the block contributes its
@@ -559,6 +593,7 @@ fn float_constant(path: &syn::Path) -> Option<f32> {
         ["f32", "EPSILON"] => Some(f32::EPSILON),
         ["f32", "MIN"] => Some(f32::MIN),
         ["f32", "MAX"] => Some(f32::MAX),
+        ["f32", "ZERO"] => Some(0.0),
         _ => None,
     }
 }
@@ -579,7 +614,22 @@ pub(crate) fn is_mode_path(path: &syn::Path) -> bool {
     }
     matches!(
         path.segments.first().map(|segment| segment.ident.to_string()),
-        Some(name) if matches!(name.as_str(), "ftz" | "rounding" | "ordering" | "scope")
+        Some(name)
+            if matches!(
+                name.as_str(),
+                "ftz"
+                    | "rounding"
+                    | "ordering"
+                    | "scope"
+                    | "nan"
+                    | "fast_acc"
+                    | "saturating"
+                    | "overflow"
+                    | "predicate"
+                    | "cmp_ordering"
+                    | "reverse"
+                    | "signedness"
+            )
     )
 }
 

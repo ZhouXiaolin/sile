@@ -270,8 +270,57 @@ const BUILTIN_FUNCTIONS: &[&str] = &[
     "broadcast_scalar",
     "program_id",
     "get_tile_block_id",
+    "get_num_tile_blocks",
     "num_programs",
     "num_tiles",
+    "get_shape_dim",
+    // The float arithmetic spellings, each the operation its plain name has.
+    "addf",
+    "subf",
+    "mulf",
+    "divf",
+    "remf",
+    "negf",
+    "absf",
+    "maxf",
+    "minf",
+    "fma",
+    "pow",
+    "atan2",
+    "ceil",
+    "floor",
+    "sin",
+    "cos",
+    "tan",
+    "sinh",
+    "cosh",
+    "tanh",
+    "exp_with_rounding",
+    "tanh_with_rounding",
+    // The integer spellings, scalar operations like their operands.
+    "addi",
+    "subi",
+    "muli",
+    "divi",
+    "remi",
+    "negi",
+    "absi",
+    "maxi",
+    "mini",
+    "andi",
+    "ori",
+    "xori",
+    "noti",
+    "shli",
+    "shri",
+    "cmpi",
+    "cmpf",
+    // Identity on this IR's one element type: the conversion a kernel writes
+    // to pin a type parameter is no operation here.
+    "convert_tile",
+    "ftof",
+    // The free-function spelling of the tensor tile load.
+    "load_tile",
 ];
 
 const BUILTIN_METHODS: &[&str] = &[
@@ -290,6 +339,23 @@ const BUILTIN_METHODS: &[&str] = &[
     "sqrt",
     "rsqrt",
     "exp2",
+    "absf",
+    "negf",
+    "sin",
+    "cos",
+    "tan",
+    "sinh",
+    "cosh",
+    "tanh",
+    "ceil",
+    "floor",
+    "exp_with_rounding",
+    "tanh_with_rounding",
+    "pow",
+    "atan2",
+    "maxf",
+    "minf",
+    "load_pipelined",
     "shape",
     "store",
     "atomic_add",
@@ -424,6 +490,9 @@ fn lower_call(
     const_params: &[ConstParam],
 ) -> syn::Result<proc_macro2::TokenStream> {
     let func_name = func.to_string();
+    if func_name == "cmpi" || func_name == "cmpf" {
+        return lower_compare_call(func, args, const_params);
+    }
     let args = call_operands(args);
     let args_exprs = args
         .iter()
@@ -476,6 +545,106 @@ fn lower_call(
         }
         "num_programs" => quote! { ::sile::hir::BuiltinOp::NumPrograms },
         "num_tiles" => quote! { ::sile::hir::BuiltinOp::NumTiles },
+        // `get_num_tile_blocks()` returns the whole launch grid, so the field
+        // access on it selects the axis, the way `get_tile_block_id` does.
+        "get_num_tile_blocks" => quote! { ::sile::hir::BuiltinOp::NumPrograms },
+        "get_shape_dim" => quote! { ::sile::hir::BuiltinOp::ShapeDim },
+        // The `f` suffix spellings name the float form of the operation its
+        // plain name has, and the mode arguments they carry are policies this
+        // IR does not model, so the operands decide the rest.
+        "addf" => quote! { ::sile::hir::BuiltinOp::Add },
+        "subf" => quote! { ::sile::hir::BuiltinOp::Sub },
+        "mulf" => quote! { ::sile::hir::BuiltinOp::Mul },
+        "divf" => quote! { ::sile::hir::BuiltinOp::Div },
+        "remf" => quote! { ::sile::hir::BuiltinOp::Rem },
+        "maxf" | "maxi" => quote! { ::sile::hir::BuiltinOp::Max },
+        "minf" | "mini" => quote! { ::sile::hir::BuiltinOp::Min },
+        "pow" => quote! { ::sile::hir::BuiltinOp::Pow },
+        "atan2" => quote! { ::sile::hir::BuiltinOp::Atan2 },
+        "absf" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Abs) },
+        "negf" | "negi" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Neg) },
+        "ceil" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Ceil) },
+        "floor" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Floor) },
+        "sin" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Sin) },
+        "cos" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Cos) },
+        "tan" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Tan) },
+        "sinh" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Sinh) },
+        "cosh" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Cosh) },
+        "tanh" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Tanh) },
+        // The rounding variants name the same functions: the rounding mode is a
+        // policy this IR does not model, and the default is what remains.
+        "exp_with_rounding" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Exp) },
+        "tanh_with_rounding" => {
+            quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Tanh) }
+        }
+        // The integer spellings are the operations their operands name: two
+        // counts lower to integer arithmetic, and the mode arguments they carry
+        // (overflow, rounding) are policies this IR does not model.
+        "addi" => quote! { ::sile::hir::BuiltinOp::Add },
+        "subi" => quote! { ::sile::hir::BuiltinOp::Sub },
+        "muli" => quote! { ::sile::hir::BuiltinOp::Mul },
+        "divi" => quote! { ::sile::hir::BuiltinOp::Div },
+        "remi" => quote! { ::sile::hir::BuiltinOp::Rem },
+        "andi" => quote! { ::sile::hir::BuiltinOp::And },
+        "ori" => quote! { ::sile::hir::BuiltinOp::Or },
+        "xori" => quote! { ::sile::hir::BuiltinOp::Xor },
+        "shli" => quote! { ::sile::hir::BuiltinOp::Shl },
+        "shri" => quote! { ::sile::hir::BuiltinOp::Shr },
+        // `fma(a, b, c)` is one multiply and one add. No target this backend
+        // writes spells the fused form the same way — WGSL has no `fma` — so
+        // the two steps are what keeps the three targets bit-identical.
+        "fma" => {
+            return fused_mul_add(args_exprs, func);
+        }
+        // `absi(x)` is the larger of `x` and `-x`. The float absolute value is
+        // a bit pattern edit a count has no use for, and the comparison form
+        // keeps the integer kind of its operand.
+        "absi" => {
+            let [x] = args_exprs.as_slice() else {
+                return Err(syn::Error::new(func.span(), "`absi` takes one argument"));
+            };
+            return Ok(quote! {
+                ::sile::hir::Expr::Builtin {
+                    op: ::sile::hir::BuiltinOp::Max,
+                    args: vec![
+                        #x,
+                        ::sile::hir::Expr::Builtin {
+                            op: ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Neg),
+                            args: vec![#x],
+                        },
+                    ],
+                }
+            });
+        }
+        // `noti(x)` is the complement, which is the exclusive or with all ones.
+        "noti" => {
+            let [x] = args_exprs.as_slice() else {
+                return Err(syn::Error::new(func.span(), "`noti` takes one argument"));
+            };
+            return Ok(quote! {
+                ::sile::hir::Expr::Builtin {
+                    op: ::sile::hir::BuiltinOp::Xor,
+                    args: vec![#x, ::sile::hir::Expr::ScalarI64(-1)],
+                }
+            });
+        }
+        // The element type of this IR is f32 alone, so a conversion that names
+        // f32 on both sides carries no information: the value goes through
+        // unchanged. A conversion naming any other type has no spelling here —
+        // the turbofish is dropped by the parser, and the element-type line is
+        // what reports it.
+        "convert_tile" | "ftof" => {
+            let [x] = args_exprs.as_slice() else {
+                return Err(syn::Error::new(
+                    func.span(),
+                    "a conversion takes one argument",
+                ));
+            };
+            return Ok(quote! { #x });
+        }
+        // The free-function spelling of the tensor form: the buffer is the
+        // first argument instead of the receiver.
+        "load_tile" => quote! { ::sile::hir::BuiltinOp::LoadTile },
         other => {
             return Err(syn::Error::new(
                 func.span(),
@@ -491,6 +660,115 @@ fn lower_call(
         ::sile::hir::Expr::Builtin {
             op: #op,
             args: vec![#(#args_exprs),*],
+        }
+    })
+}
+
+/// `cmpi(a, b, predicate::LessThan)` and `cmpf` name their comparison with a
+/// predicate value, not with the function name. The predicate is the
+/// operation, so it selects one of the six comparisons; the ordering `cmpf`
+/// adds is a NaN policy this IR does not model and rides along as a mode.
+fn lower_compare_call(
+    func: &syn::Ident,
+    args: &[KernelExpr],
+    const_params: &[ConstParam],
+) -> syn::Result<proc_macro2::TokenStream> {
+    let mut predicate: Option<&'static str> = None;
+    let mut operands = Vec::new();
+    for arg in args {
+        match comparison_predicate(arg)? {
+            Some(op) if predicate.is_none() => predicate = Some(op),
+            Some(_) => {
+                return Err(syn::Error::new(
+                    func.span(),
+                    "cmpi takes one predicate",
+                ));
+            }
+            None if arg.is_mode() => {}
+            None => operands.push(arg),
+        }
+    }
+    let Some(op) = predicate else {
+        return Err(syn::Error::new_spanned(
+            func,
+            "cmpi/cmpf needs a `predicate::` value naming the comparison",
+        ));
+    };
+    let [lhs, rhs] = operands.as_slice() else {
+        return Err(syn::Error::new_spanned(
+            func,
+            "cmpi/cmpf takes two operands and one predicate",
+        ));
+    };
+    let lhs = lower_expr(lhs, const_params)?;
+    let rhs = lower_expr(rhs, const_params)?;
+    let op: proc_macro2::TokenStream = op.parse().expect("a comparison op names itself");
+    Ok(quote! {
+        ::sile::hir::Expr::Builtin {
+            op: #op,
+            args: vec![#lhs, #rhs],
+        }
+    })
+}
+
+/// The comparison a `predicate::` value names.
+///
+/// A path in any other namespace is not a predicate and returns `None`; a
+/// `predicate::` name this table does not know is a kernel error, not a
+/// silent fallthrough.
+fn comparison_predicate(arg: &KernelExpr) -> syn::Result<Option<&'static str>> {
+    let KernelExpr::ModePath(path) = arg else {
+        return Ok(None);
+    };
+    if path
+        .segments
+        .first()
+        .map(|segment| segment.ident.to_string())
+        .as_deref()
+        != Some("predicate")
+    {
+        return Ok(None);
+    }
+    let Some(name) = path.segments.get(1) else {
+        return Err(syn::Error::new_spanned(
+            path,
+            "a predicate names one of Equal, NotEqual, LessThan, LessThanOrEqual, GreaterThan, GreaterThanOrEqual",
+        ));
+    };
+    Ok(Some(match name.ident.to_string().as_str() {
+        "Equal" => "::sile::hir::BuiltinOp::Eq",
+        "NotEqual" => "::sile::hir::BuiltinOp::Ne",
+        "LessThan" => "::sile::hir::BuiltinOp::Lt",
+        "LessThanOrEqual" => "::sile::hir::BuiltinOp::Le",
+        "GreaterThan" => "::sile::hir::BuiltinOp::Gt",
+        "GreaterThanOrEqual" => "::sile::hir::BuiltinOp::Ge",
+        other => {
+            return Err(syn::Error::new_spanned(
+                path,
+                format!("`predicate::{other}` is not a comparison predicate"),
+            ));
+        }
+    }))
+}
+
+/// The multiply and the add of `fma(a, b, c)`, as two builtins.
+fn fused_mul_add(
+    args_exprs: Vec<proc_macro2::TokenStream>,
+    func: &syn::Ident,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let [a, b, c] = args_exprs.as_slice() else {
+        return Err(syn::Error::new(func.span(), "`fma` takes three arguments"));
+    };
+    Ok(quote! {
+        ::sile::hir::Expr::Builtin {
+            op: ::sile::hir::BuiltinOp::Add,
+            args: vec![
+                ::sile::hir::Expr::Builtin {
+                    op: ::sile::hir::BuiltinOp::Mul,
+                    args: vec![#a, #b],
+                },
+                #c,
+            ],
         }
     })
 }
@@ -533,6 +811,29 @@ fn lower_method_call(
         "log2" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Log2) },
         "sqrt" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Sqrt) },
         "rsqrt" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Rsqrt) },
+        // The method spellings of the same functions their free forms name.
+        "absf" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Abs) },
+        "negf" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Neg) },
+        "ceil" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Ceil) },
+        "floor" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Floor) },
+        "sin" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Sin) },
+        "cos" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Cos) },
+        "tan" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Tan) },
+        "sinh" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Sinh) },
+        "cosh" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Cosh) },
+        "tanh" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Tanh) },
+        "exp_with_rounding" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Exp) },
+        "tanh_with_rounding" => {
+            quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Tanh) }
+        }
+        "pow" => quote! { ::sile::hir::BuiltinOp::Pow },
+        "atan2" => quote! { ::sile::hir::BuiltinOp::Atan2 },
+        "maxf" => quote! { ::sile::hir::BuiltinOp::Max },
+        "minf" => quote! { ::sile::hir::BuiltinOp::Min },
+        // `load_pipelined::<N>` names the same load with a latency hint. The
+        // hint is a scheduling promise the lowering is free to ignore, so the
+        // turbofish drops with the mode arguments and the load is the load.
+        "load_pipelined" => quote! { ::sile::hir::BuiltinOp::Load },
         "shape" => quote! { ::sile::hir::BuiltinOp::ShapeOf },
         "store" => {
             return Ok(quote! {
@@ -581,8 +882,18 @@ fn lower_field_access(
     // axis argument, so there the field selects the axis.
     if let KernelExpr::Call { func, args } = target {
         let func_name = func.to_string();
-        if func_name == "program_id" || func_name == "get_tile_block_id" {
-            let axis = if func_name == "program_id" {
+        // A call returning the whole tuple names one axis through the field:
+        // `program_id(0)` carries the axis in its argument, while
+        // `get_tile_block_id().0` and `get_num_tile_blocks().0` read it off
+        // the tuple.
+        let (tuple_call, axis_in_argument) = match func_name.as_str() {
+            "program_id" => (Some(quote! { ::sile::hir::BuiltinOp::ProgramId }), true),
+            "get_tile_block_id" => (Some(quote! { ::sile::hir::BuiltinOp::ProgramId }), false),
+            "get_num_tile_blocks" => (Some(quote! { ::sile::hir::BuiltinOp::NumPrograms }), false),
+            _ => (None, false),
+        };
+        if let Some(op) = tuple_call {
+            let axis = if axis_in_argument {
                 match args.first() {
                     Some(KernelExpr::Lit(lit)) => lit.base10_parse::<i64>().map_err(|_| {
                         syn::Error::new(lit.span(), "program_id axis must be an integer literal")
@@ -596,12 +907,10 @@ fn lower_field_access(
                     None => 0,
                 }
             } else {
-                // `get_tile_block_id()` returns the whole launch index, so the
-                // field selects the axis.
                 field.parse::<i64>().map_err(|_| {
                     syn::Error::new(
                         func.span(),
-                        "the block id has no such axis; read one of .0, .1 or .2",
+                        "the tuple has no such axis; read one of .0, .1 or .2",
                     )
                 })?
             };
@@ -613,7 +922,7 @@ fn lower_field_access(
             }
             return Ok(quote! {
                 ::sile::hir::Expr::Builtin {
-                    op: ::sile::hir::BuiltinOp::ProgramId,
+                    op: #op,
                     args: vec![::sile::hir::Expr::ScalarI64(#axis)],
                 }
             });

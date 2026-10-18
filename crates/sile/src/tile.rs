@@ -73,6 +73,14 @@ pub fn get_tile_block_id() -> TileId {
     TileId(0, 0, 0)
 }
 
+/// The launch grid, as `(x, y, z)`.
+///
+/// Matches CuTile Rust `get_num_tile_blocks()`. Like the block id, the kernel
+/// parser reads one axis through the field access on the call.
+pub fn get_num_tile_blocks() -> (i64, i64, i64) {
+    (0, 0, 0)
+}
+
 /// A compile-time shape.
 ///
 /// CuTile writes `shape![BM, BK]` because the rank is part of the type there.

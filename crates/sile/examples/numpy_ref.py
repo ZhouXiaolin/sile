@@ -103,6 +103,50 @@ def main():
     elif op == "parallel_reduce":
         a, = read_inputs(count, lengths)
         expected = np.array([a.astype(np.float64).sum()], dtype=np.float64)
+    elif op == "math_arith":
+        x, y = read_inputs(count, lengths)
+        t_x, t_y = x[:16], y[:16]
+        a = t_x + t_y
+        b = a - t_y
+        c = b * b
+        d = c / t_y
+        e = d * t_y + t_x
+        f = np.maximum(e, np.minimum(t_y, np.float32(2.0)))
+        expected = np.abs(f - np.float32(1.5))
+    elif op == "math_trig":
+        x, y = read_inputs(count, lengths)
+        t_x, t_y = x[:16], y[:16]
+        expected = (
+            np.sin(t_x)
+            + np.cos(t_x)
+            + np.tan(t_x)
+            + np.power(t_x, np.float32(3.0))
+            + np.arctan2(t_x, t_y)
+        )
+    elif op == "math_hyp":
+        x, = read_inputs(count, lengths)
+        t_x = x[:16]
+        expected = (
+            np.sinh(t_x)
+            + np.cosh(t_x)
+            + np.tanh(t_x)
+            + np.exp(t_x)
+            + np.ceil(t_x)
+            + np.floor(t_x)
+            + t_x
+        )
+    elif op == "math_int":
+        x, y = read_inputs(count, lengths)
+        t = int(scalars[0])
+        # pid is 0 with one block, so the count chain folds to one tile
+        # number, and the tile number names the tile_len-slice it loads.
+        idx = abs(0 * t + 3 - 20)
+        idx = max(min(idx, 8), 0)
+        idx = (idx << 4) >> 7
+        t_x = x[idx * t : idx * t + t]
+        t_y = y[:t]
+        picked = np.where(t_x >= t_y, t_x, t_y)
+        expected = picked
     elif op == "flash_attention":
         q, k, v = read_inputs(count, lengths)
         m, d = (int(s) for s in scalars[:2])
