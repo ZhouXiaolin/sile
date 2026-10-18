@@ -60,6 +60,8 @@ impl CpuBackend {
         let c_path = dir.path().join(format!("{}.c", kernel_name));
         let ext = if cfg!(target_os = "macos") {
             "dylib"
+        } else if cfg!(target_os = "windows") {
+            "dll"
         } else {
             "so"
         };
@@ -82,6 +84,23 @@ impl CpuBackend {
                 "-lomp",
                 "-o",
             ]);
+        } else if cfg!(target_os = "windows") {
+            // clang on Windows targets MSVC: no `-fPIC`, and the runtime has no
+            // `libm` to link. Its OpenMP library is LLVM's own, which
+            // `-fopenmp=libomp` names instead of the `omp.lib` the default
+            // spelling asks for. A shared library exports nothing by default,
+            // so the one entry point the host looks up is named explicitly.
+            // `_Float16` conversions live in compiler-rt, which the MSVC target
+            // does not link by default.
+            let export = format!("-Wl,/EXPORT:sile_kernel_{kernel_name}");
+            cmd.args([
+                "-shared",
+                "-O2",
+                "-fopenmp=libomp",
+                "-rtlib=compiler-rt",
+            ]);
+            cmd.arg(export);
+            cmd.arg("-o");
         } else {
             cmd.args([
                 "-shared",

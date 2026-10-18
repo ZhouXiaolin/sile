@@ -28,6 +28,29 @@ use super::codegen::generate as generate_wgsl;
 pub struct WgpuBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// The optional features the device was created with, so the runtime can
+    /// reject a kernel the device cannot run instead of letting wgpu panic.
+    features: wgpu::Features,
+}
+
+/// True when the type is, contains, or points at an `f16`.
+fn contains_f16(ty: &sile_llvm_ir::Type) -> bool {
+    use sile_llvm_ir::Type;
+    match ty {
+        Type::F16 => true,
+        Type::Ptr { pointee, .. } => contains_f16(pointee),
+        Type::Vector { elem, .. } | Type::Array { elem, .. } => contains_f16(elem),
+        _ => false,
+    }
+}
+
+/// True when any value or parameter of the function is an `f16`.
+fn uses_f16(func: &LlvmIrFunction) -> bool {
+    func.params.iter().any(|param| contains_f16(&param.ty))
+        || func.blocks.iter().any(|block| {
+            block.params.iter().any(|param| contains_f16(&param.ty))
+                || block.insts.iter().any(|inst| contains_f16(&inst.ty))
+        })
 }
 
 impl WgpuBackend {
@@ -41,24 +64,36 @@ impl WgpuBackend {
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
         })
         .map_err(|_| sile_core::Error::UnsupportedBackend("no WGPU adapter found"))?;
-        let (device, queue) = pollster::block_on(
-            adapter.request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("sile wgpu device"),
-                    // The lowering makes every index an i64, which is an optional
-                    // WGSL capability rather than a default, and a half buffer
-                    // is the same kind of ask. Metal, Vulkan and DX12 all have
-                    // both, so the kernel asks for what it needs instead of
-                    // narrowing every index to 32 bits or every value to f32.
-                    required_features: adapter.features().intersection(
-                        wgpu::Features::SHADER_INT64.union(wgpu::Features::SHADER_F16),
-                    ),
-                    ..Default::default()
-                },
-            ),
-        )
-        .map_err(|e| sile_core::Error::UnsupportedBackend(request_device_error(e)))?;
-        Ok(Self { device, queue })
+        // The lowering makes every index an i64, so a device without 64-bit
+        // shader integers cannot run any kernel. Asking for the intersection of
+        // optional features would silently drop this one, and the shader would
+        // fail validation later as if the kernel were at fault.
+        let (device, queue) = {
+            let available = adapter.features();
+            if !available.contains(wgpu::Features::SHADER_INT64) {
+                return Err(sile_core::Error::UnsupportedBackend(
+                    "the WGPU adapter has no SHADER_INT64 feature, which every kernel needs for its i64 indices",
+                ));
+            }
+            // The lowering makes every index an i64, which is an optional
+            // WGSL capability rather than a default, and a half buffer
+            // is the same kind of ask. Take what the adapter offers here;
+            // `execute_llir` rejects an f16 kernel when this one is missing.
+            let required_features =
+                available.intersection(wgpu::Features::SHADER_INT64 | wgpu::Features::SHADER_F16);
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("sile wgpu device"),
+                required_features,
+                ..Default::default()
+            }))
+            .map_err(|e| sile_core::Error::UnsupportedBackend(request_device_error(e)))?
+        };
+        let features = device.features();
+        Ok(Self {
+            device,
+            queue,
+            features,
+        })
     }
 
     pub fn execute_llir(
@@ -70,6 +105,14 @@ impl WgpuBackend {
         launch: &LaunchConfig,
         stream: &Stream,
     ) -> Result<()> {
+        // An adapter without `f16` support rejects the shader inside wgpu's
+        // validation, which panics on the stream worker. Name the real cause
+        // here instead: the kernel is fine, the hardware cannot run it.
+        if uses_f16(func) && !self.features.contains(wgpu::Features::SHADER_F16) {
+            return Err(sile_core::Error::UnsupportedBackend(
+                "this kernel uses f16 buffers, but the WGPU adapter has no SHADER_F16 feature",
+            ));
+        }
         let source = generate_wgsl(func)?;
         super::validate(&source)?;
 

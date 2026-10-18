@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use sile_backend::{
-    BackendArtifact, cpu::CpuBackend, metal::MetalBackend, wgsl::runtime::WgpuBackend,
-};
+use sile_backend::{BackendArtifact, cpu::CpuBackend, wgsl::runtime::WgpuBackend};
+#[cfg(target_os = "macos")]
+use sile_backend::metal::MetalBackend;
 use sile_core::{Device, KernelArg, LaunchConfig, Result, Stream};
 use sile_hir::Kernel;
 use sile_llvm_ir::format_llvm_ir;
@@ -170,7 +170,7 @@ impl<'a> KernelLauncher<'a> {
         };
 
         let parts = compiled_parts(&self.kernel)?;
-        let (typed, tile_ir_func, llvm_ir_func) = parts.as_ref();
+        let (_typed, tile_ir_func, llvm_ir_func) = parts.as_ref();
 
         if should_print(PRINT_TILE_IR_ENV) {
             eprintln!("{}", format_tile_ir(tile_ir_func));
@@ -192,7 +192,9 @@ impl<'a> KernelLauncher<'a> {
                     stream,
                 )
             }
+            #[cfg(target_os = "macos")]
             Device::Metal(_) => {
+                let typed = _typed;
                 maybe_print_backend_source(llvm_ir_func, CodegenTarget::Metal)?;
                 let backend = MetalBackend::new()?;
                 // `args` holds the buffers only, so the kinds list has to line
@@ -215,6 +217,10 @@ impl<'a> KernelLauncher<'a> {
                     stream,
                 )
             }
+            #[cfg(not(target_os = "macos"))]
+            Device::Metal(_) => Err(sile_core::Error::UnsupportedBackend(
+                "the Metal backend is only available on macOS; use C or WGPU",
+            )),
             Device::Wgpu(_) => {
                 maybe_print_backend_source(llvm_ir_func, CodegenTarget::Wgsl)?;
                 let backend = WgpuBackend::new()?;

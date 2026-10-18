@@ -1,17 +1,24 @@
 pub mod codegen;
 
+#[cfg(target_os = "macos")]
 use metal::{CommandQueue, ComputePipelineState, Device, Library};
+#[cfg(target_os = "macos")]
 use sile_core::{KernelArg, LaunchConfig, Result, Stream};
+#[cfg(target_os = "macos")]
 use sile_hir::ParamKind;
+#[cfg(target_os = "macos")]
 use sile_llvm_ir::Function as LlvmIrFunction;
 
+#[cfg(target_os = "macos")]
 use self::codegen::generate as generate_llvm_ir_metal;
 
+#[cfg(target_os = "macos")]
 pub struct MetalBackend {
     device: Device,
     queue: CommandQueue,
 }
 
+#[cfg(target_os = "macos")]
 impl MetalBackend {
     pub fn new() -> Result<Self> {
         let device = Device::system_default()

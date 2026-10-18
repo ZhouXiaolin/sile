@@ -90,7 +90,17 @@ impl Stream {
             .jobs
             .as_ref()
             .expect("the stream has not been dropped")
-            .send(Box::new(move || complete.fill(job(&handle))))
+            .send(Box::new(move || {
+                // A backend that panics would otherwise take the worker down with
+                // it, and the future would never be filled: the caller waits
+                // forever on work that has already failed. The panic becomes an
+                // error the future carries instead.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    job(&handle)
+                }))
+                .unwrap_or_else(|payload| Err(Error::Compile(panic_message(payload))));
+                complete.fill(result);
+            }))
             .expect("the stream worker outlives its queue");
         future
     }
@@ -111,6 +121,17 @@ impl Drop for StreamInner {
         if let Some(worker) = self.worker.lock().unwrap().take() {
             let _ = worker.join();
         }
+    }
+}
+
+/// The text a panicking job left behind, so the error names the real cause.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "stream job panicked".to_string()
     }
 }
 
