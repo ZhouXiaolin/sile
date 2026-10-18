@@ -1,7 +1,7 @@
-use sile_llvm_ir as llvm_ir;
+use crate as llvm_ir;
 
-use crate::TileIrFunction;
-use crate::passes::lowering::core::block::{BlockLowerer, LowerLlvmIrCtx};
+use sile_tile_ir::TileIrFunction;
+use crate::lower::core::block::{BlockLowerer, LowerLlvmIrCtx};
 
 mod grid;
 mod single_axis;

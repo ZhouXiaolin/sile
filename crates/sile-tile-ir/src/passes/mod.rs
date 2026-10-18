@@ -1,16 +1,9 @@
 pub mod dce;
-pub mod lowering;
 pub mod pointwise_fusion;
 pub mod tile_expr_cse;
 pub mod verify;
 
 use crate::TileIrFunction;
-
-pub use lowering::{
-    ACTIVE_LLVM_IR_LOWERING_PIPELINE, LlvmIrLoweringPassKind,
-    RECOMMENDED_LLVM_IR_LOWERING_PIPELINE, lower_tile_ir_to_llvm_ir,
-    run_default_llvm_ir_lowering_pipeline, run_llvm_ir_lowering_pipeline,
-};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TileIrPassKind {

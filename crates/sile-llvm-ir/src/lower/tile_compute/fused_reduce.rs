@@ -1,18 +1,18 @@
 use std::collections::HashMap;
 
-use sile_llvm_ir as llvm_ir;
+use crate as llvm_ir;
 
-use crate::TileMapExpr;
-use crate::ValueId;
-use crate::passes::lowering::core::{
+use sile_tile_ir::TileMapExpr;
+use sile_tile_ir::ValueId;
+use crate::lower::core::{
     BlockLowerer, REDUCE_UNROLL_THRESHOLD, alloc_tile_result, buffer_elem_of, buffer_rank_of,
     const_f32, const_i64, emit_bin, emit_cmp, emit_gep, emit_load, emit_store,
     lower_nested_tile_loop, lower_reduce_extent_loop, lower_reduce_extent_loop_step,
     resolve_operand,
 };
-use crate::passes::lowering::tile_compute::reduce::{ReduceCombiner, reduce_combine};
-use crate::passes::lowering::tile_expr::{collect_map_load_bases, eval_map_expr_scalar};
-use crate::passes::lowering::tile_memory::{
+use crate::lower::tile_compute::reduce::{ReduceCombiner, reduce_combine};
+use crate::lower::tile_expr::{collect_map_load_bases, eval_map_expr_scalar};
+use crate::lower::tile_memory::{
     BufferIndexBase, build_buffer_index_base, emit_buffer_load, emit_buffer_linear_index,
 };
 
@@ -1127,7 +1127,7 @@ fn lower_single_row_fused_map_reduce_loop(
 /// Emit a `VecLoad { len: 4 }` intrinsic: load 4 contiguous f32 from `buf` at
 /// `element_offset`. Returns the `ValueId` of the resulting `<4 x f32>`.
 fn emit_vec_load4(
-    ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
+    ctx: &mut crate::lower::core::LowerLlvmIrCtx,
     out: &mut Vec<llvm_ir::Inst>,
     buf: llvm_ir::Operand,
     element_offset: llvm_ir::Operand,
@@ -1148,7 +1148,7 @@ fn emit_vec_load4(
 
 /// Emit a `VecReduceAdd` intrinsic: horizontally sum a `<4 x f32>` into f32.
 fn emit_vec_reduce_add(
-    ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
+    ctx: &mut crate::lower::core::LowerLlvmIrCtx,
     out: &mut Vec<llvm_ir::Inst>,
     vector: llvm_ir::ValueId,
 ) -> llvm_ir::Operand {
@@ -1172,7 +1172,7 @@ fn emit_vec_reduce_add(
 /// float4 vectors, reduces each to a scalar with VecReduceAdd, and
 /// accumulates them, returning the scalar sum.
 fn emit_vec_sum_reduce(
-    ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
+    ctx: &mut crate::lower::core::LowerLlvmIrCtx,
     out: &mut Vec<llvm_ir::Inst>,
     buf: llvm_ir::Operand,
     base_offset: llvm_ir::Operand,

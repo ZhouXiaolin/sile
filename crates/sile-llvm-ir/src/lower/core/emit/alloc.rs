@@ -1,9 +1,9 @@
-use sile_llvm_ir as llvm_ir;
+use crate as llvm_ir;
 
-use crate::ValueId;
+use sile_tile_ir::ValueId;
 
-use crate::passes::lowering::core::block::BlockLowerer;
-use crate::passes::lowering::core::map::{llvm_ir_value, tile_ptr_type, tile_storage_type};
+use crate::lower::core::block::BlockLowerer;
+use crate::lower::core::map::{llvm_ir_value, tile_ptr_type, tile_storage_type};
 
 pub(crate) fn alloc_tile_result(
     builder: &mut BlockLowerer<'_>,

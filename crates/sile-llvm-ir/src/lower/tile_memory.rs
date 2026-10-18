@@ -1,7 +1,7 @@
-use sile_llvm_ir as llvm_ir;
+use crate as llvm_ir;
 
-use crate::ValueId;
-use crate::passes::lowering::core::{
+use sile_tile_ir::ValueId;
+use crate::lower::core::{
     BlockLowerer, alloc_tile_result, buffer_elem_of, buffer_rank_of, const_f32, const_i64,
     emit_bin, emit_cast, emit_gep, emit_load, emit_shape_dim, emit_store, load_tile_scalar_dynamic,
     lower_1d_tile_coord, lower_nested_tile_loop, resolve_operand, tile_dims_of,
@@ -259,7 +259,7 @@ pub(crate) fn lower_tile_store_inst(
 /// extent one above the last two axes, so an outer coordinate is a tile index
 /// and needs no scaling.
 pub(crate) fn emit_strided_element_index(
-    ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
+    ctx: &mut crate::lower::core::LowerLlvmIrCtx,
     out: &mut Vec<llvm_ir::Inst>,
     buf: llvm_ir::Operand,
     outer_coords: &[llvm_ir::Operand],
@@ -318,7 +318,7 @@ pub(crate) fn emit_strided_element_index(
 }
 
 pub(crate) fn build_buffer_index_base(
-    ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
+    ctx: &mut crate::lower::core::LowerLlvmIrCtx,
     out: &mut Vec<llvm_ir::Inst>,
     buf: llvm_ir::Operand,
     outer_coords: &[ValueId],
@@ -383,7 +383,7 @@ pub(crate) fn build_buffer_index_base(
 /// Compute the flat element index (`tile_origin + row * stride + col` or
 /// `tile_base + row * tile_cols + col`) without performing the GEP.
 pub(crate) fn emit_buffer_linear_index(
-    ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
+    ctx: &mut crate::lower::core::LowerLlvmIrCtx,
     out: &mut Vec<llvm_ir::Inst>,
     index_base: &BufferIndexBase,
     tile_row: llvm_ir::Operand,
@@ -452,7 +452,7 @@ pub(crate) fn emit_buffer_linear_index(
 }
 
 pub(crate) fn emit_buffer_element_ptr(
-    ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
+    ctx: &mut crate::lower::core::LowerLlvmIrCtx,
     out: &mut Vec<llvm_ir::Inst>,
     buf: llvm_ir::Operand,
     index_base: BufferIndexBase,
@@ -476,7 +476,7 @@ pub(crate) fn emit_buffer_element_ptr(
 /// The load reads the buffer's own storage; a half buffer widens here, at the
 /// load, so everything downstream of it stays f32.
 pub(crate) fn emit_buffer_load(
-    ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
+    ctx: &mut crate::lower::core::LowerLlvmIrCtx,
     out: &mut Vec<llvm_ir::Inst>,
     buf: llvm_ir::Operand,
     index_base: &BufferIndexBase,
@@ -512,7 +512,7 @@ pub(crate) fn emit_buffer_load(
 /// The store writes the buffer's own storage; a half buffer narrows here, at
 /// the store.
 pub(crate) fn emit_buffer_store(
-    ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
+    ctx: &mut crate::lower::core::LowerLlvmIrCtx,
     out: &mut Vec<llvm_ir::Inst>,
     buf: llvm_ir::Operand,
     index_base: &BufferIndexBase,

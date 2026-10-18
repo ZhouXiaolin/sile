@@ -62,16 +62,6 @@ pub enum BufferElem {
     F16,
 }
 
-impl BufferElem {
-    /// The LLVM IR type of one element of this storage.
-    pub fn llvm_type(self) -> sile_llvm_ir::Type {
-        match self {
-            BufferElem::F32 => sile_llvm_ir::Type::F32,
-            BufferElem::F16 => sile_llvm_ir::Type::F16,
-        }
-    }
-}
-
 impl fmt::Display for TileIrType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -553,6 +543,22 @@ pub struct TileIrParam {
     pub name: String,
     pub ty: TileIrType,
     pub kind: TileIrParamKind,
+    /// Shape ABI of a buffer parameter, recorded when HIR lowers to Tile IR.
+    ///
+    /// HIR knows the parameter order and the shape extent of each buffer, and
+    /// the LLVM IR lowering needs both to place `__sile_shapes` offsets. The
+    /// field carries that knowledge across the layer boundary, so the LLVM IR
+    /// layer reads Tile IR alone instead of depending on HIR.
+    pub abi: Option<TileIrParamAbi>,
+}
+
+/// The shape ABI a buffer parameter carries into LLVM IR.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileIrParamAbi {
+    /// Number of shape entries the buffer declares.
+    pub rank: usize,
+    /// Index of its first entry in the `__sile_shapes` descriptor.
+    pub shape_offset: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

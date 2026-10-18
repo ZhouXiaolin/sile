@@ -1,4 +1,5 @@
 pub mod ir;
+pub mod lower;
 pub mod passes;
 pub mod print;
 
@@ -6,6 +7,11 @@ pub use ir::{
     AddressSpace, BasicBlock, BinOp, BlockId, BlockParam, CastOp, CmpPred, Constant, Function,
     Inst, InstOp, Intrinsic, Metadata, Operand, Param, ParamAbi, SCALARS_I64_PARAM_NAME,
     SCALARS_PARAM_NAME, SHAPES_PARAM_NAME, SyncScope, Terminator, Type, ValueId,
+};
+pub use lower::{
+    ACTIVE_LLVM_IR_LOWERING_PIPELINE, LlvmIrLoweringPassKind,
+    RECOMMENDED_LLVM_IR_LOWERING_PIPELINE, lower_tile_ir_to_llvm_ir,
+    run_default_llvm_ir_lowering_pipeline, run_llvm_ir_lowering_pipeline,
 };
 pub use passes::{
     ACTIVE_PIPELINE as ACTIVE_LLVM_IR_PIPELINE, LlvmIrPassKind,

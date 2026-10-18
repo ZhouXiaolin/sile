@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use sile_llvm_ir as llvm_ir;
+use crate as llvm_ir;
 
-use crate::passes::lowering::core::{
+use crate::lower::core::{
     BlockLowerer, LowerLlvmIrCtx, alloc_tile_result, buffer_rank_of, const_f32, const_i64,
     emit_bin, emit_cast, emit_cmp, emit_gep, emit_intrinsic, emit_load, emit_select, emit_store,
     load_tile_scalar_dynamic, lower_1d_tile_coord, lower_bin_op, lower_cmp_pred,
@@ -10,7 +10,7 @@ use crate::passes::lowering::core::{
 };
 
 use super::tile_memory::emit_strided_element_index;
-use crate::{CmpOp, TileIrFunction, TileIrOp, TileIrType, TileMapExpr, UnaryOp, ValueId};
+use sile_tile_ir::{CmpOp, TileIrFunction, TileIrOp, TileIrType, TileMapExpr, UnaryOp, ValueId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CoordOperandKey {
@@ -194,11 +194,11 @@ pub(crate) fn lower_tile_map_inst(
     // scalars is one comparison and one choice. The result type says which of
     // the two this map is, and the scalar one needs neither storage nor a loop.
     let result_ty = builder.tile_ir().types.get(&result).cloned();
-    if !matches!(result_ty, Some(crate::TileIrType::Tile { .. })) {
+    if !matches!(result_ty, Some(sile_tile_ir::TileIrType::Tile { .. })) {
         // A map that produces one value produces a count or an element, and the
         // result type says which: `min(mask_start, k_seqlen_tiles)` compares two
         // counts and yields a count, which is what the division after it needs.
-        let count = matches!(result_ty, Some(crate::TileIrType::I64));
+        let count = matches!(result_ty, Some(sile_tile_ir::TileIrType::I64));
         let zero = const_i64(0);
         builder.with_current_insts(|ctx, tile_ir, out| {
             let mut bases = HashMap::new();
@@ -476,10 +476,10 @@ fn eval_tile_scalar(
                     out,
                 );
                 let bin_op = match op {
-                    TileIrOp::AddF { .. } => crate::BinOp::Add,
-                    TileIrOp::SubF { .. } => crate::BinOp::Sub,
-                    TileIrOp::MulF { .. } => crate::BinOp::Mul,
-                    TileIrOp::DivF { .. } => crate::BinOp::Div,
+                    TileIrOp::AddF { .. } => sile_tile_ir::BinOp::Add,
+                    TileIrOp::SubF { .. } => sile_tile_ir::BinOp::Sub,
+                    TileIrOp::MulF { .. } => sile_tile_ir::BinOp::Mul,
+                    TileIrOp::DivF { .. } => sile_tile_ir::BinOp::Div,
                     _ => unreachable!(),
                 };
                 return emit_bin(ctx, out, lower_bin_op(bin_op), lhs, rhs, llvm_ir::Type::F32);

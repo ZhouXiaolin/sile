@@ -1,8 +1,8 @@
-use sile_llvm_ir as llvm_ir;
+use crate as llvm_ir;
 
-use crate::TileIrFunction;
-use crate::passes::lowering::core::block::{BlockLowerer, LowerLlvmIrCtx};
-use crate::passes::lowering::core::emit::insts::{const_i64, emit_bin, emit_cmp};
+use sile_tile_ir::TileIrFunction;
+use crate::lower::core::block::{BlockLowerer, LowerLlvmIrCtx};
+use crate::lower::core::emit::insts::{const_i64, emit_bin, emit_cmp};
 
 /// Threshold above which reduce extent uses an LLVMIR loop instead of full unrolling.
 pub(crate) const REDUCE_UNROLL_THRESHOLD: i64 = 16;

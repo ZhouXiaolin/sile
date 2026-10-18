@@ -971,6 +971,9 @@ version = "0.1.0"
 [[package]]
 name = "sile-llvm-ir"
 version = "0.1.0"
+dependencies = [
+ "sile-tile-ir",
+]
 
 [[package]]
 name = "sile-macros"
@@ -986,7 +989,6 @@ name = "sile-tile-ir"
 version = "0.1.0"
 dependencies = [
  "sile-hir",
- "sile-llvm-ir",
 ]
 
 [[package]]

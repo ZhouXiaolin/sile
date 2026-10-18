@@ -1,7 +1,7 @@
-use sile_llvm_ir as llvm_ir;
+use crate as llvm_ir;
 
-use crate::passes::lowering::core::block::LowerLlvmIrCtx;
-use crate::passes::lowering::core::const_i64;
+use crate::lower::core::block::LowerLlvmIrCtx;
+use crate::lower::core::const_i64;
 
 pub(crate) fn load_tile_scalar_dynamic(
     ctx: &mut LowerLlvmIrCtx,

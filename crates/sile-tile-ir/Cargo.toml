@@ -5,4 +5,3 @@ edition.workspace = true
 
 [dependencies]
 sile-hir = { path = "../sile-hir" }
-sile-llvm-ir = { path = "../sile-llvm-ir" }

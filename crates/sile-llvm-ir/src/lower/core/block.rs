@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use sile_llvm_ir as llvm_ir;
+use crate as llvm_ir;
 
-use crate::ir::*;
+use sile_tile_ir::*;
 
 use super::map::llvm_ir_value;
 

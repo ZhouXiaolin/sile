@@ -1,6 +1,6 @@
-use sile_llvm_ir as llvm_ir;
+use crate as llvm_ir;
 
-use crate::passes::lowering::core::block::LowerLlvmIrCtx;
+use crate::lower::core::block::LowerLlvmIrCtx;
 
 pub(crate) fn lower_1d_tile_coord(
     ctx: &mut LowerLlvmIrCtx,

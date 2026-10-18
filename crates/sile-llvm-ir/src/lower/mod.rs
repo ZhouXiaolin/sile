@@ -7,16 +7,14 @@ mod tile_compute;
 mod tile_expr;
 mod tile_memory;
 
-use sile_hir::Type as HirType;
-use sile_hir::typeck::TypedKernel;
-use sile_llvm_ir as llvm_ir;
+use crate as llvm_ir;
+use sile_tile_ir::{TileIrFunction, TileIrOp, TileIrParamKind, TileIrType, ValueId};
 
 use std::collections::HashMap;
 
 use self::block::lower_block;
 use self::canonical_matmul::lower_canonical_matmul;
 use self::core::{LowerLlvmIrCtx, llvm_ir_block, llvm_ir_type, llvm_ir_value};
-use crate::{TileIrFunction, TileIrOp, TileIrParamKind, TileIrType, ValueId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LlvmIrLoweringPassKind {
@@ -40,7 +38,6 @@ const SCALARS_I64_PARAM_NAME: &str = llvm_ir::SCALARS_I64_PARAM_NAME;
 
 struct LlvmIrLoweringState<'a> {
     tile_ir: &'a TileIrFunction,
-    typed: &'a TypedKernel,
     ctx: Option<LowerLlvmIrCtx>,
     params: Option<Vec<llvm_ir::Param>>,
     blocks: Option<Vec<llvm_ir::BasicBlock>>,
@@ -48,10 +45,9 @@ struct LlvmIrLoweringState<'a> {
 }
 
 impl<'a> LlvmIrLoweringState<'a> {
-    fn new(tile_ir: &'a TileIrFunction, typed: &'a TypedKernel) -> Self {
+    fn new(tile_ir: &'a TileIrFunction) -> Self {
         Self {
             tile_ir,
-            typed,
             ctx: None,
             params: None,
             blocks: None,
@@ -62,24 +58,19 @@ impl<'a> LlvmIrLoweringState<'a> {
 
 pub fn run_llvm_ir_lowering_pipeline(
     tile_ir: &TileIrFunction,
-    typed: &TypedKernel,
     pipeline: &[LlvmIrLoweringPassKind],
 ) -> Result<llvm_ir::Function, String> {
-    run_llvm_ir_lowering_pipeline_inner(LlvmIrLoweringState::new(tile_ir, typed), pipeline)
+    run_llvm_ir_lowering_pipeline_inner(LlvmIrLoweringState::new(tile_ir), pipeline)
 }
 
 pub fn run_default_llvm_ir_lowering_pipeline(
     tile_ir: &TileIrFunction,
-    typed: &TypedKernel,
 ) -> Result<llvm_ir::Function, String> {
-    run_llvm_ir_lowering_pipeline(tile_ir, typed, ACTIVE_LLVM_IR_LOWERING_PIPELINE)
+    run_llvm_ir_lowering_pipeline(tile_ir, ACTIVE_LLVM_IR_LOWERING_PIPELINE)
 }
 
-pub fn lower_tile_ir_to_llvm_ir(
-    tile_ir: &TileIrFunction,
-    typed: &TypedKernel,
-) -> llvm_ir::Function {
-    run_default_llvm_ir_lowering_pipeline(tile_ir, typed)
+pub fn lower_tile_ir_to_llvm_ir(tile_ir: &TileIrFunction) -> llvm_ir::Function {
+    run_default_llvm_ir_lowering_pipeline(tile_ir)
         .expect("default Tile IR->LLVM IR lowering pipeline must produce LLVM IR function")
 }
 
@@ -91,12 +82,6 @@ fn run_llvm_ir_lowering_pipeline_inner(
         match pass {
             LlvmIrLoweringPassKind::LowerParams => {
                 let mut ctx = LowerLlvmIrCtx::new(state.tile_ir);
-                // The ABIs are in HIR parameter order and only a shape-bearing
-                // parameter has one, so the ones that exist line up with the
-                // buffer parameters in order. Counting them as the loop walks
-                // the parameters keeps a scalar argument from shifting every
-                // later buffer onto its neighbour's shape offset.
-                let mut buffer_abis = lower_param_abis(state.typed).into_iter().flatten();
                 let mut params = state
                     .tile_ir
                     .params
@@ -107,8 +92,15 @@ fn run_llvm_ir_lowering_pipeline_inner(
                             ctx.names.insert(id, param.name.clone());
                             ctx.operands
                                 .insert(param.value, llvm_ir::Operand::Value(id));
-                            let abi = buffer_abis.next();
-                            if let Some(abi) = abi.clone() {
+                            // The shape ABI was recorded when HIR lowered to
+                            // Tile IR, so the buffer parameters line up with
+                            // their `__sile_shapes` offsets without the HIR.
+                            let abi = param.abi.as_ref().map(|abi| llvm_ir::ParamAbi {
+                                rank: abi.rank,
+                                shape_offset: abi.shape_offset,
+                                tile: None,
+                            });
+                            if let Some(abi) = &abi {
                                 ctx.shape_offsets.insert(id, abi.shape_offset);
                             }
                             Some(llvm_ir::Param {
@@ -283,7 +275,7 @@ fn build_prologue_block(
                 });
                 ctx.buffer_shape_descs.insert(source_id, result_id);
                 let rank = match param.ty {
-                    crate::TileIrType::ShapeDesc { rank } => rank,
+                    sile_tile_ir::TileIrType::ShapeDesc { rank } => rank,
                     _ => 0,
                 };
                 for dim in 0..rank {
@@ -442,25 +434,4 @@ fn attach_tile_abi(params: &mut [llvm_ir::Param], tile_ir: &TileIrFunction) {
             usize::try_from(tile.1).unwrap_or(0),
         ));
     }
-}
-
-fn lower_param_abis(typed: &TypedKernel) -> Vec<Option<llvm_ir::ParamAbi>> {
-    let mut next_shape_offset = 0usize;
-    typed
-        .kernel
-        .params
-        .iter()
-        .map(|param| match &param.ty {
-            HirType::Tensor { shape, .. } | HirType::Tile { shape, .. } => {
-                let abi = llvm_ir::ParamAbi {
-                    rank: shape.rank(),
-                    shape_offset: next_shape_offset,
-                    tile: None,
-                };
-                next_shape_offset += abi.rank;
-                Some(abi)
-            }
-            HirType::Shape(_) | HirType::Scalar(_) | HirType::Partition { .. } => None,
-        })
-        .collect()
 }

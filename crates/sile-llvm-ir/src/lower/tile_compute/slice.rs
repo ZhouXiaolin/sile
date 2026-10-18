@@ -1,7 +1,7 @@
-use sile_llvm_ir as llvm_ir;
+use crate as llvm_ir;
 
-use crate::ValueId;
-use crate::passes::lowering::core::{
+use sile_tile_ir::ValueId;
+use crate::lower::core::{
     BlockLowerer, LowerLlvmIrCtx, alloc_tile_result, const_i64, emit_bin, emit_gep, emit_store,
     load_tile_scalar_dynamic, lower_nested_tile_loop, resolve_operand,
 };

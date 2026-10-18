@@ -12,7 +12,11 @@ pub use sile_hir::{
 };
 
 pub use sile_llvm_ir::{
-    ACTIVE_LLVM_IR_PIPELINE, LlvmIrPassKind, RECOMMENDED_LLVM_IR_PIPELINE, run_llvm_ir_passes,
+    ACTIVE_LLVM_IR_LOWERING_PIPELINE, ACTIVE_LLVM_IR_PIPELINE,
+    LlvmIrLoweringPassKind as LlvmLoweringPassKind, LlvmIrPassKind,
+    RECOMMENDED_LLVM_IR_LOWERING_PIPELINE, RECOMMENDED_LLVM_IR_PIPELINE, lower_tile_ir_to_llvm_ir,
+    run_default_llvm_ir_lowering_pipeline as run_default_llvm_lowering_pipeline,
+    run_llvm_ir_lowering_pipeline as run_llvm_lowering_pipeline, run_llvm_ir_passes,
     run_llvm_ir_pipeline,
 };
 pub use sile_tile_ir::passes::{
@@ -21,13 +25,7 @@ pub use sile_tile_ir::passes::{
     run_default_pipeline as run_tile_ir_passes, run_default_pipeline as run_default_tile_ir_pipeline,
     run_pipeline as run_tile_ir_pipeline,
 };
-pub use sile_tile_ir::{
-    ACTIVE_LLVM_IR_LOWERING_PIPELINE, LlvmIrLoweringPassKind as LlvmLoweringPassKind,
-    RECOMMENDED_LLVM_IR_LOWERING_PIPELINE, TileIrFunction, format_tile_ir,
-    lower_tile_ir_to_llvm_ir, lower_to_tile_ir,
-    run_default_llvm_ir_lowering_pipeline as run_default_llvm_lowering_pipeline,
-    run_llvm_ir_lowering_pipeline as run_llvm_lowering_pipeline,
-};
+pub use sile_tile_ir::{TileIrFunction, format_tile_ir, lower_to_tile_ir};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HirToTileIrPassKind {
@@ -101,7 +99,7 @@ pub fn run_tile_ir_to_llvm_ir_pipeline(
             }
             TileIrToLlvmIrPassKind::LowerTileIrToLlvmIr => {
                 llvm_ir = Some(
-                    run_default_llvm_lowering_pipeline(&tile_ir, typed).map_err(Error::Compile)?,
+                    run_default_llvm_lowering_pipeline(&tile_ir).map_err(Error::Compile)?,
                 );
             }
         }

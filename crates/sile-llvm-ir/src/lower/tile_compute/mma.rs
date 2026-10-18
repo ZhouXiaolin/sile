@@ -1,7 +1,7 @@
-use sile_llvm_ir as llvm_ir;
+use crate as llvm_ir;
 
-use crate::ValueId;
-use crate::passes::lowering::core::{
+use sile_tile_ir::ValueId;
+use crate::lower::core::{
     BlockLowerer, alloc_tile_result, buffer_elem_of, const_f32, const_i64, emit_bin, emit_cast,
     emit_cmp, emit_gep, emit_load, emit_shape_dim, emit_store, load_tile_scalar_dynamic,
     resolve_operand,
@@ -764,7 +764,7 @@ pub(crate) fn lower_fused_tile_mma_inst(
 }
 
 fn compute_rank2_tile_origin(
-    ctx: &mut crate::passes::lowering::core::LowerLlvmIrCtx,
+    ctx: &mut crate::lower::core::LowerLlvmIrCtx,
     out: &mut Vec<llvm_ir::Inst>,
     buf: llvm_ir::Operand,
     row_coord: ValueId,

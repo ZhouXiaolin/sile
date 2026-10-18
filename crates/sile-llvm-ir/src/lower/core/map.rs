@@ -1,6 +1,6 @@
-use sile_llvm_ir as llvm_ir;
+use crate as llvm_ir;
 
-use crate::ir::*;
+use sile_tile_ir::*;
 
 pub(crate) fn llvm_ir_value(value: ValueId) -> llvm_ir::ValueId {
     llvm_ir::ValueId(value.0)
@@ -19,9 +19,17 @@ pub(crate) fn llvm_ir_type(ty: &TileIrType) -> llvm_ir::Type {
         }
         TileIrType::Tile { rows, cols } => tile_ptr_type(*rows, *cols),
         TileIrType::Buffer { elem, .. } => {
-            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, elem.llvm_type())
+            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, buffer_elem_type(*elem))
         }
         TileIrType::Void => llvm_ir::Type::Void,
+    }
+}
+
+/// The LLVM IR type of one element of a buffer's storage.
+fn buffer_elem_type(elem: BufferElem) -> llvm_ir::Type {
+    match elem {
+        BufferElem::F32 => llvm_ir::Type::F32,
+        BufferElem::F16 => llvm_ir::Type::F16,
     }
 }
 
@@ -116,7 +124,7 @@ pub(crate) fn buffer_rank_of(value: ValueId, tile_ir: &TileIrFunction) -> usize 
 /// load and the store are emitted.
 pub(crate) fn buffer_elem_of(value: ValueId, tile_ir: &TileIrFunction) -> llvm_ir::Type {
     match tile_ir.types.get(&value) {
-        Some(TileIrType::Buffer { elem, .. }) => elem.llvm_type(),
+        Some(TileIrType::Buffer { elem, .. }) => buffer_elem_type(*elem),
         _ => llvm_ir::Type::F32,
     }
 }

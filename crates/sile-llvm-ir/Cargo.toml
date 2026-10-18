@@ -4,3 +4,4 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+sile-tile-ir = { path = "../sile-tile-ir" }

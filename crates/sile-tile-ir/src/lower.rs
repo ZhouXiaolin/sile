@@ -14,11 +14,15 @@ pub fn lower_to_tile_ir(typed: &TypedKernel) -> TileIrFunction {
     ctx.entry = entry;
     ctx.current_block = entry;
 
-    // Register kernel params as Tile IR params
+    // Register kernel params as Tile IR params. The shape ABI travels with
+    // each buffer: HIR is the layer that knows the parameter order and the
+    // declared shape extent, so it is recorded here once and the LLVM IR
+    // lowering can then read Tile IR alone.
     let mut scalar_index = 0usize;
     let mut scalar_i64_index = 0usize;
+    let mut shape_offset = 0usize;
     for param in &typed.kernel.params {
-        let (ty, kind) = match &param.ty {
+        let (ty, kind, abi) = match &param.ty {
             sile_hir::Type::Scalar(elem) => {
                 // A float and an integer travel in their own descriptor, so
                 // each counts its own slots.
@@ -31,17 +35,32 @@ pub fn lower_to_tile_ir(typed: &TypedKernel) -> TileIrFunction {
                     scalar_i64_index += 1;
                     (TileIrType::I64, index)
                 };
-                (ty, TileIrParamKind::Scalar { index })
+                (ty, TileIrParamKind::Scalar { index }, None)
             }
-            _ => (
-                TileIrType::Buffer {
-                    rank: rank_of_param(param),
-                    elem: buffer_elem_of_param(param),
-                },
-                TileIrParamKind::Buffer,
-            ),
+            _ => {
+                let rank = rank_of_param(param);
+                let abi = match &param.ty {
+                    sile_hir::Type::Tensor { .. } | sile_hir::Type::Tile { .. } => {
+                        let abi = TileIrParamAbi {
+                            rank,
+                            shape_offset,
+                        };
+                        shape_offset += rank;
+                        Some(abi)
+                    }
+                    _ => None,
+                };
+                (
+                    TileIrType::Buffer {
+                        rank,
+                        elem: buffer_elem_of_param(param),
+                    },
+                    TileIrParamKind::Buffer,
+                    abi,
+                )
+            }
         };
-        let value = ctx.push_param(param.name.clone(), ty, kind);
+        let value = ctx.push_param(param.name.clone(), ty, kind, abi);
         ctx.locals.insert(param.name.clone(), value);
     }
 
@@ -128,7 +147,13 @@ impl<'a> LowerCtx<'a> {
         result
     }
 
-    fn push_param(&mut self, name: String, ty: TileIrType, kind: TileIrParamKind) -> ValueId {
+    fn push_param(
+        &mut self,
+        name: String,
+        ty: TileIrType,
+        kind: TileIrParamKind,
+        abi: Option<TileIrParamAbi>,
+    ) -> ValueId {
         let value = self.fresh_value();
         self.types.insert(value, ty.clone());
         self.mir_params.push(TileIrParam {
@@ -136,6 +161,7 @@ impl<'a> LowerCtx<'a> {
             name,
             ty,
             kind,
+            abi,
         });
         value
     }
@@ -148,6 +174,7 @@ impl<'a> LowerCtx<'a> {
             format!("launch_idx{dim}"),
             TileIrType::I64,
             TileIrParamKind::LaunchIndex { dim },
+            None,
         );
         self.program_id_params.insert(dim, value);
         value
@@ -171,6 +198,7 @@ impl<'a> LowerCtx<'a> {
             format!("shape_{}", source_name),
             TileIrType::ShapeDesc { rank },
             TileIrParamKind::ShapeDesc { source },
+            None,
         );
         self.shape_desc_params.insert(source, value);
         value
