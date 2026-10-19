@@ -9,36 +9,41 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::passes::cfg::{dominators, natural_loops, preheader, NaturalLoop};
+use crate::passes::cfg::{
+    dominators, natural_loops, preheader, reverse_postorder, NaturalLoop,
+};
 use crate::{BlockId, CastOp, Function, Inst, InstOp, Operand, ValueId};
 
 pub fn run(mut func: Function) -> Function {
-    loop {
-        let loops = natural_loops(&func);
-        let mut moved = false;
-        for loop_blocks in loops {
-            if hoist_loop(&mut func, &loop_blocks) {
-                moved = true;
-                break;
-            }
-        }
-        if !moved {
-            break;
-        }
+    // Hoisting moves an instruction to a block that already exists, so the
+    // CFG — and with it the loop set and the dominator relation — is the same
+    // before and after. Both are computed once for the whole run.
+    let dominators = dominators(&func);
+    let mut loops = natural_loops(&func);
+    // Innermost first. Hoisting an inner loop's operands to its preheader puts
+    // their definitions inside the outer loop, and the outer loop's own sweep
+    // reads them there; the reverse order would leave the inner hoists for a
+    // second visit the pass no longer makes.
+    loops.sort_by(|left, right| left.blocks.len().cmp(&right.blocks.len()));
+    for loop_blocks in &loops {
+        hoist_loop(&mut func, loop_blocks, &dominators);
     }
     func
 }
 
-fn hoist_loop(func: &mut Function, loop_blocks: &NaturalLoop) -> bool {
+fn hoist_loop(
+    func: &mut Function,
+    loop_blocks: &NaturalLoop,
+    dominators: &HashMap<BlockId, HashSet<BlockId>>,
+) -> bool {
     let Some(preheader_id) = preheader(func, loop_blocks.header, &loop_blocks.blocks) else {
         return false;
     };
-    let dominators = dominators(func);
     let mut def_block = definitions_by_block(func);
 
     // A value defined before the preheader is available to every hoisted
-    // instruction; a value defined inside the loop becomes available only once
-    // its own instruction has been hoisted, which this loop records.
+    // instruction; a value hoisted out of an inner loop becomes available the
+    // moment this sweep passes the instruction that used it.
     let mut invariant: HashSet<ValueId> = HashSet::new();
     for (value, block) in &def_block {
         if !loop_blocks.blocks.contains(block) {
@@ -46,56 +51,59 @@ fn hoist_loop(func: &mut Function, loop_blocks: &NaturalLoop) -> bool {
         }
     }
 
+    // One sweep, in reverse postorder over the loop's blocks. Every value an
+    // instruction names is defined in a block the sweep reached earlier — a
+    // dominator always precedes its dependents in this order — or earlier in
+    // the same block. The one exception is a value carried around a back edge,
+    // and those travel in block params, which are never hoisted. A single pass
+    // therefore sees each definition before every use it can enable.
+    let mut order: Vec<BlockId> = reverse_postorder(func)
+        .into_iter()
+        .filter(|block_id| loop_blocks.blocks.contains(block_id))
+        .collect();
+    for block in &func.blocks {
+        if loop_blocks.blocks.contains(&block.id) && !order.contains(&block.id) {
+            order.push(block.id);
+        }
+    }
+
     let mut moved_any = false;
-    loop {
-        let mut moved_this_round = false;
-        let block_ids: Vec<BlockId> = func
-            .blocks
-            .iter()
-            .filter(|block| loop_blocks.blocks.contains(&block.id))
-            .map(|block| block.id)
-            .collect();
-        for block_id in block_ids {
-            let Some(block_index) = func.blocks.iter().position(|block| block.id == block_id) else {
+    for block_id in order {
+        let Some(block_index) = func.blocks.iter().position(|block| block.id == block_id) else {
+            continue;
+        };
+        let mut keep = Vec::with_capacity(func.blocks[block_index].insts.len());
+        let mut hoisted: Vec<Inst> = Vec::new();
+        for inst in func.blocks[block_index].insts.drain(..) {
+            let Some(result) = inst.result else {
+                keep.push(inst);
                 continue;
             };
-            let mut keep = Vec::with_capacity(func.blocks[block_index].insts.len());
-            let mut hoisted: Vec<Inst> = Vec::new();
-            for inst in func.blocks[block_index].insts.drain(..) {
-                let Some(result) = inst.result else {
-                    keep.push(inst);
-                    continue;
-                };
-                if !can_hoist(&inst.op, &invariant)
-                    || !operands_available(
-                        &inst.op,
-                        preheader_id,
-                        &def_block,
-                        &dominators,
-                    )
-                {
-                    keep.push(inst);
-                    continue;
-                }
-                invariant.insert(result);
-                def_block.insert(result, preheader_id);
-                hoisted.push(inst);
+            if !can_hoist(&inst.op)
+                || !operands_available(
+                    &inst.op,
+                    preheader_id,
+                    &def_block,
+                    &dominators,
+                )
+            {
+                keep.push(inst);
+                continue;
             }
-            func.blocks[block_index].insts = keep;
-            if !hoisted.is_empty() {
-                moved_this_round = true;
-                moved_any = true;
-                if let Some(preheader_block) = func
-                    .blocks
-                    .iter_mut()
-                    .find(|block| block.id == preheader_id)
-                {
-                    preheader_block.insts.extend(hoisted);
-                }
-            }
+            invariant.insert(result);
+            def_block.insert(result, preheader_id);
+            hoisted.push(inst);
         }
-        if !moved_this_round {
-            break;
+        func.blocks[block_index].insts = keep;
+        if !hoisted.is_empty() {
+            moved_any = true;
+            if let Some(preheader_block) = func
+                .blocks
+                .iter_mut()
+                .find(|block| block.id == preheader_id)
+            {
+                preheader_block.insts.extend(hoisted);
+            }
         }
     }
     moved_any
@@ -120,40 +128,21 @@ fn definitions_by_block(func: &Function) -> HashMap<ValueId, BlockId> {
     definitions
 }
 
-fn can_hoist(op: &InstOp, invariant: &HashSet<ValueId>) -> bool {
+fn can_hoist(op: &InstOp) -> bool {
     match op {
-        InstOp::Bin { op, lhs, rhs } => {
+        InstOp::Bin { op, .. } => {
             // A division or a remainder can fault, so it stays where the
             // program reached it.
             !matches!(op, crate::BinOp::Div | crate::BinOp::Rem)
-                && operands_invariant(&[lhs, rhs], invariant)
         }
-        InstOp::Cmp { lhs, rhs, .. } => operands_invariant(&[lhs, rhs], invariant),
-        InstOp::Gep { base, indices } => {
-            let mut operands = vec![base];
-            operands.extend(indices.iter());
-            operands_invariant(&operands, invariant)
-        }
-        InstOp::Select {
-            cond,
-            on_true,
-            on_false,
-        } => operands_invariant(&[cond, on_true, on_false], invariant),
-        InstOp::Cast { op, value, .. } => {
+        InstOp::Cmp { .. } | InstOp::Gep { .. } | InstOp::Select { .. } => true,
+        InstOp::Cast { op, .. } => {
             // An out-of-range float-to-int conversion is poison, and moving it
             // where the program never executed it would change the answer.
             !matches!(op, CastOp::Fptosi)
-                && operands_invariant(&[value], invariant)
         }
         _ => false,
     }
-}
-
-fn operands_invariant(operands: &[&Operand], invariant: &HashSet<ValueId>) -> bool {
-    operands.iter().all(|operand| match operand {
-        Operand::Const(_) => true,
-        Operand::Value(value) => invariant.contains(value),
-    })
 }
 
 /// Whether every value an instruction reads is defined before the preheader.

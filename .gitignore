@@ -5,3 +5,7 @@
 .alma-snapshots
 .codegraph
 .zcode
+
+# benchmark and tooling outputs
+dumps/
+.dsh-acl-report/

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     BasicBlock, BinOp, BlockId, Constant, Function, Inst, InstOp, Operand, Terminator, ValueId,
@@ -16,47 +16,63 @@ use crate::{
 /// entry's load is still in scope at the join even though the other arm wrote
 /// through the same pointer.
 pub fn run(mut func: Function) -> Function {
-    let available = available_at_entry(&func);
+    // One analysis pass answers for the IR it read. A round's rewrites change
+    // the operands of the instructions below them — an unrolled body's add
+    // names a copy-local mul until that mul folds into the original — and the
+    // changed operands are new common subexpressions the analysis never saw.
+    // So the analyze-and-rewrite repeats while a round still folds something;
+    // every round strictly removes instructions, and the repeats settle.
     let mut replacements = HashMap::<ValueId, ValueId>::new();
-    for block in &mut func.blocks {
-        // A value available at the block entry is a definition from a
-        // dominating block, so it is in scope for every instruction here. A
-        // value defined in this block is added as the walk passes its
-        // definition. The map is carried forward rather than rebuilt from the
-        // instructions kept so far, because a rebuild would put back a load
-        // that an earlier store in this same block killed.
-        let mut visible = available.get(&block.id).cloned().unwrap_or_default();
-        let old_insts = std::mem::take(&mut block.insts);
-        let mut new_insts: Vec<Inst> = Vec::with_capacity(old_insts.len());
-        for inst in old_insts {
-            let rewritten = rewrite_inst(inst, &replacements);
+    // Rewriting operands never touches the CFG, so the dominator relation one
+    // analysis round reads is the relation every round reads.
+    let dominators = crate::passes::cfg::dominators(&func);
+    for _ in 0..8 {
+        let available = available_at_entry(&func, &dominators);
+        let mut folded = 0usize;
+        for block in &mut func.blocks {
+            // A value available at the block entry is a definition from a
+            // dominating block, so it is in scope for every instruction here. A
+            // value defined in this block is added as the walk passes its
+            // definition. The map is carried forward rather than rebuilt from the
+            // instructions kept so far, because a rebuild would put back a load
+            // that an earlier store in this same block killed.
+            let mut visible = available.get(&block.id).cloned().unwrap_or_default();
+            let old_insts = std::mem::take(&mut block.insts);
+            let mut new_insts: Vec<Inst> = Vec::with_capacity(old_insts.len());
+            for inst in old_insts {
+                let rewritten = rewrite_inst(inst, &replacements);
 
-            // A write kills every load, including one the block entry still
-            // offered, so the kill happens before the lookup.
-            if writes_memory(&rewritten.op) {
-                visible.retain(|key, _| !key.starts_with("load:"));
-            }
-
-            if rewritten.metadata.is_empty()
-                && let Some(key) = expr_key(&rewritten.op)
-            {
-                if let Some(existing) = visible.get(&key).copied() {
-                    if let Some(result) = rewritten.result {
-                        // A value offered by the entry state may itself have
-                        // been replaced while an earlier block was rewritten;
-                        // the use must name the value that still exists.
-                        let existing = resolve(existing, &replacements);
-                        replacements.insert(result, existing);
-                        continue;
-                    }
-                } else if let Some(result) = rewritten.result {
-                    visible.insert(key, result);
+                // A write kills every load, including one the block entry still
+                // offered, so the kill happens before the lookup.
+                if writes_memory(&rewritten.op) {
+                    visible.retain(|key, _| !key.starts_with("load:"));
                 }
+
+                if rewritten.metadata.is_empty()
+                    && let Some(key) = expr_key(&rewritten.op)
+                {
+                    if let Some(existing) = visible.get(&key).copied() {
+                        if let Some(result) = rewritten.result {
+                            // A value offered by the entry state may itself have
+                            // been replaced while an earlier block was rewritten;
+                            // the use must name the value that still exists.
+                            let existing = resolve(existing, &replacements);
+                            replacements.insert(result, existing);
+                            folded += 1;
+                            continue;
+                        }
+                    } else if let Some(result) = rewritten.result {
+                        visible.insert(key, result);
+                    }
+                }
+                new_insts.push(rewritten);
             }
-            new_insts.push(rewritten);
+            block.insts = new_insts;
+            block.terminator = rewrite_terminator(block.terminator.clone(), &replacements);
         }
-        block.insts = new_insts;
-        block.terminator = rewrite_terminator(block.terminator.clone(), &replacements);
+        if folded == 0 {
+            break;
+        }
     }
     // A later replacement can make an earlier rewrite point at a value the
     // pass removed, so every operand is resolved against the final map.
@@ -97,17 +113,50 @@ fn resolve(value: ValueId, replacements: &HashMap<ValueId, ValueId>) -> ValueId 
 /// The entry of a block is computed separately from its exit. The exit includes
 /// the block's own definitions; the entry must not, or an instruction would be
 /// folded into itself and deleted.
-fn available_at_entry(func: &Function) -> HashMap<BlockId, HashMap<String, ValueId>> {
-    let block_ids: Vec<BlockId> = func.blocks.iter().map(|block| block.id).collect();
+fn available_at_entry(
+    func: &Function,
+    dominators: &HashMap<BlockId, HashSet<BlockId>>,
+) -> HashMap<BlockId, HashMap<String, ValueId>> {
+    // The sweep follows reverse postorder, for the same reason the dominator
+    // computation does: an unrolled body is a long straight chain, and walking
+    // the block list in source order needs one sweep per block of the chain
+    // before the entries settle. Blocks no path reaches keep their seeded
+    // entry, so they only have to appear, in any position.
+    let mut block_ids = crate::passes::cfg::reverse_postorder(func);
+    let reachable: HashSet<BlockId> = block_ids.iter().copied().collect();
+    block_ids.extend(
+        func.blocks
+            .iter()
+            .map(|block| block.id)
+            .filter(|id| !reachable.contains(id)),
+    );
     let preds = compute_predecessors(func);
     let blocks: HashMap<BlockId, &BasicBlock> =
         func.blocks.iter().map(|block| (block.id, block)).collect();
-
+    // A must-analysis over `∩` needs its top element, and here the top is
+    // "every expression whose definition dominates this block", not the empty
+    // set. Seeding a loop header's entry with `{}` makes the intersection with
+    // the back edge stay empty for the whole fixpoint: the entry can never
+    // learn a fact the latch would have to carry into it first, and the latch
+    // can never learn it because its own entry is the header's exit. A value
+    // defined dominantly before a loop — the launch base of every tile
+    // operation, for one — was therefore never reused inside it, and the
+    // printed IR kept one `mul` per tile operation.
+    //
+    // The seed only ever shrinks, so it cannot introduce a value that does not
+    // dominate the block, and a store still kills every load below it through
+    // the intersection.
+    let seed = dominating_definitions(func, dominators);
     let mut entries = HashMap::<BlockId, HashMap<String, ValueId>>::new();
     let mut exits = HashMap::<BlockId, HashMap<String, ValueId>>::new();
     for block_id in &block_ids {
-        entries.insert(*block_id, HashMap::new());
-        exits.insert(*block_id, HashMap::new());
+        let state = if *block_id == func.entry {
+            HashMap::new()
+        } else {
+            seed.get(block_id).cloned().unwrap_or_default()
+        };
+        entries.insert(*block_id, state.clone());
+        exits.insert(*block_id, state);
     }
 
     let transfer = |state: &HashMap<String, ValueId>, block: &BasicBlock| {
@@ -140,10 +189,16 @@ fn available_at_entry(func: &Function) -> HashMap<BlockId, HashMap<String, Value
                         .collect(),
                 });
             }
+            // A block that a path reaches keeps what its predecessors agree on;
+            // a block no path reaches keeps the seed it started with, since it
+            // has no incoming edge to learn from and is never rewritten.
             let entry_state = if *block_id == func.entry {
                 HashMap::new()
             } else {
-                incoming.unwrap_or_default()
+                match incoming {
+                    Some(incoming) => incoming,
+                    None => entries[block_id].clone(),
+                }
             };
             let block = blocks.get(block_id).expect("block id came from the function");
             let exit_state = transfer(&entry_state, block);
@@ -162,6 +217,48 @@ fn available_at_entry(func: &Function) -> HashMap<BlockId, HashMap<String, Value
         }
     }
     entries
+}
+
+/// The expressions each block's dominators define, as the analysis' top.
+///
+/// A definition dominates a block when the block holding it dominates that
+/// block, including the block itself. Only pure expressions enter the seed:
+/// a load is not a value a dominator guarantees, because anything between the
+/// two can have written the memory it names.
+fn dominating_definitions(
+    func: &Function,
+    dominators: &HashMap<BlockId, HashSet<BlockId>>,
+) -> HashMap<BlockId, HashMap<String, ValueId>> {
+    let mut seed: HashMap<BlockId, HashMap<String, ValueId>> = func
+        .blocks
+        .iter()
+        .map(|block| (block.id, HashMap::new()))
+        .collect();
+
+    for block in &func.blocks {
+        let defining: Vec<(String, ValueId)> = block
+            .insts
+            .iter()
+            .filter(|inst| inst.metadata.is_empty())
+            .filter(|inst| !matches!(inst.op, InstOp::Load { .. }))
+            .filter_map(|inst| Some((expr_key(&inst.op)?, inst.result?)))
+            .collect();
+        if defining.is_empty() {
+            continue;
+        }
+        // The defining block itself sees its own definitions; every block it
+        // dominates sees the first definition of each expression.
+        for (dominated, dominated_by) in dominators {
+            if !dominated_by.contains(&block.id) {
+                continue;
+            }
+            let state = seed.entry(*dominated).or_default();
+            for (key, value) in &defining {
+                state.entry(key.clone()).or_insert(*value);
+            }
+        }
+    }
+    seed
 }
 
 fn compute_predecessors(func: &Function) -> HashMap<BlockId, Vec<BlockId>> {

@@ -128,6 +128,7 @@ pub mod llvmir {
     };
 }
 pub mod compiler;
+pub mod dump;
 pub mod codegen {
     pub mod llvmir_c {
         pub use sile_backend::cpu::codegen::*;

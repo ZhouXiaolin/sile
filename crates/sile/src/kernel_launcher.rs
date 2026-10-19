@@ -42,12 +42,31 @@ fn compiled_parts(kernel: &Kernel) -> Result<Arc<CompiledParts>> {
         return Ok(Arc::clone(hit));
     }
 
+    // A dump request is served before the cache is consulted for a value, but
+    // after it: the second launch of a kernel has nothing new to record, and
+    // the first has already recorded everything. `SILE_DUMP_DIR` therefore
+    // costs one compile's worth of file writes per distinct kernel.
+    if let Some(root) = crate::dump::dump_dir_from_env() {
+        let mut reported = dumped_kernels().lock().unwrap();
+        if reported.insert(key.clone()) {
+            drop(reported);
+            crate::dump::dump_kernel(kernel, &root)?;
+        }
+    }
+
     let parts = Arc::new(compile_kernel_to_llvm_ir(kernel)?);
     compile_cache()
         .lock()
         .unwrap()
         .insert(key, Arc::clone(&parts));
     Ok(parts)
+}
+
+/// The kernels this process has already dumped, so a repeated launch of the
+/// same kernel does not rewrite the same files.
+fn dumped_kernels() -> &'static Mutex<std::collections::HashSet<String>> {
+    static DUMPED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    DUMPED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
 pub struct KernelLauncher<'a> {

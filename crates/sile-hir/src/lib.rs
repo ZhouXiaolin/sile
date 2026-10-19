@@ -1,9 +1,11 @@
 pub mod kernel;
 pub mod passes;
+pub mod print;
 pub mod typeck;
 pub mod types;
 
 pub use kernel::{BuiltinOp, Expr, Kernel, Param, ParamKind, Stmt, UnaryOp};
+pub use print::format_kernel;
 pub use passes::verify::{verify_kernel as verify_hir_kernel, verify_typed_kernel};
 pub use passes::{
     ACTIVE_PIPELINE as ACTIVE_HIR_PIPELINE, HirPassKind,
