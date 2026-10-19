@@ -716,6 +716,26 @@ fn format_intrinsic(
                 format_operand(rhs, names)
             )
         }
+        Intrinsic::Fma => {
+            let function = intrinsic
+                .ternary_float_function()
+                .expect("a ternary float function has a name");
+            let a = args.first().expect("a ternary float function takes three arguments");
+            let b = args.get(1).expect("a ternary float function takes three arguments");
+            let c = args.get(2).expect("a ternary float function takes three arguments");
+            format!(
+                "call {} @llvm.{}.{}({} {}, {} {}, {} {})",
+                format_type(result_ty),
+                function,
+                format_exp_suffix(result_ty),
+                format_operand_type(a, types),
+                format_operand(a, names),
+                format_operand_type(b, types),
+                format_operand(b, names),
+                format_operand_type(c, types),
+                format_operand(c, names)
+            )
+        }
         Intrinsic::VecLoad { len } => format_runtime_call(
             &format!("sile.vec.load.{len}"),
             result_ty,

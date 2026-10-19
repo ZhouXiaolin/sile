@@ -565,6 +565,14 @@ fn infer_builtin(
             (_, Some(Type::Tile { shape, .. })) => Ok(Type::tile(ElemType::F32, shape.clone())),
             _ => Ok(Type::Scalar(ElemType::F32)),
         },
+        // `fma(a, b, c)` is `a * b + c` with one rounding, so it types like an
+        // addition of the same operands: the operands' shape, always a float.
+        BuiltinOp::Fma => match (arg_types.first(), arg_types.get(1), arg_types.get(2)) {
+            (Some(Type::Tile { shape, .. }), _, _)
+            | (_, Some(Type::Tile { shape, .. }), _)
+            | (_, _, Some(Type::Tile { shape, .. })) => Ok(Type::tile(ElemType::F32, shape.clone())),
+            _ => Ok(Type::Scalar(ElemType::F32)),
+        },
         // `tile_to_scalar` reads the one element a tile holds. A tile of more
         // than one element has no single value, so it is rejected here rather
         // than lowered to whichever element the layout happens to put first.
@@ -689,7 +697,7 @@ fn check_arity(op: BuiltinOp, actual: usize) -> Result<(), TypeError> {
         | BuiltinOp::Le
         | BuiltinOp::Eq
         | BuiltinOp::Ne => (2, 2),
-        BuiltinOp::Select => (3, 3),
+        BuiltinOp::Select | BuiltinOp::Fma => (3, 3),
         BuiltinOp::TileToScalar => (1, 1),
         BuiltinOp::ScalarToTile => (1, 1),
         BuiltinOp::ConvertScalar => (1, 1),

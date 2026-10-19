@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::cell::OnceCell;
 
 use sile_core::{Error, Result};
 use sile_llvm_ir as llvm_ir;
@@ -1254,7 +1255,8 @@ impl<D: TargetDialect> TextCodegen for TargetEmitter<'_, D> {
         self.emit_value_decls_inner();
         let body_start = self.out.len();
         self.out.push('\n');
-        if self.emit_structured_from(self.func.entry, &[])?.is_some() {
+        let post_dominators = OnceCell::new();
+        if self.emit_structured_from(self.func.entry, &[], &post_dominators)?.is_some() {
             return Err(Error::Compile(
                 "structured codegen unexpectedly stopped at a non-terminal block".into(),
             ));
@@ -1343,6 +1345,7 @@ impl<D: TargetDialect> TargetEmitter<'_, D> {
         &mut self,
         start: llvm_ir::BlockId,
         stop_targets: &[llvm_ir::BlockId],
+        post_dominators: &OnceCell<PostDominators>,
     ) -> Result<Option<llvm_ir::BlockId>> {
         emit_structured_from(
             self,
@@ -1351,6 +1354,7 @@ impl<D: TargetDialect> TargetEmitter<'_, D> {
             stop_targets,
             None,
             None,
+            post_dominators,
             self.dialect.messages(),
         )
     }
@@ -1482,6 +1486,7 @@ pub fn emit_structured_from<E: StructuredEmitter>(
     stop_targets: &[llvm_ir::BlockId],
     stop_skip_params: Option<(llvm_ir::BlockId, Vec<llvm_ir::ValueId>)>,
     stop_skip_inst: Option<llvm_ir::ValueId>,
+    post_dominators: &OnceCell<PostDominators>,
     messages: StructuredCfgMessages,
 ) -> Result<Option<llvm_ir::BlockId>> {
     let mut current = start;
@@ -1518,7 +1523,13 @@ pub fn emit_structured_from<E: StructuredEmitter>(
         }
 
         if is_loop_preheader(func, &block) {
-            current = emit_structured_loop_preheader(emitter, func, &block, messages)?;
+            current = emit_structured_loop_preheader(
+                emitter,
+                func,
+                &block,
+                post_dominators,
+                messages,
+            )?;
             if stop_targets.contains(&current) {
                 return Ok(Some(current));
             }
@@ -1526,7 +1537,7 @@ pub fn emit_structured_from<E: StructuredEmitter>(
         }
 
         if is_loop_header(func, &block) {
-            current = emit_structured_loop_header(emitter, func, &block, messages)?;
+            current = emit_structured_loop_header(emitter, func, &block, post_dominators, messages)?;
             if stop_targets.contains(&current) {
                 return Ok(Some(current));
             }
@@ -1535,7 +1546,14 @@ pub fn emit_structured_from<E: StructuredEmitter>(
 
         if matches!(block.terminator, llvm_ir::Terminator::CondBr { .. }) {
             current =
-                emit_structured_if_else(emitter, func, &block, stop_skip_params.clone(), messages)?;
+                emit_structured_if_else(
+                    emitter,
+                    func,
+                    &block,
+                    stop_skip_params.clone(),
+                    post_dominators,
+                    messages,
+                )?;
             if stop_targets.contains(&current) {
                 return Ok(Some(current));
             }
@@ -1577,6 +1595,7 @@ fn emit_structured_loop_preheader<E: StructuredEmitter>(
     emitter: &mut E,
     func: &llvm_ir::Function,
     preheader: &llvm_ir::BasicBlock,
+    post_dominators: &OnceCell<PostDominators>,
     messages: StructuredCfgMessages,
 ) -> Result<llvm_ir::BlockId> {
     let llvm_ir::Terminator::Br {
@@ -1611,6 +1630,7 @@ fn emit_structured_loop_preheader<E: StructuredEmitter>(
         true_args,
         *false_target,
         false_args,
+        post_dominators,
         messages,
     )
 }
@@ -1619,6 +1639,7 @@ fn emit_structured_loop_header<E: StructuredEmitter>(
     emitter: &mut E,
     func: &llvm_ir::Function,
     header: &llvm_ir::BasicBlock,
+    post_dominators: &OnceCell<PostDominators>,
     messages: StructuredCfgMessages,
 ) -> Result<llvm_ir::BlockId> {
     let llvm_ir::Terminator::CondBr {
@@ -1641,6 +1662,7 @@ fn emit_structured_loop_header<E: StructuredEmitter>(
         true_args,
         *false_target,
         false_args,
+        post_dominators,
         messages,
     )
 }
@@ -1650,6 +1672,7 @@ fn emit_structured_if_else<E: StructuredEmitter>(
     func: &llvm_ir::Function,
     block: &llvm_ir::BasicBlock,
     stop_skip_params: Option<(llvm_ir::BlockId, Vec<llvm_ir::ValueId>)>,
+    post_dominators: &OnceCell<PostDominators>,
     messages: StructuredCfgMessages,
 ) -> Result<llvm_ir::BlockId> {
     let llvm_ir::Terminator::CondBr {
@@ -1662,7 +1685,7 @@ fn emit_structured_if_else<E: StructuredEmitter>(
     else {
         return Err(Error::Compile(messages.unsupported_cond_br.into()));
     };
-    let join = branch_join(func, block.id)
+    let join = branch_join(func, block.id, post_dominators)
         .ok_or_else(|| Error::Compile(messages.unsupported_cond_br.into()))?;
 
     let (cond_expr, skip_result) = branch_condition_expr::<E>(func, block, cond, false);
@@ -1682,6 +1705,7 @@ fn emit_structured_if_else<E: StructuredEmitter>(
         &[join],
         stop_skip_params.clone(),
         None,
+        post_dominators,
         messages,
     )?;
     emitter.indent_dec();
@@ -1695,6 +1719,7 @@ fn emit_structured_if_else<E: StructuredEmitter>(
         &[join],
         stop_skip_params,
         None,
+        post_dominators,
         messages,
     )?;
     emitter.indent_dec();
@@ -1714,6 +1739,7 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
     true_args: &[llvm_ir::Operand],
     false_target: llvm_ir::BlockId,
     false_args: &[llvm_ir::Operand],
+    post_dominators: &OnceCell<PostDominators>,
     messages: StructuredCfgMessages,
 ) -> Result<llvm_ir::BlockId> {
     let optimized_loop = branch_condition_expr::<E>(func, header, cond, true);
@@ -1767,6 +1793,7 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
                     &[header.id],
                     Some((header.id, vec![for_loop.induction_param])),
                     for_loop.step_value_id,
+                    post_dominators,
                     messages,
                 )?;
                 if backedge != Some(header.id) {
@@ -1791,6 +1818,7 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
                 &[header.id],
                 None,
                 None,
+                post_dominators,
                 messages,
             )?;
             if backedge != Some(header.id) {
@@ -1823,6 +1851,7 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
                 &[header.id],
                 None,
                 None,
+                post_dominators,
                 messages,
             )?;
             if backedge != Some(header.id) {
@@ -1981,6 +2010,7 @@ fn is_simple_loop_body(
                 llvm_ir::InstOp::Intrinsic { intrinsic, .. } => {
                     intrinsic.float_function().is_some()
                         || intrinsic.binary_float_function().is_some()
+                        || intrinsic.ternary_float_function().is_some()
                 }
                 _ => false,
             };
@@ -2050,8 +2080,12 @@ fn is_loop_header(func: &llvm_ir::Function, block: &llvm_ir::BasicBlock) -> bool
 /// which is the immediate post-dominator of the branch. Asking for the nearest
 /// block both arms reach would name a block inside an arm instead, because the
 /// loop that encloses the branch reaches the arm's blocks too.
-fn branch_join(func: &llvm_ir::Function, block_id: llvm_ir::BlockId) -> Option<llvm_ir::BlockId> {
-    if let Some(join) = branch_join_post_dominator(func, block_id) {
+fn branch_join(
+    func: &llvm_ir::Function,
+    block_id: llvm_ir::BlockId,
+    post_dominators: &OnceCell<PostDominators>,
+) -> Option<llvm_ir::BlockId> {
+    if let Some(join) = branch_join_post_dominator(func, block_id, post_dominators) {
         return Some(join);
     }
     // A branch whose arm returns has a join that does not post-dominate it:
@@ -2084,8 +2118,9 @@ fn branch_join(func: &llvm_ir::Function, block_id: llvm_ir::BlockId) -> Option<l
 fn branch_join_post_dominator(
     func: &llvm_ir::Function,
     block_id: llvm_ir::BlockId,
+    post_dominators: &OnceCell<PostDominators>,
 ) -> Option<llvm_ir::BlockId> {
-    let post_dominators = compute_post_dominators(func);
+    let post_dominators = post_dominators.get_or_init(|| compute_post_dominators(func));
     // A block closer to the branch post-dominates a farther one, so it has the
     // larger set: the join is the closest, which is the largest.
     let mut best: Option<(llvm_ir::BlockId, usize)> = None;
@@ -2107,7 +2142,24 @@ fn branch_join_post_dominator(
 /// to a return passes through the first. This is the dominator computation on
 /// the reversed graph: a block's set is the intersection of its successors'
 /// sets, and a block that returns post-dominates only itself.
+
+/// The post-dominator table of one function, computed at most once and only
+/// when a branch actually asks for it.
+type PostDominators = HashMap<llvm_ir::BlockId, HashSet<llvm_ir::BlockId>>;
+
 fn compute_post_dominators(
+    func: &llvm_ir::Function,
+) -> HashMap<llvm_ir::BlockId, HashSet<llvm_ir::BlockId>> {
+    let __t = std::time::Instant::now();
+    let __blocks = func.blocks.len();
+    let __r = compute_post_dominators_inner(func);
+    if std::env::var_os("SILE_PD_PROFILE").is_some() {
+        eprintln!("[pd] blocks={__blocks} compute={}ms", __t.elapsed().as_millis());
+    }
+    return __r;
+}
+
+fn compute_post_dominators_inner(
     func: &llvm_ir::Function,
 ) -> HashMap<llvm_ir::BlockId, HashSet<llvm_ir::BlockId>> {
     let returns =

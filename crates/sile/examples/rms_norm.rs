@@ -37,7 +37,7 @@ mod kernels {
         let mut rms = constant(0.0, tile_shape);
         for j in 0i64..num_tiles {
             let tx = x_part.load([row, j]);
-            rms = rms + tx * tx;
+            rms = fma(tx, tx, rms);
         }
         let rms = reduce_sum(rms, 1i64);
         let rms = rms.reshape(shape![]);

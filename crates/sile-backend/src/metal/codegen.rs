@@ -260,6 +260,24 @@ impl TargetDialect for MetalDialect<'_> {
                     format_operand(rhs)
                 )
             }
+            llvm_ir::Intrinsic::Fma => {
+                let [a, b, c] = args else {
+                    return Err(sile_core::Error::Compile(
+                        "a ternary float function takes three arguments".into(),
+                    ));
+                };
+                let function = intrinsic
+                    .ternary_float_function()
+                    .expect("a ternary float function has a name");
+                format!(
+                    "{} = metal::{}({}, {}, {});",
+                    name(),
+                    function,
+                    format_operand(a),
+                    format_operand(b),
+                    format_operand(c)
+                )
+            }
             llvm_ir::Intrinsic::VecLoad { len } => {
                 let [ptr, offset] = args else {
                     return Err(sile_core::Error::Compile(

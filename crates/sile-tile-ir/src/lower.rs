@@ -1072,17 +1072,19 @@ fn lower_while(cond: Option<&Expr>, body: &[Stmt], ctx: &mut LowerCtx<'_>) -> Fl
             } else {
                 zero_i
             };
+            let done_is_zero = ctx.emit(
+                TileIrOp::ICmp {
+                    op: CmpOp::Eq,
+                    lhs: done_param,
+                    rhs: zero_i,
+                },
+                TileIrType::I64,
+            );
             ctx.emit(
-                TileIrOp::Map {
-                    expr: TileMapExpr::Select {
-                        cond: Box::new(TileMapExpr::Cmp {
-                            op: CmpOp::Eq,
-                            lhs: Box::new(TileMapExpr::Value(done_param)),
-                            rhs: Box::new(TileMapExpr::Value(zero_i)),
-                        }),
-                        on_true: Box::new(TileMapExpr::Value(cond_set)),
-                        on_false: Box::new(TileMapExpr::Value(set_zero)),
-                    },
+                TileIrOp::Select {
+                    cond: done_is_zero,
+                    on_true: cond_set,
+                    on_false: set_zero,
                     rows: 1,
                     cols: 1,
                 },
@@ -1541,13 +1543,37 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 },
             )
         }
-        // A maximum and a minimum are one comparison and one select each, so
-        // they ride the map node: the map already carries a scalar expression
-        // per element, and no target has an instruction that does more.
+        // A maximum and a minimum are one CuTile operation each (`maxf`,
+        // `minf`), so the lowering names the operation and lets the target
+        // spell it: a comparison and a select each is what every backend
+        // would expand it back into.
         BuiltinOp::Max | BuiltinOp::Min => {
             let lhs = lower_expr(&args[0], ctx);
             let rhs = lower_expr(&args[1], ctx);
             lower_extreme(op == BuiltinOp::Max, lhs, rhs, ctx)
+        }
+        // `fma(a, b, c)` is one CuTile operation (`$lhs, $rhs, $acc`): the
+        // product and the add share one rounding. The targets that have the
+        // instruction name it; one that does not expands it back to the two
+        // steps.
+        BuiltinOp::Fma => {
+            let a = lower_expr(&args[0], ctx);
+            let b = lower_expr(&args[1], ctx);
+            let c = lower_expr(&args[2], ctx);
+            let shape = tile_shape_of(a, ctx)
+                .or_else(|| tile_shape_of(b, ctx))
+                .or_else(|| tile_shape_of(c, ctx));
+            let (rows, cols) = shape.unwrap_or((1, 1));
+            ctx.emit(
+                TileIrOp::Fma {
+                    lhs: a,
+                    rhs: b,
+                    acc: c,
+                    rows,
+                    cols,
+                },
+                pointwise_result_ty(shape, &[a, b, c], ctx),
+            )
         }
         // A mask is `0.0` or `1.0`, so a conjunction of masks is their product
         // and a disjunction is their maximum. Two counts are anded and ored bit
@@ -1720,6 +1746,9 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
             let cmp = compare_op(op).expect("a comparison names a comparison");
             lower_compare(cmp, lhs, rhs, ctx)
         }
+        // `select(cond, a, b)` is one CuTile operation (`$cond, $val_if_true,
+        // $val_if_false`). The condition stays a value: a mask of ones and
+        // zeroes, or a count, exactly what the operands of the call name.
         BuiltinOp::Select => {
             let cond = lower_expr(&args[0], ctx);
             let on_true = lower_expr(&args[1], ctx);
@@ -1729,12 +1758,10 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 .or_else(|| tile_shape_of(cond, ctx));
             let (rows, cols) = shape.unwrap_or((1, 1));
             ctx.emit(
-                TileIrOp::Map {
-                    expr: TileMapExpr::Select {
-                        cond: Box::new(TileMapExpr::Value(cond)),
-                        on_true: Box::new(TileMapExpr::Value(on_true)),
-                        on_false: Box::new(TileMapExpr::Value(on_false)),
-                    },
+                TileIrOp::Select {
+                    cond,
+                    on_true,
+                    on_false,
                     rows,
                     cols,
                 },
@@ -2202,28 +2229,27 @@ fn lower_compare(cmp: CmpOp, lhs: ValueId, rhs: ValueId, ctx: &mut LowerCtx<'_>)
 
 /// The larger, or the smaller, of two values, element by element.
 ///
-/// A maximum is one comparison and one select, which is what the map node
-/// carries, and no target has an instruction that does more.
+/// One CuTile operation (`maxf`, `minf`); the comparison-and-select form is
+/// what a target without the instruction expands it into.
 fn lower_extreme(max: bool, lhs: ValueId, rhs: ValueId, ctx: &mut LowerCtx<'_>) -> ValueId {
     let shape = tile_shape_of(lhs, ctx).or_else(|| tile_shape_of(rhs, ctx));
     let (rows, cols) = shape.unwrap_or((1, 1));
-    let op = if max { CmpOp::Ge } else { CmpOp::Le };
-    ctx.emit(
-        TileIrOp::Map {
-            expr: TileMapExpr::Select {
-                cond: Box::new(TileMapExpr::Cmp {
-                    op,
-                    lhs: Box::new(TileMapExpr::Value(lhs)),
-                    rhs: Box::new(TileMapExpr::Value(rhs)),
-                }),
-                on_true: Box::new(TileMapExpr::Value(lhs)),
-                on_false: Box::new(TileMapExpr::Value(rhs)),
-            },
+    let op = if max {
+        TileIrOp::MaxF {
+            lhs,
+            rhs,
             rows,
             cols,
-        },
-        pointwise_result_ty(shape, &[lhs, rhs], ctx),
-    )
+        }
+    } else {
+        TileIrOp::MinF {
+            lhs,
+            rhs,
+            rows,
+            cols,
+        }
+    };
+    ctx.emit(op, pointwise_result_ty(shape, &[lhs, rhs], ctx))
 }
 
 /// The type a pointwise operation over these operands produces.

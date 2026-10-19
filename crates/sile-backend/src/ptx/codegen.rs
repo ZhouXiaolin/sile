@@ -2485,6 +2485,20 @@ impl Emitter<'_> {
                 let x = self.float_argument(args, 1)?;
                 self.emit_atan2(y, x, destination)?;
             }
+            // The one instruction the fused multiply-add exists for: the
+            // product and the add round once, which no mul/add pair can say.
+            Intrinsic::Fma => {
+                let a = self.float_argument(args, 0)?;
+                let b = self.float_argument(args, 1)?;
+                let c = self.float_argument(args, 2)?;
+                self.line(format!(
+                    "fma.rn.f32 {}, {}, {}, {};",
+                    self.reg_name(destination),
+                    self.reg_name(a),
+                    self.reg_name(b),
+                    self.reg_name(c)
+                ));
+            }
             other => {
                 return Err(Error::Compile(format!(
                     "PTX codegen: intrinsic {other:?} is not implemented"

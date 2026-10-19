@@ -227,6 +227,9 @@ pub enum Intrinsic {
     Pow,
     /// The angle of the point `(x, y)`. Two arguments, `y` first.
     Atan2,
+    /// `a * b + c` under one rounding. Three arguments, in the order the
+    /// CuTile `fma` names them: `lhs`, `rhs`, `acc`.
+    Fma,
     /// Load `<len x elem_ty>` from contiguous memory starting at `ptr + offset`.
     /// Args: [ptr, offset]. Result type must be Vector.
     VecLoad {
@@ -279,6 +282,17 @@ impl Intrinsic {
         match self {
             Intrinsic::Pow => Some("pow"),
             Intrinsic::Atan2 => Some("atan2"),
+            _ => None,
+        }
+    }
+
+    /// The name a three-argument float function has on every target, when this
+    /// intrinsic is one.
+    ///
+    /// The same three-way spelling rule as [`Intrinsic::float_function`].
+    pub fn ternary_float_function(&self) -> Option<&'static str> {
+        match self {
+            Intrinsic::Fma => Some("fma"),
             _ => None,
         }
     }

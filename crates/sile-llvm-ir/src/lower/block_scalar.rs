@@ -1,8 +1,9 @@
 use crate as llvm_ir;
 
 use super::core::{
-    LowerLlvmIrCtx, comparison_pred, const_i64, emit_gep, emit_load, llvm_ir_type, llvm_ir_value,
-    load_tile_scalar_dynamic, lower_bin_op, resolve_operand,
+    LowerLlvmIrCtx, comparison_pred, const_f32, const_i64, emit_cmp, emit_gep, emit_load,
+    emit_select, llvm_ir_type, llvm_ir_value, load_tile_scalar_dynamic, lower_bin_op,
+    resolve_operand,
 };
 use sile_tile_ir::*;
 use crate::lower::tile_memory::emit_strided_element_index;
@@ -115,6 +116,87 @@ pub(crate) fn lower_scalar_inst(
                 },
                 metadata: Vec::new(),
             });
+        }
+        // A scalar `fma` is the one call: the product and the add share one
+        // rounding, which is the whole point of the operation.
+        TileIrOp::Fma { lhs, rhs, acc, .. } => {
+            let llir_id = llvm_ir_value(inst.result);
+            ctx.names
+                .insert(llir_id, format!("v{}", inst.result.0));
+            out.push(llvm_ir::Inst {
+                result: Some(llir_id),
+                result_name: Some(format!("v{}", inst.result.0)),
+                ty: llvm_ir::Type::F32,
+                op: llvm_ir::InstOp::Intrinsic {
+                    intrinsic: llvm_ir::Intrinsic::Fma,
+                    args: vec![
+                        resolve_operand(*lhs, ctx),
+                        resolve_operand(*rhs, ctx),
+                        resolve_operand(*acc, ctx),
+                    ],
+                },
+                metadata: Vec::new(),
+            });
+            ctx.operands
+                .insert(inst.result, llvm_ir::Operand::Value(llir_id));
+        }
+        // A scalar extreme is the comparison and select it always was. A count
+        // pair compares as integers and picks as counts.
+        TileIrOp::MaxF { .. } | TileIrOp::MinF { .. } => {
+            let (cmp_op, lhs, rhs) = match &inst.op {
+                TileIrOp::MaxF { lhs, rhs, .. } => (CmpOp::Ge, *lhs, *rhs),
+                TileIrOp::MinF { lhs, rhs, .. } => (CmpOp::Le, *lhs, *rhs),
+                _ => unreachable!(),
+            };
+            let cond = emit_cmp(
+                ctx,
+                out,
+                comparison_pred(cmp_op, lhs, rhs, tile_ir),
+                resolve_operand(lhs, ctx),
+                resolve_operand(rhs, ctx),
+                llvm_ir::Type::I1,
+            );
+            let value = emit_select(
+                ctx,
+                out,
+                cond,
+                resolve_operand(lhs, ctx),
+                resolve_operand(rhs, ctx),
+                llvm_ir_type(tile_ir.types.get(&inst.result).unwrap_or(&TileIrType::I64)),
+            );
+            ctx.operands.insert(inst.result, value);
+        }
+        // A scalar select tests the condition as a mask: a count is set when
+        // it is not zero, a float mask when it is above zero.
+        TileIrOp::Select {
+            cond,
+            on_true,
+            on_false,
+            ..
+        } => {
+            let (pred, zero) =
+                if matches!(tile_ir.types.get(cond), Some(TileIrType::I64)) {
+                    (llvm_ir::CmpPred::Ne, const_i64(0))
+                } else {
+                    (llvm_ir::CmpPred::Ogt, const_f32(0.0))
+                };
+            let bit = emit_cmp(
+                ctx,
+                out,
+                pred,
+                resolve_operand(*cond, ctx),
+                zero,
+                llvm_ir::Type::I1,
+            );
+            let value = emit_select(
+                ctx,
+                out,
+                bit,
+                resolve_operand(*on_true, ctx),
+                resolve_operand(*on_false, ctx),
+                llvm_ir_type(tile_ir.types.get(&inst.result).unwrap_or(&TileIrType::I64)),
+            );
+            ctx.operands.insert(inst.result, value);
         }
         TileIrOp::SileAtomicAdd {
             buf,

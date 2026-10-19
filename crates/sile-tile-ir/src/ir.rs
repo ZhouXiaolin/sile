@@ -149,6 +149,13 @@ pub enum TileMapExpr {
         lhs: Box<TileMapExpr>,
         rhs: Box<TileMapExpr>,
     },
+    /// `fma(a, b, c)`: `a * b + c` with one rounding. The fused form rides
+    /// this tree like the other pointwise functions.
+    Fma {
+        a: Box<TileMapExpr>,
+        b: Box<TileMapExpr>,
+        c: Box<TileMapExpr>,
+    },
     /// The remainder of a division.
     Rem {
         lhs: Box<TileMapExpr>,
@@ -259,6 +266,43 @@ pub enum TileIrOp {
     },
     /// `cuda_tile.divf`
     DivF {
+        lhs: ValueId,
+        rhs: ValueId,
+        rows: i64,
+        cols: i64,
+    },
+    /// `cuda_tile.fma`: `lhs * rhs + acc` with one rounding.
+    ///
+    /// CuTile spells the fused form as one op (`$lhs, $rhs, $acc`), and so do
+    /// the targets that have the instruction: an FMA pipelines as one
+    /// operation where a multiply and an add pipeline as two.
+    Fma {
+        lhs: ValueId,
+        rhs: ValueId,
+        acc: ValueId,
+        rows: i64,
+        cols: i64,
+    },
+    /// `cuda_tile.select`: `$cond, $val_if_true, $val_if_false`.
+    ///
+    /// The condition is a value like any other: a mask of ones and zeroes, or
+    /// a count. An element is picked where it tests true.
+    Select {
+        cond: ValueId,
+        on_true: ValueId,
+        on_false: ValueId,
+        rows: i64,
+        cols: i64,
+    },
+    /// `cuda_tile.maxf`: the larger of two tiles, element by element.
+    MaxF {
+        lhs: ValueId,
+        rhs: ValueId,
+        rows: i64,
+        cols: i64,
+    },
+    /// `cuda_tile.minf`: the smaller of two tiles, element by element.
+    MinF {
         lhs: ValueId,
         rhs: ValueId,
         rows: i64,
@@ -644,7 +688,16 @@ impl TileIrFunction {
             TileIrOp::AddF { lhs, rhs, .. }
             | TileIrOp::SubF { lhs, rhs, .. }
             | TileIrOp::MulF { lhs, rhs, .. }
-            | TileIrOp::DivF { lhs, rhs, .. } => vec![*lhs, *rhs],
+            | TileIrOp::DivF { lhs, rhs, .. }
+            | TileIrOp::MaxF { lhs, rhs, .. }
+            | TileIrOp::MinF { lhs, rhs, .. } => vec![*lhs, *rhs],
+            TileIrOp::Fma { lhs, rhs, acc, .. } => vec![*lhs, *rhs, *acc],
+            TileIrOp::Select {
+                cond,
+                on_true,
+                on_false,
+                ..
+            } => vec![*cond, *on_true, *on_false],
             TileIrOp::UnaryF { operand, .. } => vec![*operand],
             TileIrOp::MmaF { a, b, acc, .. } => vec![*a, *b, *acc],
             TileIrOp::ReduceSum { value, .. }
@@ -739,6 +792,11 @@ fn collect_tile_map_expr_uses(expr: &TileMapExpr, uses: &mut Vec<ValueId>) {
         | TileMapExpr::Atan2 { lhs, rhs } => {
             collect_tile_map_expr_uses(lhs, uses);
             collect_tile_map_expr_uses(rhs, uses);
+        }
+        TileMapExpr::Fma { a, b, c } => {
+            collect_tile_map_expr_uses(a, uses);
+            collect_tile_map_expr_uses(b, uses);
+            collect_tile_map_expr_uses(c, uses);
         }
         TileMapExpr::Unary { operand, .. } | TileMapExpr::Transpose { value: operand } => {
             collect_tile_map_expr_uses(operand, uses);

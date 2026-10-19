@@ -699,11 +699,21 @@ fn lower_call(
         "xori" => quote! { ::sile::hir::BuiltinOp::Xor },
         "shli" => quote! { ::sile::hir::BuiltinOp::Shl },
         "shri" => quote! { ::sile::hir::BuiltinOp::Shr },
-        // `fma(a, b, c)` is one multiply and one add. No target this backend
-        // writes spells the fused form the same way — WGSL has no `fma` — so
-        // the two steps are what keeps the three targets bit-identical.
+        // `fma(a, b, c)` stays one operation all the way down: the tile IR
+        // names it, and each target spells the instruction it has — C the
+        // `fmaf` of math.h, Metal `metal::fma`, PTX `fma.rn`. WGSL has no
+        // fused form, so that target expands the two steps and the three
+        // results differ in the last bit only.
         "fma" => {
-            return fused_mul_add(args_exprs, func);
+            let [a, b, c] = args_exprs.as_slice() else {
+                return Err(syn::Error::new(func.span(), "`fma` takes three arguments"));
+            };
+            return Ok(quote! {
+                ::sile::hir::Expr::Builtin {
+                    op: ::sile::hir::BuiltinOp::Fma,
+                    args: vec![#a, #b, #c],
+                }
+            });
         }
         // `absi(x)` is the larger of `x` and `-x`. The float absolute value is
         // a bit pattern edit a count has no use for, and the comparison form
@@ -1076,27 +1086,6 @@ fn comparison_predicate(arg: &KernelExpr) -> syn::Result<Option<&'static str>> {
     }))
 }
 
-/// The multiply and the add of `fma(a, b, c)`, as two builtins.
-fn fused_mul_add(
-    args_exprs: Vec<proc_macro2::TokenStream>,
-    func: &syn::Ident,
-) -> syn::Result<proc_macro2::TokenStream> {
-    let [a, b, c] = args_exprs.as_slice() else {
-        return Err(syn::Error::new(func.span(), "`fma` takes three arguments"));
-    };
-    Ok(quote! {
-        ::sile::hir::Expr::Builtin {
-            op: ::sile::hir::BuiltinOp::Add,
-            args: vec![
-                ::sile::hir::Expr::Builtin {
-                    op: ::sile::hir::BuiltinOp::Mul,
-                    args: vec![#a, #b],
-                },
-                #c,
-            ],
-        }
-    })
-}
 
 fn lower_method_call(
     receiver: &KernelExpr,

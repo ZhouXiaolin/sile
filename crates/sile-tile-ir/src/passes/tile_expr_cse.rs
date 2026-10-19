@@ -102,6 +102,33 @@ fn expr_key(op: &TileIrOp) -> Option<String> {
         TileIrOp::Broadcast { value, rows, cols } => {
             Some(format!("broadcast:{}:{rows}:{cols}", value.0))
         }
+        TileIrOp::Fma {
+            lhs,
+            rhs,
+            acc,
+            rows,
+            cols,
+        } => Some(format!("fma:{}:{}:{}:{rows}:{cols}", lhs.0, rhs.0, acc.0)),
+        // maxf and minf are commutative, so the pair sorts the way an addf's
+        // does.
+        TileIrOp::MaxF { lhs, rhs, rows, cols } => {
+            let (lhs, rhs) = if lhs.0 > rhs.0 { (*rhs, *lhs) } else { (*lhs, *rhs) };
+            Some(format!("maxf:{}:{}:{rows}:{cols}", lhs.0, rhs.0))
+        }
+        TileIrOp::MinF { lhs, rhs, rows, cols } => {
+            let (lhs, rhs) = if lhs.0 > rhs.0 { (*rhs, *lhs) } else { (*lhs, *rhs) };
+            Some(format!("minf:{}:{}:{rows}:{cols}", lhs.0, rhs.0))
+        }
+        TileIrOp::Select {
+            cond,
+            on_true,
+            on_false,
+            rows,
+            cols,
+        } => Some(format!(
+            "select:{}:{}:{}:{rows}:{cols}",
+            cond.0, on_true.0, on_false.0
+        )),
         TileIrOp::Reshape { value, rows, cols } => {
             Some(format!("reshape:{}:{rows}:{cols}", value.0))
         }
@@ -251,6 +278,44 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
         } => TileIrOp::UnaryF {
             op,
             operand: rewrite(operand),
+            rows,
+            cols,
+        },
+        TileIrOp::Fma {
+            lhs,
+            rhs,
+            acc,
+            rows,
+            cols,
+        } => TileIrOp::Fma {
+            lhs: rewrite(lhs),
+            rhs: rewrite(rhs),
+            acc: rewrite(acc),
+            rows,
+            cols,
+        },
+        TileIrOp::MaxF { lhs, rhs, rows, cols } => TileIrOp::MaxF {
+            lhs: rewrite(lhs),
+            rhs: rewrite(rhs),
+            rows,
+            cols,
+        },
+        TileIrOp::MinF { lhs, rhs, rows, cols } => TileIrOp::MinF {
+            lhs: rewrite(lhs),
+            rhs: rewrite(rhs),
+            rows,
+            cols,
+        },
+        TileIrOp::Select {
+            cond,
+            on_true,
+            on_false,
+            rows,
+            cols,
+        } => TileIrOp::Select {
+            cond: rewrite(cond),
+            on_true: rewrite(on_true),
+            on_false: rewrite(on_false),
             rows,
             cols,
         },
@@ -500,6 +565,11 @@ fn rewrite_map_expr(
         crate::TileMapExpr::Atan2 { lhs, rhs } => crate::TileMapExpr::Atan2 {
             lhs: Box::new(rewrite_map_expr(*lhs, replacements)),
             rhs: Box::new(rewrite_map_expr(*rhs, replacements)),
+        },
+        crate::TileMapExpr::Fma { a, b, c } => crate::TileMapExpr::Fma {
+            a: Box::new(rewrite_map_expr(*a, replacements)),
+            b: Box::new(rewrite_map_expr(*b, replacements)),
+            c: Box::new(rewrite_map_expr(*c, replacements)),
         },
         crate::TileMapExpr::Transpose { value } => crate::TileMapExpr::Transpose {
             value: Box::new(rewrite_map_expr(*value, replacements)),

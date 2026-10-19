@@ -14,8 +14,8 @@ use super::tile_compute::{
     lower_tile_mma_inst, lower_tile_reduce_inst, lower_tile_scan_inst,
 };
 use super::tile_expr::{
-    PointwiseTileDefs, build_pointwise_tile_defs, lower_pointwise_rank1_store_inst,
-    lower_pointwise_rank1_store_map_inst, lower_tile_expr_inst, lower_tile_map_inst,
+    PointwiseTileDefs, build_pointwise_tile_defs, lower_pointwise_store_inst, lower_tile_expr_inst,
+    lower_tile_map_inst,
 };
 use super::tile_memory::{
     lower_tile_constant_inst, lower_tile_load_inst, lower_tile_reshape_inst, lower_tile_store_inst,
@@ -61,50 +61,20 @@ pub(crate) fn lower_block(
             lower_fused_map_reduce_inst(inst.result, fusion, &mut builder);
             continue;
         }
-        if let Some(expr) = pointwise_plan.store_maps.get(&inst.result) {
-            let TileIrOp::StorePtrTko {
-                buf,
-                row_coord,
-                col_coord,
-                rows,
-                cols,
-                ..
-            } = &inst.op
-            else {
-                unreachable!("store map plan must only be attached to store ops");
-            };
-            lower_pointwise_rank1_store_map_inst(
-                *buf,
-                expr.clone(),
-                *row_coord,
-                *col_coord,
-                *rows,
-                *cols,
-                &mut builder,
-            );
-            continue;
-        }
-        if let Some(pending_tiles) = pointwise_plan.store_fusions.get(&inst.result) {
-            let TileIrOp::StorePtrTko {
-                buf,
-                value,
-                row_coord,
-                col_coord,
-                rows,
-                cols,
-                ..
-            } = &inst.op
-            else {
+        if let Some(plan) = pointwise_plan.store_fusions.get(&inst.result) {
+            let TileIrOp::StorePtrTko { buf, .. } = &inst.op else {
                 unreachable!("store fusion plan must only be attached to store ops");
             };
-            lower_pointwise_rank1_store_inst(
+            lower_pointwise_store_inst(
                 *buf,
-                *value,
-                *row_coord,
-                *col_coord,
-                *rows,
-                *cols,
-                pending_tiles.clone(),
+                plan.value,
+                &plan.outer_coords,
+                plan.row_coord,
+                plan.col_coord,
+                plan.rows,
+                plan.cols,
+                plan.stride_shape_idx,
+                plan.pending_tiles.clone(),
                 &mut builder,
             );
             continue;
@@ -146,7 +116,19 @@ pub(crate) fn lower_block(
             | TileIrOp::MulF { rows, cols, .. }
             | TileIrOp::DivF { rows, cols, .. }
             | TileIrOp::UnaryF { rows, cols, .. }
-            | TileIrOp::Broadcast { rows, cols, .. } => {
+            | TileIrOp::Fma { rows, cols, .. }
+            | TileIrOp::Select { rows, cols, .. }
+            | TileIrOp::MaxF { rows, cols, .. }
+            | TileIrOp::MinF { rows, cols, .. }
+            | TileIrOp::Broadcast { rows, cols, .. }
+                // A pointwise op over tiles fills private storage. Over
+                // scalars it is one value, which the scalar path spells
+                // without a loop: `min` of two counts must stay a count.
+                if matches!(
+                    builder.tile_ir().types.get(&inst.result),
+                    Some(TileIrType::Tile { .. })
+                ) =>
+            {
                 let pending_tiles = pointwise_plan
                     .expr_fusions
                     .get(&inst.result)
@@ -374,8 +356,7 @@ pub(crate) fn lower_block(
 
 struct PointwiseLoweringPlan {
     mma_fusions: HashMap<ValueId, MmaFusionPlan>,
-    store_maps: HashMap<ValueId, TileMapExpr>,
-    store_fusions: HashMap<ValueId, PointwiseTileDefs>,
+    store_fusions: HashMap<ValueId, PointwiseStorePlan>,
     expr_fusions: HashMap<ValueId, PointwiseTileDefs>,
     load_reduce_fusions: HashMap<ValueId, LoadReduceFusion>,
     map_reduce_fusions: HashMap<ValueId, MapReduceFusion>,
@@ -409,7 +390,6 @@ impl PointwiseLoweringPlan {
         let mut skipped_values = HashSet::new();
 
         let mut mma_fusions = HashMap::new();
-        let mut store_maps = HashMap::new();
         let mut store_fusions = HashMap::new();
         let mut expr_fusions = HashMap::new();
         let mut load_reduce_fusions = HashMap::new();
@@ -509,18 +489,24 @@ impl PointwiseLoweringPlan {
         }
 
         for inst in &block.insts {
-            let TileIrOp::StorePtrTko { buf, value, .. } = &inst.op else {
+            let TileIrOp::StorePtrTko {
+                buf,
+                value,
+                outer_coords,
+                row_coord,
+                col_coord,
+                rows,
+                cols,
+                stride_shape_idx,
+                ..
+            } = &inst.op
+            else {
                 continue;
             };
-            if buffer_rank_of(*buf, tile_ir) != 1 {
+            // A rank-0 output receives one scalar per program through an
+            // atomic add, so there is no tile walk to fuse into.
+            if buffer_rank_of(*buf, tile_ir) == 0 {
                 continue;
-            }
-            if let Some(TileIrOp::Map { expr, .. }) = defs.get(value) {
-                if use_counts.get(value).copied().unwrap_or(0) == 1 {
-                    store_maps.insert(inst.result, expr.clone());
-                    skipped_values.insert(*value);
-                    continue;
-                }
             }
             let Some(pending_tiles) =
                 build_pointwise_tile_defs(*value, &defs, tile_ir, &use_counts, true)
@@ -528,7 +514,19 @@ impl PointwiseLoweringPlan {
                 continue;
             };
             skipped_values.extend(pending_tiles.keys().copied());
-            store_fusions.insert(inst.result, pending_tiles);
+            store_fusions.insert(
+                inst.result,
+                PointwiseStorePlan {
+                    value: *value,
+                    outer_coords: outer_coords.clone(),
+                    row_coord: *row_coord,
+                    col_coord: *col_coord,
+                    rows: *rows,
+                    cols: *cols,
+                    stride_shape_idx: *stride_shape_idx,
+                    pending_tiles,
+                },
+            );
         }
 
         for inst in &block.insts {
@@ -542,6 +540,20 @@ impl PointwiseLoweringPlan {
                 | TileIrOp::DivF { rows, cols, .. }
                 | TileIrOp::UnaryF { rows, cols, .. }
                 | TileIrOp::Broadcast { rows, cols, .. } => Some((*rows, *cols)),
+                // A chain root must fill storage; a scalar root is spelled in
+                // place by the scalar path, so it never becomes a fusion.
+                TileIrOp::Fma { rows, cols, .. }
+                | TileIrOp::Select { rows, cols, .. }
+                | TileIrOp::MaxF { rows, cols, .. }
+                | TileIrOp::MinF { rows, cols, .. }
+                    if matches!(
+                        tile_ir.types.get(&inst.result),
+                        Some(TileIrType::Tile { .. })
+                    ) =>
+                {
+                    Some((*rows, *cols))
+                }
+                _ => None,
                 _ => None,
             };
             if rows_cols.is_none() {
@@ -657,7 +669,6 @@ impl PointwiseLoweringPlan {
 
         Self {
             mma_fusions,
-            store_maps,
             store_fusions,
             expr_fusions,
             load_reduce_fusions,
@@ -666,6 +677,23 @@ impl PointwiseLoweringPlan {
             skipped_values,
         }
     }
+}
+
+/// One store lowered as the tail of a pointwise chain.
+///
+/// The chain's tiles are evaluated element by element straight into the output
+/// buffer, so no private tile is allocated and no second loop reads it back.
+/// `pending_tiles` holds every chain step including the root; a chain whose
+/// root is a `Map` looks the same as one of plain arithmetic.
+struct PointwiseStorePlan {
+    value: ValueId,
+    outer_coords: Vec<ValueId>,
+    row_coord: ValueId,
+    col_coord: ValueId,
+    rows: i64,
+    cols: i64,
+    stride_shape_idx: usize,
+    pending_tiles: PointwiseTileDefs,
 }
 
 #[derive(Clone, Copy)]

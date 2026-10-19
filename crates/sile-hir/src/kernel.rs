@@ -63,6 +63,12 @@ pub enum BuiltinOp {
     Ne,
     /// `select(cond, a, b)`: `a` where `cond` is non-zero, else `b`.
     Select,
+    /// `fma(a, b, c)`: `a * b + c` with one rounding.
+    ///
+    /// CuTile names the fused form as one operation, and so do the targets
+    /// that have the instruction; the lowering keeps it whole so the pipeline
+    /// sees the fusion the kernel wrote.
+    Fma,
     /// `iota(shape![N])`: the rank-one sequence `0, 1, …, N-1`.
     ///
     /// CuTile names it as one operation, so it stays one here. The sequence is

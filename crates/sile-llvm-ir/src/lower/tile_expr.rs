@@ -3,13 +3,14 @@ use std::collections::HashMap;
 use crate as llvm_ir;
 
 use crate::lower::core::{
-    BlockLowerer, LowerLlvmIrCtx, alloc_tile_result, buffer_rank_of, const_f32, const_i64,
+    BlockLowerer, LowerLlvmIrCtx, alloc_tile_result, buffer_elem_of, buffer_rank_of, const_f32,
+    const_i64,
     emit_bin, emit_cast, emit_cmp, emit_gep, emit_intrinsic, emit_load, emit_select, emit_store,
     load_tile_scalar_dynamic, lower_1d_tile_coord, lower_bin_op, lower_cmp_pred,
     lower_float_cmp_pred, lower_nested_tile_loop, resolve_operand, tile_dims_of,
 };
 
-use super::tile_memory::emit_strided_element_index;
+use super::tile_memory::{build_buffer_index_base, emit_buffer_store, emit_strided_element_index};
 use sile_tile_ir::{CmpOp, TileIrFunction, TileIrOp, TileIrType, TileMapExpr, UnaryOp, ValueId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -91,18 +92,21 @@ pub(crate) fn lower_tile_expr_inst(
     );
 }
 
-pub(crate) fn lower_pointwise_rank1_store_inst(
+pub(crate) fn lower_pointwise_store_inst(
     buf: ValueId,
     value: ValueId,
+    outer_coords: &[ValueId],
     row_coord: ValueId,
     col_coord: ValueId,
     rows: i64,
     cols: i64,
+    stride_shape_idx: usize,
     pending_tiles: PointwiseTileDefs,
     builder: &mut BlockLowerer<'_>,
 ) {
     let buf_operand = resolve_operand(buf, builder.ctx());
-    let (fused_load_bases, store_base) = builder.with_current_insts(|ctx, tile_ir, out| {
+    let rank = buffer_rank_of(buf, builder.tile_ir());
+    let (fused_load_bases, index_base, elem) = builder.with_current_insts(|ctx, tile_ir, out| {
         let mut bases = HashMap::new();
         let mut coord_bases = HashMap::new();
         collect_fused_load_bases(
@@ -114,15 +118,21 @@ pub(crate) fn lower_pointwise_rank1_store_inst(
             &mut bases,
             &mut coord_bases,
         );
-        let store_base = get_or_create_1d_tile_base(
-            row_coord,
-            col_coord,
-            rows * cols,
+        let row_operand = resolve_operand(row_coord, ctx);
+        let col_operand = resolve_operand(col_coord, ctx);
+        let index_base = build_buffer_index_base(
             ctx,
             out,
-            &mut coord_bases,
+            buf_operand.clone(),
+            outer_coords,
+            row_operand,
+            col_operand,
+            rows,
+            cols,
+            stride_shape_idx,
+            rank,
         );
-        (bases, store_base)
+        (bases, index_base, buffer_elem_of(buf, tile_ir))
     });
 
     let prefix = format!("tile_pointwise_store_{}", value.0);
@@ -142,42 +152,16 @@ pub(crate) fn lower_pointwise_rank1_store_inst(
                 &fused_load_bases,
                 out,
             );
-            let element_offset = if rows == 1 {
-                col
-            } else {
-                let row_offset = emit_bin(
-                    ctx,
-                    out,
-                    llvm_ir::BinOp::Mul,
-                    row,
-                    const_i64(cols),
-                    llvm_ir::Type::I64,
-                );
-                emit_bin(
-                    ctx,
-                    out,
-                    llvm_ir::BinOp::Add,
-                    row_offset,
-                    col,
-                    llvm_ir::Type::I64,
-                )
-            };
-            let linear_index = emit_bin(
-                ctx,
-                out,
-                llvm_ir::BinOp::Add,
-                store_base.clone(),
-                element_offset,
-                llvm_ir::Type::I64,
-            );
-            let dst_ptr = emit_gep(
+            emit_buffer_store(
                 ctx,
                 out,
                 buf_operand.clone(),
-                vec![linear_index],
-                llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, llvm_ir::Type::F32),
+                &index_base,
+                row,
+                col,
+                scalar,
+                &elem,
             );
-            emit_store(out, dst_ptr, scalar);
         },
     );
 }
@@ -240,88 +224,6 @@ pub(crate) fn lower_tile_map_inst(
                 dst_tile.clone(),
                 vec![row, col],
                 llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::F32),
-            );
-            emit_store(out, dst_ptr, scalar);
-        },
-    );
-}
-
-pub(crate) fn lower_pointwise_rank1_store_map_inst(
-    buf: ValueId,
-    expr: TileMapExpr,
-    row_coord: ValueId,
-    col_coord: ValueId,
-    rows: i64,
-    cols: i64,
-    builder: &mut BlockLowerer<'_>,
-) {
-    let buf_operand = resolve_operand(buf, builder.ctx());
-    let (fused_load_bases, store_base) = builder.with_current_insts(|ctx, tile_ir, out| {
-        let mut bases = HashMap::new();
-        let mut coord_bases = HashMap::new();
-        collect_map_load_bases(&expr, ctx, tile_ir, out, &mut bases, &mut coord_bases);
-        let store_base = get_or_create_1d_tile_base(
-            row_coord,
-            col_coord,
-            rows * cols,
-            ctx,
-            out,
-            &mut coord_bases,
-        );
-        (bases, store_base)
-    });
-
-    let prefix = format!("tile_map_store_{}", buf.0);
-    lower_nested_tile_loop(
-        builder,
-        prefix.as_str(),
-        rows,
-        cols,
-        move |ctx, tile_ir, out, row, col| {
-            let scalar = eval_map_expr_scalar(
-                &expr,
-                row.clone(),
-                col.clone(),
-                ctx,
-                tile_ir,
-                &fused_load_bases,
-                out,
-                false,
-            );
-            let element_offset = if rows == 1 {
-                col
-            } else {
-                let row_offset = emit_bin(
-                    ctx,
-                    out,
-                    llvm_ir::BinOp::Mul,
-                    row,
-                    const_i64(cols),
-                    llvm_ir::Type::I64,
-                );
-                emit_bin(
-                    ctx,
-                    out,
-                    llvm_ir::BinOp::Add,
-                    row_offset,
-                    col,
-                    llvm_ir::Type::I64,
-                )
-            };
-            let linear_index = emit_bin(
-                ctx,
-                out,
-                llvm_ir::BinOp::Add,
-                store_base.clone(),
-                element_offset,
-                llvm_ir::Type::I64,
-            );
-            let dst_ptr = emit_gep(
-                ctx,
-                out,
-                buf_operand.clone(),
-                vec![linear_index],
-                llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, llvm_ir::Type::F32),
             );
             emit_store(out, dst_ptr, scalar);
         },
@@ -518,6 +420,91 @@ fn eval_tile_scalar(
                     out,
                 );
             }
+            TileIrOp::Map { expr, .. } => {
+                // The map's bases were collected with the rest of the chain's
+                // before the loop, so the expression reads them here.
+                return eval_map_expr_scalar(
+                    &expr,
+                    row,
+                    col,
+                    ctx,
+                    tile_ir,
+                    fused_load_bases,
+                    out,
+                    false,
+                );
+            }
+            // A top-level `fma` reads as the map expression of the same name:
+            // the product and the add share one rounding.
+            TileIrOp::Fma { lhs, rhs, acc, .. } => {
+                let expr = TileMapExpr::Fma {
+                    a: Box::new(TileMapExpr::Value(lhs)),
+                    b: Box::new(TileMapExpr::Value(rhs)),
+                    c: Box::new(TileMapExpr::Value(acc)),
+                };
+                return eval_map_expr_scalar(
+                    &expr,
+                    row,
+                    col,
+                    ctx,
+                    tile_ir,
+                    fused_load_bases,
+                    out,
+                    false,
+                );
+            }
+            // An extreme is the select the old lowering spelled: one
+            // comparison of the two operands, picking between them. A count
+            // pair stays a count, so the type follows the left operand.
+            TileIrOp::MaxF { lhs, rhs, .. } => {
+                return eval_tile_extreme(
+                    CmpOp::Ge,
+                    lhs,
+                    rhs,
+                    row,
+                    col,
+                    ctx,
+                    tile_ir,
+                    fused_load_bases,
+                    out,
+                );
+            }
+            TileIrOp::MinF { lhs, rhs, .. } => {
+                return eval_tile_extreme(
+                    CmpOp::Le,
+                    lhs,
+                    rhs,
+                    row,
+                    col,
+                    ctx,
+                    tile_ir,
+                    fused_load_bases,
+                    out,
+                );
+            }
+            TileIrOp::Select {
+                cond,
+                on_true,
+                on_false,
+                ..
+            } => {
+                let expr = TileMapExpr::Select {
+                    cond: Box::new(TileMapExpr::Value(cond)),
+                    on_true: Box::new(TileMapExpr::Value(on_true)),
+                    on_false: Box::new(TileMapExpr::Value(on_false)),
+                };
+                let count = map_expr_is_count(&expr, tile_ir);
+                return eval_map_expr_scalar(
+                    &expr,
+                    row,
+                    col,
+                    ctx,
+                    tile_ir,
+                    fused_load_bases,
+                    out,
+                    count,
+                );
+            }
             _ => {}
         }
     }
@@ -530,6 +517,36 @@ fn eval_tile_scalar(
     }
 
     load_tile_scalar_dynamic(ctx, out, resolve_operand(value, ctx), row, col)
+}
+
+/// One extreme read as the select it is: a comparison of the two operands
+/// picking between them, the way `lower_extreme` used to spell it before the
+/// operation became a CuTile op of its own.
+#[allow(clippy::too_many_arguments)]
+fn eval_tile_extreme(
+    cmp_op: CmpOp,
+    lhs: ValueId,
+    rhs: ValueId,
+    row: llvm_ir::Operand,
+    col: llvm_ir::Operand,
+    ctx: &mut LowerLlvmIrCtx,
+    tile_ir: &TileIrFunction,
+    fused_load_bases: &HashMap<ValueId, llvm_ir::Operand>,
+    out: &mut Vec<llvm_ir::Inst>,
+) -> llvm_ir::Operand {
+    // A count pair stays a count; the type follows the left operand, the way
+    // `map_expr_is_count` reads a value.
+    let count = matches!(tile_ir.types.get(&lhs), Some(TileIrType::I64));
+    let expr = TileMapExpr::Select {
+        cond: Box::new(TileMapExpr::Cmp {
+            op: cmp_op,
+            lhs: Box::new(TileMapExpr::Value(lhs)),
+            rhs: Box::new(TileMapExpr::Value(rhs)),
+        }),
+        on_true: Box::new(TileMapExpr::Value(lhs)),
+        on_false: Box::new(TileMapExpr::Value(rhs)),
+    };
+    eval_map_expr_scalar(&expr, row, col, ctx, tile_ir, fused_load_bases, out, count)
 }
 
 fn collect_fused_load_bases(
@@ -583,10 +600,34 @@ fn collect_fused_load_bases(
                 coord_bases,
             );
         }
+        TileIrOp::Fma { lhs, rhs, acc, .. } => {
+            collect_fused_load_bases(lhs, pending_tiles, ctx, tile_ir, out, bases, coord_bases);
+            collect_fused_load_bases(rhs, pending_tiles, ctx, tile_ir, out, bases, coord_bases);
+            collect_fused_load_bases(acc, pending_tiles, ctx, tile_ir, out, bases, coord_bases);
+        }
+        TileIrOp::MaxF { lhs, rhs, .. } | TileIrOp::MinF { lhs, rhs, .. } => {
+            collect_fused_load_bases(lhs, pending_tiles, ctx, tile_ir, out, bases, coord_bases);
+            collect_fused_load_bases(rhs, pending_tiles, ctx, tile_ir, out, bases, coord_bases);
+        }
+        TileIrOp::Select {
+            cond,
+            on_true,
+            on_false,
+            ..
+        } => {
+            collect_fused_load_bases(cond, pending_tiles, ctx, tile_ir, out, bases, coord_bases);
+            collect_fused_load_bases(on_true, pending_tiles, ctx, tile_ir, out, bases, coord_bases);
+            collect_fused_load_bases(on_false, pending_tiles, ctx, tile_ir, out, bases, coord_bases);
+        }
         // A broadcast of a scalar has no load to hoist, and the recursive call
         // returns immediately when the source is not a pending tile.
         TileIrOp::Broadcast { value, .. } => {
             collect_fused_load_bases(value, pending_tiles, ctx, tile_ir, out, bases, coord_bases);
+        }
+        // A map in the chain reads its expression's operands through the map
+        // bases, collected here into the same table the fused loads use.
+        TileIrOp::Map { expr, .. } => {
+            collect_map_load_bases(&expr, ctx, tile_ir, out, bases, coord_bases);
         }
         _ => {}
     }
@@ -639,6 +680,11 @@ pub(crate) fn collect_map_load_bases(
         | TileMapExpr::Atan2 { lhs, rhs } => {
             collect_map_load_bases(lhs, ctx, tile_ir, out, bases, coord_bases);
             collect_map_load_bases(rhs, ctx, tile_ir, out, bases, coord_bases);
+        }
+        TileMapExpr::Fma { a, b, c } => {
+            collect_map_load_bases(a, ctx, tile_ir, out, bases, coord_bases);
+            collect_map_load_bases(b, ctx, tile_ir, out, bases, coord_bases);
+            collect_map_load_bases(c, ctx, tile_ir, out, bases, coord_bases);
         }
         TileMapExpr::Unary { operand, .. } => {
             collect_map_load_bases(operand, ctx, tile_ir, out, bases, coord_bases);
@@ -924,6 +970,36 @@ pub(crate) fn eval_map_expr_scalar(
                 llvm_ir::Type::F32,
             )
         }
+        TileMapExpr::Fma { a, b, c } => {
+            let a = eval_map_expr_scalar(
+                a,
+                row.clone(),
+                col.clone(),
+                ctx,
+                tile_ir,
+                fused_load_bases,
+                out,
+                count,
+            );
+            let b = eval_map_expr_scalar(
+                b,
+                row.clone(),
+                col.clone(),
+                ctx,
+                tile_ir,
+                fused_load_bases,
+                out,
+                count,
+            );
+            let c = eval_map_expr_scalar(c, row, col, ctx, tile_ir, fused_load_bases, out, count);
+            emit_intrinsic(
+                ctx,
+                out,
+                llvm_ir::Intrinsic::Fma,
+                vec![a, b, c],
+                llvm_ir::Type::F32,
+            )
+        }
         TileMapExpr::Unary { op, operand } => {
             let operand = eval_map_expr_scalar(
                 operand,
@@ -1126,6 +1202,7 @@ fn map_expr_is_count(expr: &TileMapExpr, tile_ir: &TileIrFunction) -> bool {
         | TileMapExpr::Unary { .. }
         | TileMapExpr::Pow { .. }
         | TileMapExpr::Atan2 { .. }
+        | TileMapExpr::Fma { .. }
         | TileMapExpr::Iota
         | TileMapExpr::Broadcast { .. }
         | TileMapExpr::Transpose { .. }
@@ -1401,6 +1478,77 @@ fn collect_pointwise_tile_defs(
                 return false;
             }
         }
+        // A scalar form of these ops stays out of a chain: the chain is
+        // spelled element by element, and a count read as an element there
+        // would say the wrong type.
+        TileIrOp::Fma { lhs, rhs, acc, .. }
+            if !matches!(tile_ir.types.get(&value), Some(TileIrType::Tile { .. })) =>
+        {
+            return false
+        }
+        TileIrOp::Fma { lhs, rhs, acc, .. } => {
+            for operand in [lhs, rhs, acc] {
+                if !collect_pointwise_tile_defs(
+                    root,
+                    *operand,
+                    defs,
+                    tile_ir,
+                    use_counts,
+                    require_single_use_root,
+                    pending_tiles,
+                ) {
+                    return false;
+                }
+            }
+        }
+        TileIrOp::MaxF { lhs, rhs, .. } | TileIrOp::MinF { lhs, rhs, .. }
+            if !matches!(tile_ir.types.get(&value), Some(TileIrType::Tile { .. })) =>
+        {
+            return false
+        }
+        TileIrOp::MaxF { lhs, rhs, .. } | TileIrOp::MinF { lhs, rhs, .. } => {
+            for operand in [lhs, rhs] {
+                if !collect_pointwise_tile_defs(
+                    root,
+                    *operand,
+                    defs,
+                    tile_ir,
+                    use_counts,
+                    require_single_use_root,
+                    pending_tiles,
+                ) {
+                    return false;
+                }
+            }
+        }
+        TileIrOp::Select {
+            cond,
+            on_true,
+            on_false,
+            ..
+        } if !matches!(tile_ir.types.get(&value), Some(TileIrType::Tile { .. })) => {
+            return false
+        }
+        TileIrOp::Select {
+            cond,
+            on_true,
+            on_false,
+            ..
+        } => {
+            for operand in [cond, on_true, on_false] {
+                if !collect_pointwise_tile_defs(
+                    root,
+                    *operand,
+                    defs,
+                    tile_ir,
+                    use_counts,
+                    require_single_use_root,
+                    pending_tiles,
+                ) {
+                    return false;
+                }
+            }
+        }
         TileIrOp::Broadcast { value, .. } => {
             // A broadcast of a scalar has nothing to collect: the source is the
             // value itself, and the map reads it as an operand.
@@ -1417,6 +1565,12 @@ fn collect_pointwise_tile_defs(
             {
                 return false;
             }
+        }
+        TileIrOp::Map { .. } => {
+            // A map joins a chain as one step. Its expression's tile operands
+            // stay out of the chain — the map reads them from their own
+            // storage — so the walk does not descend into the expression, and
+            // only the map itself becomes a pending value.
         }
         _ => return false,
     }

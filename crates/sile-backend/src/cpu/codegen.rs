@@ -497,6 +497,12 @@ fn intrinsic_name(intrinsic: &llvm_ir::Intrinsic) -> String {
                 .binary_float_function()
                 .expect("a binary float function has a name")
         ),
+        llvm_ir::Intrinsic::Fma => format!(
+            "{}f",
+            intrinsic
+                .ternary_float_function()
+                .expect("a ternary float function has a name")
+        ),
         llvm_ir::Intrinsic::VecLoad { len } => format!("llir_vec_load_{}", len),
         llvm_ir::Intrinsic::VecStore { len } => format!("llir_vec_store_{}", len),
         llvm_ir::Intrinsic::VecReduceAdd => "llir_vec_reduce_add".to_string(),

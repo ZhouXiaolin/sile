@@ -75,19 +75,36 @@ pub fn format_tile_ir(func: &TileIrFunction) -> String {
         }
 
         for inst in &block.insts {
+            let op_text = format_tile_ir_op(&inst.op);
+            // An mmaf names its operand types itself, in the CuTile order;
+            // the accumulator type among them is the result.
+            if matches!(inst.op, TileIrOp::MmaF { .. }) {
+                writeln!(&mut out, "      {} = {}", inst.result, op_text).unwrap();
+                continue;
+            }
+            // A select names the condition's type next to the result's, the
+            // way the CuTile printer spells it.
+            if let TileIrOp::Select { cond, .. } = &inst.op {
+                let cond_ty = func
+                    .types
+                    .get(cond)
+                    .map(format_tile_ir_type)
+                    .unwrap_or("?".into());
+                let ty = func
+                    .types
+                    .get(&inst.result)
+                    .map(format_tile_ir_type)
+                    .unwrap_or("?".into());
+                writeln!(&mut out, "      {} = {} : {}, {}", inst.result, op_text, cond_ty, ty)
+                    .unwrap();
+                continue;
+            }
             let ty = func
                 .types
                 .get(&inst.result)
                 .map(format_tile_ir_type)
                 .unwrap_or("?".into());
-            writeln!(
-                &mut out,
-                "      {} = {} : {}",
-                inst.result,
-                format_tile_ir_op(&inst.op),
-                ty
-            )
-            .unwrap();
+            writeln!(&mut out, "      {} = {} : {}", inst.result, op_text, ty).unwrap();
         }
 
         writeln!(
@@ -165,6 +182,22 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
         TileIrOp::SubF { lhs, rhs, .. } => format!("subf {lhs}, {rhs}"),
         TileIrOp::MulF { lhs, rhs, .. } => format!("mulf {lhs}, {rhs}"),
         TileIrOp::DivF { lhs, rhs, .. } => format!("divf {lhs}, {rhs}"),
+        // The spellings the CuTile printer uses: `fma $lhs, $rhs, $acc`,
+        // `select $cond, $val_if_true, $val_if_false`, `maxf`, `minf`.
+        TileIrOp::Fma {
+            lhs,
+            rhs,
+            acc,
+            ..
+        } => format!("fma {lhs}, {rhs}, {acc}"),
+        TileIrOp::Select {
+            cond,
+            on_true,
+            on_false,
+            ..
+        } => format!("select {cond}, {on_true}, {on_false}"),
+        TileIrOp::MaxF { lhs, rhs, .. } => format!("maxf {lhs}, {rhs}"),
+        TileIrOp::MinF { lhs, rhs, .. } => format!("minf {lhs}, {rhs}"),
         TileIrOp::UnaryF { op, operand, .. } => format!("{} {operand}", unary_name(*op)),
         TileIrOp::MmaF {
             a,
@@ -174,7 +207,12 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
             tile_n,
             tile_k,
         } => {
-            format!("mmaf {a}, {b}, {acc} {{m = {tile_m}, n = {tile_n}, k = {tile_k}}}")
+            // The shapes ride on the operand types, the way the CuTile
+            // printer spells them: there is no m/n/k attribute to keep in
+            // step with the types.
+            format!(
+                "mmaf {a}, {b}, {acc} : tile<{tile_m}x{tile_k}xf32>, tile<{tile_k}x{tile_n}xf32>, tile<{tile_m}x{tile_n}xf32>"
+            )
         }
         TileIrOp::ReduceSum {
             value,
@@ -183,7 +221,7 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
             in_cols,
         } => {
             format!(
-                "reduce {value} {{axis = {axis}, combiner = \"sum\", input_shape = [{in_rows}, {in_cols}]}}"
+                "reduce {value} {{dim = {axis}, combiner = \"sum\", input_shape = [{in_rows}, {in_cols}]}}"
             )
         }
         TileIrOp::ReduceMax {
@@ -193,7 +231,7 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
             in_cols,
         } => {
             format!(
-                "reduce {value} {{axis = {axis}, combiner = \"max\", input_shape = [{in_rows}, {in_cols}]}}"
+                "reduce {value} {{dim = {axis}, combiner = \"max\", input_shape = [{in_rows}, {in_cols}]}}"
             )
         }
         TileIrOp::ReduceMin {
@@ -203,7 +241,7 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
             in_cols,
         } => {
             format!(
-                "reduce {value} {{axis = {axis}, combiner = \"min\", input_shape = [{in_rows}, {in_cols}]}}"
+                "reduce {value} {{dim = {axis}, combiner = \"min\", input_shape = [{in_rows}, {in_cols}]}}"
             )
         }
         TileIrOp::ReduceProd {
@@ -213,7 +251,7 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
             in_cols,
         } => {
             format!(
-                "reduce {value} {{axis = {axis}, combiner = \"prod\", input_shape = [{in_rows}, {in_cols}]}}"
+                "reduce {value} {{dim = {axis}, combiner = \"prod\", input_shape = [{in_rows}, {in_cols}]}}"
             )
         }
         TileIrOp::Scan {
@@ -232,7 +270,7 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
                 crate::ir::ReduceCombiner::Min => "min",
             };
             format!(
-                "scan {value} {{axis = {axis}, combiner = \"{combiner}\", reverse = {reverse}, input_shape = [{in_rows}, {in_cols}]}}"
+                "scan {value} {{dim = {axis}, combiner = \"{combiner}\", reverse = {reverse}, input_shape = [{in_rows}, {in_cols}]}}"
             )
         }
         TileIrOp::Cat {
@@ -245,7 +283,7 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
             rhs_cols,
         } => {
             format!(
-                "cat {lhs}, {rhs} {{axis = {axis}, lhs_shape = [{lhs_rows}, {lhs_cols}], rhs_shape = [{rhs_rows}, {rhs_cols}]}}"
+                "cat {lhs}, {rhs} {{dim = {axis}, lhs_shape = [{lhs_rows}, {lhs_cols}], rhs_shape = [{rhs_rows}, {rhs_cols}]}}"
             )
         }
         TileIrOp::ExtractSlice {
@@ -300,10 +338,12 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
             format!("{} {lhs}, {rhs}", format_tile_binary_op(*op, true))
         }
         TileIrOp::ICmp { op, lhs, rhs } => {
-            format!("cmpi \"{op}\" {lhs}, {rhs}")
+            format!("cmpi {} {lhs}, {rhs}, signed", comparison_predicate_name(*op))
         }
         TileIrOp::ConstI64(v) => format!("constant <i64: {v}>"),
-        TileIrOp::ConstF64(v) => format!("constant <f64: {}>", format_float_literal(*v)),
+        // The value is held wide, but the tile type system only carries f32
+        // scalars: the element spelling names the type the result has.
+        TileIrOp::ConstF64(v) => format!("constant <f32: {}>", format_float_literal(*v)),
         TileIrOp::ShapeDim { shape, dim } => format!("sile.shape_dim {shape} {{dim = {dim}}}"),
         TileIrOp::GridDim { dim } => format!("sile.grid_dim {{dim = {dim}}}"),
         TileIrOp::NumTiles {
@@ -391,6 +431,12 @@ fn format_tile_map_expr(expr: &TileMapExpr) -> String {
                 format_tile_map_expr(rhs)
             )
         }
+        TileMapExpr::Fma { a, b, c } => format!(
+            "fma({}, {}, {})",
+            format_tile_map_expr(a),
+            format_tile_map_expr(b),
+            format_tile_map_expr(c)
+        ),
         TileMapExpr::Select {
             cond,
             on_true,
@@ -524,5 +570,17 @@ fn format_float_literal(value: f64) -> String {
         format!("{value:.1}")
     } else {
         value.to_string()
+    }
+}
+
+/// The predicate spelling the CuTile printer uses, per its name table.
+fn comparison_predicate_name(op: CmpOp) -> &'static str {
+    match op {
+        CmpOp::Lt => "less_than",
+        CmpOp::Le => "less_than_or_equal",
+        CmpOp::Gt => "greater_than",
+        CmpOp::Ge => "greater_than_or_equal",
+        CmpOp::Eq => "equal",
+        CmpOp::Ne => "not_equal",
     }
 }
