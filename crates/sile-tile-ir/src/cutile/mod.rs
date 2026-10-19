@@ -11,7 +11,9 @@
 
 pub mod bounds;
 pub mod emit;
+pub mod predicate;
 pub mod print;
+pub mod value_ids;
 
 use std::fmt;
 

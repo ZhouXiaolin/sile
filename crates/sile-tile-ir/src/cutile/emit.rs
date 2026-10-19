@@ -76,6 +76,19 @@ struct Builder {
     /// emitter keeps walking so the message names every axis, and `emit`
     /// hands the first one back.
     errors: Vec<String>,
+    /// The access checks the compiler could not decide but the host can.
+    ///
+    /// These leave the kernel: the emitted text carries no `assert`, and the
+    /// launcher evaluates each predicate against the real tensor extents before
+    /// it launches. A check lands here when its goal ranges only over
+    /// launch-known quantities.
+    launch_checks: Vec<super::predicate::LaunchCheck>,
+    /// The goals already known true at this point in the body.
+    ///
+    /// A goal that is believed needs no check: the JIT rung of the proof ladder
+    /// is exactly "a dominating assumption entails it". Canonical predicates
+    /// make that a set membership, so the set is what the rung reads.
+    assumptions: Vec<super::predicate::Predicate>,
     body: Vec<Stmt>,
     args: Vec<(ValueId, super::Type)>,
     /// Every tensor parameter, by name, with what the body needs to reach it.
@@ -86,6 +99,16 @@ struct Builder {
     values: Vec<(String, ValueId, Option<super::Type>)>,
     /// The type of every binding, as `sile-hir`'s checker recorded it.
     locals: std::collections::BTreeMap<String, Type>,
+    /// The canonical linear term of every integer binding, for the goals an
+    /// access check states.
+    ///
+    /// `bounds` answers "is this a single value"; a term answers "is this equal
+    /// to that", which is what a launch-stage goal needs. Both are filled from
+    /// the same places, and neither replaces the other.
+    terms: Vec<(String, super::predicate::Term)>,
+    /// The stable id of every binding, so an induction variable can be named by
+    /// its identity rather than by its name.
+    value_ids: super::value_ids::ValueIds,
     /// The interval of every integer binding known at compile time.
     ///
     /// cutile folds an integer expression whose interval is a single value into
@@ -135,6 +158,9 @@ struct Builder {
 /// What the body knows about one tensor parameter.
 #[derive(Clone)]
 struct Tensor {
+    /// The parameter this tensor came from. A launch check names its operands by
+    /// parameter position, so the name is what ties a view back to one.
+    name: String,
     /// The view a `partition` already built, when this tensor is one.
     partition_view: Option<ValueId>,
     /// The view the prologue built for it.
@@ -334,6 +360,101 @@ fn literal_comparison(
 /// none, so cutile leaves it to the launch grid. An index whose range exceeds
 /// the tile count of a *dynamic* extent is the one case that costs ops:
 /// `ceil(extent / tile)` is only known at run time, so the check is emitted.
+/// Record what a `for` over `num_tiles(&p, axis)` proves about its variable.
+///
+/// The loop walks exactly the tiles of that axis, so every value it visits is
+/// inside the grid. Stating that as a predicate — rather than as an interval —
+/// is what lets a goal over tile counts be discharged: `TileCount` is an atom,
+/// and no arithmetic relationship to it is otherwise known.
+fn assume_loop_over_tile_count(
+    builder: &mut Builder,
+    kernel: &Kernel,
+    var: &str,
+    end: &sile_hir::Expr,
+) {
+    use sile_hir::{BuiltinOp, Expr};
+    use super::predicate::{Atom, Predicate, Term};
+    let Expr::Builtin {
+        op: BuiltinOp::NumTiles,
+        args,
+    } = end
+    else {
+        return;
+    };
+    let Some(Expr::Var(tensor_name)) = args.first() else {
+        return;
+    };
+    let axis = match args.get(1) {
+        Some(Expr::ScalarI64(axis)) => *axis as usize,
+        _ => return,
+    };
+    // The name may be a partition rather than the parameter itself, so the
+    // tensor it resolved to is what knows which parameter it came from.
+    let Some(tensor) = builder.tensors.iter().find(|(n, _)| n == tensor_name) else {
+        return;
+    };
+    let Some(param) = buffer_param_position(kernel, &tensor.1.name) else {
+        return;
+    };
+    let Some(tile) = tensor.1.tile.get(axis).copied().flatten().filter(|t| *t > 0) else {
+        return;
+    };
+    let Some(iv) = builder.value_ids.id(var) else {
+        return;
+    };
+    let index = Term::atom(Atom::Iv(iv));
+    let count = Term::atom(Atom::TileCount {
+        param,
+        axis,
+        tile: tile as i32,
+    });
+    // The loop's own bound: `0 <= i < num_tiles`. Both halves are believed, so
+    // an access indexed by `i` on this axis is discharged rather than checked.
+    if let Some(upper) = Predicate::lt(&index, &count) {
+        builder.assumptions.push(upper);
+    }
+    if let Some(lower) = Predicate::le(&Term::constant(0), &index) {
+        builder.assumptions.push(lower);
+    }
+}
+
+/// Whether the goal pair for this axis is already believed.
+///
+/// Both halves must be in the assumption set: an access needs `0 <= i` and
+/// `i < num_tiles`, and a loop over `num_tiles` states exactly that about its
+/// variable. Anything the assumptions do not name — a value derived from the
+/// variable, an index from another axis — is not decided here.
+fn believed_access(
+    builder: &Builder,
+    kernel: &Kernel,
+    index_arg: Option<&sile_hir::Expr>,
+    axis: usize,
+    tile: i64,
+    tensor_name: &str,
+) -> bool {
+    use super::predicate::{Atom, Predicate, Term};
+    let Some(index) = index_arg.and_then(|arg| index_expr(arg, axis)) else {
+        return false;
+    };
+    let Some(term) = term_of(builder, kernel, &index) else {
+        return false;
+    };
+    let Some(param) = buffer_param_position(kernel, tensor_name) else {
+        return false;
+    };
+    let count = Term::atom(Atom::TileCount {
+        param,
+        axis,
+        tile: tile as i32,
+    });
+    let upper = Predicate::lt(&term, &count);
+    let lower = Predicate::le(&Term::constant(0), &term);
+    [upper, lower].iter().all(|goal| {
+        goal.as_ref()
+            .is_some_and(|goal| builder.assumptions.contains(goal))
+    })
+}
+
 /// Decide one axis's access check from its index interval and the tile grid.
 ///
 /// cutile's `fold_static` (`checks/goals.rs`) does this before emitting
@@ -353,12 +474,26 @@ fn fold_static(
     let Some(index) = index_arg.and_then(|arg| index_expr(arg, axis)) else {
         return;
     };
-    let Some(bounds) = bounds_of(builder, kernel, index) else {
+    let Some(bounds) = bounds_of(builder, kernel, &index) else {
         return;
     };
     let num_tiles = (extent + tile - 1) / tile;
     if 0 <= bounds.start && bounds.end < num_tiles {
         return;
+    }
+    // The JIT rung: a goal already believed needs no check at all. This is what
+    // a loop over `num_tiles` gives its body.
+    if let Some(term) = term_of(builder, kernel, &index) {
+        use super::predicate::{Predicate, Term};
+        let upper = Predicate::lt(&term, &Term::constant(num_tiles));
+        let lower = Predicate::le(&Term::constant(0), &term);
+        let believed = |goal: &Option<Predicate>| {
+            goal.as_ref()
+                .is_some_and(|goal| builder.assumptions.contains(goal))
+        };
+        if believed(&upper) && believed(&lower) {
+            return;
+        }
     }
     builder.errors.push(format!(
         "Bounds check failed: 0 <= {} && {} < {}",
@@ -370,11 +505,109 @@ fn fold_static(
 ///
 /// A tuple index spells every axis. A shape index names one symbol per axis,
 /// and a symbol that is a const generic is that constant.
-fn index_expr<'e>(arg: &'e sile_hir::Expr, axis: usize) -> Option<&'e sile_hir::Expr> {
+fn index_expr(arg: &sile_hir::Expr, axis: usize) -> Option<sile_hir::Expr> {
     match arg {
-        sile_hir::Expr::TileIndex(items) => items.get(axis),
+        sile_hir::Expr::TileIndex(items) => items.get(axis).cloned(),
+        // A shape index names one symbol per axis; a symbol is that variable.
+        sile_hir::Expr::Shape(shape) => match shape_items(shape).get(axis) {
+            Some(ShapeExpr::Symbol(name)) => Some(sile_hir::Expr::Var(name.clone())),
+            _ => None,
+        },
         _ => None,
     }
+}
+
+/// Where a tensor parameter sits among the buffer parameters.
+///
+/// The launcher holds one argument per buffer, in declaration order, and the
+/// scalars travel elsewhere — so the position a launch check names is the
+/// buffer's, not the parameter list's.
+fn buffer_param_position(kernel: &Kernel, tensor_name: &str) -> Option<usize> {
+    kernel
+        .params
+        .iter()
+        .filter(|param| !matches!(param.ty, Type::Scalar(_)))
+        .position(|param| param.name == tensor_name)
+}
+
+/// The axes whose index is a compile-time literal, with its value.
+///
+/// An index arrives either as a tuple of expressions (`[0i64]`) or as a shape
+/// of symbols (`shape![4]`), and a literal can be spelled in both, so both are
+/// read here rather than at each use.
+fn literal_indices(arg: Option<&sile_hir::Expr>) -> Vec<(usize, i64)> {
+    match arg {
+        Some(sile_hir::Expr::TileIndex(items)) => items
+            .iter()
+            .enumerate()
+            .filter_map(|(axis, item)| match item {
+                sile_hir::Expr::ScalarI64(value) => Some((axis, *value)),
+                _ => None,
+            })
+            .collect(),
+        Some(sile_hir::Expr::Shape(shape)) => shape_items(shape)
+            .iter()
+            .enumerate()
+            .filter_map(|(axis, item)| match item {
+                ShapeExpr::Constant(value) => Some((axis, *value)),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Move a constant index's access goal to the host.
+///
+/// The goal is `0 <= idx` and `idx < ceil(extent / tile)`, where the extent is
+/// the parameter's view extent — a launch-time fact. The predicate names the
+/// extent by an [`Atom::ViewExtent`], so the host can evaluate it once per
+/// launch; nothing about it is known at JIT time, which is why it cannot be
+/// decided here.
+fn hoist_literal_index(
+    builder: &mut Builder,
+    kernel: &Kernel,
+    tensor_name: &str,
+    value: i64,
+    axis: usize,
+    tile: i64,
+) {
+    use super::predicate::{Atom, Predicate, Term};
+    // The parameter position identifies the atom: a name would not survive
+    // inlining, and the host resolves by position. The host holds one entry per
+    // buffer parameter, in declaration order, so the index counts buffer
+    // parameters rather than every parameter.
+    let Some(param) = buffer_param_position(kernel, tensor_name) else {
+        return;
+    };
+    // `ceil(extent / tile)` is not affine, so it is an atom of its own: the
+    // host computes the quotient when it evaluates the goal. `TileCount` bakes
+    // the tile size into the atom's identity, because the same axis at two tile
+    // sizes is two different quantities.
+    let count = Term::atom(Atom::TileCount {
+        param,
+        axis,
+        tile: tile as i32,
+    });
+    let Some(upper) = Predicate::le(&Term::constant(value), &count) else {
+        return;
+    };
+    let Some(lower) = Predicate::le(&Term::constant(0), &Term::constant(value)) else {
+        return;
+    };
+    // The lower goal is over no atoms, so it is decided now.
+    if lower.eval(&|_| None) != Some(true) {
+        builder.errors.push(format!(
+            "Bounds check failed: 0 <= {value}"
+        ));
+        return;
+    }
+    builder.launch_checks.push(super::predicate::LaunchCheck {
+        predicate: upper,
+        cause: format!(
+            "partition access out of bounds: dim {axis}, block index >= ceil(?/{tile})"
+        ),
+    });
 }
 
 fn check_partition_access(
@@ -414,6 +647,19 @@ fn check_partition_access(
             .collect(),
         _ => return,
     };
+    // A literal index over a dynamic extent is not decided by inspection: the
+    // extent is a launch-time fact, so the goal moves to the host. cutile makes
+    // the same call, and the check leaving the kernel is the whole point of the
+    // launch rung.
+    for (axis, value) in literal_indices(index_arg) {
+        let Some(Extent::Value(_)) = tensor.view_shape.get(axis) else {
+            continue;
+        };
+        let Some(tile_extent) = tile.get(axis).copied().filter(|t| *t > 0) else {
+            continue;
+        };
+        hoist_literal_index(builder, kernel, &tensor.name, value, axis, tile_extent);
+    }
     for (axis, item) in items.iter().enumerate() {
         // A literal index is proven by inspection; every other index carries no
         // range cutile can use, so its access carries a check.
@@ -432,6 +678,12 @@ fn check_partition_access(
         // a violation is a compile error (`checks/goals.rs` `fold_static`).
         // A dynamic one is a value the prologue assumed, so its check runs on
         // the device.
+        // The JIT rung: a goal already believed needs no check. A loop over
+        // `num_tiles` walks exactly that axis's tiles, so the access it indexes
+        // is inside the grid by construction — nothing is emitted for it.
+        if believed_access(builder, kernel, index_arg, axis, tile_extent, &tensor.name) {
+            continue;
+        }
         let extent = match tensor.view_shape.get(axis) {
             Some(Extent::Value(value)) => *value,
             Some(Extent::Literal(extent)) => {
@@ -577,6 +829,10 @@ impl Builder {
         Self {
             next_value: 0,
             errors: Vec::new(),
+            terms: Vec::new(),
+            launch_checks: Vec::new(),
+            assumptions: Vec::new(),
+            value_ids: super::value_ids::ValueIds::default(),
             body: Vec::new(),
             args: Vec::new(),
             tensors: Vec::new(),
@@ -1257,9 +1513,10 @@ fn shape_extents(shape: &ShapeExpr, consts: &[(String, i64)]) -> Vec<i64> {
 pub fn emit(
     kernel: &Kernel,
     locals: &std::collections::BTreeMap<String, Type>,
-) -> Result<Module, String> {
+) -> Result<(Module, Vec<super::predicate::LaunchCheck>), String> {
     let mut builder = Builder::new(kernel);
     builder.locals = locals.clone();
+    builder.value_ids = super::value_ids::ValueIds::of(kernel);
     declare_params(&mut builder, kernel);
     // A kernel whose body partitions a buffer by generics that its own
     // parameter types also name instantiates those generics up front: cutile
@@ -1298,7 +1555,7 @@ pub fn emit(
         return Err(error.clone());
     }
 
-    Ok(Module {
+    let module = Module {
         name: kernel.origin.module.clone(),
         functions: vec![Function {
             name: format!("{}_entry", kernel.name),
@@ -1306,7 +1563,8 @@ pub fn emit(
             args: builder.args,
             body: builder.body,
         }],
-    })
+    };
+    Ok((module, builder.launch_checks))
 }
 
 /// The entry parameters, in declaration order, and then one view per tensor.
@@ -1347,6 +1605,7 @@ fn declare_params(builder: &mut Builder, kernel: &Kernel) {
                 tensors.push((
                     param.name.clone(),
                     Tensor {
+                        name: param.name.clone(),
                         view: ptr,
                         token: ptr,
                         tile,
@@ -1411,8 +1670,9 @@ fn declare_params(builder: &mut Builder, kernel: &Kernel) {
             },
         );
         builder.tensors.push((
-            name,
+            name.clone(),
             Tensor {
+                name,
                 view,
                 token,
                 view_shape: shape,
@@ -1438,6 +1698,9 @@ fn emit_stmt(builder: &mut Builder, stmt: &sile_hir::Stmt, kernel: &Kernel) {
             builder.values.push((name.clone(), value, Some(ty)));
             if let Some(bound) = bounds_of(builder, kernel, expr) {
                 builder.bounds.push((name.clone(), bound));
+            }
+            if let Some(term) = term_of(builder, kernel, expr) {
+                builder.terms.push((name.clone(), term));
             }
             // A partition binds a view of an existing tensor: record it as a
             // tensor of its own so a later `load` can read through it.
@@ -1502,6 +1765,9 @@ fn emit_stmt(builder: &mut Builder, stmt: &sile_hir::Stmt, kernel: &Kernel) {
             // `K / BK` prints before the `1`.
             let (start_value, _) = emit_expr(builder, start, kernel);
             let (end_value, _) = emit_expr(builder, end, kernel);
+            // A loop over `num_tiles` walks exactly that axis's tiles, so what
+            // it visits is inside the grid by construction.
+            assume_loop_over_tile_count(builder, kernel, var, end);
             let step_value = match step {
                 Some(step) => emit_expr(builder, step, kernel).0,
                 None => builder.i32_const(1),
@@ -1626,6 +1892,14 @@ fn emit_stmt(builder: &mut Builder, stmt: &sile_hir::Stmt, kernel: &Kernel) {
                             start: 0,
                             end,
                         },
+                    ));
+                }
+                // The variable's own value is an atom; its interval is the
+                // separate fact `bounds` holds.
+                if let Some(id) = builder.value_ids.id(&var) {
+                    builder.terms.push((
+                        var.clone(),
+                        super::predicate::Term::atom(super::predicate::Atom::Iv(id)),
                     ));
                 }
             }
@@ -2815,9 +3089,12 @@ fn emit_builtin(
                     strides: tensor.strides.clone(),
                 },
             });
+            // One result per axis: the index-space shape of the view, one
+            // extent per rank.
+            let rank = tensor.tile.len();
             let base = builder.next_value;
-            builder.next_value += 2;
-            let ids = vec![ValueId(base), ValueId(base + 1)];
+            builder.next_value += rank as u32;
+            let ids = (0..rank).map(|i| ValueId(base + i as u32)).collect::<Vec<_>>();
             builder.push_op(Op {
                 results: ids.clone(),
                 format: Format::Plain,
@@ -3129,6 +3406,65 @@ fn integer_opcode(op: sile_hir::BuiltinOp) -> &'static str {
         sile_hir::BuiltinOp::Rem => "remi",
         sile_hir::BuiltinOp::CeilDiv | sile_hir::BuiltinOp::Div => "divi",
         _ => "addi",
+    }
+}
+
+/// The canonical linear term of an integer expression.
+///
+/// This is the fragment the predicate algebra reasons over: a sum of atoms with
+/// coefficients, plus a constant. Anything outside the fragment — a product of
+/// two unknowns, a remainder — is not formed, so a goal over it sinks to a later
+/// stage instead of being decided wrongly.
+fn term_of(
+    builder: &Builder,
+    kernel: &Kernel,
+    expr: &sile_hir::Expr,
+) -> Option<super::predicate::Term> {
+    use sile_hir::Expr;
+    use super::predicate::Term;
+    match expr {
+        Expr::ScalarI64(value) => Some(Term::constant(*value)),
+        Expr::Var(name) => {
+            if let Some((_, term)) = builder.terms.iter().rev().find(|(n, _)| n == name) {
+                return Some(term.clone());
+            }
+            // An induction variable is a name for its own value: `1 * iv`. The
+            // id is the binding's, not the name's, so a shadowed name still
+            // names the value the body means.
+            if builder.loop_vars.iter().any(|var| var == name) {
+                return builder
+                    .value_ids
+                    .id(name)
+                    .map(|id| Term::atom(super::predicate::Atom::Iv(id)));
+            }
+            // A const generic is a JIT-time constant.
+            kernel
+                .const_params
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, value)| Term::constant(*value))
+        }
+        Expr::Builtin { op, args } => {
+            let lhs = term_of(builder, kernel, args.first()?)?;
+            let rhs = match args.get(1) {
+                Some(rhs) => term_of(builder, kernel, rhs)?,
+                None => Term::constant(0),
+            };
+            match op {
+                sile_hir::BuiltinOp::Add => lhs.add(&rhs),
+                sile_hir::BuiltinOp::Sub => lhs.sub(&rhs),
+                sile_hir::BuiltinOp::Mul => {
+                    // Only a constant times a term stays linear.
+                    match (lhs.as_constant(), rhs.as_constant()) {
+                        (Some(k), _) => rhs.mul_const(k),
+                        (_, Some(k)) => lhs.mul_const(k),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 

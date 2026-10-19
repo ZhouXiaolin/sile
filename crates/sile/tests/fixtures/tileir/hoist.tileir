@@ -1,0 +1,29 @@
+cuda_tile.module @kernels {
+  entry @hoist_entry(%0: tile<ptr<f32>>, %1: tile<i32>, %2: tile<i32>, %3: tile<i32>, %4: tile<i32>, %5: tile<ptr<f32>>, %6: tile<i32>, %7: tile<i32>) di_name = "hoist" {
+    %8 = constant <i32: 2> : tile<i32>
+    %9 = assume bounded<0, ?>, %1 : tile<i32>
+    %10 = make_token : token
+    %11 = make_tensor_view %0, shape = [%9], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
+    %12 = assume bounded<0, ?>, %6 : tile<i32>
+    %13 = make_token : token
+    %14 = make_tensor_view %5, shape = [%12], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
+    %15 = constant <i32: 2> : tile<i32>
+    %16 = constant <i32: 2> : tile<i32>
+    %17 = constant <i32: -1> : tile<i32>
+    %18 = constant <i32: -1> : tile<i32>
+    %19 = make_partition_view %14 : partition_view<tile=(2), padding_value = zero, tensor_view<?xf32, strides=[1]>>
+    %20 = constant <i32: 0> : tile<i32>
+    %21 = constant <i32: 2> : tile<i32>
+    %22, %23 = load_view_tko weak %19[%20] token = %13 : partition_view<tile=(2), padding_value = zero, tensor_view<?xf32, strides=[1]>>, tile<i32> -> tile<2xf32>, token
+    %24 = constant <i32: 2> : tile<i32>
+    %25 = constant <i32: 2> : tile<i32>
+    %26, %27, %28 = get_tile_block_id : tile<i32>
+    %29 = assume bounded<0, ?>, %26 : tile<i32>
+    %30 = assume bounded<0, ?>, %27 : tile<i32>
+    %31 = assume bounded<0, ?>, %28 : tile<i32>
+    %32 = constant <i32: 2> : tile<i32>
+    %33 = make_partition_view %11 : partition_view<tile=(2), tensor_view<?xf32, strides=[1]>>
+    %34 = store_view_tko weak %22, %33[%29] token = %10 : tile<2xf32>, partition_view<tile=(2), tensor_view<?xf32, strides=[1]>>, tile<i32> -> token
+    return
+  }
+}

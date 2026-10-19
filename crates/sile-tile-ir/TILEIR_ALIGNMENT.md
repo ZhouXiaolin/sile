@@ -200,10 +200,14 @@ axis ends it:
    in-kernel `assert`, hoisted to the outermost loop preheader whose frame
    decides it.
 
-The emitter implements rungs 1, 2 and 5. Rungs 3 and 4 need a host-side
-predicate language that sile does not have yet, so an undecided goal goes
-straight to rung 5 — which is what cutile does too whenever its own rungs 3 and
-4 find nothing to work with.
+All five rungs are implemented. Rungs 3 and 4 read `cutile/predicate.rs`, a
+copy of cutile's own predicate algebra: a canonical linear term per goal, and a
+`Stage` per term that says when it can be decided. A goal's stage is the maximum
+over its atoms, so "can this move to the host" is computed rather than judged.
+
+The algebra is not CUDA-specific. Its atoms are the execution-model quantities
+every GPU compute model has — a buffer's extent, a block's id, the grid's size —
+and it depends on nothing but `BTreeMap`.
 
 ### What each rung needs
 
@@ -211,6 +215,19 @@ Rung 1 reads a fact carried by the value: which axis, if any, bounds it.
 `Builder::bounded_loop_vars` holds the names a `for` assumed non-negative, and
 `is_block_id_component` recognises the grid components. A value *derived* from
 either has lost the bound, which is why `i + 1` is not rung-1 material.
+
+Rung 3 reads `Builder::assumptions`, a set of goals already believed. Because
+predicates are canonical, "is this believed" is a set membership: no solver is
+needed, and `a == b` and `b == a` are the same entry. A `for` over
+`num_tiles(&p, axis)` states both halves of its own access goal about its
+variable, so the body's access is discharged rather than checked.
+
+Rung 4 asks whether every atom of the goal is launch-known. If it is, the goal
+becomes a `LaunchCheck` and leaves the kernel: the printed text carries no
+`assert`, and `KernelLauncher::apply` evaluates the predicate against the real
+buffer extents before it launches anything. Resolution **fails closed** — an
+atom this launcher cannot resolve is an error, because a check nothing evaluates
+is worse than no check, the kernel having relied on it.
 
 Rung 2 needs two things, and the second is the one that used to be missing:
 
@@ -235,24 +252,33 @@ correct behaviour: a statically violated access is not a program.
 ### Why the fixtures keep their asserts
 
 `gemm` carries one `assert` and `flash_attention` carries eight, and both match
-cutile byte for byte. That is not a gap: those kernels index by a block id
-whose extent is `?`, so rung 2 has no static extent and abstains, and rungs 3
-and 4 have nothing to prove with. cutile emits the same assert for the same
-reason. The check is the honest answer, not a fallback sile failed to improve
-on.
+cutile byte for byte. That is not a gap: those kernels index by a block id,
+which is a device-stage atom, so rungs 2, 3 and 4 all abstain and rung 5 is the
+only one left. cutile emits the same assert for the same reason. The check is
+the honest answer, not a fallback sile failed to improve on.
 
-`static_extent` is the fixture that shows the difference. Its input declares
-`[64]`, so the extent is static, the index is a loop counter plus one, and
-rung 2 proves `1 <= i + 1 <= 4` inside `ceil(64 / 2) = 32` tiles. No assert is
-emitted. The same kernel with `0..40` is a compile error on both sides.
+Three fixtures show the three new rungs:
+
+- `static_extent` — its input declares `[64]`, so the extent is static, the
+  index is a loop counter plus one, and rung 2 proves `1 <= i + 1 <= 4` inside
+  `ceil(64 / 2) = 32` tiles. No assert is emitted. The same kernel with `0..40`
+  is a compile error on both sides.
+- `jit_rung` — the loop bound is `num_tiles(&part, 0)`, so rung 3 discharges the
+  access from that bound alone. Nothing is emitted and nothing reaches the host.
+- `hoist` — the index is a literal while the extent is dynamic. Rung 2 has no
+  static extent, rung 3 has no assumption naming a literal, and rung 4 moves the
+  goal to `LaunchCheck` with a `TileCount` atom. The kernel text loses the six
+  ops the check used to cost, and an out-of-range index fails at launch with
+  `(checked at launch)` rather than running.
 
 ## Status
 
-**All fifteen fixtures print byte for byte.**
-`./scripts/check_tileir_alignment.sh` reports `15/15 PASS`: `saxpy`,
+**All seventeen fixtures print byte for byte.**
+`./scripts/check_tileir_alignment.sh` reports `17/17 PASS`: `saxpy`,
 `async_add`, `async_gemm`, `batch_matmul`, `dropout`, `flash_attention`,
 `flash_attention_causal`, `gemm`, `gemm_static`, `rms_norm`, `softmax`,
-`async_saxpy`, `hello_world`, `jit_custom_store`, `static_extent`. The
+`async_saxpy`, `hello_world`, `jit_custom_store`, `static_extent`, `hoist`,
+`jit_rung`. The
 comparison needs no GPU and no `tileiras`: cutile compiles with
 `KernelCompiler::compile()` and reads `CompileArtifacts::ir_text()`, sile dumps
 `tileir-00-lowered` with `SILE_DUMP_TILEIR_ONLY=1`.

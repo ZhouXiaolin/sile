@@ -213,7 +213,15 @@ impl<'a> KernelLauncher<'a> {
         };
 
         let parts = compiled_parts(&self.kernel)?;
-        let (_typed, tile_ir_func, llvm_ir_func) = parts.as_ref();
+        let (typed, tile_ir_func, llvm_ir_func) = parts.as_ref();
+
+        // The access checks the compiler moved out of the kernel run here,
+        // before anything is launched. A check that cannot be resolved is an
+        // error rather than a skip: a check the host cannot evaluate is one
+        // nothing would ever enforce.
+        let checks = crate::tileir_text::launch_checks(typed)
+            .map_err(sile_core::Error::Shape)?;
+        validate_launch_checks(&checks, &self.args)?;
 
         if should_print(PRINT_TILE_IR_ENV) {
             eprintln!("{}", format_tile_ir(tile_ir_func));
@@ -344,6 +352,54 @@ fn maybe_print_backend_source(
         | BackendArtifact::WgslSource(source)
         | BackendArtifact::PtxSource(source) => {
             eprintln!("{}", source);
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate the access checks the compiler moved out of the kernel.
+///
+/// Each predicate names its operands by parameter position and axis, so the
+/// resolver reads the buffer the launch was handed. It fails closed: an atom
+/// this launcher cannot resolve is an error, not a silent pass — a check that
+/// nothing evaluates is worse than no check, because the kernel relies on it.
+fn validate_launch_checks(
+    checks: &[sile_tile_ir::cutile::predicate::LaunchCheck],
+    args: &[KernelArg<'_>],
+) -> Result<()> {
+    use sile_tile_ir::cutile::predicate::Atom;
+    for check in checks {
+        let resolved = check.predicate.eval(&|atom: &Atom| match atom {
+            Atom::Dim { param, axis } | Atom::ViewExtent { param, axis } => args
+                .get(*param)
+                .and_then(|arg| arg.shape.get(*axis))
+                .map(|extent| *extent as i64),
+            Atom::TileCount { param, axis, tile } => {
+                let extent = args
+                    .get(*param)
+                    .and_then(|arg| arg.shape.get(*axis))
+                    .copied()? as i64;
+                if *tile < 1 {
+                    return None;
+                }
+                Some((extent + *tile as i64 - 1) / *tile as i64)
+            }
+            Atom::NumTileBlocks(_) | Atom::TileBlockId(_) | Atom::Iv(_) => None,
+        });
+        match resolved {
+            Some(true) => {}
+            Some(false) => {
+                return Err(sile_core::Error::Shape(format!(
+                    "{} (checked at launch)",
+                    check.cause
+                )))
+            }
+            None => {
+                return Err(sile_core::Error::Shape(format!(
+                    "{}: the check names a value this launch cannot resolve",
+                    check.cause
+                )))
+            }
         }
     }
     Ok(())

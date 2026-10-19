@@ -15,6 +15,18 @@ use sile_hir::typeck::TypedKernel;
 /// An access check cutile decides at compile time can fail, and that failure is
 /// the kernel's: a violated access is a compile error, not a device assert.
 pub fn emit(typed: &TypedKernel) -> Result<String, String> {
-    let module = sile_tile_ir::cutile::emit::emit(&typed.kernel, &typed.locals)?;
+    let (module, _checks) = sile_tile_ir::cutile::emit::emit(&typed.kernel, &typed.locals)?;
     Ok(sile_tile_ir::cutile::print::format(&module))
+}
+
+/// The access checks the compiler moved out of the kernel.
+///
+/// They are not part of the printed text: the text is the same whether a check
+/// is an in-kernel `assert` or a host-side predicate, and these are the ones the
+/// launcher must evaluate before it runs the kernel.
+pub fn launch_checks(
+    typed: &TypedKernel,
+) -> Result<Vec<sile_tile_ir::cutile::predicate::LaunchCheck>, String> {
+    let (_module, checks) = sile_tile_ir::cutile::emit::emit(&typed.kernel, &typed.locals)?;
+    Ok(checks)
 }

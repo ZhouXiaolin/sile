@@ -12,7 +12,7 @@ set -eu
 
 EXAMPLES="saxpy async_add async_gemm batch_matmul dropout flash_attention \
 flash_attention_causal gemm gemm_static rms_norm softmax async_saxpy \
-hello_world jit_custom_store static_extent"
+hello_world jit_custom_store static_extent hoist jit_rung"
 
 OUT=${1:?usage: dump_tileir.sh <out-dir>}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
