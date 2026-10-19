@@ -348,6 +348,13 @@ fn check_block(
             // `continue` has no type, so it has nothing to infer. It does have
             // to be inside a loop: outside one there is no iteration to end,
             // and the lowering would have no header to branch to.
+            // A print names values, so every operand has to have one. It
+            // yields nothing, and it may appear anywhere a statement may.
+            Stmt::Print { args, .. } => {
+                for arg in args {
+                    infer_expr(arg, locals)?;
+                }
+            }
             Stmt::Continue => match scope.loop_break {
                 Some(_) => {}
                 None => {
@@ -409,7 +416,7 @@ fn infer_builtin(
     };
 
     match op {
-        BuiltinOp::ProgramId | BuiltinOp::NumPrograms | BuiltinOp::NumTiles => {
+        BuiltinOp::ProgramId | BuiltinOp::ProgramIdAxis | BuiltinOp::NumPrograms | BuiltinOp::NumTiles => {
             Ok(Type::Scalar(ElemType::F32))
         }
         BuiltinOp::LoadTile => Ok(Type::tile(ElemType::F32, declared_shape(args, 1, locals))),
@@ -670,7 +677,7 @@ fn infer_builtin(
 /// with the message naming the builtin rather than a panic inside lowering.
 fn check_arity(op: BuiltinOp, actual: usize) -> Result<(), TypeError> {
     let (min, max) = match op {
-        BuiltinOp::ProgramId => (0, 1),
+        BuiltinOp::ProgramId | BuiltinOp::ProgramIdAxis => (0, 1),
         BuiltinOp::NumPrograms => (0, 1),
         BuiltinOp::NumTiles => (2, 2),
         BuiltinOp::LoadTile => (3, 3),

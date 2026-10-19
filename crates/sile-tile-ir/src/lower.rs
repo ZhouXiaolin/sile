@@ -350,6 +350,10 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx<'_>) -> Flow {
             let value = lower_expr(expr, ctx);
             ctx.locals.insert(name.clone(), value);
         }
+        // The compute IR has no print op. A debug statement is not part of
+        // what a kernel computes, so it lowers to nothing and the operands are
+        // not even evaluated.
+        Stmt::Print { .. } => {}
         Stmt::Store {
             target,
             value,
@@ -1288,6 +1292,8 @@ fn collect_carried_names(body: &[Stmt], ctx: &LowerCtx<'_>, vars: &mut Vec<Strin
             Stmt::While { body, .. } | Stmt::Loop { body } => {
                 collect_carried_names(body, ctx, vars)
             }
+            // A print carries nothing across an iteration.
+            Stmt::Print { .. } => {}
             Stmt::If {
                 then_body,
                 else_body,
@@ -1338,7 +1344,7 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx<'_>) -> ValueId {
 
 fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueId {
     match op {
-        BuiltinOp::ProgramId => {
+        BuiltinOp::ProgramId | BuiltinOp::ProgramIdAxis => {
             // `program_id(axis)` names its axis; the historical `id()` spelling
             // reached here through `ShapeDim`, which carries the same axis in
             // its second argument.
@@ -2730,6 +2736,11 @@ fn collect_buffer_tile_shapes(
     match stmt {
         sile_hir::Stmt::Let { expr, .. } | sile_hir::Stmt::Assign { expr, .. } => {
             collect_tile_shapes_in_expr(expr, buf_name, ctx, out);
+        }
+        sile_hir::Stmt::Print { args, .. } => {
+            for arg in args {
+                collect_tile_shapes_in_expr(arg, buf_name, ctx, out);
+            }
         }
         sile_hir::Stmt::ForLoop { body, .. } => {
             for inner in body {

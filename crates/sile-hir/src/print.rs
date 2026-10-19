@@ -158,6 +158,14 @@ fn format_stmt(stmt: &Stmt, depth: usize, out: &mut String) {
             }
         }
         Stmt::Break => writeln!(out, "{pad}break").unwrap(),
+        Stmt::Print { format, args } => {
+            let args = args
+                .iter()
+                .map(|arg| format_expr(arg))
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(out, "{pad}print(\"{format}\", {args})").unwrap()
+        }
         Stmt::Continue => writeln!(out, "{pad}continue").unwrap(),
         Stmt::Return => writeln!(out, "{pad}return").unwrap(),
     }
@@ -211,7 +219,8 @@ pub fn format_unary_name(op: UnaryOp) -> &'static str {
 
 fn builtin_name(op: BuiltinOp) -> &'static str {
     match op {
-        BuiltinOp::ProgramId => "program_id",
+        BuiltinOp::ProgramId => "get_tile_block_id",
+        BuiltinOp::ProgramIdAxis => "program_id",
         BuiltinOp::NumPrograms => "num_programs",
         BuiltinOp::NumTiles => "num_tiles",
         BuiltinOp::LoadTile => "load_tile",

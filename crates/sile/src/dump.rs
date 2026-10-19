@@ -94,7 +94,8 @@ pub fn dump_kernel(kernel: &sile_hir::Kernel, root: &Path) -> Result<()> {
     let mut tile_ir: TileIrFunction = sile_tile_ir::lower_to_tile_ir(&typed);
     stages.push(Stage {
         label: "tileir-00-lowered".into(),
-        text: crate::tileir_text::emit(&typed),
+        text: crate::tileir_text::emit(&typed)
+            .map_err(sile_core::Error::Shape)?,
         micros: started.elapsed().as_micros(),
     });
 

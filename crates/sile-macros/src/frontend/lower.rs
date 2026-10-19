@@ -141,6 +141,21 @@ fn lower_stmt(
     const_params: &[ConstParam],
 ) -> syn::Result<proc_macro2::TokenStream> {
     Ok(match stmt {
+        // The format string travels as text: the Tile IR rewrites each `{}`
+        // into `%` plus the operand's element letter, which needs the types
+        // only the lowering knows.
+        KernelStmt::Print { format, args } => {
+            let args = args
+                .iter()
+                .map(|arg| lower_expr(arg, const_params))
+                .collect::<syn::Result<Vec<_>>>()?;
+            quote! {
+                ::sile::hir::Stmt::Print {
+                    format: #format.to_string(),
+                    args: vec![#(#args),*],
+                }
+            }
+        }
         KernelStmt::Let { name, expr } => {
             let name = name.to_string();
             let expr = lower_expr(expr, const_params)?;
@@ -655,9 +670,11 @@ fn lower_call(
         // `broadcast_scalar(s, shape)` is the free-function spelling of
         // `s.broadcast(shape)`, so it lowers to the same broadcast.
         "broadcast_scalar" => quote! { ::sile::hir::BuiltinOp::Broadcast },
-        "program_id" | "id" | "get_tile_block_id" => {
-            quote! { ::sile::hir::BuiltinOp::ProgramId }
-        }
+        // `program_id(axis)` is CuTile's single-axis helper; the tuple read is
+        // the other spelling. They cost different numbers of ids, so they stay
+        // apart.
+        "program_id" => quote! { ::sile::hir::BuiltinOp::ProgramIdAxis },
+        "id" | "get_tile_block_id" => quote! { ::sile::hir::BuiltinOp::ProgramId },
         "num_programs" => quote! { ::sile::hir::BuiltinOp::NumPrograms },
         "num_tiles" => quote! { ::sile::hir::BuiltinOp::NumTiles },
         // `get_num_tile_blocks()` returns the whole launch grid, so the field
@@ -1214,7 +1231,7 @@ fn lower_field_access(
         // `get_tile_block_id().0` and `get_num_tile_blocks().0` read it off
         // the tuple.
         let (tuple_call, axis_in_argument) = match func_name.as_str() {
-            "program_id" => (Some(quote! { ::sile::hir::BuiltinOp::ProgramId }), true),
+            "program_id" => (Some(quote! { ::sile::hir::BuiltinOp::ProgramIdAxis }), true),
             "get_tile_block_id" => (Some(quote! { ::sile::hir::BuiltinOp::ProgramId }), false),
             "get_num_tile_blocks" => (Some(quote! { ::sile::hir::BuiltinOp::NumPrograms }), false),
             _ => (None, false),

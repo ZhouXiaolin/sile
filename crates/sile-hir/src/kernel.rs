@@ -8,8 +8,18 @@ pub enum ParamKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuiltinOp {
-    /// `program_id(axis)`: this tile program's index along grid axis `axis`.
+    /// `get_tile_block_id().k`: this tile program's index along grid axis `k`.
+    ///
+    /// The tuple is read once and its components are reused, which is what the
+    /// reference prints.
     ProgramId,
+    /// `program_id(axis)`: the same component, read through CuTile's
+    /// single-axis helper.
+    ///
+    /// CuTile writes that helper as a plain function with an `if` chain over
+    /// the axis, so every call reads the triple again and tests the axis. That
+    /// cost is part of the text, so it is a separate op from the tuple read.
+    ProgramIdAxis,
     /// `num_programs(axis)`: the launch grid extent along grid axis `axis`.
     NumPrograms,
     /// `num_tiles(buffer, axis)`: tile count along one buffer axis.
@@ -285,6 +295,15 @@ pub enum Stmt {
         cond: Expr,
         then_body: Vec<Stmt>,
         else_body: Vec<Stmt>,
+    },
+    /// `cuda_tile_print!("..", a, b)`: debug output from inside a kernel.
+    ///
+    /// The format string keeps its `{}` placeholders here; the Tile IR prints
+    /// them as `%` followed by the element type's letter, so the lowering needs
+    /// the operands' types and the text together.
+    Print {
+        format: String,
+        args: Vec<Expr>,
     },
     /// `continue`: end this pass through the loop body.
     ///

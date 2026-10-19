@@ -113,6 +113,16 @@ macro_rules! shape {
     };
 }
 
+/// `cuda_tile_print!("..", a, b)`: debug output from inside a kernel.
+///
+/// The kernel parser reads this macro's tokens directly, so the expansion only
+/// has to satisfy the host build: the stub prints nothing, because the device
+/// program is where the text goes.
+#[macro_export]
+macro_rules! cuda_tile_print {
+    ($($arg:tt)*) => {{}};
+}
+
 /// CuTile's second spelling of a compile-time shape. Both carry the same
 /// dimension list, so both expand to the same array.
 #[macro_export]

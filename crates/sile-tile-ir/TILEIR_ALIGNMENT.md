@@ -179,201 +179,104 @@ Two rules the table cannot show: `, signed` appears only on the integer ops
 that carry a signedness attribute, and an empty attribute dictionary is
 omitted entirely rather than printed as `{}`.
 
-## Measured value counts, per construct
+## Access checks: the proof ladder
 
-Every body op of every fixture has `Location::Unknown`, so a constant cannot be
-attributed to its source position (`cutile/tests/ir_locate.rs`). The counts
-below come from compiling one statement at a time and diffing the results
-(`cutile/tests/ir_probe3.rs`, `ir_probe5.rs`, `ir_probe6.rs`, `ir_probe7.rs`,
-`ir_probe8.rs`).
+cutile decides an access check before it emits anything, and only falls back to
+a device `assert` when every proof source fails (`cutile-compiler/src/compiler/
+checks/mod.rs`). The rungs are tried top-down and the first one that decides the
+axis ends it:
 
-Most of the shape constants are **dead**: `Broadcast` and `Reshape` take their
-shape as an attribute and name only one operand, so the constants their shape
-arguments cost are printed but never consumed. cutile does not run DCE before
-printing, and neither may this emitter.
+1. **Provenance.** The index is bounded by construction: a `tile_block_id(k)`
+   component is bounded by the launch grid, and a partition-axis iterand is
+   bounded by its axis's tile count. Both goals hold, so no check is emitted.
+2. **Static fold.** The index interval and the tile grid are both known, so
+   `0 <= start && end < num_tiles` decides the axis. This rung is a decision,
+   not a check: a violation is a **compile error**.
+3. **Declared-fact entailment.** The goal follows at JIT time from a
+   launch-verified precondition.
+4. **Launch hoist.** The operands are launch-known, so the check moves to the
+   host.
+5. **Residual placement.** Nothing decided it, so the check becomes an
+   in-kernel `assert`, hoisted to the outermost loop preheader whose frame
+   decides it.
 
-| construct | values | breakdown |
-| --- | --- | --- |
-| `constant` `assume` `make_token` `make_tensor_view` `make_partition_view` `store_view_tko` arithmetic `reshape` `broadcast` | 1 | — |
-| `get_tile_block_id` | 3 | plus 3 `assume`, so 6 in the body |
-| `load_view_tko` | 2 | tile and token |
-| `reduce` | 4 | `^bb0` args 2, body 1, result 1 |
-| `a.broadcast(literal S)` over a scalar, rank `r` | 2r + (r+1) + 1 + r + r + 1 | `2r` target extents, `r+1` ones, `reshape`, `r` ones, `r` target, `broadcast` |
-| `a.broadcast(x.shape())` over a scalar, rank `r` | 4r + (r+1) + 1 + r + r + 1 | `x.shape()` costs **4r**, twice what a literal shape costs |
+The emitter implements rungs 1, 2 and 5. Rungs 3 and 4 need a host-side
+predicate language that sile does not have yet, so an undecided goal goes
+straight to rung 5 — which is what cutile does too whenever its own rungs 3 and
+4 find nothing to work with.
 
-The scalar broadcast is always three instructions — `reshape` the scalar to
-all-ones, then `broadcast` — and the target shape is materialised twice before
-the reshape and once more around the broadcast. Rank 1, rank 3 and rank 4 all
-follow the same formula; it was checked at each rank.
+### What each rung needs
 
-## Verified: saxpy prints byte for byte
+Rung 1 reads a fact carried by the value: which axis, if any, bounds it.
+`Builder::bounded_loop_vars` holds the names a `for` assumed non-negative, and
+`is_block_id_component` recognises the grid components. A value *derived* from
+either has lost the bound, which is why `i + 1` is not rung-1 material.
 
-`scripts/check_tileir_alignment.sh` reports `saxpy PASS`. The emitter covers the
-five constructs saxpy uses: a scalar broadcast, `load_like`, `load`, `store`, and
-one binary arithmetic op.
+Rung 2 needs two things, and the second is the one that used to be missing:
 
-## The shape-fetch groups, and why they do not generalise
+- the **interval** of the index, from `bounds.rs` via `bounds_of`. A `for`
+  variable contributes `[0, end]` because its `assume bounded<0, n>` says so.
+- the **static extent**, which `declared_extents` already resolved from the
+  parameter's declaration. A literal extent means the tile grid is known; a
+  `-1` or a dynamic symbol means it is not, and rung 2 abstains.
 
-A tile read is groups of `constant` fetches around one `get_tile_block_id`
-(`ir_probe3`, `ir_probe10`, `ir_probe12`, each compiled with distinct extents so
-a group boundary is unambiguous):
-
-```
-<generics>          one constant per const generic, once
-group group ...     before the block id
-get_tile_block_id   3 results, then one assume each
-group group ...     after the block id
-make_partition_view
-load_view_tko
-```
-
-One group is `rank` constants — one shape expression's worth. The counts:
-
-| case | rank | groups before | after |
-| --- | --- | --- | --- |
-| `z.load()`, `z.store(t)` | 2 | 2 | 1 |
-| `x.load_like(z)`, all static | 2 | 5 | 2 |
-| `x.load_like(z)`, source dynamic | 2 | 5 | 2 |
-| `x.load_like(z)`, all static | 1 | 4 | 2 |
-| saxpy `x.load_like(y)` | 2 | 4 | 2 |
-| saxpy `y.load()` | 2 | 2 | 1 |
-
-Static and dynamic give the same answer, and a plain `load` gives the same
-answer twice over. Rank does not: rank 1 costs 4 groups and rank 2 costs 5. And
-two rank-2 `load_like` calls disagree with each other (5 versus saxpy's 4).
-
-### Where the counts come from (read off cutile's source)
-
-Three mechanisms, all confirmed in `cutile-rs`:
-
-1. **`compile_binary_op.rs:668`** — cutile allocates the id for an integer
-   operation, runs `value_facts::transfer`, and if the interval is a single
-   value it returns a fresh `constant` *without appending the operation*. The
-   discarded id is never printed. This is the whole reason the fixtures have
-   gaps in their numbering (gemm's `%74`, async_gemm's `%73`, batch_matmul's
-   `%88`, rms_norm's `%31`, flash_attention_causal's `%163/304/322/325`).
-   `crates/sile-tile-ir/src/cutile/bounds.rs` is the interval arithmetic, and
-   `Builder::discard` reproduces the gap.
-2. **`compile_cuda_tile_op.rs:792`** — `make_partition_view` *compiles* its
-   shape argument (emitting that shape's `constant` fetches) but then takes the
-   tile shape from the argument's static *type* (`type_instance.shape`) and
-   throws the compiled value away. So a shape argument is printed and dropped.
-3. **`cutile/src/_core.rs:4141`** — `load_tile_like` is ordinary generic Rust;
-   the JIT inlines it. Every `shape()` call and every `make_partition_view`
-   shape argument inside that body costs its own `2r` fetches, so the group
-   count follows the *library body*, not the kernel.
-
-Point 3 is the wall. `load_tile_like` is written once per rank, and how many
-times its `y.shape()` and tile-shape argument get materialised depends on the
-bounds cutile infers for each (mechanism 1 changing the control flow of the
-inlined body). Two rank-2 `load_like` calls with identical strides and generics
-land on 6 and 7 groups respectively, and the difference tracks whether the
-*source* view's extents are static.
-
-### Measured, from cutile's own output (rank 1, one tensor parameter)
-
-Constant counts read off probe kernels, deltas over an empty body:
-
-| body | constants | delta |
-| --- | --- | --- |
-| empty, rank 1 | 2 | — (the prologue's own `2 2`) |
-| `z.shape()` | 3 | **1** = rank |
-| `z.shape()` twice | 4 | +1 |
-| `z.shape()` three times | 5 | +1 each |
-| `z.shape()` rank 2 | 6 | 4 = 2 × rank for the prologue, +2 for the call |
-| `x.load_like(z)` | 8 | **6** = 3 × rank × 2 |
-| `x.load_like(z)` twice | 14 | +6 |
-| `x.load_like(z)` ×3 | 20 | +6 each |
-| `x.load_like(z)`, rank 2 | 16 | **14** = 7 × rank |
-
-So `shape()` costs exactly `rank` constants every time it is called — it is
-**not** memoised. `load_like` costs `3 × rank × 2` for a rank-1 target and
-`7 × rank` for rank 2, i.e. its body names the target's extents three times
-(two rounds before the block id, one after) and the source's extents the same,
-which is the `read_tile` shape already implemented.
-
-### Refuted: a shape memo
-
-An earlier turn hypothesised that `get_tensor_shape_meta` memoises the shape, so
-the second `load_like` on the same target would be cheaper. Two measurements
-kill it:
-
-* `z.shape()` called three times in one body costs `1, 1, 1` — no saving.
-* `async_add`'s second `load_like` is short by exactly one constant, and a memo
-  keyed on the *target* cannot explain that while leaving `saxpy` intact: adding
-  it regressed `saxpy` from PASS to DIFF, because `saxpy` calls
-  `a.broadcast(y.shape())` first and would then double-count.
-
-The one-constant difference in `async_add` is therefore **not** a memo hit. It
-is still unexplained, and it is the only thing standing between the current
-emitter and a second passing fixture.
-
-### The decisive fact: the same expression is not always the same cost
-
-In `async_add` the golden text contains two `load_like` calls on the same
-target tensor `z` and the same rank:
+So `fold_static` reads the interval, computes `num_tiles = ceil(extent / tile)`,
+and either accepts the axis silently or records a compile error. The message is
+the one cutile prints, because it is the kernel author's message:
 
 ```
-x.load_like(z)   costs 5 shape fetches before the block id:  2 2 -1 2 -1
-y.load_like(z)   costs 2 shape fetches before the block id:  2 2
+Bounds check failed: 0 <= 1 && 40 < 32
 ```
 
-Same library function, same `z`, same rank, same generics. The second call is
-cheap because `get_tensor_shape_meta` is a `return_type_meta_field` compiler op
-(`compile_intrinsic.rs:2197`) that hands back the shape value **already stored
-in the tensor's type metadata** — it does not emit a new `constant` at all.
-`label_param_extents` (`_function.rs:394`) then annotates that shared value with
-the parameter's extent atoms, in place.
+That error leaves `emit` as an `Err`, not as an `assert` in the text. This is
+the one place sile rejects a kernel that it used to accept, and it is the
+correct behaviour: a statically violated access is not a program.
 
-So the cost of a shape fetch is a property of **whether that shape has been
-materialised yet in this compilation**, not of the expression that asks for it.
-An emitter that walks expressions independently cannot reproduce it; it needs
-the same memo of "this tensor's shape is already a value".
+### Why the fixtures keep their asserts
 
-### Why this is not a table either
+`gemm` carries one `assert` and `flash_attention` carries eight, and both match
+cutile byte for byte. That is not a gap: those kernels index by a block id
+whose extent is `?`, so rung 2 has no static extent and abstains, and rungs 3
+and 4 have nothing to prove with. cutile emits the same assert for the same
+reason. The check is the honest answer, not a fallback sile failed to improve
+on.
 
-The remaining ten fixtures cannot be finished by extending a formula. Both are rank-2
-`load_like` over an output whose view is whole-buffer; the only difference is
-that one source is fully dynamic and the other declared `[-1,-1]` against a
-`[2,2]` tile. Same shape, same strides, same generics count, different cost.
-
-The counts come from cutile's generic instantiation and bounds inference
-(`generics.rs`, 138K; `compile_cuda_tile_op.rs`, 191K), which substitute the
-bounds each `const_shape!` argument resolves to. Reproducing them means
-reimplementing that substitution, not extending a formula.
+`static_extent` is the fixture that shows the difference. Its input declares
+`[64]`, so the extent is static, the index is a loop counter plus one, and
+rung 2 proves `1 <= i + 1 <= 4` inside `ceil(64 / 2) = 32` tiles. No assert is
+emitted. The same kernel with `0..40` is a compile error on both sides.
 
 ## Status
 
-**All eleven fixtures print byte for byte.** `./scripts/check_tileir_alignment.sh`
-reports `11/11 PASS`: `saxpy`, `async_add`, `async_gemm`, `batch_matmul`,
-`dropout`, `flash_attention`, `flash_attention_causal`, `gemm`, `gemm_static`,
-`rms_norm`, `softmax`. The comparison needs no GPU and no `tileiras`: cutile
-compiles with `KernelCompiler::compile()` and reads `CompileArtifacts::ir_text()`,
-sile dumps `tileir-00-lowered` with `SILE_DUMP_TILEIR_ONLY=1`.
+**All fifteen fixtures print byte for byte.**
+`./scripts/check_tileir_alignment.sh` reports `15/15 PASS`: `saxpy`,
+`async_add`, `async_gemm`, `batch_matmul`, `dropout`, `flash_attention`,
+`flash_attention_causal`, `gemm`, `gemm_static`, `rms_norm`, `softmax`,
+`async_saxpy`, `hello_world`, `jit_custom_store`, `static_extent`. The
+comparison needs no GPU and no `tileiras`: cutile compiles with
+`KernelCompiler::compile()` and reads `CompileArtifacts::ir_text()`, sile dumps
+`tileir-00-lowered` with `SILE_DUMP_TILEIR_ONLY=1`.
 
-The two pieces the last section called for are now in the emitter, but in the
-form the measurements supported rather than as a general memo and a general
-interval analysis:
+The per-construct value counts and the shape-fetch groups are in
+`TILEIR_MEASUREMENTS.md`. They are a regression list, not the specification:
+this document states why the text is what it is.
 
-- **Shape fetches are counted per construct.** `shape_materialised` records the
-  buffers whose extents have already become values, and `shape_derived` marks the
-  bindings whose value came out of a shape. Those two flags decide the extra
-  round a `broadcast` or a `load_like` pays. A general per-tensor memo was not
-  needed: the only place the reference reuses a stored shape is a shape the
-  kernel bound to a name.
-- **Folding is decided per comparison, not by interval arithmetic.** A comparison
-  between a const generic and a literal folds while compiling: the compared value
-  is named, `Builder::discard` reproduces the id the dropped comparison took, and
-  the branch is pasted in place of a region. `bounds.rs` states the rules; the
-  emitter does not yet need a general interval domain for these fixtures.
+### Shape fetches
+
+A tensor's extents become SSA values once, when its view is built. A later
+`broadcast` or `load_like` that needs them again pays for them again, because
+cutile reads the shape out of the tensor's type metadata and only the first
+asker pays for materialising it. Two facts decide the extra round:
+`shape_materialised` records the buffers whose extents have already become
+values, and `shape_derived` marks the bindings whose value came out of a shape.
 
 ### Control flow
 
 A region is written after the ops it contains, because its result ids follow
 everything they dominate. An `if` yields the values the enclosing `for` carries
 first, then the names the branch assigns. A branch that changes a carried value
-prints an `else` even when the kernel has none, holding the value from before the
-branch.
+prints an `else` even when the kernel has none, holding the value from before
+the branch.
 
 ### Element types
 
@@ -381,3 +284,19 @@ branch.
 literal as `Expr::ScalarBool`, so the emitter can name the mask's element type.
 Arithmetic follows the operands: integer tiles print `addi`/`subi`/`muli` and
 integer comparisons print `cmpi … signed`, float ones `addf`/`cmpf … ordered`.
+
+### Program id and print
+
+Two spellings read the same three grid components and cost different ids, so
+they are separate ops. `get_tile_block_id().k` reads the triple once and every
+later component reuses it; `program_id(axis)` is CuTile's helper, written as a
+plain Rust function with an `if` chain, so each call reads the triple again and
+tests the axis. Every test names its candidate constant and yields a constant
+predicate, and the compared id between them is allocated and dropped. Only the
+`else` arm carries the assertion, and it tests the predicate the last comparison
+already produced.
+
+`print_tko` yields a token and never states it: the operand types already end
+the line. Its format string keeps the kernel's text, with each `{}` rewritten to
+`%` plus the operand's element letter, which is why the print op has to be a HIR
+statement carrying both the text and the operands.

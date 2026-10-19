@@ -11,7 +11,10 @@
 use sile_hir::typeck::TypedKernel;
 
 /// The Tile IR text cutile-rs prints for this kernel.
-pub fn emit(typed: &TypedKernel) -> String {
-    let module = sile_tile_ir::cutile::emit::emit(&typed.kernel, &typed.locals);
-    sile_tile_ir::cutile::print::format(&module)
+///
+/// An access check cutile decides at compile time can fail, and that failure is
+/// the kernel's: a violated access is a compile error, not a device assert.
+pub fn emit(typed: &TypedKernel) -> Result<String, String> {
+    let module = sile_tile_ir::cutile::emit::emit(&typed.kernel, &typed.locals)?;
+    Ok(sile_tile_ir::cutile::print::format(&module))
 }

@@ -92,6 +92,9 @@ fn format_op(op: &Op, out: &mut String) {
                 .join(", ");
             writeln!(out, " : {types} -> {results}").unwrap();
         }
+        // `print_tko` yields a token and never states it: the operand types
+        // already end the line.
+        None if op.opcode == "print_tko" => writeln!(out).unwrap(),
         None => {
             if let Some(ty) = op.result_types.first() {
                 writeln!(out, " : {ty}").unwrap();

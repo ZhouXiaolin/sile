@@ -68,6 +68,14 @@ fn declared_extents(shape: &ShapeExpr, consts: &[(String, i64)]) -> Vec<Option<i
 
 struct Builder {
     next_value: u32,
+    /// The access checks that failed at compile time.
+    ///
+    /// cutile decides a check whose index interval and tile grid are both
+    /// static before it emits anything, and a violation is a compile error
+    /// rather than a device assert (`checks/goals.rs` `fold_static`). The
+    /// emitter keeps walking so the message names every axis, and `emit`
+    /// hands the first one back.
+    errors: Vec<String>,
     body: Vec<Stmt>,
     args: Vec<(ValueId, super::Type)>,
     /// Every tensor parameter, by name, with what the body needs to reach it.
@@ -326,6 +334,49 @@ fn literal_comparison(
 /// none, so cutile leaves it to the launch grid. An index whose range exceeds
 /// the tile count of a *dynamic* extent is the one case that costs ops:
 /// `ceil(extent / tile)` is only known at run time, so the check is emitted.
+/// Decide one axis's access check from its index interval and the tile grid.
+///
+/// cutile's `fold_static` (`checks/goals.rs`) does this before emitting
+/// anything: the interval of the index, the static extent, and the tile extent
+/// give the number of tiles, and `0 <= start && end < num_tiles` proves the
+/// access. Anything else — a violation, or an index or extent this IR cannot
+/// range — is left to the device check, except that a violation is a compile
+/// error, which is the one case cutile refuses to compile.
+fn fold_static(
+    builder: &mut Builder,
+    kernel: &Kernel,
+    index_arg: Option<&sile_hir::Expr>,
+    axis: usize,
+    extent: i64,
+    tile: i64,
+) {
+    let Some(index) = index_arg.and_then(|arg| index_expr(arg, axis)) else {
+        return;
+    };
+    let Some(bounds) = bounds_of(builder, kernel, index) else {
+        return;
+    };
+    let num_tiles = (extent + tile - 1) / tile;
+    if 0 <= bounds.start && bounds.end < num_tiles {
+        return;
+    }
+    builder.errors.push(format!(
+        "Bounds check failed: 0 <= {} && {} < {}",
+        bounds.start, bounds.end, num_tiles
+    ));
+}
+
+/// The expression one axis of an index names.
+///
+/// A tuple index spells every axis. A shape index names one symbol per axis,
+/// and a symbol that is a const generic is that constant.
+fn index_expr<'e>(arg: &'e sile_hir::Expr, axis: usize) -> Option<&'e sile_hir::Expr> {
+    match arg {
+        sile_hir::Expr::TileIndex(items) => items.get(axis),
+        _ => None,
+    }
+}
+
 fn check_partition_access(
     builder: &mut Builder,
     tensor: &Tensor,
@@ -373,14 +424,21 @@ fn check_partition_access(
         // upper comparison; a value derived from a block id has no range at
         // all, so its access tests both sides.
         let proven_non_negative = builder.bounded_loop_vars.iter().any(|bound| bound == name);
-        // The extent as the view prints it: a literal is proven at compile
-        // time, a dynamic one is a value the prologue assumed.
-        let extent = match tensor.view_shape.get(axis) {
-            Some(Extent::Value(value)) => *value,
-            _ => continue,
-        };
         let Some(tile_extent) = tile.get(axis).copied().filter(|t| *t > 0) else {
             continue;
+        };
+        // The extent as the view prints it. A literal one needs no emitted
+        // check: the index interval against the tile grid decides it now, and
+        // a violation is a compile error (`checks/goals.rs` `fold_static`).
+        // A dynamic one is a value the prologue assumed, so its check runs on
+        // the device.
+        let extent = match tensor.view_shape.get(axis) {
+            Some(Extent::Value(value)) => *value,
+            Some(Extent::Literal(extent)) => {
+                fold_static(builder, kernel, index_arg, axis, *extent, tile_extent);
+                continue;
+            }
+            None => continue,
         };
         // `ceil(extent / tile)`, with the extent a run-time value. The tile
         // extent is named again here, inside the check.
@@ -518,6 +576,7 @@ impl Builder {
     fn new(_kernel: &Kernel) -> Self {
         Self {
             next_value: 0,
+            errors: Vec::new(),
             body: Vec::new(),
             args: Vec::new(),
             tensors: Vec::new(),
@@ -643,6 +702,83 @@ impl Builder {
             indent: 0,
         });
         result
+    }
+
+    /// `program_id(axis)`: cutile's `program_id` is a plain Rust function, so
+    /// the axis is an `if` chain over a constant. The axis argument compiles
+    /// first, then the triple, then one `axis == k` test per arm the chain
+    /// walks: each test names `k` and yields a constant predicate, and the
+    /// compared id between them is allocated and dropped.
+    fn program_id_checked(&mut self, axis: i64) -> ValueId {
+        self.i32_const(axis);
+        let ids = self.block_id();
+        let arms = axis.clamp(0, 2);
+        let mut last = ValueId(0);
+        for candidate in 0..=arms {
+            self.i32_const(candidate);
+            // The comparison is decided while compiling, so its id is spent
+            // and its value is a constant.
+            self.discard();
+            last = self.i32_const_i1(candidate == axis);
+        }
+        // Only the `else` arm carries the assertion, and it tests the predicate
+        // the last comparison already produced.
+        if axis >= 2 {
+            self.push_op(Op {
+                results: Vec::new(),
+                format: Format::Plain,
+                opcode: "assert",
+                operands: vec![last],
+                result_types: Vec::new(),
+                attrs: Vec::new(),
+                text: format!("{last}, \"program_id: axis must be 0, 1, or 2\" : tile<i1>"),
+                operand_types: None,
+                indent: 0,
+            });
+        }
+        ids[arms as usize]
+    }
+
+    /// `num_programs(axis)`: the same `if` chain as [`Self::program_id_checked`],
+    /// over the grid extent triple and with its own assertion text.
+    fn num_programs(&mut self, axis: i64) -> ValueId {
+        self.i32_const(axis);
+        let base = self.next_value;
+        self.next_value += 3;
+        let ids = (0..3).map(|i| ValueId(base + i)).collect::<Vec<_>>();
+        self.push_op(Op {
+            results: ids.clone(),
+            format: Format::Plain,
+            opcode: "get_num_tile_blocks",
+            operands: Vec::new(),
+            result_types: vec![Self::i32_tile(); 3],
+            attrs: Vec::new(),
+            text: String::new(),
+            operand_types: None,
+            indent: 0,
+        });
+        let assumed = ids.into_iter().map(|id| self.assume(id)).collect::<Vec<_>>();
+        let arms = axis.clamp(0, 2);
+        let mut last = ValueId(0);
+        for candidate in 0..=arms {
+            self.i32_const(candidate);
+            self.discard();
+            last = self.i32_const_i1(candidate == axis);
+        }
+        if axis >= 2 {
+            self.push_op(Op {
+                results: Vec::new(),
+                format: Format::Plain,
+                opcode: "assert",
+                operands: vec![last],
+                result_types: Vec::new(),
+                attrs: Vec::new(),
+                text: format!("{last}, \"num_programs: axis must be 0, 1, or 2\" : tile<i1>"),
+                operand_types: None,
+                indent: 0,
+            });
+        }
+        assumed[arms as usize]
     }
 
     fn assume(&mut self, subject: ValueId) -> ValueId {
@@ -1022,6 +1158,7 @@ fn compared_to_literal(body: &[sile_hir::Stmt], name: &str) -> bool {
             Stmt::AtomicAdd { index, value, .. } => {
                 walk_expr(index, name) || walk_expr(value, name)
             }
+            Stmt::Print { args, .. } => args.iter().any(|arg| walk_expr(arg, name)),
             Stmt::ForLoop { start, end, step, body, .. } => {
                 walk_expr(start, name)
                     || walk_expr(end, name)
@@ -1117,7 +1254,10 @@ fn shape_extents(shape: &ShapeExpr, consts: &[(String, i64)]) -> Vec<i64> {
 /// twice over.
 
 /// The program cutile prints for `kernel`.
-pub fn emit(kernel: &Kernel, locals: &std::collections::BTreeMap<String, Type>) -> Module {
+pub fn emit(
+    kernel: &Kernel,
+    locals: &std::collections::BTreeMap<String, Type>,
+) -> Result<Module, String> {
     let mut builder = Builder::new(kernel);
     builder.locals = locals.clone();
     declare_params(&mut builder, kernel);
@@ -1152,7 +1292,13 @@ pub fn emit(kernel: &Kernel, locals: &std::collections::BTreeMap<String, Type>) 
     }
     builder.body.push(Stmt::Return);
 
-    Module {
+    // A failed access check is a compile error, not a device assert, so no
+    // module is printed for it.
+    if let Some(error) = builder.errors.first() {
+        return Err(error.clone());
+    }
+
+    Ok(Module {
         name: kernel.origin.module.clone(),
         functions: vec![Function {
             name: format!("{}_entry", kernel.name),
@@ -1160,7 +1306,7 @@ pub fn emit(kernel: &Kernel, locals: &std::collections::BTreeMap<String, Type>) 
             args: builder.args,
             body: builder.body,
         }],
-    }
+    })
 }
 
 /// The entry parameters, in declaration order, and then one view per tensor.
@@ -1470,6 +1616,18 @@ fn emit_stmt(builder: &mut Builder, stmt: &sile_hir::Stmt, kernel: &Kernel) {
             builder.loop_carried.push(carried.clone());
             if bound != "?" {
                 builder.bounded_loop_vars.push(var.clone());
+                // The assumption states the interval, so record it: an access
+                // indexed by this variable can be decided without emitting a
+                // check.
+                if let Ok(end) = bound.parse::<i64>() {
+                    builder.bounds.push((
+                        var.clone(),
+                        super::bounds::Bounds {
+                            start: 0,
+                            end,
+                        },
+                    ));
+                }
             }
             for (name, (_, ty)) in carried.iter().zip(inits.iter()) {
                 builder
@@ -1664,6 +1822,67 @@ fn emit_stmt(builder: &mut Builder, stmt: &sile_hir::Stmt, kernel: &Kernel) {
                     entry.1 = *result_id;
                 }
             }
+        }
+        // `cuda_tile_print!("fmt {}", a)`: the format string keeps its text and
+        // gains one `%` plus the operand's element letter per placeholder.
+        sile_hir::Stmt::Print { format, args } => {
+            let mut text = String::new();
+            let mut operands = Vec::new();
+            let mut types = Vec::new();
+            let mut rest = format.as_str();
+            for arg in args {
+                let (value, ty) = emit_expr(builder, arg, kernel);
+                operands.push(value);
+                types.push(ty.clone());
+                let letter = match &ty {
+                    super::Type::Tile { element: TileElement::Scalar(scalar), .. } => match scalar {
+                        ScalarType::F32 | ScalarType::F16 => "f",
+                        ScalarType::I1 => "i",
+                        _ => "i",
+                    },
+                    _ => "i",
+                };
+                // The placeholder becomes `%` and the letter; everything before
+                // it is the literal text the kernel wrote.
+                match rest.split_once("{}") {
+                    Some((before, after)) => {
+                        text.push_str(before);
+                        text.push('%');
+                        text.push_str(letter);
+                        rest = after;
+                    }
+                    None => panic!("more print arguments than `{{}}` placeholders: {format}"),
+                }
+            }
+            text.push_str(rest);
+            let types_text = types
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let operands_text = operands
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            // A print yields a token. The id is real even though nothing reads
+            // it, so it takes one like any other op.
+            let result = builder.value();
+            builder.push_op(Op {
+                results: vec![result],
+                format: Format::Plain,
+                opcode: "print_tko",
+                operands: operands.clone(),
+                result_types: vec![super::Type::Token],
+                attrs: Vec::new(),
+                text: if operands.is_empty() {
+                    format!("{text:?}")
+                } else {
+                    format!("{text:?}, {operands_text} : {types_text}")
+                },
+                operand_types: None,
+                indent: 0,
+            });
         }
         // A loop's `continue` is the trailer the loop already printed.
         sile_hir::Stmt::Continue | sile_hir::Stmt::Break => {}
@@ -2613,8 +2832,8 @@ fn emit_builtin(
             (ids[axis], Builder::i32_tile())
         }
         // `get_tile_block_id()`: three values, each assumed bounded. The kernel
-        // names the whole tuple once and then reads its elements, so the block
-        // id is fetched once and every later use reads the same three values.
+        // `get_tile_block_id().k`: the tuple is read once and every later read
+        // of any component reuses those three values.
         BuiltinOp::ProgramId => {
             if builder.program_id.is_none() {
                 let ids = builder.block_id();
@@ -2629,6 +2848,26 @@ fn emit_builtin(
                 Some(id) => (id, Builder::i32_tile()),
                 None => (ValueId(0), Builder::i32_tile()),
             }
+        }
+        // `program_id(axis)`: CuTile writes this helper as a plain function
+        // with an `if` chain over the axis, so each call reads the triple
+        // again and tests the axis. The extra ids are part of the text.
+        BuiltinOp::ProgramIdAxis => {
+            let index = match args.first() {
+                Some(Expr::ScalarI64(index)) => *index,
+                _ => 0,
+            };
+            (builder.program_id_checked(index), Builder::i32_tile())
+        }
+        // `num_programs(axis)`: the grid extent along one axis. cutile emits
+        // the whole triple, checks the axis against 0/1/2, and keeps the
+        // selected component.
+        BuiltinOp::NumPrograms => {
+            let index = match args.first() {
+                Some(Expr::ScalarI64(index)) => *index,
+                _ => 0,
+            };
+            (builder.num_programs(index), Builder::i32_tile())
         }
         // `fma(a, b, c)` lowers to `mulf a, b` then `addf c, product`: the
         // accumulator is the left operand of the sum.

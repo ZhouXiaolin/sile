@@ -1,0 +1,62 @@
+cuda_tile.module @kernels {
+  entry @hello_world_kernel_entry() di_name = "hello_world_kernel" {
+    %0 = constant <i32: 0> : tile<i32>
+    %1, %2, %3 = get_tile_block_id : tile<i32>
+    %4 = assume bounded<0, ?>, %1 : tile<i32>
+    %5 = assume bounded<0, ?>, %2 : tile<i32>
+    %6 = assume bounded<0, ?>, %3 : tile<i32>
+    %7 = constant <i32: 0> : tile<i32>
+    %9 = constant <i1: 1> : tile<i1>
+    %10 = constant <i32: 1> : tile<i32>
+    %11, %12, %13 = get_tile_block_id : tile<i32>
+    %14 = assume bounded<0, ?>, %11 : tile<i32>
+    %15 = assume bounded<0, ?>, %12 : tile<i32>
+    %16 = assume bounded<0, ?>, %13 : tile<i32>
+    %17 = constant <i32: 0> : tile<i32>
+    %19 = constant <i1: 0> : tile<i1>
+    %20 = constant <i32: 1> : tile<i32>
+    %22 = constant <i1: 1> : tile<i1>
+    %23 = constant <i32: 2> : tile<i32>
+    %24, %25, %26 = get_tile_block_id : tile<i32>
+    %27 = assume bounded<0, ?>, %24 : tile<i32>
+    %28 = assume bounded<0, ?>, %25 : tile<i32>
+    %29 = assume bounded<0, ?>, %26 : tile<i32>
+    %30 = constant <i32: 0> : tile<i32>
+    %32 = constant <i1: 0> : tile<i1>
+    %33 = constant <i32: 1> : tile<i32>
+    %35 = constant <i1: 0> : tile<i1>
+    %36 = constant <i32: 2> : tile<i32>
+    %38 = constant <i1: 1> : tile<i1>
+    assert %38, "program_id: axis must be 0, 1, or 2" : tile<i1>
+    %39 = constant <i32: 0> : tile<i32>
+    %40, %41, %42 = get_num_tile_blocks : tile<i32>
+    %43 = assume bounded<0, ?>, %40 : tile<i32>
+    %44 = assume bounded<0, ?>, %41 : tile<i32>
+    %45 = assume bounded<0, ?>, %42 : tile<i32>
+    %46 = constant <i32: 0> : tile<i32>
+    %48 = constant <i1: 1> : tile<i1>
+    %49 = constant <i32: 1> : tile<i32>
+    %50, %51, %52 = get_num_tile_blocks : tile<i32>
+    %53 = assume bounded<0, ?>, %50 : tile<i32>
+    %54 = assume bounded<0, ?>, %51 : tile<i32>
+    %55 = assume bounded<0, ?>, %52 : tile<i32>
+    %56 = constant <i32: 0> : tile<i32>
+    %58 = constant <i1: 0> : tile<i1>
+    %59 = constant <i32: 1> : tile<i32>
+    %61 = constant <i1: 1> : tile<i1>
+    %62 = constant <i32: 2> : tile<i32>
+    %63, %64, %65 = get_num_tile_blocks : tile<i32>
+    %66 = assume bounded<0, ?>, %63 : tile<i32>
+    %67 = assume bounded<0, ?>, %64 : tile<i32>
+    %68 = assume bounded<0, ?>, %65 : tile<i32>
+    %69 = constant <i32: 0> : tile<i32>
+    %71 = constant <i1: 0> : tile<i1>
+    %72 = constant <i32: 1> : tile<i32>
+    %74 = constant <i1: 0> : tile<i1>
+    %75 = constant <i32: 2> : tile<i32>
+    %77 = constant <i1: 1> : tile<i1>
+    assert %77, "num_programs: axis must be 0, 1, or 2" : tile<i1>
+    %78 = print_tko "Hello, I am program <%i, %i, %i> in a kernel with <%i, %i, %i> programs.\n", %4, %15, %29, %43, %54, %68 : tile<i32>, tile<i32>, tile<i32>, tile<i32>, tile<i32>, tile<i32>
+    return
+  }
+}

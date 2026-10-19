@@ -102,3 +102,37 @@ pub fn transfer(op: BuiltinOp, lhs: Bounds, rhs: Bounds) -> Option<Bounds> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_exact_interval_names_one_value() {
+        assert!(Bounds::exact(7).is_exact());
+        assert!(!Bounds { start: 0, end: 3 }.is_exact());
+    }
+
+    #[test]
+    fn addition_takes_the_corner_extremes() {
+        let sum = transfer(
+            BuiltinOp::Add,
+            Bounds { start: 0, end: 3 },
+            Bounds::exact(1),
+        )
+        .expect("addition has a transfer function");
+        assert_eq!(sum, Bounds { start: 1, end: 4 });
+    }
+
+    #[test]
+    fn a_zero_divisor_makes_the_result_unknown() {
+        assert_eq!(
+            transfer(
+                BuiltinOp::Div,
+                Bounds::exact(4),
+                Bounds { start: -1, end: 1 }
+            ),
+            None
+        );
+    }
+}

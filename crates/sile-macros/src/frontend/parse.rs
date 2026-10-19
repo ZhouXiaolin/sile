@@ -57,6 +57,44 @@ pub fn parse_kernel(input: &syn::ItemFn) -> syn::Result<KernelDecl> {
 /// Two copies let `store` mean different things at top level and inside a loop.
 fn parse_stmt(stmt: &syn::Stmt, body: &mut Vec<KernelStmt>) -> syn::Result<()> {
     match stmt {
+        // `cuda_tile_print!("fmt {}", x);` with its semicolon is a macro
+        // statement, not an expression statement. The format string is a
+        // literal and every later argument is an expression to print.
+        syn::Stmt::Macro(mac)
+            if mac
+                .mac
+                .path
+                .segments
+                .last()
+                .is_some_and(|seg| seg.ident == "cuda_tile_print") =>
+        {
+            let parsed = mac.mac.parse_body_with(
+                syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated,
+            )?;
+            let mut items = parsed.into_iter();
+            let format = match items.next() {
+                Some(syn::Expr::Lit(lit)) => match lit.lit {
+                    syn::Lit::Str(text) => text.value(),
+                    other => {
+                        return Err(syn::Error::new_spanned(
+                            other,
+                            "the print format must be a string literal",
+                        ));
+                    }
+                },
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        other,
+                        "the print format must be a string literal",
+                    ));
+                }
+            };
+            let args = items
+                .map(|arg| parse_expr(&arg))
+                .collect::<syn::Result<Vec<_>>>()?;
+            body.push(KernelStmt::Print { format, args });
+            Ok(())
+        }
         syn::Stmt::Local(local) => {
             let name = match &local.pat {
                 syn::Pat::Ident(pat) => pat.ident.clone(),
@@ -343,6 +381,11 @@ fn rewrite_block_id_fields(body: &mut [KernelStmt], block_ids: &[syn::Ident]) {
                 rewrite_block_id_expr(index, block_ids);
                 rewrite_block_id_expr(value, block_ids);
             }
+            KernelStmt::Print { args, .. } => {
+                for arg in args {
+                    rewrite_block_id_expr(arg, block_ids);
+                }
+            }
             KernelStmt::ForLoop {
                 start,
                 end,
@@ -378,17 +421,20 @@ fn rewrite_block_id_fields(body: &mut [KernelStmt], block_ids: &[syn::Ident]) {
 }
 
 fn rewrite_block_id_expr(expr: &mut KernelExpr, block_ids: &[syn::Ident]) {
-    // A field of a block id is an axis, so it becomes the call that names one.
+    // A field of a block id is an axis. The binding named the whole tuple, so
+    // the read becomes `get_tile_block_id().k`: the tuple spelling, which reads
+    // the three ids once. CuTile's `program_id(axis)` is a different call that
+    // reads them again every time, and writing it here would charge a kernel
+    // for ids it never spends.
     if let KernelExpr::FieldAccess { target, field } = expr
         && let KernelExpr::Var(name) = target.as_ref()
         && block_ids.contains(name)
         && let Ok(axis) = field.parse::<u16>()
     {
-        let func = syn::Ident::new("program_id", name.span());
-        let lit = syn::LitInt::new(&axis.to_string(), name.span());
-        *expr = KernelExpr::Call {
-            func,
-            args: vec![KernelExpr::Lit(lit)],
+        let func = syn::Ident::new("get_tile_block_id", name.span());
+        *expr = KernelExpr::FieldAccess {
+            target: Box::new(KernelExpr::Call { func, args: Vec::new() }),
+            field: syn::LitInt::new(&axis.to_string(), name.span()).to_string(),
         };
         return;
     }
@@ -431,8 +477,11 @@ fn rewrite_block_id_syn(expr: &mut syn::Expr, block_ids: &[syn::Ident]) {
         && block_ids.contains(name)
         && let syn::Member::Unnamed(index) = &field.member
     {
-        let axis = syn::LitInt::new(&index.index.to_string(), index.span);
-        *expr = syn::parse_quote! { program_id(#axis) };
+        // The binding named the whole tuple, so the read stays a tuple read:
+        // `get_tile_block_id().k` fetches the three ids once, while CuTile's
+        // `program_id(axis)` fetches them again on every call.
+        let index = syn::Member::Unnamed(index.clone());
+        *expr = syn::parse_quote! { get_tile_block_id().#index };
         return;
     }
     match expr {

@@ -125,6 +125,11 @@ pub enum KernelStmt {
         then_body: Vec<KernelStmt>,
         else_body: Vec<KernelStmt>,
     },
+    /// `cuda_tile_print!("..", a, b)`: debug output from inside a kernel.
+    Print {
+        format: String,
+        args: Vec<KernelExpr>,
+    },
     Continue,
 }
 
