@@ -51,10 +51,7 @@ pub fn lower_to_tile_ir(typed: &TypedKernel) -> TileIrFunction {
                     _ => None,
                 };
                 (
-                    TileIrType::Buffer {
-                        rank,
-                        elem: buffer_elem_of_param(param),
-                    },
+                    param_buffer_type(param, rank),
                     TileIrParamKind::Buffer,
                     abi,
                 )
@@ -94,6 +91,8 @@ struct LowerCtx<'a> {
     mir_params: Vec<TileIrParam>,
     program_id_params: HashMap<i64, ValueId>,
     shape_desc_params: HashMap<ValueId, ValueId>,
+    /// One partition view per buffer, made once.
+    views: HashMap<ValueId, ValueId>,
     blocks: Vec<TileIrBlock>,
     current_block: BlockId,
     entry: BlockId,
@@ -116,6 +115,7 @@ impl<'a> LowerCtx<'a> {
             types: HashMap::new(),
             mir_params: Vec::new(),
             program_id_params: HashMap::new(),
+            views: HashMap::new(),
             shape_desc_params: HashMap::new(),
             blocks: Vec::new(),
             current_block: BlockId(0),
@@ -180,6 +180,37 @@ impl<'a> LowerCtx<'a> {
         value
     }
 
+    /// The partition view for a buffer, made once and reused.
+    ///
+    /// CuTile's memory model names a view and accesses through it; two accesses
+    /// to one buffer are two accesses to one view, not two views.
+    fn get_or_create_view(&mut self, source: ValueId, rows: i64, cols: i64) -> ValueId {
+        if let Some(value) = self.views.get(&source).copied() {
+            return value;
+        }
+        let op = TileIrOp::MakePartitionView {
+            source,
+            tile_rows: rows,
+            tile_cols: cols,
+            semantics: Default::default(),
+        };
+        // The view's type names the buffer's tensor; the tile extent it carries
+        // is the one this program will access through it.
+        let ty = match self.types.get(&source).cloned() {
+            Some(TileIrType::PartitionView(pv)) => {
+                TileIrType::PartitionView(PartitionViewType {
+                    tile_shape: vec![rows as i32, cols as i32],
+                    ..pv
+                })
+            }
+            Some(other) => other,
+            None => TileIrType::Void,
+        };
+        let value = self.emit(op, ty);
+        self.views.insert(source, value);
+        value
+    }
+
     fn get_or_create_shape_desc_param(&mut self, source: ValueId) -> ValueId {
         if let Some(value) = self.shape_desc_params.get(&source).copied() {
             return value;
@@ -192,7 +223,8 @@ impl<'a> LowerCtx<'a> {
             .unwrap_or_else(|| format!("v{}", source.0));
         let rank = match self.types.get(&source) {
             Some(TileIrType::Buffer { rank, .. }) => *rank,
-            _ => 1,
+            Some(ty) => view_rank(ty).unwrap_or(1),
+            None => 1,
         };
         let value = self.push_param(
             format!("shape_{}", source_name),
@@ -1289,6 +1321,10 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx<'_>) -> ValueId {
         }
         Expr::ScalarI64(v) => ctx.emit(TileIrOp::ConstI64(*v), TileIrType::I64),
         Expr::ScalarF32(v) => ctx.emit(TileIrOp::ConstF64(*v as f64), TileIrType::F32),
+        // The backends keep one element type, so a mask value is `1.0`/`0.0`.
+        Expr::ScalarBool(v) => {
+            ctx.emit(TileIrOp::ConstF64(if *v { 1.0 } else { 0.0 }), TileIrType::F32)
+        }
         Expr::Shape(_) => ctx.emit(TileIrOp::ConstI64(0), TileIrType::I64),
         // An index tuple's value is its first axis. Callers needing every axis
         // use `extract_runtime_coords`, which reads the inner list directly.
@@ -1416,15 +1452,17 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 (outer_coords(&coords), row, col)
             };
             let stride_shape_idx = param_stride_dim(&base, ctx);
+            let view = ctx.get_or_create_view(base, rows, cols);
             ctx.emit(
-                TileIrOp::LoadPtrTko {
-                    buf: base,
+                TileIrOp::LoadViewTko {
+                    view,
                     outer_coords: plane,
                     row_coord,
                     col_coord,
                     rows,
                     cols,
                     stride_shape_idx,
+                    semantics: Default::default(),
                 },
                 TileIrType::Tile { rows, cols },
             )
@@ -1443,15 +1481,17 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
             let (rows, cols) = shape_to_2d(&tile_shape);
             let (row_coord, col_coord) = coords_to_2d(&coords, ctx);
             let stride_shape_idx = param_stride_dim(&base, ctx);
+            let view = ctx.get_or_create_view(base, rows, cols);
             ctx.emit(
-                TileIrOp::LoadPtrTko {
-                    buf: base,
+                TileIrOp::LoadViewTko {
+                    view,
                     outer_coords: outer_coords(&coords),
                     row_coord,
                     col_coord,
                     rows,
                     cols,
                     stride_shape_idx,
+                    semantics: Default::default(),
                 },
                 TileIrType::Tile { rows, cols },
             )
@@ -1473,15 +1513,17 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
             let (rows, cols) = shape_to_2d(&shape);
             let (plane, row_coord, col_coord) = program_tile_coords(buffer_rank(input, ctx), ctx);
             let stride_shape_idx = param_stride_dim(&input, ctx);
+            let view = ctx.get_or_create_view(input, rows, cols);
             ctx.emit(
-                TileIrOp::LoadPtrTko {
-                    buf: input,
+                TileIrOp::LoadViewTko {
+                    view,
                     outer_coords: plane,
                     row_coord,
                     col_coord,
                     rows,
                     cols,
                     stride_shape_idx,
+                    semantics: Default::default(),
                 },
                 TileIrType::Tile { rows, cols },
             )
@@ -1628,14 +1670,19 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
                 TileIrType::I64,
             )
         }
-        BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Mul | BuiltinOp::Div | BuiltinOp::Rem => {
+        BuiltinOp::Add
+        | BuiltinOp::Sub
+        | BuiltinOp::Mul
+        | BuiltinOp::Div
+        | BuiltinOp::TrueDiv
+        | BuiltinOp::Rem => {
             let lhs = lower_expr(&args[0], ctx);
             let rhs = lower_expr(&args[1], ctx);
             let bin_op = match op {
                 BuiltinOp::Add => BinOp::Add,
                 BuiltinOp::Sub => BinOp::Sub,
                 BuiltinOp::Mul => BinOp::Mul,
-                BuiltinOp::Div => BinOp::Div,
+                BuiltinOp::Div | BuiltinOp::TrueDiv => BinOp::Div,
                 BuiltinOp::Rem => BinOp::Rem,
                 _ => unreachable!(),
             };
@@ -2064,7 +2111,8 @@ fn lower_store(target: &str, value: &Expr, index: Option<&Expr>, ctx: &mut Lower
 
     let output_rank = match ctx.types.get(&output) {
         Some(TileIrType::Buffer { rank, .. }) => *rank,
-        _ => 1,
+        Some(ty) => view_rank(ty).unwrap_or(1),
+        None => 1,
     };
     // `y.store(t)` names no coordinates, so the tile is the one this program
     // owns and the launch index addresses it. `part.store(t, [i, j])` names
@@ -2098,9 +2146,10 @@ fn lower_store(target: &str, value: &Expr, index: Option<&Expr>, ctx: &mut Lower
 
     let stride_shape_idx = param_stride_dim(&output, ctx);
 
+    let view = ctx.get_or_create_view(output, rows, cols);
     ctx.emit(
-        TileIrOp::StorePtrTko {
-            buf: output,
+        TileIrOp::StoreViewTko {
+            view,
             value: stored,
             outer_coords: plane,
             row_coord,
@@ -2108,6 +2157,7 @@ fn lower_store(target: &str, value: &Expr, index: Option<&Expr>, ctx: &mut Lower
             rows,
             cols,
             stride_shape_idx,
+            semantics: Default::default(),
         },
         TileIrType::Void,
     );
@@ -2136,6 +2186,7 @@ fn lower_atomic_add(target: &str, index: &Expr, value: &Expr, ctx: &mut LowerCtx
             row_coord,
             col_coord,
             stride_shape_idx,
+            semantics: Default::default(),
         },
         TileIrType::Void,
     );
@@ -2309,7 +2360,7 @@ fn try_eval_i64(expr: &Expr, ctx: &LowerCtx<'_>) -> Option<i64> {
             args,
         } => Some(try_eval_i64(args.first()?, ctx)? * try_eval_i64(args.get(1)?, ctx)?),
         Expr::Builtin {
-            op: BuiltinOp::Div | BuiltinOp::ScalarDiv,
+            op: BuiltinOp::Div | BuiltinOp::TrueDiv | BuiltinOp::ScalarDiv,
             args,
         } => {
             let lhs = try_eval_i64(args.first()?, ctx)?;
@@ -2553,8 +2604,47 @@ fn program_tile_coords(rank: usize, ctx: &mut LowerCtx<'_>) -> (Vec<ValueId>, Va
 fn buffer_rank(value: ValueId, ctx: &LowerCtx<'_>) -> usize {
     match ctx.types.get(&value) {
         Some(TileIrType::Buffer { rank, .. }) => *rank,
-        _ => 2,
+        Some(ty) => view_rank(ty).unwrap_or(2),
+        None => 2,
     }
+}
+
+/// The number of axes a view describes, if this type is one.
+fn view_rank(ty: &TileIrType) -> Option<usize> {
+    match ty {
+        TileIrType::TensorView(tv) => Some(tv.shape.len()),
+        TileIrType::PartitionView(pv) => Some(pv.tensor_view.shape.len()),
+        TileIrType::GatherScatterView(gv) => Some(gv.tensor_view.shape.len()),
+        TileIrType::StridedView(sv) => Some(sv.tensor_view.shape.len()),
+        _ => None,
+    }
+}
+
+/// The type a kernel buffer parameter is declared with.
+///
+/// CuTile declares every buffer as a partition view: a tile grid laid over a
+/// tensor in global memory. The tensor's shape and strides are dynamic — only
+/// the launch's shape descriptor knows them — so the type names the axes and
+/// leaves the extents to be read at run time.
+fn param_buffer_type(param: &sile_hir::Param, rank: usize) -> TileIrType {
+    let elem = match buffer_elem_of_param(param) {
+        BufferElem::F32 => ScalarType::F32,
+        BufferElem::F16 => ScalarType::F16,
+    };
+    let dynamic = vec![DYNAMIC_STRIDE; rank];
+    let tensor_view = TensorViewType {
+        element_type: elem,
+        shape: dynamic.clone(),
+        strides: dynamic,
+    };
+    // The tile a program owns is two axes; the grid above it is the axes the
+    // launch walks, which the kernel body decides.
+    TileIrType::PartitionView(PartitionViewType {
+        tile_shape: vec![1, 1],
+        tensor_view,
+        dim_map: (0..rank as i32).collect(),
+        padding_value: None,
+    })
 }
 
 fn tile_shape_of(value: ValueId, ctx: &LowerCtx<'_>) -> Option<(i64, i64)> {

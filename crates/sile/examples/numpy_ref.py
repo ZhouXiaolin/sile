@@ -64,10 +64,14 @@ def main():
         alpha = np.float32(float(scalars[0]))
         expected = alpha * x + y
     elif op == "dropout":
+        # The kernel selects the draws in `x_keep` where they exceed `p` and
+        # zeroes the rest, so `x` plays no part. Reading it here would test a
+        # kernel this example does not compile.
         x, keep = read_inputs(count, lengths)
+        del x
         p = np.float32(float(scalars[0]))
         kept = keep > p
-        expected = np.where(kept, x / (np.float32(1.0) - p), np.float32(0.0))
+        expected = np.where(kept, keep / (np.float32(1.0) - p), np.float32(0.0))
     elif op == "matmul":
         a, b = read_inputs(count, lengths)
         m, k, n = (int(s) for s in scalars)

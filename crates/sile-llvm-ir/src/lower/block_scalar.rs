@@ -15,6 +15,39 @@ pub(crate) fn lower_scalar_inst(
     out: &mut Vec<llvm_ir::Inst>,
 ) {
     match &inst.op {
+        // The view family is lowered where the block lowerer owns the
+        // addressing; the scalar path never sees one.
+        TileIrOp::MakePartitionView { .. }
+        | TileIrOp::LoadViewTko { .. }
+        | TileIrOp::StoreViewTko { .. } => {
+            ctx.unhandled_op.get_or_insert_with(|| {
+                "a view access reached the scalar path, which has no addressing".to_string()
+            });
+        }
+        // A general-form op names its LLVM IR, or says why it has none.
+        TileIrOp::Opaque {
+            opcode,
+            operands,
+            results,
+            ..
+        } => {
+            let ty = tile_ir
+                .types
+                .get(&inst.result)
+                .cloned()
+                .unwrap_or(TileIrType::Void);
+            if let Err(why) = super::op_lowering::lower_opaque(
+                inst.result,
+                *opcode,
+                operands,
+                results,
+                &ty,
+                ctx,
+                out,
+            ) {
+                ctx.unhandled_op.get_or_insert(why);
+            }
+        }
         TileIrOp::ConstI64(value) => {
             ctx.operands.insert(
                 inst.result,
@@ -205,6 +238,7 @@ pub(crate) fn lower_scalar_inst(
             col_coord,
             outer_coords,
             stride_shape_idx,
+            ..
         } => {
             let buf_operand = resolve_operand(*buf, ctx);
             let row_operand = resolve_operand(*row_coord, ctx);
@@ -330,3 +364,4 @@ fn load_shape_desc_dim(
     }
     loaded
 }
+

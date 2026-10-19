@@ -3,6 +3,8 @@ use std::fmt;
 
 pub use sile_hir::UnaryOp;
 
+pub use crate::opcode::Opcode;
+
 // ── Value & Block identifiers ──────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,16 +39,170 @@ impl fmt::Display for BlockId {
 
 // ── Types ──────────────────────────────────────────────────────────
 
+/// One scalar (element) type.
+///
+/// CuTile names sixteen of these; every one is here so an op signature can be
+/// read off this enum instead of a string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScalarType {
+    I1,
+    I4,
+    I8,
+    I16,
+    I32,
+    I64,
+    F16,
+    BF16,
+    F32,
+    TF32,
+    F64,
+    F8E4M3FN,
+    F8E5M2,
+    F8E8M0FNU,
+    F4E2M1FN,
+    F8E5M3FNU,
+}
+
+impl ScalarType {
+    pub fn is_integer(self) -> bool {
+        matches!(
+            self,
+            Self::I1 | Self::I4 | Self::I8 | Self::I16 | Self::I32 | Self::I64
+        )
+    }
+
+    pub fn is_float(self) -> bool {
+        !self.is_integer()
+    }
+}
+
+/// What a tile's elements are: a scalar, or a pointer to one.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TileElementType {
+    Scalar(ScalarType),
+    Pointer(Box<PointerType>),
+}
+
+/// A pointer to a scalar in device memory.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PointerType {
+    pub pointee: ScalarType,
+}
+
+/// The pointer classification CuTile attaches to a pointer or view.
+///
+/// Only `None` is public today; the variant exists so an absent attribute and
+/// an explicit `none` stay distinguishable, as they are in CuTile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PointerAttribute {
+    None,
+}
+
+/// A statically shaped tile of elements.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TileType {
+    pub shape: Vec<i64>,
+    pub element_type: TileElementType,
+}
+
+/// A tensor in global memory: element type, shape, and per-axis strides.
+///
+/// A stride of [`DYNAMIC_STRIDE`] means the value is not known statically.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TensorViewType {
+    pub element_type: ScalarType,
+    pub shape: Vec<i64>,
+    pub strides: Vec<i64>,
+}
+
+/// Where a partition view sits: a tile grid laid over a tensor view.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PartitionViewType {
+    pub tile_shape: Vec<i32>,
+    pub tensor_view: TensorViewType,
+    pub dim_map: Vec<i32>,
+    pub padding_value: Option<PaddingValue>,
+}
+
+/// A partition view whose tiles gather through a sparse index along one axis.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GatherScatterViewType {
+    pub tile_shape: Vec<i32>,
+    pub tensor_view: TensorViewType,
+    pub sparse_dim: i32,
+    pub padding_value: Option<PaddingValue>,
+}
+
+/// A partition view that walks the tensor with per-axis traversal strides.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct StridedViewType {
+    pub tile_shape: Vec<i32>,
+    pub traversal_strides: Vec<i32>,
+    pub tensor_view: TensorViewType,
+    pub dim_map: Vec<i32>,
+    pub padding_value: Option<PaddingValue>,
+}
+
+/// What a view reads where its tile reaches past the tensor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PaddingValue {
+    Zero,
+    NegZero,
+    Nan,
+    PosInf,
+    NegInf,
+}
+
+/// A function signature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FuncType {
+    pub inputs: Vec<TileIrType>,
+    pub results: Vec<TileIrType>,
+}
+
+/// Marker for a dimension or stride whose size is not known statically.
+/// It matches CuTile's `?`; a negative extent never means a real one.
+pub const DYNAMIC_STRIDE: i64 = i64::MIN;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TileIrType {
     /// i64 index / scalar integer
     I64,
     /// f32 scalar
     F32,
+    /// Any one of the sixteen scalar types, named.
+    Scalar(ScalarType),
+    /// A pointer to a scalar.
+    Pointer(PointerType),
     /// Opaque shape descriptor view
     ShapeDesc { rank: usize },
     /// Tile of f32 with known shape
+    ///
+    /// This is the f32 two-axis shorthand for [`TileIrType::TileOf`]: the
+    /// kernels sile lowers today are all f32 tiles over two axes, and spelling
+    /// them this way keeps every shape match in the pipeline reading two
+    /// numbers instead of a vector.
     Tile { rows: i64, cols: i64 },
+    /// A tile of any element type and any rank.
+    TileOf(TileType),
+    /// A tensor in global memory.
+    TensorView(TensorViewType),
+    /// A tile grid over a tensor.
+    PartitionView(PartitionViewType),
+    /// A tile grid that gathers through a sparse index.
+    GatherScatterView(GatherScatterViewType),
+    /// A tile grid that walks with per-axis traversal strides.
+    StridedView(StridedViewType),
+    /// A function signature.
+    Func(FuncType),
+    /// The completion of memory operations, passed as a value.
+    ///
+    /// A token is how this IR states ordering: a load produces one, a store
+    /// consumes one, and `JoinTokens` merges two. Nothing here is ordered by
+    /// where an instruction sits in a block.
+    Token,
+    /// A type carrying a pointer classification.
+    WithPointerAttribute(Box<TileIrType>, PointerAttribute),
     /// Opaque buffer pointer (kernel parameter). The element type is the
     /// buffer's storage: a half buffer converts at its loads and stores, and
     /// every tile between them stays f32.
@@ -62,13 +218,215 @@ pub enum BufferElem {
     F16,
 }
 
+impl fmt::Display for ScalarType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            ScalarType::I1 => "i1",
+            ScalarType::I4 => "i4",
+            ScalarType::I8 => "i8",
+            ScalarType::I16 => "i16",
+            ScalarType::I32 => "i32",
+            ScalarType::I64 => "i64",
+            ScalarType::F16 => "f16",
+            ScalarType::BF16 => "bf16",
+            ScalarType::F32 => "f32",
+            ScalarType::TF32 => "tf32",
+            ScalarType::F64 => "f64",
+            ScalarType::F8E4M3FN => "f8e4m3fn",
+            ScalarType::F8E5M2 => "f8e5m2",
+            ScalarType::F8E8M0FNU => "f8e8m0fnu",
+            ScalarType::F4E2M1FN => "f4e2m1fn",
+            ScalarType::F8E5M3FNU => "f8e5m3fnu",
+        };
+        write!(f, "{name}")
+    }
+}
+
+impl fmt::Display for TileElementType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TileElementType::Scalar(s) => write!(f, "{s}"),
+            TileElementType::Pointer(p) => write!(f, "ptr<{}>", p.pointee),
+        }
+    }
+}
+
+/// Print one extent, or `?` where it is dynamic.
+fn fmt_extent(d: i64) -> String {
+    if d == DYNAMIC_STRIDE || d < 0 {
+        "?".into()
+    } else {
+        d.to_string()
+    }
+}
+
+fn fmt_extents(shape: &[i64]) -> String {
+    shape.iter().map(|d| fmt_extent(*d)).collect::<Vec<_>>().join("x")
+}
+
+impl fmt::Display for TensorViewType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let strides = self
+            .strides
+            .iter()
+            .map(|d| fmt_extent(*d))
+            .collect::<Vec<_>>()
+            .join(",");
+        write!(
+            f,
+            "tensor_view<{}x{}, strides=[{strides}]>",
+            fmt_extents(&self.shape),
+            self.element_type
+        )
+    }
+}
+
+impl PartitionViewType {
+    /// The `, padding_value = ...` suffix, or nothing when the view does not pad.
+    fn padding_suffix(&self) -> String {
+        match self.padding_value {
+            Some(PaddingValue::Zero) => ", padding_value = zero".into(),
+            Some(PaddingValue::NegZero) => ", padding_value = neg_zero".into(),
+            Some(PaddingValue::Nan) => ", padding_value = nan".into(),
+            Some(PaddingValue::PosInf) => ", padding_value = pos_inf".into(),
+            Some(PaddingValue::NegInf) => ", padding_value = neg_inf".into(),
+            None => String::new(),
+        }
+    }
+
+    /// The `, dim_map = [...]` suffix, or nothing for the identity mapping.
+    fn dim_map_suffix(&self) -> String {
+        let identity = self.dim_map.iter().enumerate().all(|(i, d)| *d == i as i32);
+        if identity {
+            String::new()
+        } else {
+            let vals = self
+                .dim_map
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(", dim_map=[{vals}]")
+        }
+    }
+
+    fn tile_shape_str(&self) -> String {
+        self.tile_shape
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join("x")
+    }
+}
+
+impl fmt::Display for PartitionViewType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "partition_view<tile=({}){}, {}{}>",
+            self.tile_shape_str(),
+            self.padding_suffix(),
+            self.tensor_view,
+            self.dim_map_suffix()
+        )
+    }
+}
+
+impl fmt::Display for GatherScatterViewType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tile_shape = self
+            .tile_shape
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join("x");
+        let padding = match self.padding_value {
+            Some(PaddingValue::Zero) => ", padding_value = zero",
+            Some(PaddingValue::NegZero) => ", padding_value = neg_zero",
+            Some(PaddingValue::Nan) => ", padding_value = nan",
+            Some(PaddingValue::PosInf) => ", padding_value = pos_inf",
+            Some(PaddingValue::NegInf) => ", padding_value = neg_inf",
+            None => "",
+        };
+        write!(
+            f,
+            "gather_scatter_view<tile=({tile_shape}), sparse_dim={}{padding}, {}>",
+            self.sparse_dim, self.tensor_view
+        )
+    }
+}
+
+impl fmt::Display for StridedViewType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tile_shape = self
+            .tile_shape
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join("x");
+        let traversal = self
+            .traversal_strides
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        write!(
+            f,
+            "strided_view<tile=({tile_shape}), traversal_strides=[{traversal}], {}>",
+            self.tensor_view
+        )
+    }
+}
+
 impl fmt::Display for TileIrType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TileIrType::I64 => write!(f, "i64"),
             TileIrType::F32 => write!(f, "f32"),
+            TileIrType::Scalar(s) => write!(f, "{s}"),
+            TileIrType::Pointer(p) => write!(f, "ptr<{}>", p.pointee),
             TileIrType::ShapeDesc { rank } => write!(f, "shape_desc<rank={rank}>"),
-            TileIrType::Tile { rows, cols } => write!(f, "tile<f32, {rows}x{cols}>"),
+            TileIrType::Tile { rows, cols } => write!(f, "tile<{rows}x{cols}xf32>"),
+            TileIrType::TileOf(t) => {
+                if t.shape.is_empty() {
+                    write!(f, "tile<{}>", t.element_type)
+                } else {
+                    write!(f, "tile<{}x{}>", fmt_extents(&t.shape), t.element_type)
+                }
+            }
+            TileIrType::TensorView(tv) => write!(f, "{tv}"),
+            TileIrType::PartitionView(pv) => write!(f, "{pv}"),
+            TileIrType::GatherScatterView(gv) => write!(f, "{gv}"),
+            TileIrType::StridedView(sv) => write!(f, "{sv}"),
+            TileIrType::Func(ft) => {
+                let inputs = ft
+                    .inputs
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let results = ft
+                    .results
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "({inputs}) -> ({results})")
+            }
+            TileIrType::Token => write!(f, "token"),
+            TileIrType::WithPointerAttribute(base, _) => {
+                // The attribute is spelled the way CuTile spells it: inside the
+                // closing angle bracket it qualifies.
+                let text = base.to_string();
+                match text.rfind('>') {
+                    Some(end) => write!(
+                        f,
+                        "{}, #cuda_tile.ptr_attr<none>>",
+                        &text[..end]
+                    ),
+                    None => write!(f, "{text}, #cuda_tile.ptr_attr<none>"),
+                }
+            }
             TileIrType::Buffer { rank, elem } => {
                 let elem = match elem {
                     BufferElem::F32 => "f32",
@@ -78,6 +436,127 @@ impl fmt::Display for TileIrType {
             }
             TileIrType::Void => write!(f, "void"),
         }
+    }
+}
+
+impl TileIrType {
+    /// The `(rows, cols)` of an f32 two-axis tile, if this is one.
+    ///
+    /// Every tile the current lowering produces is f32 over two axes, so the
+    /// shape-only readers stay two numbers wide.
+    pub fn tile_rows_cols(&self) -> Option<(i64, i64)> {
+        match self {
+            TileIrType::Tile { rows, cols } => Some((*rows, *cols)),
+            TileIrType::TileOf(t) if t.shape.len() == 2 => Some((t.shape[0], t.shape[1])),
+            _ => None,
+        }
+    }
+}
+
+// ── Memory semantics ───────────────────────────────────────────────
+
+/// How wide a memory operation's effect is visible.
+///
+/// A token says an operation finished. A scope says who can see it. The two
+/// are separate: a store can be complete and still not be visible to the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemoryScope {
+    /// Visible to the threads of one tile block.
+    TileBlock,
+    /// Visible to the whole device.
+    Device,
+    /// Visible to the host.
+    System,
+}
+
+/// How strongly a memory operation orders against others.
+///
+/// This is the atomics vocabulary, and it applies to the same three questions:
+/// what may be reordered across it, and in which direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemoryOrdering {
+    Weak,
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+}
+
+/// The combining function of an atomic read-modify-write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AtomicRmwMode {
+    And,
+    Or,
+    Xor,
+    Add,
+    AddF,
+    Max,
+    Min,
+    UMax,
+    UMin,
+    Xchg,
+}
+
+/// The predicate of an integer or float comparison.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ComparisonPredicate {
+    Equal,
+    NotEqual,
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+}
+
+/// How a rounding operation breaks a tie or a halfway case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RoundingMode {
+    /// Round to nearest, ties to even.
+    NearestEven,
+    /// Round toward zero.
+    Zero,
+    /// Round toward positive infinity.
+    PositiveInfinity,
+    /// Round toward negative infinity.
+    NegativeInfinity,
+}
+
+/// Whether an integer operation may wrap, and how it reports that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OverflowMode {
+    None,
+    /// Wrap on overflow.
+    Wrap,
+    /// Saturate at the type's bounds.
+    Saturate,
+    /// Produce a flag alongside the result.
+    Flag,
+}
+
+/// One attribute a general op carries, as CuTile stores attributes: a name and
+/// a value.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Attribute {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(String),
+    /// A list of integers, such as `dim_map = [0, 1]`.
+    IntList(Vec<i64>),
+}
+
+impl Attribute {
+    /// The integer this attribute holds, if it holds one.
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Attribute::Int(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Whether this attribute is the boolean `true`.
+    pub fn is_true(&self) -> bool {
+        matches!(self, Attribute::Bool(true))
     }
 }
 
@@ -208,6 +687,11 @@ pub enum TileIrOp {
         cols: i64,
         /// Which shape dimension to use as stride
         stride_shape_idx: usize,
+        /// The token this load waits for, held as the semantics struct so an
+        /// op states its ordering, scope and token in one place.
+        ///
+        /// A load that waits for nothing says so; it does not mean unordered.
+        semantics: crate::token::TkoSemantics,
     },
     /// `cuda_tile.store_ptr_tko`
     StorePtrTko {
@@ -225,6 +709,54 @@ pub enum TileIrOp {
         rows: i64,
         cols: i64,
         stride_shape_idx: usize,
+        /// The token this store waits for. This is the only place two ordering
+        /// chains meet: the store names the join, and nothing else orders it.
+        semantics: crate::token::TkoSemantics,
+    },
+    /// `cuda_tile.make_partition_view`: a tile grid laid over a buffer.
+    ///
+    /// This is CuTile's memory model. A kernel does not address a buffer; it
+    /// names a view of one, and every access goes through the view. The view
+    /// carries the tile it will load, so an access states no extent of its own.
+    MakePartitionView {
+        /// The buffer the view describes.
+        source: ValueId,
+        /// The tile a load or a store through this view reads or writes.
+        tile_rows: i64,
+        tile_cols: i64,
+        /// The token the view is made under: the ordering of the memory the
+        /// view describes.
+        semantics: crate::token::TkoSemantics,
+    },
+    /// `cuda_tile.load_view_tko`: read one tile through a view.
+    ///
+    /// The tile is the view's, so the op names coordinates and no extent.
+    LoadViewTko {
+        view: ValueId,
+        row_coord: ValueId,
+        col_coord: ValueId,
+        /// One coordinate for each axis above the tile, outermost first.
+        outer_coords: Vec<ValueId>,
+        rows: i64,
+        cols: i64,
+        /// Which shape dimension to use as stride.
+        stride_shape_idx: usize,
+        semantics: crate::token::TkoSemantics,
+    },
+    /// `cuda_tile.store_view_tko`: write one tile through a view.
+    ///
+    /// The store names the token it waits for. That name is the only ordering
+    /// edge it has: nothing about where the instruction sits orders it.
+    StoreViewTko {
+        view: ValueId,
+        value: ValueId,
+        row_coord: ValueId,
+        col_coord: ValueId,
+        outer_coords: Vec<ValueId>,
+        rows: i64,
+        cols: i64,
+        stride_shape_idx: usize,
+        semantics: crate::token::TkoSemantics,
     },
     /// `sile.atomic_add`
     SileAtomicAdd {
@@ -240,6 +772,8 @@ pub enum TileIrOp {
         /// the addressing is what it was.
         outer_coords: Vec<ValueId>,
         stride_shape_idx: usize,
+        /// The token this atomic waits for.
+        semantics: crate::token::TkoSemantics,
     },
     /// Splat a scalar constant to a full tile
     Splat { value: f64, rows: i64, cols: i64 },
@@ -475,6 +1009,30 @@ pub enum TileIrOp {
         dim: usize,
         tile_extent: i64,
     },
+
+    // ── General form ──
+    /// Any CUDA Tile op, carried by its opcode.
+    ///
+    /// CuTile has one representation for all 105 operations: an opcode, a list
+    /// of operands, a list of result types, and a list of attributes. That is
+    /// the right shape for an IR whose job is to state *what* runs, and it
+    /// keeps a target from needing a variant per function it will lower to the
+    /// same instruction.
+    ///
+    /// The variants above stay because they carry what a traversal reads most:
+    /// tile extents, view axes, combiner choice. This one carries everything
+    /// else, so no op is unrepresentable. An op lowers to its own variant once
+    /// a pass needs to read its fields structurally.
+    Opaque {
+        opcode: Opcode,
+        /// Extra operands beyond `result`, in CuTile's operand order.
+        operands: Vec<ValueId>,
+        /// The types this op defines, when it defines more than `result`
+        /// (`load_ptr_tko` yields a tile and a token; `get_tile_block_id`
+        /// yields three scalars).
+        results: Vec<TileIrType>,
+        attributes: Vec<(String, Attribute)>,
+    },
 }
 
 /// Which combiner a fold applies to the elements it carries.
@@ -649,6 +1207,8 @@ impl TileIrFunction {
     /// Collect all ValueIds used (read) by a given instruction
     pub fn inst_uses(op: &TileIrOp) -> Vec<ValueId> {
         match op {
+            // The general form states its operands; there is nothing to derive.
+            TileIrOp::Opaque { operands, .. } => operands.clone(),
             TileIrOp::LoadPtrTko {
                 buf,
                 row_coord,
@@ -670,6 +1230,38 @@ impl TileIrFunction {
             } => {
                 let mut uses = vec![*buf, *value, *row_coord, *col_coord];
                 uses.extend(outer_coords.iter().copied());
+                uses
+            }
+            TileIrOp::MakePartitionView { source, semantics, .. } => {
+                let mut uses = vec![*source];
+                uses.extend(semantics.token);
+                uses
+            }
+            TileIrOp::LoadViewTko {
+                view,
+                row_coord,
+                col_coord,
+                outer_coords,
+                semantics,
+                ..
+            } => {
+                let mut uses = vec![*view, *row_coord, *col_coord];
+                uses.extend(outer_coords.iter().copied());
+                uses.extend(semantics.token);
+                uses
+            }
+            TileIrOp::StoreViewTko {
+                view,
+                value,
+                row_coord,
+                col_coord,
+                outer_coords,
+                semantics,
+                ..
+            } => {
+                let mut uses = vec![*view, *value, *row_coord, *col_coord];
+                uses.extend(outer_coords.iter().copied());
+                uses.extend(semantics.token);
                 uses
             }
             TileIrOp::SileAtomicAdd {

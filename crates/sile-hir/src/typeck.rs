@@ -371,6 +371,7 @@ fn infer_expr(expr: &Expr, locals: &BTreeMap<String, Type>) -> Result<Type, Type
         Expr::Shape(shape) => Ok(Type::Shape(shape.clone())),
         Expr::ScalarI64(_) => Ok(Type::Scalar(ElemType::F32)),
         Expr::ScalarF32(_) => Ok(Type::Scalar(ElemType::F32)),
+        Expr::ScalarBool(_) => Ok(Type::Scalar(ElemType::Bool)),
         // A tile index is a list of runtime scalars. Its individual elements are
         // checked, so an unbound name in an index is caught here.
         Expr::TileIndex(elems) => {
@@ -519,6 +520,7 @@ fn infer_builtin(
         | BuiltinOp::Sub
         | BuiltinOp::Mul
         | BuiltinOp::Div
+        | BuiltinOp::TrueDiv
         | BuiltinOp::Rem => {
             // Two tiles must agree on their shape. Lowering takes the first
             // operand's shape and reads the second at the same coordinates, so
@@ -688,6 +690,7 @@ fn check_arity(op: BuiltinOp, actual: usize) -> Result<(), TypeError> {
         | BuiltinOp::Sub
         | BuiltinOp::Mul
         | BuiltinOp::Div
+        | BuiltinOp::TrueDiv
         | BuiltinOp::Rem
         | BuiltinOp::CeilDiv => (2, 2),
         BuiltinOp::Unary(_) => (1, 1),

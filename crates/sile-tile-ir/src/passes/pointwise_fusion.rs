@@ -93,6 +93,7 @@ fn build_pointwise_map_expr(
             rows,
             cols,
             stride_shape_idx,
+            ..
         } => Some((
             TileMapExpr::LoadPtrTko {
                 buf,
@@ -222,6 +223,10 @@ fn tile_shape_for_op(op: &TileIrOp) -> (i64, i64) {
         | TileIrOp::MulF { rows, cols, .. }
         | TileIrOp::DivF { rows, cols, .. }
         | TileIrOp::UnaryF { rows, cols, .. }
+        | TileIrOp::MaxF { rows, cols, .. }
+        | TileIrOp::MinF { rows, cols, .. }
+        | TileIrOp::Fma { rows, cols, .. }
+        | TileIrOp::Select { rows, cols, .. }
         | TileIrOp::Broadcast { rows, cols, .. }
         | TileIrOp::Reshape { rows, cols, .. }
         | TileIrOp::Map { rows, cols, .. }

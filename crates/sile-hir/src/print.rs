@@ -13,6 +13,16 @@ use crate::types::{ElemType, ShapeExpr, Type};
 pub fn format_kernel(kernel: &Kernel) -> String {
     let mut out = String::new();
     writeln!(out, "hir kernel @{}", kernel.name).unwrap();
+    if !kernel.origin.module.is_empty() {
+        writeln!(
+            out,
+            "  origin module = {}, entry = {}, source bytes = {}",
+            kernel.origin.module,
+            kernel.origin.entry_index,
+            kernel.origin.source.len()
+        )
+        .unwrap();
+    }
     if !kernel.const_params.is_empty() {
         let consts = kernel
             .const_params
@@ -159,6 +169,7 @@ fn format_expr(expr: &Expr) -> String {
         Expr::Shape(shape) => format!("shape![{}]", format_shape(shape)),
         Expr::ScalarI64(value) => format!("{value}i64"),
         Expr::ScalarF32(value) => format!("{value}f32"),
+        Expr::ScalarBool(value) => format!("{value}"),
         Expr::TileIndex(coords) => {
             let parts = coords.iter().map(format_expr).collect::<Vec<_>>();
             format!("[{}]", parts.join(", "))
@@ -216,6 +227,7 @@ fn builtin_name(op: BuiltinOp) -> &'static str {
         BuiltinOp::Sub => "subf",
         BuiltinOp::Mul => "mulf",
         BuiltinOp::Div => "divf",
+        BuiltinOp::TrueDiv => "true_div",
         BuiltinOp::Rem => "remf",
         BuiltinOp::Unary(op) => format_unary_name(op),
         BuiltinOp::Gt => "gt_tile",
@@ -279,6 +291,7 @@ fn format_elem(elem: ElemType) -> &'static str {
         ElemType::F32 => "f32",
         ElemType::F16 => "f16",
         ElemType::I64 => "i64",
+        ElemType::Bool => "bool",
     }
 }
 

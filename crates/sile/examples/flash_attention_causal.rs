@@ -138,7 +138,7 @@ mod kernels {
             let l_ij: Tile<f32, { [BM] }> = reduce_sum(p, 1);
             let l_ij: Tile<f32, { [BM, 1] }> = l_ij.reshape(shape![BM, 1]);
             let alpha: Tile<f32, { [BM, 1] }> = exp2(m_i - m_ij, ftz::Disabled);
-            l_i = fma(l_i, alpha, l_ij);
+            l_i = l_i * alpha + l_ij;
             acc = acc * alpha.broadcast(shape![BM, D]);
 
             // Compute softmax(mask(scale(q @ k^T))) @ v.

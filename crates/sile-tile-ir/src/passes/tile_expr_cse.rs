@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::token::TkoSemantics;
 use crate::{BinOp, TileIrFunction, TileIrInst, TileIrOp, TileIrTerminator, ValueId};
 
 pub fn run(mut func: TileIrFunction) -> TileIrFunction {
@@ -49,6 +50,14 @@ pub fn run(mut func: TileIrFunction) -> TileIrFunction {
 
 fn expr_key(op: &TileIrOp) -> Option<String> {
     match op {
+        // A general op is not folded: its semantic content lives in attributes
+        // this key would have to reproduce exactly to be sound.
+        TileIrOp::Opaque { .. } => None,
+        // A view is a description of memory, and two descriptions of the same
+        // buffer are not one value: each names its own ordering.
+        TileIrOp::MakePartitionView { .. }
+        | TileIrOp::LoadViewTko { .. }
+        | TileIrOp::StoreViewTko { .. } => None,
         TileIrOp::ConstI64(v) => Some(format!("const_i64:{v}")),
         TileIrOp::ConstF64(v) => Some(format!("const_f64:{}", v.to_bits())),
         TileIrOp::IBinary { op, lhs, rhs } => {
@@ -171,9 +180,31 @@ fn canonical_pair(op: BinOp, lhs: ValueId, rhs: ValueId) -> (ValueId, ValueId) {
     }
 }
 
+/// Rewrite the token an op waits for, leaving its ordering and scope alone.
+fn rewrite_tko(
+    semantics: TkoSemantics,
+    rewrite: &impl Fn(ValueId) -> ValueId,
+) -> TkoSemantics {
+    TkoSemantics {
+        token: semantics.token.map(|t| rewrite(t)),
+        ..semantics
+    }
+}
+
 fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrOp {
     let rewrite = |value: ValueId| resolve_replacement(value, replacements);
     match op {
+        TileIrOp::Opaque {
+            opcode,
+            operands,
+            results,
+            attributes,
+        } => TileIrOp::Opaque {
+            opcode,
+            operands: operands.iter().map(|v| rewrite(*v)).collect(),
+            results,
+            attributes,
+        },
         TileIrOp::LoadPtrTko {
             buf,
             row_coord,
@@ -182,6 +213,7 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             rows,
             cols,
             stride_shape_idx,
+            semantics,
         } => TileIrOp::LoadPtrTko {
             buf: rewrite(buf),
             row_coord: rewrite(row_coord),
@@ -190,6 +222,7 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             rows,
             cols,
             stride_shape_idx,
+            semantics: rewrite_tko(semantics, &rewrite),
         },
         TileIrOp::StorePtrTko {
             buf,
@@ -200,6 +233,7 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             rows,
             cols,
             stride_shape_idx,
+            semantics,
         } => TileIrOp::StorePtrTko {
             buf: rewrite(buf),
             value: rewrite(value),
@@ -209,6 +243,7 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             rows,
             cols,
             stride_shape_idx,
+            semantics: rewrite_tko(semantics, &rewrite),
         },
         TileIrOp::SileAtomicAdd {
             buf,
@@ -217,6 +252,7 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             col_coord,
             outer_coords,
             stride_shape_idx,
+            semantics,
         } => TileIrOp::SileAtomicAdd {
             buf: rewrite(buf),
             value: rewrite(value),
@@ -224,6 +260,58 @@ fn rewrite_op(op: TileIrOp, replacements: &HashMap<ValueId, ValueId>) -> TileIrO
             col_coord: rewrite(col_coord),
             outer_coords: outer_coords.iter().map(|c| rewrite(*c)).collect(),
             stride_shape_idx,
+            semantics: rewrite_tko(semantics, &rewrite),
+        },
+        TileIrOp::MakePartitionView {
+            source,
+            tile_rows,
+            tile_cols,
+            semantics,
+        } => TileIrOp::MakePartitionView {
+            source: rewrite(source),
+            tile_rows,
+            tile_cols,
+            semantics: rewrite_tko(semantics, &rewrite),
+        },
+        TileIrOp::LoadViewTko {
+            view,
+            row_coord,
+            col_coord,
+            outer_coords,
+            rows,
+            cols,
+            stride_shape_idx,
+            semantics,
+        } => TileIrOp::LoadViewTko {
+            view: rewrite(view),
+            row_coord: rewrite(row_coord),
+            col_coord: rewrite(col_coord),
+            outer_coords: outer_coords.iter().map(|c| rewrite(*c)).collect(),
+            rows,
+            cols,
+            stride_shape_idx,
+            semantics: rewrite_tko(semantics, &rewrite),
+        },
+        TileIrOp::StoreViewTko {
+            view,
+            value,
+            row_coord,
+            col_coord,
+            outer_coords,
+            rows,
+            cols,
+            stride_shape_idx,
+            semantics,
+        } => TileIrOp::StoreViewTko {
+            view: rewrite(view),
+            value: rewrite(value),
+            row_coord: rewrite(row_coord),
+            col_coord: rewrite(col_coord),
+            outer_coords: outer_coords.iter().map(|c| rewrite(*c)).collect(),
+            rows,
+            cols,
+            stride_shape_idx,
+            semantics: rewrite_tko(semantics, &rewrite),
         },
         TileIrOp::Splat { value, rows, cols } => TileIrOp::Splat { value, rows, cols },
         TileIrOp::AddF {

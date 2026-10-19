@@ -318,16 +318,25 @@ pub struct PointerSpelling {
     pub has_address_of: bool,
     /// Whether a load through a pointer dereferences it.
     pub load_deref: bool,
+    /// How a flat subscript spells a computed index.
+    ///
+    /// A target whose array subscript is 32-bit cannot take the 64-bit index
+    /// the lowering produces, so it converts at the subscript and leaves every
+    /// other value at the width the IR gave it. A constant index never needs
+    /// the conversion and is left alone.
+    pub index_cast: fn(String) -> String,
 }
 
 pub const POINTER_LANGUAGE: PointerSpelling = PointerSpelling {
     has_address_of: true,
     load_deref: true,
+    index_cast: std::convert::identity,
 };
 
 pub const NO_POINTERS: PointerSpelling = PointerSpelling {
     has_address_of: false,
     load_deref: false,
+    index_cast: std::convert::identity,
 };
 
 /// How a target spells a three-way choice.
@@ -467,16 +476,17 @@ pub fn scaled_index(
     index: &llvm_ir::Operand,
     stride: usize,
     format_operand: &dyn Fn(&llvm_ir::Operand) -> String,
+    index_cast: fn(String) -> String,
 ) -> String {
-    if stride == 1 {
-        return format!("({})", format_operand(index));
-    }
     // A constant index folds into the constant, so a tile access with literal
     // coordinates stays one literal in the emitted source.
     if let llvm_ir::Operand::Const(llvm_ir::Constant::Int(value)) = index {
         return format!("({})", value * stride as i64);
     }
-    format!("({}) * ({stride})", format_operand(index))
+    if stride == 1 {
+        return index_cast(format!("({})", format_operand(index)));
+    }
+    index_cast(format!("({}) * ({stride})", format_operand(index)))
 }
 
 /// Spell the element a pointer names, for a target that has no pointers.
@@ -488,12 +498,13 @@ pub fn element_operand(
     gep_elements: &HashMap<llvm_ir::ValueId, GepLink>,
     value_name: &dyn Fn(llvm_ir::ValueId) -> String,
     format_operand: &dyn Fn(&llvm_ir::Operand) -> String,
+    index_cast: fn(String) -> String,
 ) -> String {
     match walk_gep_chain(ptr, gep_elements) {
         Some((root, indices)) => {
             let terms: Vec<String> = indices
                 .iter()
-                .map(|(idx, stride)| scaled_index(idx, *stride, format_operand))
+                .map(|(idx, stride)| scaled_index(idx, *stride, format_operand, index_cast))
                 .collect();
             match terms.as_slice() {
                 [] => format!("{}[0]", format_operand(root)),
@@ -569,7 +580,13 @@ where
     // pointer-free target, so a Gep is already there when its use arrives.
 
     let element = |ptr: &llvm_ir::Operand| -> String {
-        element_operand(ptr, gep_elements, &value_name, &format_operand)
+        element_operand(
+            ptr,
+            gep_elements,
+            &value_name,
+            &format_operand,
+            pointers.index_cast,
+        )
     };
     // A pointer target reads straight through the geps a single load or store
     // uses, so the access spells `base[i]` and the gep itself leaves no text.

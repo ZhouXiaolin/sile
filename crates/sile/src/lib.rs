@@ -10,6 +10,7 @@ pub use sile_hir::{
 pub use half;
 
 pub mod tensor;
+pub mod tileir_text;
 pub mod tile;
 
 pub use tensor::{Partition, PartitionMut, Tensor};

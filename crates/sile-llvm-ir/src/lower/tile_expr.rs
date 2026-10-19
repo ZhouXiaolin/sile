@@ -243,6 +243,9 @@ fn eval_tile_scalar(
     if let Some(op) = pending_tiles.get(&value).cloned() {
         match op {
             TileIrOp::Splat { value, .. } => return const_f32(value),
+            // A load through a view reads the buffer the view describes, so it
+            // reaches this path by the view's own value id: the view resolves to
+            // that buffer when it lowers.
             TileIrOp::LoadPtrTko {
                 buf,
                 row_coord,
@@ -251,6 +254,17 @@ fn eval_tile_scalar(
                 rows,
                 cols,
                 stride_shape_idx,
+                ..
+            }
+            | TileIrOp::LoadViewTko {
+                view: buf,
+                row_coord,
+                col_coord,
+                outer_coords,
+                rows,
+                cols,
+                stride_shape_idx,
+                ..
             } => {
                 let buf_operand = resolve_operand(buf, ctx);
                 let rank = buffer_rank_of(buf, tile_ir);
@@ -569,6 +583,14 @@ fn collect_fused_load_bases(
             rows,
             cols,
             ..
+        }
+        | TileIrOp::LoadViewTko {
+            view: buf,
+            row_coord,
+            col_coord,
+            rows,
+            cols,
+            ..
         } => {
             if buffer_rank_of(buf, tile_ir) <= 1 && !bases.contains_key(&value) {
                 let tile_base = get_or_create_1d_tile_base(
@@ -822,6 +844,7 @@ pub(crate) fn eval_map_expr_scalar(
             rows,
             cols,
             stride_shape_idx,
+            ..
         } => emit_map_load_scalar(
             *buf,
             outer_coords,
@@ -1440,6 +1463,12 @@ fn collect_pointwise_tile_defs(
                 return false;
             }
         }
+        // A view names its buffer, so the same rank question applies.
+        TileIrOp::LoadViewTko { view, .. } => {
+            if buffer_rank_of(*view, tile_ir) == 0 {
+                return false;
+            }
+        }
         TileIrOp::Splat { .. } => {}
         TileIrOp::AddF { lhs, rhs, .. }
         | TileIrOp::SubF { lhs, rhs, .. }
@@ -1478,14 +1507,17 @@ fn collect_pointwise_tile_defs(
                 return false;
             }
         }
-        // A scalar form of these ops stays out of a chain: the chain is
-        // spelled element by element, and a count read as an element there
-        // would say the wrong type.
-        TileIrOp::Fma { lhs, rhs, acc, .. }
+        // The scalar path turns these four into an expression whose operands
+        // are `Value`s, and a `Value` reads the operand's storage. Putting an
+        // operand into the chain would skip that storage and leave the read
+        // pointing at a value nothing ever wrote, so the operands stay out.
+        TileIrOp::Fma { .. } | TileIrOp::MaxF { .. } | TileIrOp::MinF { .. }
             if !matches!(tile_ir.types.get(&value), Some(TileIrType::Tile { .. })) =>
         {
             return false
         }
+        // The chain is a map over the tile domain: every operand of these four
+        // is itself a tile, so each joins the chain.
         TileIrOp::Fma { lhs, rhs, acc, .. } => {
             for operand in [lhs, rhs, acc] {
                 if !collect_pointwise_tile_defs(
@@ -1501,41 +1533,8 @@ fn collect_pointwise_tile_defs(
                 }
             }
         }
-        TileIrOp::MaxF { lhs, rhs, .. } | TileIrOp::MinF { lhs, rhs, .. }
-            if !matches!(tile_ir.types.get(&value), Some(TileIrType::Tile { .. })) =>
-        {
-            return false
-        }
         TileIrOp::MaxF { lhs, rhs, .. } | TileIrOp::MinF { lhs, rhs, .. } => {
             for operand in [lhs, rhs] {
-                if !collect_pointwise_tile_defs(
-                    root,
-                    *operand,
-                    defs,
-                    tile_ir,
-                    use_counts,
-                    require_single_use_root,
-                    pending_tiles,
-                ) {
-                    return false;
-                }
-            }
-        }
-        TileIrOp::Select {
-            cond,
-            on_true,
-            on_false,
-            ..
-        } if !matches!(tile_ir.types.get(&value), Some(TileIrType::Tile { .. })) => {
-            return false
-        }
-        TileIrOp::Select {
-            cond,
-            on_true,
-            on_false,
-            ..
-        } => {
-            for operand in [cond, on_true, on_false] {
                 if !collect_pointwise_tile_defs(
                     root,
                     *operand,

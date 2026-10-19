@@ -102,13 +102,19 @@ impl CpuBackend {
             cmd.arg(export);
             cmd.arg("-o");
         } else {
+            // gcc's OpenMP runtime is libgomp, clang's is libomp. Each driver
+            // links its own when it sees `-fopenmp`; naming `-lomp` by hand
+            // picks a library half the Linux machines do not have.
+            //
+            // `nodelete` keeps the library mapped after `dlclose`. libgomp's
+            // worker threads are parked inside this library and the runtime
+            // tears them down lazily, so unloading it under them segfaults.
             cmd.args([
                 "-shared",
                 "-fPIC",
                 "-O2",
-                "-Xpreprocessor",
                 "-fopenmp",
-                "-lomp",
+                "-Wl,-z,nodelete",
                 "-lm",
                 "-o",
             ]);

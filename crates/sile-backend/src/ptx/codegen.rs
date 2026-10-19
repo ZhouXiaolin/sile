@@ -39,12 +39,23 @@ use crate::emit::{array_dims, find_output_buffer, is_shapes_param, tile_storage_
 /// [`generate_for_arch`]. `61` is the local target (a Pascal MX250).
 pub const DEFAULT_COMPUTE_CAPABILITY: u32 = 61;
 
-/// The PTX ISA version this emitter writes.
+/// The PTX ISA version this emitter writes for an arch.
 ///
-/// Everything used here exists in PTX 6.0, which every driver from CUDA 9 on
-/// accepts. A newer version would buy nothing and would raise the minimum
-/// driver.
-const PTX_VERSION: &str = "6.0";
+/// The instructions used here exist in PTX 6.0, but a `.target` needs a
+/// `.version` that knows it: `ptxas` refuses `sm_120` from anything below 8.7.
+/// Each arch therefore names the oldest version that accepts its target, so a
+/// newer target does not raise the minimum driver for an older one.
+fn ptx_version(arch: u32) -> &'static str {
+    match arch {
+        // Blackwell.
+        100.. => "8.7",
+        // Hopper.
+        90.. => "7.8",
+        // Ampere and Ada.
+        80.. => "7.0",
+        _ => "6.0",
+    }
+}
 
 pub fn generate(func: &Function) -> Result<String> {
     generate_for_arch(func, DEFAULT_COMPUTE_CAPABILITY)
@@ -603,7 +614,7 @@ impl<'a> Emitter<'a> {
 
     fn assemble(&self, arch: u32) -> String {
         let mut out = String::new();
-        out.push_str(&format!(".version {PTX_VERSION}\n"));
+        out.push_str(&format!(".version {}\n", ptx_version(arch)));
         out.push_str(&format!(".target sm_{arch}\n"));
         out.push_str(".address_size 64\n\n");
         out.push_str(&format!(

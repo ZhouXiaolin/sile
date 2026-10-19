@@ -16,6 +16,18 @@ pub(crate) struct LowerLlvmIrCtx {
     pub(crate) scalars_param: Option<llvm_ir::Operand>,
     pub(crate) scalars_i64_param: Option<llvm_ir::Operand>,
     pub(crate) prologue_entry: Option<llvm_ir::BlockId>,
+    /// Each view's value id mapped to the buffer it describes.
+    ///
+    /// A view names its buffer; every question about rank, element type or
+    /// shape ABI is a question about that buffer, so the mapping is recorded
+    /// once when the view is made.
+    pub(crate) view_sources: HashMap<ValueId, ValueId>,
+    /// The first op the lowering could not express, if any.
+    ///
+    /// A lowering that stops mid-block has already mutated the context; failing
+    /// the whole call would lose the diagnosis. The op is recorded here and the
+    /// caller reads it once the block is done.
+    pub(crate) unhandled_op: Option<String>,
     next_llvm_ir_value: u32,
     next_llvm_ir_block: u32,
 }
@@ -31,7 +43,9 @@ impl LowerLlvmIrCtx {
             shapes_param: None,
             scalars_param: None,
             scalars_i64_param: None,
+            view_sources: HashMap::new(),
             prologue_entry: None,
+            unhandled_op: None,
             next_llvm_ir_value: next_llvm_ir_value(tile_ir),
             next_llvm_ir_block: next_llvm_ir_block(tile_ir),
         }
@@ -159,6 +173,15 @@ impl<'a> BlockLowerer<'a> {
     pub(crate) fn tile_ir(&self) -> &TileIrFunction {
         self.tile_ir
     }
+}
+
+/// The buffer a value names, following a view to what it describes.
+///
+/// A view carries no storage: it is the buffer plus the tile grid over it. Every
+/// question about rank, element type or shape offset is a question about that
+/// buffer, so it is answered here rather than at each site.
+pub(crate) fn source_of(value: ValueId, ctx: &LowerLlvmIrCtx) -> ValueId {
+    ctx.view_sources.get(&value).copied().unwrap_or(value)
 }
 
 pub(crate) fn resolve_operand(value: ValueId, ctx: &LowerLlvmIrCtx) -> llvm_ir::Operand {

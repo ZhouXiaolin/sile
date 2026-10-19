@@ -624,6 +624,7 @@ impl CanonicalMatmulPlan {
                 rows,
                 cols,
                 stride_shape_idx: 1,
+                ..
             } if outer_coords.is_empty() => (*buf, *row_coord, *col_coord, *rows, *cols),
             _ => return None,
         };
@@ -637,6 +638,7 @@ impl CanonicalMatmulPlan {
                 rows,
                 cols,
                 stride_shape_idx: 1,
+                ..
             } if outer_coords.is_empty() => (*buf, *row_coord, *col_coord, *rows, *cols),
             _ => return None,
         };
@@ -674,6 +676,7 @@ impl CanonicalMatmulPlan {
                 rows,
                 cols,
                 stride_shape_idx: 1,
+                ..
             } if outer_coords.is_empty() => (*buf, *value, *row_coord, *col_coord, *rows, *cols),
             _ => return None,
         };

@@ -1,0 +1,103 @@
+cuda_tile.module @kernels {
+  entry @rms_norm_entry(%0: tile<ptr<f32>>, %1: tile<i32>, %2: tile<i32>, %3: tile<i32>, %4: tile<i32>, %5: tile<ptr<f32>>, %6: tile<i32>, %7: tile<i32>, %8: tile<ptr<f32>>, %9: tile<i32>, %10: tile<i32>, %11: tile<i32>, %12: tile<i32>, %13: tile<i32>, %14: tile<i32>, %15: tile<i32>, %16: tile<i32>, %17: tile<f32>) di_name = "rms_norm" {
+    %18 = constant <i32: 8> : tile<i32>
+    %19 = constant <i32: 2> : tile<i32>
+    %20 = assume bounded<0, ?>, %1 : tile<i32>
+    %21 = make_token : token
+    %22 = make_tensor_view %0, shape = [%20, 8], strides = [8, 1] : tile<i32> -> tensor_view<?x8xf32, strides=[8,1]>
+    %23 = make_token : token
+    %24 = make_tensor_view %5, shape = [8], strides = [1] : tensor_view<8xf32, strides=[1]>
+    %25 = assume bounded<0, ?>, %9 : tile<i32>
+    %26 = assume bounded<0, ?>, %10 : tile<i32>
+    %27 = make_token : token
+    %28 = make_tensor_view %8, shape = [%25, %26], strides = [8, 1] : tile<i32> -> tensor_view<?x?xf32, strides=[8,1]>
+    %29 = constant <i32: 8> : tile<i32>
+    %30 = constant <i32: 2> : tile<i32>
+    %32 = constant <i32: 4> : tile<i32>
+    %33, %34, %35 = get_tile_block_id : tile<i32>
+    %36 = assume bounded<0, ?>, %33 : tile<i32>
+    %37 = assume bounded<0, ?>, %34 : tile<i32>
+    %38 = assume bounded<0, ?>, %35 : tile<i32>
+    %39 = constant <i32: 1> : tile<i32>
+    %40 = constant <i32: 2> : tile<i32>
+    %41 = constant <i32: -1> : tile<i32>
+    %42 = constant <i32: 8> : tile<i32>
+    %43 = constant <i32: -1> : tile<i32>
+    %44 = constant <i32: 8> : tile<i32>
+    %45 = make_partition_view %22 : partition_view<tile=(1x2), padding_value = zero, tensor_view<?x8xf32, strides=[8,1]>>
+    %46 = constant <f32: 0.0> : tile<1x2xf32>
+    %47 = constant <i32: 0> : tile<i32>
+    %48 = constant <i32: 1> : tile<i32>
+    %57 = for %49 in (%47 to %32, step %48) : tile<i32> iter_values(%50 = %46) -> (tile<1x2xf32>) {
+      %51 = assume bounded<0, 3>, %49 : tile<i32>
+      %52 = constant <i32: 1> : tile<i32>
+      %53 = constant <i32: 2> : tile<i32>
+      %54, %55 = load_view_tko weak %45[%36, %51] token = %21 : partition_view<tile=(1x2), padding_value = zero, tensor_view<?x8xf32, strides=[8,1]>>, tile<i32> -> tile<1x2xf32>, token
+      %56 = fma %54, %54, %50 : tile<1x2xf32>
+      continue %56 : tile<1x2xf32>
+    }
+    %61 = reduce %57 dim=1 identities=[0] : tile<1x2xf32> -> tile<1xf32> {
+    ^bb0(%58: tile<f32>, %59: tile<f32>):
+      %60 = addf %58, %59 : tile<f32>
+      yield %60 : tile<f32>
+    }
+    %62 = constant <i32: 1> : tile<i32>
+    %63 = reshape %61 : tile<1xf32> -> tile<f32>
+    %64 = itof %29 signed : tile<i32> -> tile<f32>
+    %65 = constant <f32: 1.0> : tile<f32>
+    %66 = divf %63, %64 : tile<f32>
+    %67 = addf %66, %17 : tile<f32>
+    %68 = divf %65, %67 : tile<f32>
+    %69 = sqrt %68 rounding<negative_inf> : tile<f32>
+    %70 = constant <i32: 1> : tile<i32>
+    %71 = constant <i32: 2> : tile<i32>
+    %72 = constant <i32: 1> : tile<i32>
+    %73 = constant <i32: 2> : tile<i32>
+    %74 = constant <i32: 1> : tile<i32>
+    %75 = constant <i32: 1> : tile<i32>
+    %76 = constant <i32: 1> : tile<i32>
+    %77 = reshape %69 : tile<f32> -> tile<1x1xf32>
+    %78 = constant <i32: 1> : tile<i32>
+    %79 = constant <i32: 1> : tile<i32>
+    %80 = constant <i32: 1> : tile<i32>
+    %81 = constant <i32: 2> : tile<i32>
+    %82 = broadcast %77 : tile<1x1xf32> -> tile<1x2xf32>
+    %83 = constant <i32: 2> : tile<i32>
+    %84 = constant <i32: 8> : tile<i32>
+    %85 = constant <i32: 8> : tile<i32>
+    %86 = make_partition_view %24 : partition_view<tile=(2), padding_value = zero, tensor_view<8xf32, strides=[1]>>
+    %87 = constant <i32: 1> : tile<i32>
+    %88 = constant <i32: 2> : tile<i32>
+    %89 = constant <i32: 1> : tile<i32>
+    %90 = constant <i32: 8> : tile<i32>
+    %91 = constant <i32: 1> : tile<i32>
+    %92 = constant <i32: 8> : tile<i32>
+    %93 = make_partition_view %28 : partition_view<tile=(1x2), tensor_view<?x?xf32, strides=[8,1]>>
+    %94, %95, %96 = get_tile_block_id : tile<i32>
+    %97 = constant <i32: 4> : tile<i32>
+    %98 = muli %95, %97 : tile<i32>
+    %99 = constant <i32: 0> : tile<i32>
+    %100 = constant <i32: 1> : tile<i32>
+    for %101 in (%99 to %32, step %100) : tile<i32> {
+      %102 = assume bounded<0, 3>, %101 : tile<i32>
+      %103 = constant <i32: 1> : tile<i32>
+      %104 = constant <i32: 2> : tile<i32>
+      %105, %106 = load_view_tko weak %45[%36, %102] token = %21 : partition_view<tile=(1x2), padding_value = zero, tensor_view<?x8xf32, strides=[8,1]>>, tile<i32> -> tile<1x2xf32>, token
+      %107 = constant <i32: 2> : tile<i32>
+      %108, %109 = load_view_tko weak %86[%102] token = %23 : partition_view<tile=(2), padding_value = zero, tensor_view<8xf32, strides=[1]>>, tile<i32> -> tile<2xf32>, token
+      %110 = constant <i32: 2> : tile<i32>
+      %111 = constant <i32: 1> : tile<i32>
+      %112 = constant <i32: 2> : tile<i32>
+      %113 = reshape %108 : tile<2xf32> -> tile<1x2xf32>
+      %114 = mulf %105, %82 : tile<1x2xf32>
+      %115 = mulf %114, %113 : tile<1x2xf32>
+      %116 = constant <i32: 1> : tile<i32>
+      %117 = constant <i32: 2> : tile<i32>
+      %118 = addi %94, %36 : tile<i32>
+      %119 = addi %98, %102 : tile<i32>
+      %120 = store_view_tko weak %115, %93[%118, %119] token = %27 : tile<1x2xf32>, partition_view<tile=(1x2), tensor_view<?x?xf32, strides=[8,1]>>, tile<i32> -> token
+      continue
+    }
+    return
+  }
+}

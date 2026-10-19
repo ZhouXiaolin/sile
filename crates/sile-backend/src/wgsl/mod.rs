@@ -5,6 +5,34 @@ pub mod runtime;
 
 use sile_core::Result;
 
+/// The bytes one WGSL source needs in function-scope storage.
+///
+/// A function-scope `var` array is the workgroup's storage, and `workgroup_size(1)`
+/// with no `workgroupBarrier` means every element of it is one workgroup item's
+/// own state. The sum of those arrays is what the driver refuses above the
+/// adapter's `max_compute_workgroup_storage_size`.
+pub fn local_array_bytes(source: &str) -> u32 {
+    let mut total: u32 = 0;
+    for line in source.lines() {
+        // `var name: array<f32, N>;` — the f32 tiles are the whole cost; an
+        // `i64` or an aggregate would need a wider rule, and none exists here.
+        let Some(rest) = line.trim().strip_prefix("var ") else {
+            continue;
+        };
+        let Some((_, spec)) = rest.split_once("array<f32, ") else {
+            continue;
+        };
+        let Some((count, _)) = spec.split_once(">") else {
+            continue;
+        };
+        let Ok(count) = count.trim().parse::<u32>() else {
+            continue;
+        };
+        total = total.saturating_add(4 * count);
+    }
+    total
+}
+
 /// Parse and validate WGSL source.
 ///
 /// Naga is the front end of the compiler stack this backend feeds, so its

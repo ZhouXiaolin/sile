@@ -6,7 +6,9 @@ use sile_tile_ir::*;
 
 use super::block_scalar::lower_scalar_inst;
 use super::block_terminator::lower_terminator;
-use super::core::{BlockLowerer, LowerLlvmIrCtx, llvm_ir_block, llvm_ir_type, llvm_ir_value};
+use super::core::{
+    BlockLowerer, LowerLlvmIrCtx, llvm_ir_block, llvm_ir_type, llvm_ir_value, resolve_operand,
+};
 use super::tile_compute::{
     FusedAccInit, FusedTileLoad, LoadReduceFusion, MapReduceFusion, ReduceCombiner,
     lower_fused_load_reduce_inst, lower_fused_map_reduce_inst, lower_fused_tile_mma_inst,
@@ -62,11 +64,13 @@ pub(crate) fn lower_block(
             continue;
         }
         if let Some(plan) = pointwise_plan.store_fusions.get(&inst.result) {
-            let TileIrOp::StorePtrTko { buf, .. } = &inst.op else {
-                unreachable!("store fusion plan must only be attached to store ops");
+            let buf = match &inst.op {
+                TileIrOp::StorePtrTko { buf, .. } => *buf,
+                TileIrOp::StoreViewTko { view, .. } => *view,
+                _ => unreachable!("store fusion plan must only be attached to store ops"),
             };
             lower_pointwise_store_inst(
-                *buf,
+                buf,
                 plan.value,
                 &plan.outer_coords,
                 plan.row_coord,
@@ -98,10 +102,68 @@ pub(crate) fn lower_block(
                 rows,
                 cols,
                 stride_shape_idx,
+                ..
             } => {
                 lower_tile_load_inst(
                     inst.result,
                     *buf,
+                    outer_coords,
+                    *row_coord,
+                    *col_coord,
+                    *rows,
+                    *cols,
+                    *stride_shape_idx,
+                    &mut builder,
+                );
+            }
+            // A view names the buffer it describes, so an access through it is
+            // the same access: the view's operand was filled when the view was
+            // made, and the addressing reads the buffer it resolves to.
+            TileIrOp::MakePartitionView { source, .. } => {
+                // The view resolves to the buffer it describes, so an access
+                // through the view addresses that buffer.
+                let operand = resolve_operand(*source, builder.ctx());
+                builder.with_current_insts(|ctx, _, _| {
+                    ctx.operands.insert(inst.result, operand);
+                    ctx.view_sources.insert(inst.result, *source);
+                });
+            }
+            TileIrOp::LoadViewTko {
+                view,
+                row_coord,
+                col_coord,
+                outer_coords,
+                rows,
+                cols,
+                stride_shape_idx,
+                ..
+            } => {
+                lower_tile_load_inst(
+                    inst.result,
+                    *view,
+                    outer_coords,
+                    *row_coord,
+                    *col_coord,
+                    *rows,
+                    *cols,
+                    *stride_shape_idx,
+                    &mut builder,
+                );
+            }
+            TileIrOp::StoreViewTko {
+                view,
+                value,
+                row_coord,
+                col_coord,
+                outer_coords,
+                rows,
+                cols,
+                stride_shape_idx,
+                ..
+            } => {
+                lower_tile_store_inst(
+                    *view,
+                    *value,
                     outer_coords,
                     *row_coord,
                     *col_coord,
@@ -151,6 +213,7 @@ pub(crate) fn lower_block(
                 rows,
                 cols,
                 stride_shape_idx,
+                ..
             } => {
                 lower_tile_store_inst(
                     *buf,
@@ -415,6 +478,7 @@ impl PointwiseLoweringPlan {
                 rows: a_rows,
                 cols: a_cols,
                 stride_shape_idx: a_stride_shape_idx,
+                ..
             }) = defs.get(a)
             else {
                 continue;
@@ -427,6 +491,7 @@ impl PointwiseLoweringPlan {
                 rows: b_rows,
                 cols: b_cols,
                 stride_shape_idx: b_stride_shape_idx,
+                ..
             }) = defs.get(b)
             else {
                 continue;
@@ -489,7 +554,9 @@ impl PointwiseLoweringPlan {
         }
 
         for inst in &block.insts {
-            let TileIrOp::StorePtrTko {
+            // A store through a view writes the buffer the view describes; the
+            // view's own value stands in for that buffer here.
+            let (
                 buf,
                 value,
                 outer_coords,
@@ -498,10 +565,48 @@ impl PointwiseLoweringPlan {
                 rows,
                 cols,
                 stride_shape_idx,
-                ..
-            } = &inst.op
-            else {
-                continue;
+            ) = match &inst.op {
+                TileIrOp::StorePtrTko {
+                    buf,
+                    value,
+                    outer_coords,
+                    row_coord,
+                    col_coord,
+                    rows,
+                    cols,
+                    stride_shape_idx,
+                    ..
+                } => (
+                    buf,
+                    value,
+                    outer_coords,
+                    row_coord,
+                    col_coord,
+                    rows,
+                    cols,
+                    stride_shape_idx,
+                ),
+                TileIrOp::StoreViewTko {
+                    view,
+                    value,
+                    outer_coords,
+                    row_coord,
+                    col_coord,
+                    rows,
+                    cols,
+                    stride_shape_idx,
+                    ..
+                } => (
+                    view,
+                    value,
+                    outer_coords,
+                    row_coord,
+                    col_coord,
+                    rows,
+                    cols,
+                    stride_shape_idx,
+                ),
+                _ => continue,
             };
             // A rank-0 output receives one scalar per program through an
             // atomic add, so there is no tile walk to fuse into.
@@ -617,6 +722,7 @@ impl PointwiseLoweringPlan {
                 rows,
                 cols,
                 stride_shape_idx,
+                ..
             }) = defs.get(&value)
             {
                 load_reduce_fusions.insert(
@@ -957,6 +1063,10 @@ fn trace_loop_carried_splat_seed(
 fn buffer_rank_of(value: ValueId, tile_ir: &TileIrFunction) -> usize {
     match tile_ir.types.get(&value) {
         Some(TileIrType::Buffer { rank, .. }) => *rank,
+        Some(TileIrType::TensorView(tv)) => tv.shape.len(),
+        Some(TileIrType::PartitionView(pv)) => pv.tensor_view.shape.len(),
+        Some(TileIrType::GatherScatterView(gv)) => gv.tensor_view.shape.len(),
+        Some(TileIrType::StridedView(sv)) => sv.tensor_view.shape.len(),
         _ => 0,
     }
 }

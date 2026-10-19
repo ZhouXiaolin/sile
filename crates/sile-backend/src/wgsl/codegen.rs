@@ -26,6 +26,15 @@ const SCALARS_NAME: &str = "sile_scalars";
 /// WGSL spelling of the integer scalar descriptor.
 const SCALARS_I64_NAME: &str = "sile_scalars_i64";
 
+/// WGSL spelling of one array subscript.
+///
+/// WGSL subscripts take `i32` or `u32`, and the lowering makes every index
+/// `i64`, so a computed index narrows here. Every other value keeps the width
+/// the IR gave it; this is the one place the two disagree.
+fn wgsl_index(index: String) -> String {
+    format!("i32({index})")
+}
+
 pub fn generate(func: &llvm_ir::Function) -> Result<String> {
     let dialect = WgslDialect::new(func)?;
     emit::generate_text(emit::TargetEmitter::new(func, dialect))
@@ -91,7 +100,13 @@ impl<'a> WgslDialect<'a> {
         value_name: &dyn Fn(llvm_ir::ValueId) -> String,
         format_operand: &dyn Fn(&llvm_ir::Operand) -> String,
     ) -> String {
-        let spelled = element_operand(ptr, &self.gep_elements, value_name, format_operand);
+        let spelled = element_operand(
+            ptr,
+            &self.gep_elements,
+            value_name,
+            format_operand,
+            wgsl_index,
+        );
         match ptr {
             llvm_ir::Operand::Value(id) if self.gep_elements.contains_key(id) => spelled,
             _ => format_operand(ptr),
@@ -171,7 +186,7 @@ impl<'a> WgslDialect<'a> {
             emit::walk_gep_chain(ptr, &self.gep_elements).unwrap_or((ptr, Vec::new()));
         let index = indices
             .iter()
-            .map(|(index, stride)| emit::scaled_index(index, *stride, &format_operand))
+            .map(|(index, stride)| emit::scaled_index(index, *stride, &format_operand, wgsl_index))
             .collect::<Vec<_>>()
             .join(" + ");
         // The alias binding is named after the kernel parameter it covers, so
@@ -477,10 +492,10 @@ impl TargetDialect for WgslDialect<'_> {
     }
 
     fn pointers(&self) -> emit::PointerSpelling {
-        // WGSL has no pointers: a `load` reads the element and a `gep` yields
-        // the element itself, so the shared instruction lowering must not emit
-        // `&` or `*`.
-        NO_POINTERS
+        emit::PointerSpelling {
+            index_cast: wgsl_index,
+            ..NO_POINTERS
+        }
     }
 
     fn int_div(&self) -> emit::IntDivSpelling {

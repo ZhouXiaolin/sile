@@ -20,6 +20,8 @@ pub enum ElemType {
     F32,
     F16,
     I64,
+    /// A mask: what a comparison yields. Only `constant(true, ..)` names one.
+    Bool,
 }
 
 impl ElemType {

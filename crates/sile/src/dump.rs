@@ -30,6 +30,18 @@ use crate::compiler::{
 /// The environment variable that turns dumping on and names its directory.
 pub const DUMP_DIR_ENV: &str = "SILE_DUMP_DIR";
 
+/// The environment variable that limits a dump to the Tile IR text.
+///
+/// Aligning the Tile IR needs one stage. Every later stage costs a compile of
+/// the whole pipeline and the backend sources, and none of them is compared, so
+/// this switch stops the dump at the text the fixtures hold.
+pub const TILEIR_ONLY_ENV: &str = "SILE_DUMP_TILEIR_ONLY";
+
+/// Whether the dump stops after the Tile IR.
+pub fn tileir_only() -> bool {
+    std::env::var_os(TILEIR_ONLY_ENV).is_some()
+}
+
 /// The directory to dump into, when the environment asks for one.
 pub fn dump_dir_from_env() -> Option<PathBuf> {
     std::env::var_os(DUMP_DIR_ENV)
@@ -74,18 +86,46 @@ pub fn dump_kernel(kernel: &sile_hir::Kernel, root: &Path) -> Result<()> {
     });
 
     // ── Tile IR, one snapshot per pass ─────────────────────────────
+    //
+    // The first snapshot is the text cutile-rs prints, not what the backends'
+    // IR happens to say: that is the text the alignment fixtures compare, so it
+    // is the one worth recording.
     let started = Instant::now();
     let mut tile_ir: TileIrFunction = sile_tile_ir::lower_to_tile_ir(&typed);
     stages.push(Stage {
         label: "tileir-00-lowered".into(),
-        text: sile_tile_ir::format_tile_ir(&tile_ir),
+        text: crate::tileir_text::emit(&typed),
         micros: started.elapsed().as_micros(),
     });
 
+    // The text is the whole point of this mode, so the dump ends here: the
+    // later stages are a full compile of every backend, which nothing compares.
+    if tileir_only() {
+        for stage in &stages {
+            fs::write(dir.join(format!("{}.txt", stage.label)), &stage.text)?;
+        }
+        return Ok(());
+    }
+
+    // A pass that rejects the IR still leaves a result worth reading, so the
+    // failure becomes a stage of its own and every stage so far is written.
+    let mut failure: Option<String> = None;
+
     for (index, kind) in ACTIVE_TILE_IR_PIPELINE.iter().enumerate() {
         let started = Instant::now();
-        tile_ir = sile_tile_ir::run_tile_ir_pipeline(tile_ir, &[*kind])
-            .map_err(sile_core::Error::Shape)?;
+        match sile_tile_ir::run_tile_ir_pipeline(tile_ir.clone(), &[*kind]) {
+            Ok(next) => tile_ir = next,
+            Err(err) => {
+                let label = format!("tileir-{:02}-{}-FAILED", index + 1, tile_ir_pass_name(*kind));
+                stages.push(Stage {
+                    label,
+                    text: err.clone(),
+                    micros: started.elapsed().as_micros(),
+                });
+                failure = Some(err);
+                break;
+            }
+        }
         let micros = started.elapsed().as_micros();
         let label = format!("tileir-{:02}-{}", index + 1, tile_ir_pass_name(*kind));
         stages.push(Stage {
@@ -106,9 +146,23 @@ pub fn dump_kernel(kernel: &sile_hir::Kernel, root: &Path) -> Result<()> {
     });
 
     for (index, kind) in ACTIVE_LLVM_IR_PIPELINE.iter().enumerate() {
+        if failure.is_some() {
+            break;
+        }
         let started = Instant::now();
-        llvm_ir = sile_llvm_ir::run_llvm_ir_pipeline(llvm_ir, &[*kind])
-            .map_err(sile_core::Error::Shape)?;
+        match sile_llvm_ir::run_llvm_ir_pipeline(llvm_ir.clone(), &[*kind]) {
+            Ok(next) => llvm_ir = next,
+            Err(err) => {
+                let label = format!("llvmir-{:02}-{}-FAILED", index + 1, llvm_ir_pass_name(*kind));
+                stages.push(Stage {
+                    label,
+                    text: err.clone(),
+                    micros: started.elapsed().as_micros(),
+                });
+                failure = Some(err);
+                break;
+            }
+        }
         let micros = started.elapsed().as_micros();
         let label = format!("llvmir-{:02}-{}", index + 1, llvm_ir_pass_name(*kind));
         stages.push(Stage {
@@ -179,6 +233,10 @@ pub fn dump_kernel(kernel: &sile_hir::Kernel, root: &Path) -> Result<()> {
         let _ = writeln!(&mut timing, "{}\t{}", stage.label, stage.micros);
     }
     fs::write(dir.join("timing.tsv"), timing)?;
+
+    if let Some(err) = failure {
+        return Err(sile_core::Error::Shape(err));
+    }
 
     Ok(())
 }

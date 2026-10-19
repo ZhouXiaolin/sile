@@ -5,6 +5,10 @@
 //! The original draws `x` from `randn` and `x_keep` from `rand`, both seeded on
 //! the device; this port generates deterministic values on the host instead,
 //! because the python reference must see the exact bytes the kernel reads.
+//!
+//! The kernel body matches the original line for line. `_x` is unused there and
+//! is unused here: dropout keeps or zeroes the draws in `x_keep`, so the values
+//! in `x` never reach the output.
 
 use sile::{Device, Tensor};
 use kernels::dropout;
@@ -20,7 +24,7 @@ mod kernels {
     #[sile::entry]
     pub fn dropout<const BM: i64>(
         p: f32,
-        x: &Tensor<f32, { [-1] }>,
+        _x: &Tensor<f32, { [-1] }>,
         x_keep: &Tensor<f32, { [-1] }>,
         out: &mut Tensor<f32, { [BM] }>,
     ) {
@@ -28,12 +32,12 @@ mod kernels {
         let ones = constant(1.0, out.shape());
         let p_tile = p.broadcast(out.shape());
         let x_keep_tile = x_keep.load_like(out);
-        let x_tile = x.load_like(out);
-        // `x_keep` is the probability of keeping a value: a draw above `p` keeps it.
-        let keep = gt_tile(x_keep_tile, p_tile);
-        let out_tile = select(keep, x_tile, zeros);
-        // Rescale the kept values so the expected value does not change.
-        out.store(out_tile / (ones - p_tile));
+        // x_keep_tile is the probability of keeping (higher is more likely).
+        // p_tile is the probability of dropout (lower keeps more values).
+        let out_tile = select(gt_tile(x_keep_tile, p_tile), x_keep_tile, zeros);
+        // Rescale outputs based on dropout probability.
+        let out_tile = out_tile / (ones - p_tile);
+        out.store(out_tile);
     }
 }
 

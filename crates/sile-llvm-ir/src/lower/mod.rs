@@ -5,6 +5,7 @@ mod canonical_matmul;
 mod core;
 mod tile_compute;
 mod tile_expr;
+mod op_lowering;
 mod tile_memory;
 
 use crate as llvm_ir;
@@ -175,6 +176,13 @@ fn run_llvm_ir_lowering_pipeline_inner(
                             .iter()
                             .flat_map(|block| lower_block(block, state.tile_ir, ctx)),
                     );
+                }
+                // A lowering that met an op it could not express has already
+                // written part of the block. Reporting here is what keeps that
+                // op from vanishing into a program that computes less than the
+                // kernel asked for.
+                if let Some(why) = ctx.unhandled_op.take() {
+                    return Err(why);
                 }
                 state.blocks = Some(blocks);
             }

@@ -31,6 +31,9 @@ pub struct WgpuBackend {
     /// The optional features the device was created with, so the runtime can
     /// reject a kernel the device cannot run instead of letting wgpu panic.
     features: wgpu::Features,
+    /// The device's limits, so a kernel too large for this adapter is named
+    /// here rather than failing inside the driver.
+    limits: wgpu::Limits,
 }
 
 /// True when the type is, contains, or points at an `f16`.
@@ -84,15 +87,22 @@ impl WgpuBackend {
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("sile wgpu device"),
                 required_features,
+                // The device starts at conservative defaults, which understate
+                // what the adapter can do: a kernel that fits the hardware
+                // would be rejected by the software limit instead. Ask for what
+                // the adapter reports.
+                required_limits: adapter.limits(),
                 ..Default::default()
             }))
             .map_err(|e| sile_core::Error::UnsupportedBackend(request_device_error(e)))?
         };
         let features = device.features();
+        let limits = device.limits();
         Ok(Self {
             device,
             queue,
             features,
+            limits,
         })
     }
 
@@ -115,6 +125,22 @@ impl WgpuBackend {
         }
         let source = generate_wgsl(func)?;
         super::validate(&source)?;
+
+        // A function-scope `var` array lives in the workgroup's storage, and
+        // the driver refuses a pipeline over the adapter's limit without
+        // saying so — the dispatch fails later as `Encoder is invalid`. Name
+        // the real cause here, the way the f16 check above does.
+        let local_bytes = super::local_array_bytes(&source);
+        let limit = self.limits.max_compute_workgroup_storage_size;
+        if local_bytes > limit {
+            return Err(sile_core::Error::UnsupportedBackend(Box::leak(
+                format!(
+                    "this kernel needs {local_bytes} bytes of workgroup storage, \
+                     but the WGPU adapter allows {limit}"
+                )
+                .into_boxed_str(),
+            )));
+        }
 
         // Every kernel buffer becomes one storage buffer, uploaded after the
         // host leaves its data in shared storage. The bytes travel as the host
@@ -266,12 +292,23 @@ impl WgpuBackend {
                 bind_group_layouts: &[&layout],
                 push_constant_ranges: &[],
             });
+        // A driver that rejects the module reports the reason on the device's
+        // error scope; without this the pipeline is silently invalid and the
+        // failure surfaces as `Encoder is invalid` at submit time.
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("sile wgsl"),
                 source: wgpu::ShaderSource::Wgsl(source.into()),
             });
+        self.device.poll(wgpu::PollType::Wait);
+        if let Some(error) = pollster::block_on(self.device.pop_error_scope()) {
+            return Err(sile_core::Error::Compile(format!(
+                "the WGPU device rejected the shader: {error}"
+            )));
+        }
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let pipeline = self
             .device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -282,6 +319,12 @@ impl WgpuBackend {
                 compilation_options: Default::default(),
                 cache: None,
             });
+        self.device.poll(wgpu::PollType::Wait);
+        if let Some(error) = pollster::block_on(self.device.pop_error_scope()) {
+            return Err(sile_core::Error::Compile(format!(
+                "the WGPU device rejected the pipeline: {error}"
+            )));
+        }
 
         let mut encoder = self
             .device

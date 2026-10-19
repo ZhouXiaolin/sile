@@ -1,0 +1,52 @@
+cuda_tile.module @kernels {
+  entry @dropout_entry(%0: tile<f32>, %1: tile<ptr<f32>>, %2: tile<i32>, %3: tile<i32>, %4: tile<ptr<f32>>, %5: tile<i32>, %6: tile<i32>, %7: tile<ptr<f32>>, %8: tile<i32>, %9: tile<i32>, %10: tile<i32>, %11: tile<i32>) di_name = "dropout" {
+    %12 = constant <i32: 4> : tile<i32>
+    %13 = assume bounded<0, ?>, %2 : tile<i32>
+    %14 = make_token : token
+    %15 = make_tensor_view %1, shape = [%13], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
+    %16 = assume bounded<0, ?>, %5 : tile<i32>
+    %17 = make_token : token
+    %18 = make_tensor_view %4, shape = [%16], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
+    %19 = assume bounded<0, ?>, %8 : tile<i32>
+    %20 = make_token : token
+    %21 = make_tensor_view %7, shape = [%19], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
+    %22 = constant <i32: 4> : tile<i32>
+    %23 = constant <f32: 0.0> : tile<4xf32>
+    %24 = constant <f32: 1.0> : tile<4xf32>
+    %25 = constant <i32: 4> : tile<i32>
+    %26 = constant <i32: 4> : tile<i32>
+    %27 = constant <i32: 4> : tile<i32>
+    %28 = constant <i32: 1> : tile<i32>
+    %29 = constant <i32: 1> : tile<i32>
+    %30 = reshape %0 : tile<f32> -> tile<1xf32>
+    %31 = constant <i32: 1> : tile<i32>
+    %32 = constant <i32: 4> : tile<i32>
+    %33 = broadcast %30 : tile<1xf32> -> tile<4xf32>
+    %34 = constant <i32: 4> : tile<i32>
+    %35 = constant <i32: -1> : tile<i32>
+    %36 = constant <i32: 4> : tile<i32>
+    %37 = constant <i32: -1> : tile<i32>
+    %38, %39, %40 = get_tile_block_id : tile<i32>
+    %41 = assume bounded<0, ?>, %38 : tile<i32>
+    %42 = assume bounded<0, ?>, %39 : tile<i32>
+    %43 = assume bounded<0, ?>, %40 : tile<i32>
+    %44 = constant <i32: 4> : tile<i32>
+    %45 = constant <i32: -1> : tile<i32>
+    %46 = make_partition_view %18 : partition_view<tile=(4), padding_value = zero, tensor_view<?xf32, strides=[1]>>
+    %47, %48 = load_view_tko weak %46[%41] token = %17 : partition_view<tile=(4), padding_value = zero, tensor_view<?xf32, strides=[1]>>, tile<i32> -> tile<4xf32>, token
+    %49 = cmpf greater_than ordered %47, %33 : tile<4xf32> -> tile<4xi1>
+    %50 = select %49, %47, %23 : tile<4xi1>, tile<4xf32>
+    %51 = subf %24, %33 : tile<4xf32>
+    %52 = divf %50, %51 : tile<4xf32>
+    %53 = constant <i32: 4> : tile<i32>
+    %54 = constant <i32: 4> : tile<i32>
+    %55, %56, %57 = get_tile_block_id : tile<i32>
+    %58 = assume bounded<0, ?>, %55 : tile<i32>
+    %59 = assume bounded<0, ?>, %56 : tile<i32>
+    %60 = assume bounded<0, ?>, %57 : tile<i32>
+    %61 = constant <i32: 4> : tile<i32>
+    %62 = make_partition_view %21 : partition_view<tile=(4), tensor_view<?xf32, strides=[1]>>
+    %63 = store_view_tko weak %52, %62[%58] token = %20 : tile<4xf32>, partition_view<tile=(4), tensor_view<?xf32, strides=[1]>>, tile<i32> -> token
+    return
+  }
+}

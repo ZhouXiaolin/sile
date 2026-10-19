@@ -21,7 +21,45 @@ pub(crate) fn llvm_ir_type(ty: &TileIrType) -> llvm_ir::Type {
         TileIrType::Buffer { elem, .. } => {
             llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, buffer_elem_type(*elem))
         }
+        // The general forms carry no storage of their own in a kernel this
+        // lowering still emits; only their result types reach a target.
+        TileIrType::Scalar(s) => llvm_ir_type(&scalar_to_tile_ir(*s)),
+        TileIrType::Pointer(_) => {
+            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, llvm_ir::Type::I64)
+        }
+        TileIrType::TileOf(t) => match t.shape.as_slice() {
+            [rows, cols] => tile_ptr_type(*rows, *cols),
+            [rows] => tile_ptr_type(*rows, 1),
+            _ => llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::F32),
+        },
+        // A view's storage is the tensor's: a pointer to its element type in
+        // global memory, exactly as a bare buffer pointer was.
+        TileIrType::TensorView(_)
+        | TileIrType::PartitionView(_)
+        | TileIrType::GatherScatterView(_)
+        | TileIrType::StridedView(_) => {
+            match tensor_view_of(ty).map(|tv| tv.element_type) {
+                Some(ScalarType::F16) => {
+                    llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, llvm_ir::Type::F16)
+                }
+                _ => llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, llvm_ir::Type::F32),
+            }
+        }
+        TileIrType::Token | TileIrType::Func(_) => {
+            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, llvm_ir::Type::I64)
+        }
+        TileIrType::WithPointerAttribute(base, _) => llvm_ir_type(base),
         TileIrType::Void => llvm_ir::Type::Void,
+    }
+}
+
+/// The two scalar forms that carry storage of their own.
+fn scalar_to_tile_ir(s: ScalarType) -> TileIrType {
+    match s {
+        ScalarType::I64 | ScalarType::I32 | ScalarType::I16 | ScalarType::I8 | ScalarType::I1 => {
+            TileIrType::I64
+        }
+        _ => TileIrType::F32,
     }
 }
 
@@ -113,7 +151,24 @@ pub(crate) fn comparison_pred(
 pub(crate) fn buffer_rank_of(value: ValueId, tile_ir: &TileIrFunction) -> usize {
     match tile_ir.types.get(&value) {
         Some(TileIrType::Buffer { rank, .. }) => *rank,
+        // A kernel parameter may also arrive as the tensor view CuTile names.
+        // Its rank is the length of the shape the view describes.
+        Some(TileIrType::TensorView(tv)) => tv.shape.len(),
+        Some(TileIrType::PartitionView(pv)) => pv.tensor_view.shape.len(),
+        Some(TileIrType::GatherScatterView(gv)) => gv.tensor_view.shape.len(),
+        Some(TileIrType::StridedView(sv)) => sv.tensor_view.shape.len(),
         _ => 1,
+    }
+}
+
+/// The tensor view behind a view value, peeled from whichever view kind it is.
+pub(crate) fn tensor_view_of(ty: &TileIrType) -> Option<&TensorViewType> {
+    match ty {
+        TileIrType::TensorView(tv) => Some(tv),
+        TileIrType::PartitionView(pv) => Some(&pv.tensor_view),
+        TileIrType::GatherScatterView(gv) => Some(&gv.tensor_view),
+        TileIrType::StridedView(sv) => Some(&sv.tensor_view),
+        _ => None,
     }
 }
 
@@ -125,7 +180,13 @@ pub(crate) fn buffer_rank_of(value: ValueId, tile_ir: &TileIrFunction) -> usize 
 pub(crate) fn buffer_elem_of(value: ValueId, tile_ir: &TileIrFunction) -> llvm_ir::Type {
     match tile_ir.types.get(&value) {
         Some(TileIrType::Buffer { elem, .. }) => buffer_elem_type(*elem),
-        _ => llvm_ir::Type::F32,
+        // A view states its element type on the tensor it describes; reading
+        // f32 there would re-type a half buffer's loads and stores.
+        Some(ty) => match tensor_view_of(ty).map(|tv| tv.element_type) {
+            Some(ScalarType::F16) => llvm_ir::Type::F16,
+            _ => llvm_ir::Type::F32,
+        },
+        None => llvm_ir::Type::F32,
     }
 }
 

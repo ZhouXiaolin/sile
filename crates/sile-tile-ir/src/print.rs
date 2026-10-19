@@ -1,3 +1,4 @@
+use crate::token::TkoSemantics;
 use std::fmt::Write;
 
 use crate::ir::*;
@@ -133,6 +134,14 @@ fn format_coords(outer_coords: &[ValueId], row_coord: &ValueId, col_coord: &Valu
 
 fn format_tile_ir_op(op: &TileIrOp) -> String {
     match op {
+        // The general form prints as CuTile does: the opcode's name, the
+        // operands, the attributes, then the result types.
+        TileIrOp::Opaque {
+            opcode,
+            operands,
+            results,
+            attributes,
+        } => format_opaque(*opcode, operands, results, attributes),
         TileIrOp::LoadPtrTko {
             buf,
             row_coord,
@@ -141,10 +150,12 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
             rows,
             cols,
             stride_shape_idx,
+            semantics,
         } => {
             format!(
-                "load_ptr_tko {buf}, {} {{shape = [{rows}, {cols}], stride_dim = {stride_shape_idx}}}",
-                format_coords(outer_coords, row_coord, col_coord)
+                "load_ptr_tko {buf}, {} {{shape = [{rows}, {cols}], stride_dim = {stride_shape_idx}}}{}",
+                format_coords(outer_coords, row_coord, col_coord),
+                format_tko_wait(semantics)
             )
         }
         TileIrOp::StorePtrTko {
@@ -156,12 +167,50 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
             rows,
             cols,
             stride_shape_idx,
+            semantics,
         } => {
             format!(
-                "store_ptr_tko {buf}, {value}, {} {{shape = [{rows}, {cols}], stride_dim = {stride_shape_idx}}}",
-                format_coords(outer_coords, row_coord, col_coord)
+                "store_ptr_tko {buf}, {value}, {} {{shape = [{rows}, {cols}], stride_dim = {stride_shape_idx}}}{}",
+                format_coords(outer_coords, row_coord, col_coord),
+                format_tko_wait(semantics)
             )
         }
+        TileIrOp::MakePartitionView {
+            source,
+            tile_rows,
+            tile_cols,
+            ..
+        } => format!(
+            "make_partition_view {source} : partition_view<tile=({tile_rows}x{tile_cols})>"
+        ),
+        TileIrOp::LoadViewTko {
+            view,
+            row_coord,
+            col_coord,
+            outer_coords,
+            semantics,
+            ..
+        } => format!(
+            "load_view_tko {} {}{} : tile",
+            format_tko_ordering(semantics),
+            format_coords(outer_coords, row_coord, col_coord),
+            format_view_at(view)
+        ),
+        TileIrOp::StoreViewTko {
+            view,
+            value,
+            row_coord,
+            col_coord,
+            outer_coords,
+            semantics,
+            ..
+        } => format!(
+            "store_view_tko {} {value}, {}{}{} : token",
+            format_tko_ordering(semantics),
+            format_coords(outer_coords, row_coord, col_coord),
+            format_view_at(view),
+            format_tko_wait(semantics)
+        ),
         TileIrOp::SileAtomicAdd {
             buf,
             value,
@@ -169,6 +218,7 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
             col_coord,
             outer_coords,
             stride_shape_idx,
+            ..
         } => {
             format!(
                 "sile.atomic_add {buf}, {value}, {} {{stride_dim = {stride_shape_idx}}}",
@@ -504,7 +554,9 @@ fn format_tile_ir_type(ty: &TileIrType) -> String {
             };
             format!("tile<ptr<{elem}>>")
         }
-        TileIrType::Void => "none".into(),
+        // The remaining forms print themselves; a match arm per variant would
+        // only restate the Display impl.
+        other => other.to_string(),
     }
 }
 
@@ -531,6 +583,12 @@ fn format_tile_binary_op(op: BinOp, is_float: bool) -> &'static str {
 fn buffer_rank_attr(ty: &TileIrType) -> usize {
     match ty {
         TileIrType::Buffer { rank, .. } => *rank,
+        // A kernel parameter is a view, so its rank is the axes the tensor it
+        // describes has.
+        TileIrType::TensorView(tv) => tv.shape.len(),
+        TileIrType::PartitionView(pv) => pv.tensor_view.shape.len(),
+        TileIrType::GatherScatterView(gv) => gv.tensor_view.shape.len(),
+        TileIrType::StridedView(sv) => sv.tensor_view.shape.len(),
         _ => 0,
     }
 }
@@ -582,5 +640,70 @@ fn comparison_predicate_name(op: CmpOp) -> &'static str {
         CmpOp::Ge => "greater_than_or_equal",
         CmpOp::Eq => "equal",
         CmpOp::Ne => "not_equal",
+    }
+}
+
+/// Print the ordering word a memory op states, as CuTile prints it.
+fn format_tko_ordering(semantics: &TkoSemantics) -> String {
+    let word = match semantics.ordering {
+        crate::MemoryOrdering::Weak => "weak",
+        crate::MemoryOrdering::Relaxed => "relaxed",
+        crate::MemoryOrdering::Acquire => "acquire",
+        crate::MemoryOrdering::Release => "release",
+        crate::MemoryOrdering::AcqRel => "acq_rel",
+    };
+    word.to_string()
+}
+
+/// Print the buffered operand an access reads through, as `%vN[...]`.
+fn format_view_at(view: &ValueId) -> String {
+    format!("[%{}]", view.0)
+}
+
+/// Print the `wait %vN` clause a memory op carries, or nothing when it waits
+/// for no token.
+fn format_tko_wait(semantics: &TkoSemantics) -> String {
+    match semantics.token {
+        Some(token) => format!(" wait %{}", token.0),
+        None => String::new(),
+    }
+}
+
+/// Print a general-form op: name, operands, attributes, then result types.
+fn format_opaque(
+    opcode: Opcode,
+    operands: &[ValueId],
+    results: &[TileIrType],
+    attributes: &[(String, Attribute)],
+) -> String {
+    let mut text = opcode.name().to_string();
+    for v in operands {
+        text.push_str(&format!(" %{}", v.0));
+    }
+    for (name, value) in attributes {
+        text.push_str(&format!(" {name} = {}", format_attr(value)));
+    }
+    if !results.is_empty() {
+        let types = results
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!(" : ({types})"));
+    }
+    text
+}
+
+/// Print one attribute value the way CuTile prints it.
+fn format_attr(value: &Attribute) -> String {
+    match value {
+        Attribute::Int(v) => v.to_string(),
+        Attribute::Float(v) => format_float_literal(*v),
+        Attribute::Bool(v) => v.to_string(),
+        Attribute::Str(v) => format!("\"{v}\""),
+        Attribute::IntList(vs) => {
+            let vals = vs.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
+            format!("[{vals}]")
+        }
     }
 }

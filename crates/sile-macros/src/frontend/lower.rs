@@ -13,7 +13,14 @@ use super::ast::{
 /// compiles, runs, and computes the wrong answer. A rejected kernel is the
 /// cheaper failure, so an unknown call, method, field or literal is an error
 /// with the span of the offending token.
-pub fn lower_kernel_to_hir(decl: &KernelDecl) -> syn::Result<proc_macro2::TokenStream> {
+/// Lower the parsed kernel, recording where it came from.
+///
+/// The origin is what a lowering can use to replay the walk cutile-rs's front
+/// end makes over the same source, which is what the Tile IR alignment needs.
+pub fn lower_kernel_to_hir(
+    decl: &KernelDecl,
+    origin: Option<&super::source::Origin>,
+) -> syn::Result<proc_macro2::TokenStream> {
     let name = decl.name.to_string();
     let params = decl
         .params
@@ -35,6 +42,10 @@ pub fn lower_kernel_to_hir(decl: &KernelDecl) -> syn::Result<proc_macro2::TokenS
             })
         })
         .collect();
+    let origin = match origin {
+        Some(origin) => origin.to_tokens(),
+        None => quote! { ::sile::hir::KernelOrigin::default() },
+    };
     Ok(quote! {
         ::sile::hir::Kernel::new(
             #name,
@@ -42,6 +53,7 @@ pub fn lower_kernel_to_hir(decl: &KernelDecl) -> syn::Result<proc_macro2::TokenS
             vec![#(#params),*],
             vec![#(#body),*],
         )
+        .with_origin(#origin)
     })
 }
 
@@ -480,12 +492,9 @@ fn lower_expr(
             };
             quote! { ::sile::hir::Expr::ScalarF32(#token) }
         }
-        // A boolean is a mask value, which is the one element type this IR has.
-        // `constant(true, shape)` is therefore a tile of `1.0`, the same value
-        // `gt_tile` produces where its comparison holds.
         KernelExpr::BoolLit(lit) => {
-            let val: f32 = if lit.value { 1.0 } else { 0.0 };
-            quote! { ::sile::hir::Expr::ScalarF32(#val) }
+            let val = lit.value;
+            quote! { ::sile::hir::Expr::ScalarBool(#val) }
         }
         KernelExpr::Call { func, args } => lower_call(func, args, const_params)?,
         KernelExpr::MethodCall {
@@ -632,10 +641,7 @@ fn lower_call(
         "log2" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Log2) },
         "sqrt" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Sqrt) },
         "rsqrt" => quote! { ::sile::hir::BuiltinOp::Unary(::sile::hir::UnaryOp::Rsqrt) },
-        // `true_div(a, b)` is a division that does not truncate. This IR has one
-        // division per type and the float one is already that, so the name adds
-        // nothing to the operation.
-        "true_div" => quote! { ::sile::hir::BuiltinOp::Div },
+        "true_div" => quote! { ::sile::hir::BuiltinOp::TrueDiv },
         "select" => quote! { ::sile::hir::BuiltinOp::Select },
         "gt_tile" => quote! { ::sile::hir::BuiltinOp::Gt },
         "ge_tile" => quote! { ::sile::hir::BuiltinOp::Ge },

@@ -43,6 +43,10 @@ pub enum BuiltinOp {
     Sub,
     Mul,
     Div,
+    /// `true_div(a, b)`: a float division that rounds approximately and flushes
+    /// subnormals to zero. CuTile prints it with those two attributes, so the
+    /// distinction has to survive lowering.
+    TrueDiv,
     /// `%`: the remainder of a division. CuTile writes `pid.0 % h` for the
     /// head a program owns, so the operation is a scalar one here as well as an
     /// elementwise one.
@@ -183,6 +187,33 @@ pub struct Param {
     pub name: String,
     pub kind: ParamKind,
     pub ty: Type,
+    /// The row-major strides of the buffer this parameter is bound to, when the
+    /// launcher knows them.
+    ///
+    /// They are a property of the buffer, not of the tile the kernel declares,
+    /// so they cannot be read off the parameter type: a kernel that writes a
+    /// 2x2 tile of a 4x8 tensor strides by 8 and 1. The launcher fills them in
+    /// from the argument it was handed.
+    pub strides: Option<Vec<i64>>,
+}
+
+/// Where a kernel came from: the module it was written in, the text of that
+/// module, and the position of its `#[entry]` inside it.
+///
+/// The Tile IR alignment work needs this because cutile-rs prints its Tile IR
+/// in the order its front end walks the source, down to one `constant` per
+/// shape argument per call. The text is what lets a lowering replay that walk;
+/// the name and index say which entry the kernel is. It rides along with the
+/// kernel instead of being passed beside it so the pipeline stages that only
+/// look at the body need no extra parameter.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct KernelOrigin {
+    /// The Rust module the entry was written in, e.g. `kernels`.
+    pub module: String,
+    /// The source text of that module, as the macro captured it.
+    pub source: String,
+    /// The entry's position among the module's `#[entry]` functions.
+    pub entry_index: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -191,6 +222,7 @@ pub struct Kernel {
     pub const_params: Vec<(String, i64)>,
     pub params: Vec<Param>,
     pub body: Vec<Stmt>,
+    pub origin: KernelOrigin,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -268,6 +300,8 @@ pub enum Expr {
     Shape(ShapeExpr),
     ScalarI64(i64),
     ScalarF32(f32),
+    /// A boolean literal: `constant(true, shape)` is a mask tile, not `1.0`.
+    ScalarBool(bool),
     /// A runtime tile index, one scalar per axis: `[pid_m, k]` in CuTile Rust.
     ///
     /// Distinct from `Shape` because a shape is compile-time metadata while an
@@ -286,6 +320,7 @@ impl Param {
             name: name.into(),
             kind,
             ty,
+            strides: None,
         }
     }
 }
@@ -302,7 +337,16 @@ impl Kernel {
             const_params,
             params,
             body,
+            origin: KernelOrigin::default(),
         }
+    }
+
+    /// Record where the kernel was written. A kernel without an origin lowers
+    /// the way it always did; one with an origin can be lowered by replaying
+    /// its source.
+    pub fn with_origin(mut self, origin: KernelOrigin) -> Self {
+        self.origin = origin;
+        self
     }
 }
 
@@ -318,6 +362,7 @@ impl Expr {
             Self::Shape(_) => "shape",
             Self::ScalarI64(_) => "scalar",
             Self::ScalarF32(_) => "scalar_f32",
+            Self::ScalarBool(_) => "scalar_bool",
             Self::TileIndex(_) => "tile_index",
         }
     }

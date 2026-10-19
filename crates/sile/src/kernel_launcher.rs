@@ -62,6 +62,17 @@ fn compiled_parts(kernel: &Kernel) -> Result<Arc<CompiledParts>> {
     Ok(parts)
 }
 
+/// The strides a buffer of `shape` has in row-major order.
+fn row_major_strides(shape: &[i64]) -> Vec<i64> {
+    let mut strides = vec![1i64; shape.len()];
+    let mut acc = 1i64;
+    for axis in (0..shape.len()).rev() {
+        strides[axis] = acc;
+        acc *= shape[axis];
+    }
+    strides
+}
+
 /// The kernels this process has already dumped, so a repeated launch of the
 /// same kernel does not rewrite the same files.
 fn dumped_kernels() -> &'static Mutex<std::collections::HashSet<String>> {
@@ -84,11 +95,24 @@ pub struct KernelLauncher<'a> {
 
 impl<'a> KernelLauncher<'a> {
     pub fn new(
-        kernel: Kernel,
+        mut kernel: Kernel,
         args: Vec<KernelArg<'a>>,
         scalars: Vec<f32>,
         scalars_i64: Vec<i64>,
     ) -> Self {
+        // The buffer's strides are a property of the launch, not of the kernel
+        // source, so they are recorded here: a lowering that prints the buffer
+        // address the way cutile does needs them, and the HIR is where the
+        // parameter order and the buffer list meet.
+        let mut buffers = args.iter();
+        for param in &mut kernel.params {
+            if matches!(param.ty, sile_hir::Type::Scalar(_)) {
+                continue;
+            }
+            if let Some(arg) = buffers.next() {
+                param.strides = Some(row_major_strides(arg.shape));
+            }
+        }
         Self {
             kernel,
             args,
@@ -196,6 +220,13 @@ impl<'a> KernelLauncher<'a> {
         }
         if should_print(PRINT_LLVM_IR_ENV) {
             eprintln!("{}", format_llvm_ir(llvm_ir_func));
+        }
+
+        // A dump that stops at the Tile IR has nothing to run: the launch would
+        // execute the kernel on the device, which is minutes of work and, in
+        // the CPU backend, a crash. The IR is already written.
+        if crate::dump::tileir_only() {
+            return Ok(());
         }
 
         match stream.device() {

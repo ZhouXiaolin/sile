@@ -313,9 +313,12 @@ fn validate_entry_keys(attr: &syn::Attribute) -> syn::Result<()> {
     Ok(())
 }
 
-fn expand_kernel_fn(input: &syn::ItemFn) -> syn::Result<proc_macro2::TokenStream> {
+fn expand_kernel_fn(
+    input: &syn::ItemFn,
+    origin: Option<&frontend::source::Origin>,
+) -> syn::Result<proc_macro2::TokenStream> {
     let decl = frontend::parse::parse_kernel(input)?;
-    let kernel_hir = frontend::lower::lower_kernel_to_hir(&decl)?;
+    let kernel_hir = frontend::lower::lower_kernel_to_hir(&decl, origin)?;
     let name = &input.sig.ident;
     let vis = &input.vis;
     let attrs = &input.attrs;
@@ -562,8 +565,10 @@ fn expand_module(input: &syn::ItemMod) -> syn::Result<proc_macro2::TokenStream> 
 
     let mut names: Vec<String> = devices.keys().cloned().collect();
     names.sort();
+    let module_name = input.ident.to_string();
+    let source = frontend::source::Origin::source_of(input);
     let mut expanded_entries = Vec::new();
-    for entry in &entries {
+    for (entry_index, entry) in entries.iter().enumerate() {
         let mut stack = Vec::new();
         let mut fresh = 0usize;
         let stmts = frontend::inline::inline_device_calls(
@@ -581,7 +586,12 @@ fn expand_module(input: &syn::ItemMod) -> syn::Result<proc_macro2::TokenStream> 
                 stmts,
             }),
         };
-        expanded_entries.push(expand_kernel_fn(&flat)?);
+        let origin = frontend::source::Origin {
+            module: module_name.clone(),
+            source: source.clone(),
+            entry_index,
+        };
+        expanded_entries.push(expand_kernel_fn(&flat, Some(&origin))?);
     }
 
     let vis = &input.vis;

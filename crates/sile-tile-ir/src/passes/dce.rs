@@ -73,8 +73,13 @@ fn find_live_values(func: &TileIrFunction) -> HashSet<crate::ValueId> {
 }
 
 fn is_side_effect(op: &TileIrOp) -> bool {
-    matches!(
-        op,
-        TileIrOp::StorePtrTko { .. } | TileIrOp::SileAtomicAdd { .. }
-    )
+    match op {
+        TileIrOp::StorePtrTko { .. }
+        | TileIrOp::StoreViewTko { .. }
+        | TileIrOp::SileAtomicAdd { .. } => true,
+        // A token op is the ordering a store waits on. Removing one would leave
+        // the store waiting on a value nothing defines.
+        TileIrOp::Opaque { opcode, .. } => crate::token::is_token_op(*opcode),
+        _ => false,
+    }
 }
