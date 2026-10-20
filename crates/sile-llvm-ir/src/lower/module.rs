@@ -1257,6 +1257,7 @@ impl<'a> Lowerer<'a> {
         &mut self,
         recipe: &Recipe,
         index: llvm_ir::Operand,
+        row: Option<&llvm_ir::Operand>,
         shape: &[i64],
     ) -> llvm_ir::Operand {
         match recipe {
@@ -1270,8 +1271,8 @@ impl<'a> Lowerer<'a> {
             } => {
                 let cols = view_shape.last().copied().unwrap_or(1).max(1);
                 let col = self.rem_i64(index.clone(), self.const_operand(cols));
-                let row = self.div_i64(index, self.const_operand(cols));
-                let ptr = self.view_element_ptr(view, indices, row, col, elem);
+                let view_row = self.div_i64(index, self.const_operand(cols));
+                let ptr = self.view_element_ptr(view, indices, view_row, col, elem);
                 self.emit(elem.clone(), "ld", llvm_ir::InstOp::Load { ptr })
             }
             Recipe::Bin {
@@ -1284,10 +1285,12 @@ impl<'a> Lowerer<'a> {
                 lhs_shape,
                 rhs_shape,
             } => {
+                let lhs_row = aligned_row(row, out_shape, lhs_shape);
                 let lhs_index = self.aligned_index(index.clone(), out_shape, lhs_shape);
-                let a = self.recipe_element(lhs, lhs_index, lhs_shape);
+                let a = self.recipe_element(lhs, lhs_index, lhs_row, lhs_shape);
+                let rhs_row = aligned_row(row, out_shape, rhs_shape);
                 let rhs_index = self.aligned_index(index, out_shape, rhs_shape);
-                let b = self.recipe_element(rhs, rhs_index, rhs_shape);
+                let b = self.recipe_element(rhs, rhs_index, rhs_row, rhs_shape);
                 if *ceil_div {
                     self.ceil_div(elem, a, b)
                 } else {
@@ -1302,10 +1305,12 @@ impl<'a> Lowerer<'a> {
                 lhs_shape,
                 rhs_shape,
             } => {
+                let lhs_row = aligned_row(row, out_shape, lhs_shape);
                 let lhs_index = self.aligned_index(index.clone(), out_shape, lhs_shape);
-                let a = self.recipe_element(lhs, lhs_index, lhs_shape);
+                let a = self.recipe_element(lhs, lhs_index, lhs_row, lhs_shape);
+                let rhs_row = aligned_row(row, out_shape, rhs_shape);
                 let rhs_index = self.aligned_index(index, out_shape, rhs_shape);
-                let b = self.recipe_element(rhs, rhs_index, rhs_shape);
+                let b = self.recipe_element(rhs, rhs_index, rhs_row, rhs_shape);
                 self.emit(
                     llvm_ir::Type::I1,
                     "cmp",
@@ -1322,7 +1327,7 @@ impl<'a> Lowerer<'a> {
                 shape: source_shape,
                 source,
             } => {
-                let value = self.recipe_element(source, index, source_shape);
+                let value = self.recipe_element(source, index, row, source_shape);
                 self.unary_value(*opcode, elem, value)
             }
             Recipe::Fma {
@@ -1332,7 +1337,7 @@ impl<'a> Lowerer<'a> {
             } => {
                 let values = parts
                     .iter()
-                    .map(|part| self.recipe_element(part, index.clone(), part_shape))
+                    .map(|part| self.recipe_element(part, index.clone(), row, part_shape))
                     .collect::<Vec<_>>();
                 self.emit(
                     elem.clone(),
@@ -1350,7 +1355,7 @@ impl<'a> Lowerer<'a> {
             } => {
                 let values = parts
                     .iter()
-                    .map(|part| self.recipe_element(part, index.clone(), part_shape))
+                    .map(|part| self.recipe_element(part, index.clone(), row, part_shape))
                     .collect::<Vec<_>>();
                 self.emit(
                     elem.clone(),
@@ -1376,7 +1381,9 @@ impl<'a> Lowerer<'a> {
                         permute_index(self, out_shape, source_shape, permutation, index)
                     }
                 };
-                self.recipe_element(source, mapped, source_shape)
+                // A reshape or a permute reinterprets the axes, so the row
+                // coordinate the caller handed down no longer names a row.
+                self.recipe_element(source, mapped, None, source_shape)
             }
             Recipe::Broadcast {
                 shape: out_shape,
@@ -1388,12 +1395,21 @@ impl<'a> Lowerer<'a> {
                     .map(|d| (*d).max(1) as usize)
                     .product::<usize>()
                     .max(1);
-                let mapped = if source_len == 1 {
+                // A rank-2 source with one column reads one element per
+                // output row, and the row coordinate the split loop hands
+                // down is that element: no division to re-derive it.
+                let mapped = if let Some(row) = row
+                    && source_shape.len() == 2
+                    && source_shape[0] > 1
+                    && source_shape[1] == 1
+                {
+                    row.clone()
+                } else if source_len == 1 {
                     llvm_ir::Operand::Const(llvm_ir::Constant::Int(0))
                 } else {
                     broadcast_index(self, out_shape, source_shape, index, source_len)
                 };
-                self.recipe_element(source, mapped, source_shape)
+                self.recipe_element(source, mapped, None, source_shape)
             }
         }
     }
@@ -1403,10 +1419,11 @@ impl<'a> Lowerer<'a> {
         &mut self,
         value: Value,
         index: llvm_ir::Operand,
+        row: Option<&llvm_ir::Operand>,
         shape: &[i64],
     ) -> llvm_ir::Operand {
         match self.recipes.get(&value).cloned() {
-            Some(recipe) => self.recipe_element(&recipe, index, shape),
+            Some(recipe) => self.recipe_element(&recipe, index, row, shape),
             None => {
                 let base = self.operand_of(value);
                 let elem = self.elem_of_value(value);
@@ -1430,10 +1447,37 @@ impl<'a> Lowerer<'a> {
         let dst = self.alloc_tile(value, shape, elem);
         let len = self.tile_len_of(value);
         self.materializing.push(value);
-        self.counted_loop("mt", len, |lowerer, index| {
-            let element = lowerer.tile_value_at(value, index.clone(), shape);
-            lowerer.store_element(&dst, elem, index, element);
-        });
+        // A rank-2 result that reads a row-repeated broadcast materializes
+        // one loop per row. The broadcast's row coordinate is then the
+        // segment's constant, so the row reads leave the inner loop and the
+        // rest of it is affine — the one form a target can vectorize. Rows
+        // are compile-time tile extents and capped, so the loop sequence
+        // stays short.
+        let rows = shape.first().copied().unwrap_or(1).max(1);
+        let cols = shape.get(1).copied().unwrap_or(1).max(1);
+        let row_wise = shape.len() == 2
+            && cols > 1
+            && rows <= 16
+            && self
+                .recipes
+                .get(&value)
+                .is_some_and(|recipe| has_row_broadcast(recipe));
+        if row_wise {
+            for row in 0..rows {
+                self.counted_loop("mtr", cols as usize, |lowerer, col| {
+                    let flat = lowerer.add_i64(lowerer.const_operand(row * cols), col);
+                    let row_at = lowerer.const_operand(row);
+                    let element =
+                        lowerer.tile_value_at(value, flat.clone(), Some(&row_at), shape);
+                    lowerer.store_element(&dst, elem, flat, element);
+                });
+            }
+        } else {
+            self.counted_loop("mt", len, |lowerer, index| {
+                let element = lowerer.tile_value_at(value, index.clone(), None, shape);
+                lowerer.store_element(&dst, elem, index, element);
+            });
+        }
         self.materializing.pop();
         self.recipes.remove(&value);
         dst
@@ -2349,6 +2393,7 @@ impl<'a> Lowerer<'a> {
             return self.tile_value_at(
                 value,
                 llvm_ir::Operand::Const(llvm_ir::Constant::Int(0)),
+                None,
                 &shape,
             );
         }
@@ -2559,7 +2604,7 @@ impl<'a> Lowerer<'a> {
             let col = lowerer.rem_i64(index.clone(), lowerer.const_operand(cols));
             // `view_element_ptr` adds the tile origin from the view's own tile extent.
             let _ = (rows, cols);
-            let value = lowerer.tile_value_at(value_operand, index, &shape);
+            let value = lowerer.tile_value_at(value_operand, index, None, &shape);
             let ptr = lowerer.view_element_ptr(&view, &index_operands, row, col, &elem);
             lowerer.store_void(ptr, value);
         });
@@ -3126,7 +3171,7 @@ impl<'a> Lowerer<'a> {
                         if is_tile {
                             self.counted_loop("ys", *len, |lowerer, index| {
                                 let value =
-                                    lowerer.tile_value_at(source_value, index.clone(), &source_shape);
+                                    lowerer.tile_value_at(source_value, index.clone(), None, &source_shape);
                                 lowerer.store_element(dst, elem, index, value);
                             });
                         } else if *len <= 1 {
@@ -3279,7 +3324,50 @@ fn reduce_combiner(module: &Module, op_id: OpId) -> Opcode {
     Opcode::AddF
 }
 
+/// The row hint an operand keeps through `aligned_index`: a coordinate for
+/// the output's rows names the operand's rows too, when the two agree on
+/// the row extent. Anything else falls back to the flat index.
+fn aligned_row<'r>(
+    row: Option<&'r llvm_ir::Operand>,
+    out_shape: &[i64],
+    source_shape: &[i64],
+) -> Option<&'r llvm_ir::Operand> {
+    if row.is_some() && out_shape.first() == source_shape.first() {
+        row
+    } else {
+        None
+    }
+}
+
+/// True when the recipe reads a row-repeated broadcast somewhere: a rank-2
+/// source with one column, so every output row reads one source element.
+/// That is the shape `materialize` splits its loop on, and the walk follows
+/// exactly the variants the split's row hint reaches — a broadcast under
+/// another broadcast never sees the hint, so its subtree is not walked.
+fn has_row_broadcast(recipe: &Recipe) -> bool {
+    match recipe {
+        Recipe::Broadcast { source_shape, .. } => {
+            source_shape.len() == 2 && source_shape[0] > 1 && source_shape[1] == 1
+        }
+        Recipe::Bin { lhs, rhs, .. } | Recipe::Cmp { lhs, rhs, .. } => {
+            has_row_broadcast(lhs) || has_row_broadcast(rhs)
+        }
+        Recipe::Un { source, .. } => has_row_broadcast(source),
+        Recipe::Fma { parts, .. } | Recipe::Select { parts, .. } => {
+            parts.iter().any(has_row_broadcast)
+        }
+        _ => false,
+    }
+}
+
 /// The source element a broadcast reads for output element `index`.
+///
+/// The `row` hint a split materialization loop hands down re-addresses one
+/// case without arithmetic: a rank-2 source whose last axis has extent one
+/// reads element `row` of its source row for output element `row * cols +
+/// col`, which is the same value the flat decomposition derives with a
+/// remainder and a division — the two operations that keep a loop from
+/// vectorizing.
 fn broadcast_index(
     lowerer: &mut Lowerer<'_>,
     out_shape: &[i64],
