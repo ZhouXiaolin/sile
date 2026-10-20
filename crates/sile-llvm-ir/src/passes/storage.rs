@@ -26,6 +26,7 @@ use crate::{AddressSpace, Function, Inst, InstOp, Operand, Terminator, Type, Val
 pub fn run(func: &mut Function) {
     loop {
         let mut changed = forward_copy_loads(func);
+        changed |= drop_empty_loops(func);
         changed |= drop_write_only(func);
         if !changed {
             break;
@@ -253,6 +254,125 @@ fn drop_write_only(func: &mut Function) -> bool {
             },
             _ => inst.result.map_or(true, |result| !dead.contains(&result)),
         });
+    }
+    true
+}
+
+/// Delete one natural loop whose body carries no effect. True when a loop
+/// went away.
+///
+/// The lowering spells a tile op as a loop even after the pipeline has
+/// emptied its body: what remains is the induction variable's own plumbing.
+/// Redirecting the preheader to the exit erases the loop; the variable's
+/// allocation then has no reader left and dies in `drop_write_only`.
+///
+/// One loop per call, and the analysis is retaken every time: deleting the
+/// innermost empty loop first lets an empty nest around it fall out on the
+/// next round, and the exit of a surviving loop is never itself deleted.
+fn drop_empty_loops(func: &mut Function) -> bool {
+    let loops = cfg::natural_loops(func);
+    // Outermost first from `natural_loops`, so the walk takes the innermost
+    // first and a deleted nest takes its children with it.
+    for loop_ in loops.iter().rev() {
+        let blocks = &loop_.blocks;
+        if blocks.contains(&func.entry) || !loop_is_empty(func, blocks) {
+            continue;
+        }
+        // One exit edge, and the exit takes no block parameters, so the
+        // preheader's unconditional branch can name it unchanged.
+        let header = func.blocks.iter().find(|block| block.id == loop_.header);
+        let exit = match header.map(|block| &block.terminator) {
+            Some(Terminator::CondBr {
+                true_target,
+                false_target,
+                ..
+            }) => {
+                let outside =
+                    |target: &crate::BlockId| !blocks.contains(target);
+                match (outside(true_target), outside(false_target)) {
+                    (true, false) => Some(*true_target),
+                    (false, true) => Some(*false_target),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some(exit) = exit else { continue };
+        if func
+            .blocks
+            .iter()
+            .find(|block| block.id == exit)
+            .is_some_and(|block| !block.params.is_empty())
+        {
+            continue;
+        }
+        let Some(preheader) = cfg::preheader(func, loop_.header, blocks) else {
+            continue;
+        };
+        let preheader = func
+            .blocks
+            .iter_mut()
+            .find(|block| block.id == preheader)
+            .unwrap();
+        preheader.terminator = Terminator::Br {
+            target: exit,
+            args: Vec::new(),
+        };
+        func.blocks
+            .retain(|block| !blocks.contains(&block.id));
+        return true;
+    }
+    false
+}
+
+/// True when every instruction in the blocks is dead weight. Arithmetic,
+/// loads and address chains have no effect of their own. A store is dead
+/// weight exactly when nothing reads its storage past the blocks — reads are
+/// what observing a value is; a write from outside, such as the induction
+/// variable's initialization in the preheader, feeds values that only the
+/// blocks ever see, and dies with them as a write-only storage.
+fn loop_is_empty(func: &Function, blocks: &HashSet<crate::BlockId>) -> bool {
+    let storages = private_storages(func);
+    let root_of: HashMap<ValueId, ValueId> = storages
+        .iter()
+        .flat_map(|(root, storage)| storage.derived.iter().map(move |id| (*id, *root)))
+        .collect();
+    for block in &func.blocks {
+        if !blocks.contains(&block.id) {
+            continue;
+        }
+        for inst in &block.insts {
+            match &inst.op {
+                InstOp::Store { ptr, .. } => {
+                    let Operand::Value(id) = ptr else {
+                        return false;
+                    };
+                    let Some(root) = root_of.get(id) else {
+                        // A pointer this pass cannot see through may reach
+                        // memory that outlives the loop.
+                        return false;
+                    };
+                    let storage = &storages[root];
+                    let read_outside = storage
+                        .load_blocks
+                        .iter()
+                        .chain(storage.escape_blocks.iter())
+                        .any(|block| !blocks.contains(block));
+                    if read_outside {
+                        return false;
+                    }
+                }
+                InstOp::Call { .. }
+                | InstOp::Intrinsic { .. }
+                | InstOp::AtomicAdd { .. }
+                | InstOp::Memcpy { .. } => return false,
+                _ => {}
+            }
+        }
+        match &block.terminator {
+            Terminator::Br { .. } | Terminator::CondBr { .. } => {}
+            _ => return false,
+        }
     }
     true
 }
