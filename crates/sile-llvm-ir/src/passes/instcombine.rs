@@ -72,13 +72,127 @@ pub fn run(mut func: Function) -> Function {
         }
 
         if replacements.is_empty() {
-            break;
+            // The recombination exposes folds and the folds expose the next
+            // recombination, so the two share the fixed point.
+            if !recombine_remainders(&mut func) {
+                break;
+            }
+            continue;
         }
         apply_replacements(&mut func, &replacements);
     }
 
     eliminate_dead_insts(&mut func);
     func
+}
+
+/// `(iv / W) * W + iv % W` is `iv`.
+///
+/// Truncated division — the one C spells — partitions `iv` into quotient and
+/// remainder for every value and every width other than zero, so the
+/// reassembly is exact. The lowering spells every two-dimensional index as
+/// this sum plus a base offset, and the extra `div` and `rem` are what keep
+/// a copy loop from vectorising. The base form rewrites the add in place to
+/// `base + iv`; the quotient term alone next to the remainder is just `iv`.
+fn recombine_remainders(func: &mut Function) -> bool {
+    let mut bins: HashMap<ValueId, (BinOp, Operand, Operand)> = HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if let (Some(result), InstOp::Bin { op, lhs, rhs }) = (inst.result, &inst.op) {
+                bins.insert(result, (*op, lhs.clone(), rhs.clone()));
+            }
+        }
+    }
+    // The quotient term: `iv / W` times `W`, in either operand order.
+    let quotient_times_width = |id: ValueId, width: i64, iv: ValueId| -> bool {
+        let Some((BinOp::Mul, lhs, rhs)) = bins.get(&id) else {
+            return false;
+        };
+        let quotient = match (lhs, rhs) {
+            (Operand::Value(q), Operand::Const(Constant::Int(w))) if *w == width => q,
+            (Operand::Const(Constant::Int(w)), Operand::Value(q)) if *w == width => q,
+            _ => return false,
+        };
+        matches!(
+            bins.get(quotient),
+            Some((BinOp::Div, Operand::Value(dividend), Operand::Const(Constant::Int(d))))
+                if *d == width && *dividend == iv
+        )
+    };
+    let mut rewrites: Vec<(ValueId, Operand, Operand)> = Vec::new();
+    let mut replacements: HashMap<ValueId, Operand> = HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let Some(result) = inst.result else { continue };
+            let InstOp::Bin {
+                op: BinOp::Add,
+                lhs,
+                rhs,
+            } = &inst.op
+            else {
+                continue;
+            };
+            for (other, rem) in [(lhs, rhs), (rhs, lhs)] {
+                let Operand::Value(rem_id) = rem else { continue };
+                let Some((
+                    BinOp::Rem,
+                    Operand::Value(iv),
+                    Operand::Const(Constant::Int(width)),
+                )) = bins.get(rem_id)
+                else {
+                    continue;
+                };
+                let (iv, width) = (*iv, *width);
+                if width == 0 {
+                    continue;
+                }
+                let pair = |side: &Operand| {
+                    matches!(side, Operand::Value(p) if quotient_times_width(*p, width, iv))
+                };
+                match other {
+                    Operand::Value(inner) if pair(other) => {
+                        replacements.insert(result, Operand::Value(iv));
+                    }
+                    Operand::Value(inner) => {
+                        // `base + quotient term` next to the remainder: the
+                        // term is reabsorbed and the other side is the base.
+                        let Some((BinOp::Add, a, b)) = bins.get(inner) else {
+                            continue;
+                        };
+                        let (a, b) = (a.clone(), b.clone());
+                        if pair(&a) {
+                            rewrites.push((result, b.clone(), Operand::Value(iv)));
+                        } else if pair(&b) {
+                            rewrites.push((result, a.clone(), Operand::Value(iv)));
+                        } else {
+                            continue;
+                        }
+                    }
+                    _ => continue,
+                }
+                break;
+            }
+        }
+    }
+    if rewrites.is_empty() && replacements.is_empty() {
+        return false;
+    }
+    if !rewrites.is_empty() {
+        for block in &mut func.blocks {
+            for inst in &mut block.insts {
+                let Some(result) = inst.result else { continue };
+                let Some((_, base, iv)) = rewrites.iter().find(|(r, ..)| *r == result) else {
+                    continue;
+                };
+                if let InstOp::Bin { lhs, rhs, .. } = &mut inst.op {
+                    *lhs = base.clone();
+                    *rhs = iv.clone();
+                }
+            }
+        }
+    }
+    apply_replacements(func, &replacements);
+    true
 }
 
 /// The type of every block parameter and instruction result.
