@@ -921,6 +921,15 @@ pub struct TargetEmitter<'a, D: TargetDialect> {
     /// gep a load folded through. The body records them here and the held-back
     /// declarations are filtered by it.
     assigned_values: HashSet<llvm_ir::ValueId>,
+    /// The alloca-form counted loops keyed by header, from the emission
+    /// pre-pass. Their index updates fold into the `for` header.
+    for_loops: HashMap<llvm_ir::BlockId, AllocaForLoop>,
+    /// The index allocas of those loops. Their stores fold away, so emission
+    /// skips them and their declaration demotes to the scalar itself.
+    demoted_ivs: HashSet<llvm_ir::ValueId>,
+    /// The step instructions of those loops. Their result only feeds the
+    /// skipped store, so they fold away wherever the body put them.
+    step_values: HashSet<llvm_ir::ValueId>,
     /// Declarations held back while the body emits, filtered, then written.
     deferred_decls: Vec<(llvm_ir::ValueId, llvm_ir::Type)>,
     defer_decls: bool,
@@ -1117,7 +1126,7 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
         } else {
             HashMap::new()
         };
-        let value_names = build_value_names(func)
+        let mut value_names = build_value_names(func)
             .into_iter()
             .map(|(id, name)| {
                 // The descriptors are the IR names a target can reject, so they
@@ -1133,7 +1142,21 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
                 };
                 (id, name)
             })
-            .collect();
+            .collect::<HashMap<_, _>>();
+        // A `for` induction spells its alloca's scalar name wherever its uses
+        // appear: the loads fold away — the header's into the `for` header,
+        // the body's into the scalar they read — so none of their results
+        // reach the text.
+        let (for_loops, load_index) = find_alloca_for_loops(func);
+        let demoted_ivs: HashSet<llvm_ir::ValueId> =
+            for_loops.values().map(|loop_| loop_.iv).collect();
+        let step_values: HashSet<llvm_ir::ValueId> =
+            for_loops.values().map(|loop_| loop_.step_value).collect();
+        for (load, iv) in &load_index {
+            if let Some(name) = value_names.get(iv).cloned() {
+                value_names.insert(*load, name);
+            }
+        }
         Self {
             func,
             dialect,
@@ -1143,6 +1166,9 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
             gep_elements,
             folded_geps,
             assigned_values: HashSet::new(),
+            for_loops,
+            demoted_ivs,
+            step_values,
             deferred_decls: Vec::new(),
             defer_decls: false,
             indent: 0,
@@ -1222,12 +1248,13 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
         for (id, ty) in std::mem::take(&mut self.deferred_decls) {
             let assigned = self.assigned_values.contains(&id);
             let storage = self.storage_values.contains(&id);
+            let demoted = self.demoted_ivs.contains(&id);
             let block_param = self
                 .func
                 .blocks
                 .iter()
                 .any(|block| block.params.iter().any(|param| param.id == id));
-            if assigned || storage || block_param {
+            if assigned || storage || demoted || block_param {
                 self.write_decl(id, &ty);
             }
         }
@@ -1236,9 +1263,17 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
     /// The declaration text for one value.
     fn write_decl(&mut self, id: llvm_ir::ValueId, ty: &llvm_ir::Type) {
         let name = self.value_name(id);
+        // A demoted `for` induction declares the scalar itself, not the
+        // storage-plus-pointer pair: the `for` header updates the scalar.
+        let ty = match ty {
+            llvm_ir::Type::Ptr { pointee, .. } if self.demoted_ivs.contains(&id) => {
+                pointee.as_ref().clone()
+            }
+            _ => ty.clone(),
+        };
         let decl = self
             .dialect
-            .var_decl(ty, &name, self.storage_values.contains(&id));
+            .var_decl(&ty, &name, self.storage_values.contains(&id));
         if let Some(decl) = decl {
             self.writeln(&decl);
         }
@@ -1313,10 +1348,6 @@ impl<D: TargetDialect> TextCodegen for TargetEmitter<'_, D> {
 }
 
 impl<D: TargetDialect> StructuredEmitter for TargetEmitter<'_, D> {
-    fn float_literal(value: f64) -> String {
-        D::float_literal(value)
-    }
-
     fn emit_block_insts(&mut self, block: &llvm_ir::BasicBlock) -> Result<()> {
         self.emit_block_insts_except(block, None)
     }
@@ -1331,6 +1362,25 @@ impl<D: TargetDialect> StructuredEmitter for TargetEmitter<'_, D> {
                 && inst.result == Some(skip_result)
             {
                 continue;
+            }
+            // A `for` induction's updates fold into the `for` header: the
+            // entry init and the step store never reach the text, the step
+            // add — wherever the body put it — only fed that store, and a
+            // body reload of the index reads the scalar itself.
+            if let Some(result) = inst.result
+                && self.step_values.contains(&result)
+            {
+                continue;
+            }
+            match &inst.op {
+                llvm_ir::InstOp::Load {
+                    ptr: llvm_ir::Operand::Value(base),
+                }
+                | llvm_ir::InstOp::Store {
+                    ptr: llvm_ir::Operand::Value(base),
+                    ..
+                } if self.demoted_ivs.contains(base) => continue,
+                _ => {}
             }
             self.emit_inst(inst)?;
         }
@@ -1375,6 +1425,10 @@ impl<D: TargetDialect> StructuredEmitter for TargetEmitter<'_, D> {
 
     fn vectorize_hint(&mut self, is_simple_body: bool) -> Option<String> {
         self.dialect.vectorize_hint(is_simple_body)
+    }
+
+    fn for_loop_induction(&self, header: llvm_ir::BlockId) -> Option<AllocaForLoop> {
+        self.for_loops.get(&header).copied()
     }
 }
 
@@ -1490,21 +1544,18 @@ pub trait StructuredEmitter {
     }
     fn format_operand(&self, operand: &llvm_ir::Operand) -> String;
 
-    /// How this target spells a floating-point constant, for the branch
-    /// conditions this emitter formats outside its own name table.
-    fn float_literal(value: f64) -> String
-    where
-        Self: Sized,
-    {
-        float_literal(value)
-    }
-
     fn writeln(&mut self, line: &str);
     fn indent_inc(&mut self);
     fn indent_dec(&mut self);
 
     /// A loop-carried hint the target wants before a simple loop, if any.
     fn vectorize_hint(&mut self, is_simple_body: bool) -> Option<String>;
+
+    /// The alloca-form counted loop whose header this is, if the emission
+    /// pre-pass matched one.
+    fn for_loop_induction(&self, _header: llvm_ir::BlockId) -> Option<AllocaForLoop> {
+        None
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1726,7 +1777,9 @@ fn emit_structured_if_else<E: StructuredEmitter>(
     let join = branch_join(func, block.id, post_dominators)
         .ok_or_else(|| Error::Compile(messages.unsupported_cond_br.into()))?;
 
-    let (cond_expr, skip_result) = branch_condition_expr::<E>(func, block, cond, false);
+    let format_cond = |op: &llvm_ir::Operand| emitter.format_operand(op);
+    let (cond_expr, skip_result) =
+        branch_condition_expr(&format_cond, block, func, cond, false);
     emitter.emit_block_insts_except(block, skip_result)?;
     emitter.writeln(&format!("if ({cond_expr}) {{"));
     emitter.indent_inc();
@@ -1780,69 +1833,66 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
     post_dominators: &OnceCell<PostDominators>,
     messages: StructuredCfgMessages,
 ) -> Result<llvm_ir::BlockId> {
-    let optimized_loop = branch_condition_expr::<E>(func, header, cond, true);
+    // The lowering's alloca-form counted loop: the index lives in an alloca
+    // the entry initializes and the latch steps, and the header only loads and
+    // compares. All three index updates fold into the `for` header; the name
+    // table already spells the header load's uses as the induction name.
+    if let Some(loop_) = emitter.for_loop_induction(header.id) {
+        let cmp_id = operand_value_id(cond)
+            .ok_or_else(|| Error::Compile(messages.header_must_cond_br.into()))?;
+        let llvm_ir::InstOp::Cmp { pred, lhs, rhs } =
+            &get_inst_by_result(func, cmp_id)
+                .ok_or_else(|| Error::Compile(messages.header_must_cond_br.into()))?
+                .op
+        else {
+            return Err(Error::Compile(messages.header_must_cond_br.into()));
+        };
+        let iv = emitter.format_operand(lhs);
+        let cond_expr = format!(
+            "{} {} {}",
+            iv,
+            cmp_pred_symbol(*pred),
+            emitter.format_operand(rhs)
+        );
+        let init_expr = format!("{iv} = {}", loop_.init);
+        let step_expr = induction_step_expr(&iv, loop_.step);
+        // OpenMP needs the initialization in the header, which the alloca
+        // form always provides.
+        if let Some(vectorize) =
+            emitter.vectorize_hint(is_simple_loop_body(func, true_target, header.id))
+        {
+            emitter.writeln(&vectorize);
+        }
+        emitter.writeln(&format!(
+            "for ({init_expr}; {cond_expr}; {step_expr}) {{"
+        ));
+        emitter.indent_inc();
+        emitter.emit_block_param_assignments(true_target, true_args);
+        let backedge = emit_structured_from(
+            emitter,
+            func,
+            true_target,
+            &[header.id],
+            None,
+            Some(loop_.step_value),
+            post_dominators,
+            messages,
+        )?;
+        if backedge != Some(header.id) {
+            return Err(Error::Compile(messages.loop_backedge_mismatch.into()));
+        }
+        emitter.indent_dec();
+        emitter.writeln("}");
+        emitter.emit_block_param_assignments(false_target, false_args);
+        return Ok(false_target);
+    }
+
+    let format_cond = |op: &llvm_ir::Operand| emitter.format_operand(op);
+    let optimized_loop = branch_condition_expr(&format_cond, header, func, cond, true);
     match optimized_loop {
         (cond_expr, skip_result @ Some(_))
             if header_only_contains_skipped_cmp(header, skip_result) =>
         {
-            if let Some(for_loop) =
-                detect_for_loop_induction(func, header, cond, true_target, true_args)
-            {
-                let induction_name =
-                    emitter.format_operand(&llvm_ir::Operand::Value(for_loop.induction_param));
-                if let Some(args) = incoming_header_args {
-                    emitter.emit_block_param_assignments_skipping(
-                        header.id,
-                        args,
-                        &[for_loop.induction_param],
-                    );
-                }
-                let init_expr = incoming_header_args
-                    .and_then(|args| args.get(for_loop.induction_param_index))
-                    .map(|arg| format!("{induction_name} = {}", emitter.format_operand(arg)))
-                    .unwrap_or_default();
-                let step_expr = induction_step_expr(&induction_name, for_loop.step);
-                // Only C has this directive, and a target without one keeps
-                // the loop as it is.
-                //
-                // OpenMP requires the loop's initializer to be `var = init`
-                // in the `for` header. When the preheader is inside a branch,
-                // the induction value is assigned before the loop and the
-                // header is empty, so the directive would make the C compiler
-                // reject the whole file. The loop is still correct without it.
-                let vectorize = (!init_expr.is_empty())
-                    .then(|| {
-                        emitter.vectorize_hint(is_simple_loop_body(func, true_target, header.id))
-                    })
-                    .flatten();
-                if let Some(vectorize) = vectorize {
-                    emitter.writeln(&vectorize);
-                }
-                emitter.writeln(&format!(
-                    "for ({}; {}; {}) {{",
-                    init_expr, cond_expr, step_expr
-                ));
-                emitter.indent_inc();
-                emitter.emit_block_param_assignments(true_target, true_args);
-                let backedge = emit_structured_from(
-                    emitter,
-                    func,
-                    true_target,
-                    &[header.id],
-                    Some((header.id, vec![for_loop.induction_param])),
-                    for_loop.step_value_id,
-                    post_dominators,
-                    messages,
-                )?;
-                if backedge != Some(header.id) {
-                    return Err(Error::Compile(messages.loop_backedge_mismatch.into()));
-                }
-                emitter.indent_dec();
-                emitter.writeln("}");
-                emitter.emit_block_param_assignments(false_target, false_args);
-                return Ok(false_target);
-            }
-
             if let Some(args) = incoming_header_args {
                 emitter.emit_block_param_assignments(header.id, args);
             }
@@ -1903,117 +1953,292 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
     }
 }
 
+/// An alloca-form counted loop the emitter spells as a `for`.
+///
+/// The lowering emits every loop in memory form: the index lives in a scalar
+/// `alloca`, the entry stores the initial value, the header loads and compares
+/// it, and the latch stores the step. The pre-pass collects the loops matching
+/// that shape exactly, so emission can fold all three index updates into the
+/// `for` header and demote the alloca to a plain scalar — the canonical form
+/// an OpenMP loop directive requires.
 #[derive(Clone, Copy)]
-struct ForLoopInduction {
-    induction_param: llvm_ir::ValueId,
-    induction_param_index: usize,
-    step: i64,
-    step_value_id: Option<llvm_ir::ValueId>,
+pub(crate) struct AllocaForLoop {
+    /// The index `alloca`. Its declaration demotes to the scalar itself.
+    pub iv: llvm_ir::ValueId,
+    /// The entry's initial value.
+    pub init: i64,
+    /// The signed step the latch adds.
+    pub step: i64,
+    /// The step instruction, which the latch must not emit: the `for` header
+    /// writes it.
+    pub step_value: llvm_ir::ValueId,
 }
 
-fn detect_for_loop_induction(
+/// The alloca-form counted loops of `func`, keyed by header block.
+///
+/// Strictly gated: a header holding only an index load and its compare;
+/// exactly two stores, an entry-side constant and a step on a load inside the
+/// true arm; two predecessors, the entry edge and the latch; and a step
+/// direction consistent with the comparison. The body may reload the index
+/// freely, but every reload must sit inside the true arm — a load the loop
+/// cannot reach would read the index outside the `for`, where the folded init
+/// has not run yet. Under these gates the index has no access between its
+/// init and the header or between the step and the back edge, so folding the
+/// init into the `for` header's initializer and the step into its increment
+/// preserves the semantics wherever the two sit. Anything else is not a
+/// counted loop and falls back to the `while` spelling.
+///
+/// Also returns every load of a recognized index, mapped to the index: the
+/// emitter spells all of them as the scalar.
+pub(crate) fn find_alloca_for_loops(
     func: &llvm_ir::Function,
-    header: &llvm_ir::BasicBlock,
-    cond: &llvm_ir::Operand,
-    true_target: llvm_ir::BlockId,
-    _true_args: &[llvm_ir::Operand],
-) -> Option<ForLoopInduction> {
-    let cond_id = operand_value_id(cond)?;
-    let cmp_inst = get_inst_by_result(func, cond_id)?;
-    let llvm_ir::InstOp::Cmp { pred, lhs, rhs } = &cmp_inst.op else {
-        return None;
-    };
-    let llvm_ir::Operand::Value(loop_param) = lhs else {
-        return None;
-    };
-    if !matches!(
-        pred,
-        llvm_ir::CmpPred::Slt
-            | llvm_ir::CmpPred::Sle
-            | llvm_ir::CmpPred::Sgt
-            | llvm_ir::CmpPred::Sge
-    ) {
-        return None;
-    }
-    let induction_param_index = header
-        .params
-        .iter()
-        .position(|param| param.id == *loop_param)?;
-    let backedge_candidates = find_loop_backedge_args(func, header.id, true_target);
-    let (step, step_value_id) = backedge_candidates.into_iter().find_map(|args| {
-        induction_step_from_backedge_arg(func, *loop_param, args.get(induction_param_index)?)
-    })?;
-    if step == 0 {
-        return None;
-    }
-    if !matches!(
-        (step > 0, pred),
-        (true, llvm_ir::CmpPred::Slt | llvm_ir::CmpPred::Sle)
-            | (false, llvm_ir::CmpPred::Sgt | llvm_ir::CmpPred::Sge)
-    ) {
-        return None;
-    }
-    if !matches!(rhs, llvm_ir::Operand::Const(_) | llvm_ir::Operand::Value(_)) {
-        return None;
-    }
-    Some(ForLoopInduction {
-        induction_param: *loop_param,
-        induction_param_index,
-        step,
-        step_value_id,
-    })
-}
+) -> (
+    HashMap<llvm_ir::BlockId, AllocaForLoop>,
+    HashMap<llvm_ir::ValueId, llvm_ir::ValueId>,
+) {
+    let mut loads: HashMap<llvm_ir::ValueId, Vec<(llvm_ir::BlockId, llvm_ir::ValueId)>> =
+        HashMap::new();
+    let mut stores: HashMap<llvm_ir::ValueId, Vec<(llvm_ir::BlockId, &llvm_ir::Operand)>> =
+        HashMap::new();
+    let mut alloca_ty: HashMap<llvm_ir::ValueId, &llvm_ir::Type> = HashMap::new();
 
-fn find_loop_backedge_args(
-    func: &llvm_ir::Function,
-    header_id: llvm_ir::BlockId,
-    true_target: llvm_ir::BlockId,
-) -> Vec<Vec<llvm_ir::Operand>> {
-    func.blocks
-        .iter()
-        .filter_map(|block| match &block.terminator {
-            llvm_ir::Terminator::Br { target, args }
-                if *target == header_id
-                    && block_reaches(func, true_target, block.id, &mut HashSet::new()) =>
-            {
-                Some(args.clone())
+    for block in &func.blocks {
+        for inst in &block.insts {
+            match &inst.op {
+                llvm_ir::InstOp::Alloca {
+                    alloc_ty,
+                    addr_space: llvm_ir::AddressSpace::Private,
+                } => {
+                    if let Some(result) = inst.result {
+                        alloca_ty.insert(result, alloc_ty);
+                    }
+                }
+                llvm_ir::InstOp::Load {
+                    ptr: llvm_ir::Operand::Value(base),
+                } => {
+                    if let Some(result) = inst.result {
+                        loads
+                            .entry(*base)
+                            .or_default()
+                            .push((block.id, result));
+                    }
+                }
+                llvm_ir::InstOp::Store {
+                    ptr: llvm_ir::Operand::Value(base),
+                    value,
+                } => {
+                    stores
+                        .entry(*base)
+                        .or_default()
+                        .push((block.id, value));
+                }
+                _ => {}
             }
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-}
-
-fn induction_step_from_backedge_arg(
-    func: &llvm_ir::Function,
-    loop_param: llvm_ir::ValueId,
-    arg: &llvm_ir::Operand,
-) -> Option<(i64, Option<llvm_ir::ValueId>)> {
-    let llvm_ir::Operand::Value(step_value_id) = arg else {
-        return None;
-    };
-    let step_inst = get_inst_by_result(func, *step_value_id)?;
-    let llvm_ir::InstOp::Bin { op, lhs, rhs } = &step_inst.op else {
-        return None;
-    };
-    let step_val = *step_value_id;
-    match (op, lhs, rhs) {
-        (
-            llvm_ir::BinOp::Add,
-            llvm_ir::Operand::Value(id),
-            llvm_ir::Operand::Const(llvm_ir::Constant::Int(step)),
-        ) if *id == loop_param => Some((*step, Some(step_val))),
-        (
-            llvm_ir::BinOp::Add,
-            llvm_ir::Operand::Const(llvm_ir::Constant::Int(step)),
-            llvm_ir::Operand::Value(id),
-        ) if *id == loop_param => Some((*step, Some(step_val))),
-        (
-            llvm_ir::BinOp::Sub,
-            llvm_ir::Operand::Value(id),
-            llvm_ir::Operand::Const(llvm_ir::Constant::Int(step)),
-        ) if *id == loop_param => Some((-*step, Some(step_val))),
-        _ => None,
+        }
     }
+
+    let mut loops = HashMap::new();
+    let mut load_index = HashMap::new();
+    for (iv, alloc_ty) in &alloca_ty {
+        // A counted index is a scalar integer; arrays are tile storage.
+        if !matches!(alloc_ty, llvm_ir::Type::I64) {
+            continue;
+        }
+        let Some(sites) = loads.get(iv) else {
+            continue;
+        };
+        // The header's first instruction is the index load the compare reads.
+        // The header's first instruction is the index load the compare reads.
+        let mut header_site = None;
+        for (block_id, site_load) in sites {
+            let Some(first) = get_block(func, *block_id).and_then(|b| b.insts.first()) else {
+                continue;
+            };
+            if first.result == Some(*site_load)
+                && matches!(
+                    &first.op,
+                    llvm_ir::InstOp::Load {
+                        ptr: llvm_ir::Operand::Value(base),
+                    } if *base == *iv
+                )
+            {
+                header_site = Some((*block_id, *site_load));
+                break;
+            }
+        }
+        let Some((header_id, load)) = header_site else {
+            continue;
+        };
+        let Some(store_sites) = stores.get(iv) else {
+            continue;
+        };
+        if store_sites.len() != 2 {
+            continue;
+        }
+        let Some(header) = get_block(func, header_id) else {
+            continue;
+        };
+        // The header carries exactly the index load and its compare, no block
+        // params, and branches on the compare.
+        if !header.params.is_empty() || header.insts.len() != 2 {
+            continue;
+        }
+        if header.insts[0].result != Some(load) {
+            continue;
+        }
+        let llvm_ir::InstOp::Cmp {
+            pred,
+            lhs: llvm_ir::Operand::Value(lhs),
+            ..
+        } = &header.insts[1].op
+        else {
+            continue;
+        };
+        if *lhs != load {
+            continue;
+        }
+        let Some(cmp_id) = header.insts[1].result else {
+            continue;
+        };
+        let llvm_ir::Terminator::CondBr {
+            cond: llvm_ir::Operand::Value(cond_id),
+            true_target,
+            ..
+        } = &header.terminator
+        else {
+            continue;
+        };
+        if *cond_id != cmp_id {
+            continue;
+        }
+        // Every reload of the index must sit inside the true arm: a load the
+        // loop cannot reach reads the index outside the `for`, where the
+        // folded init has not run yet.
+        if !sites.iter().all(|(block_id, _)| {
+            block_reaches(func, *true_target, *block_id, &mut HashSet::new())
+        }) {
+            continue;
+        }
+        // The two predecessors are the entry edge and the latch, told apart
+        // by which one the loop itself reaches.
+        let mut preds = Vec::new();
+        for block in &func.blocks {
+            let targets = match &block.terminator {
+                llvm_ir::Terminator::Br { target, .. } => vec![*target],
+                llvm_ir::Terminator::CondBr {
+                    true_target,
+                    false_target,
+                    ..
+                } => vec![*true_target, *false_target],
+                _ => Vec::new(),
+            };
+            if targets.contains(&header_id) {
+                preds.push(block.id);
+            }
+        }
+        if preds.len() != 2 {
+            continue;
+        }
+        let Some(latch) = preds
+            .iter()
+            .copied()
+            .find(|pred| block_reaches(func, header_id, *pred, &mut HashSet::new()))
+        else {
+            continue;
+        };
+        let Some(entry_edge) = preds.iter().copied().find(|pred| *pred != latch) else {
+            continue;
+        };
+
+        // The two stores: an entry-side constant and a step on the load, taken
+        // inside the loop's true arm.
+        let mut init = None;
+        let mut step = None;
+        for (site_block, value) in store_sites {
+            match value {
+                llvm_ir::Operand::Const(llvm_ir::Constant::Int(value)) => {
+                    // Entry side: on the way to the header through the entry
+                    // edge, so the init runs once per loop entry.
+                    if *site_block == entry_edge
+                        || block_reaches(func, *site_block, entry_edge, &mut HashSet::new())
+                    {
+                        init = Some(*value);
+                    }
+                }
+                llvm_ir::Operand::Value(step_value) => {
+                    let Some(step_inst) = get_inst_by_result(func, *step_value) else {
+                        continue;
+                    };
+                    let (op, amount) = match &step_inst.op {
+                        llvm_ir::InstOp::Bin {
+                            op: llvm_ir::BinOp::Add,
+                            lhs: llvm_ir::Operand::Value(id),
+                            rhs: llvm_ir::Operand::Const(llvm_ir::Constant::Int(k)),
+                        } if *id == load => (llvm_ir::BinOp::Add, *k),
+                        llvm_ir::InstOp::Bin {
+                            op: llvm_ir::BinOp::Sub,
+                            lhs: llvm_ir::Operand::Value(id),
+                            rhs: llvm_ir::Operand::Const(llvm_ir::Constant::Int(k)),
+                        } if *id == load => (llvm_ir::BinOp::Sub, *k),
+                        _ => continue,
+                    };
+                    // Inside the true arm, inside the loop, and on the way
+                    // back to the header.
+                    if block_reaches(func, *true_target, *site_block, &mut HashSet::new())
+                        && block_reaches(func, header_id, *site_block, &mut HashSet::new())
+                        && block_reaches(func, *site_block, header_id, &mut HashSet::new())
+                    {
+                        step = Some((op, *site_block, amount, *step_value));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(init_value) = init else {
+            continue;
+        };
+        let Some((op, latch, amount, step_value)) = step else {
+            continue;
+        };
+        // The step instruction lives next to its store, in the latch, so the
+        // emission skip finds both in one block.
+        let latch_holds_step = get_block(func, latch).is_some_and(|block| {
+            block.insts.iter().any(|inst| inst.result == Some(step_value))
+        });
+        if !latch_holds_step {
+            continue;
+        }
+        // The back edge must be the loop's true arm: the `for` body is what
+        // returns to the header.
+        if !block_reaches(func, *true_target, header_id, &mut HashSet::new()) {
+            continue;
+        }
+        let signed_step = match op {
+            llvm_ir::BinOp::Add => amount,
+            _ => -amount,
+        };
+        let direction_ok = matches!(
+            (signed_step > 0, pred),
+            (true, llvm_ir::CmpPred::Slt | llvm_ir::CmpPred::Sle)
+                | (false, llvm_ir::CmpPred::Sgt | llvm_ir::CmpPred::Sge)
+        );
+        if !direction_ok {
+            continue;
+        }
+        loops.insert(
+            header_id,
+            AllocaForLoop {
+                iv: *iv,
+                init: init_value,
+                step: signed_step,
+                step_value,
+            },
+        );
+        for (_, load_result) in sites {
+            load_index.insert(*load_result, *iv);
+        }
+    }
+    (loops, load_index)
 }
 
 /// Loop step text, as an assignment every target accepts.
@@ -2096,7 +2321,7 @@ fn is_loop_preheader(func: &llvm_ir::Function, block: &llvm_ir::BasicBlock) -> b
         .unwrap_or(false)
 }
 
-fn is_loop_header(func: &llvm_ir::Function, block: &llvm_ir::BasicBlock) -> bool {
+pub(crate) fn is_loop_header(func: &llvm_ir::Function, block: &llvm_ir::BasicBlock) -> bool {
     let llvm_ir::Terminator::CondBr {
         true_target,
         false_target,
@@ -2300,35 +2525,40 @@ fn block_reaches(
     reaches
 }
 
-fn branch_condition_expr<E: StructuredEmitter>(
-    func: &llvm_ir::Function,
+/// Spell a branch condition as an expression.
+///
+/// Operands go through the emitter's formatter so skipped definitions (an
+/// induction variable's body reload, say) still name the value that survives.
+fn branch_condition_expr(
+    format_operand: &impl Fn(&llvm_ir::Operand) -> String,
     block: &llvm_ir::BasicBlock,
+    func: &llvm_ir::Function,
     cond: &llvm_ir::Operand,
     require_header_only: bool,
 ) -> (String, Option<llvm_ir::ValueId>) {
     let Some(cond_id) = operand_value_id(cond) else {
-        return (format_operand_with_function::<E>(func, cond), None);
+        return (format_operand(cond), None);
     };
     let Some(inst) = get_inst_by_result(func, cond_id) else {
-        return (format_operand_with_function::<E>(func, cond), None);
+        return (format_operand(cond), None);
     };
     if !matches!(inst.op, llvm_ir::InstOp::Cmp { .. }) {
-        return (format_operand_with_function::<E>(func, cond), None);
+        return (format_operand(cond), None);
     }
     if require_header_only && !header_only_contains_skipped_cmp(block, Some(cond_id)) {
-        return (format_operand_with_function::<E>(func, cond), None);
+        return (format_operand(cond), None);
     }
     match &inst.op {
         llvm_ir::InstOp::Cmp { pred, lhs, rhs } => (
             format!(
                 "{} {} {}",
-                format_operand_with_function::<E>(func, lhs),
+                format_operand(lhs),
                 cmp_pred_symbol(*pred),
-                format_operand_with_function::<E>(func, rhs)
+                format_operand(rhs)
             ),
             Some(cond_id),
         ),
-        _ => (format_operand_with_function::<E>(func, cond), None),
+        _ => (format_operand(cond), None),
     }
 }
 
@@ -2352,13 +2582,6 @@ fn operand_value_id(operand: &llvm_ir::Operand) -> Option<llvm_ir::ValueId> {
     }
 }
 
-fn format_operand_with_function<E: StructuredEmitter>(
-    func: &llvm_ir::Function,
-    operand: &llvm_ir::Operand,
-) -> String {
-    let value_names = build_value_names(func);
-    format_operand(&value_names, E::float_literal, operand)
-}
 
 fn predecessor_count(func: &llvm_ir::Function, target: llvm_ir::BlockId) -> usize {
     func.blocks

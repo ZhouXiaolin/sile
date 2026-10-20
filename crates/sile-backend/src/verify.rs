@@ -1,6 +1,7 @@
 use sile_core::{Error, Result};
 use sile_llvm_ir::Function as LlvmIrFunction;
 
+use crate::emit::{find_alloca_for_loops, is_loop_header};
 use crate::CodegenTarget;
 
 pub(crate) fn for_target(
@@ -34,6 +35,27 @@ fn verify_shared_contract(llvm_ir: &LlvmIrFunction, stage: &str) -> Result<()> {
                     block.name
                 )));
             }
+        }
+    }
+    verify_structured_shapes(llvm_ir, stage)
+}
+
+/// The emitter spells three shapes — straight line, counted `for`, if/else —
+/// and a loop header outside the counted shape would silently fall back to a
+/// `while (true)` loop: correct text, but no vectorization hint and a contract
+/// violation nobody sees. This check makes that fallback loud instead: every
+/// loop header must match the alloca-form counted loop the lowering emits.
+fn verify_structured_shapes(llvm_ir: &LlvmIrFunction, stage: &str) -> Result<()> {
+    let (for_loops, _) = find_alloca_for_loops(llvm_ir);
+    for block in &llvm_ir.blocks {
+        if matches!(block.terminator, sile_llvm_ir::Terminator::CondBr { .. })
+            && is_loop_header(llvm_ir, block)
+            && !for_loops.contains_key(&block.id)
+        {
+            return Err(Error::Compile(format!(
+                "{stage}: loop header `{}` is not a counted loop (index alloca with an entry init, a header load+compare, and a latch step), so backend emit cannot spell it as `for`",
+                block.name
+            )));
         }
     }
     Ok(())
