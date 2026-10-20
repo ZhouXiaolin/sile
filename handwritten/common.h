@@ -59,20 +59,30 @@ static void check_close(const char *what, const float *got, const float *want,
     }
 }
 
-// Milliseconds of the fastest of `reps` runs. The fastest run is the one least
-// disturbed by the scheduler, which is what two labels should be compared on.
-// A row kernel at bench size is a fraction of a millisecond of work, so the
-// rep count has to be high enough that one unlucky wakeup cannot become the
-// number: softmax measures 0.79 ms at 25 reps and 4.9 ms at 9.
+// Milliseconds of the median of `reps` runs. The median carries two jobs on
+// this box. The clock itself can read another CPU's counter after a thread
+// migrates, and a fastest-run statistic promotes one such ~0.1 ms reading to
+// the number. Worse is the cold-start transient: the first ~20 omp regions of
+// a process each cost a flat ~6 ms whatever they run — a bare parallel-for
+// over empty bodies measures 6.0 ms, then snaps to 0.005 ms and stays — so a
+// short bench can sit entirely inside the transient. The rep count has to be
+// high enough that fewer than half the launches land in it; 100 is measured
+// safe, and the median then reports the steady state on both sides alike.
+static int cmp_double(void const *a, void const *b) {
+    double x = *(double const *)a;
+    double y = *(double const *)b;
+    return (x > y) - (x < y);
+}
+
 static double bench_ms(void (*run)(void *), void *ctx, int reps) {
-    double best = 1e30;
+    double samples[reps];
     for (int r = 0; r < reps; ++r) {
         double t0 = now_ms();
         run(ctx);
-        double dt = now_ms() - t0;
-        if (dt < best) best = dt;
+        samples[r] = now_ms() - t0;
     }
-    return best;
+    qsort(samples, (size_t)reps, sizeof samples[0], cmp_double);
+    return samples[reps / 2];
 }
 
 static void report(const char *kernel, double ms, double work, const char *unit) {

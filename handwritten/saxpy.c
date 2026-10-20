@@ -32,7 +32,7 @@ int main(int argc, char **argv) {
         fill_uniform(&seed, x, n);
         fill_uniform(&seed, y, n);
         struct bench_ctx ctx = {y, x, 2.0f, n};
-        double ms = bench_ms(run, &ctx, 25);
+        double ms = bench_ms(run, &ctx, 100);
         report("saxpy", ms, (double)n * 3.0 * sizeof(float), "GB/s");
         free(x);
         free(y);

@@ -9,7 +9,9 @@ one loop and reports each side's best time, so both see the same conditions.
 Each side is a process, so the alternation is between processes: the reference
 is the already-built `handwritten/<kernel>` binary and the sile side is
 `target/release/examples/bench_m2`. Both print one `BENCH <name> <ms> ms <rate>`
-line and both report their own best of 25 launches.
+line and both report their own median of 100 launches (the first ~20 omp
+regions of a process run under a flat cold-start transient, so the median has
+to outvote them).
 
 Usage:
     python3 scripts/compare_golden.py --rounds 5

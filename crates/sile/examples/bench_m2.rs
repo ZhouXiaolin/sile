@@ -4,8 +4,10 @@
 //! `docs/BACKEND_PLAN.md` M2 asks for saxpy, softmax and rms_norm at 80% of
 //! hand-written C. That comparison only means something when both sides run the
 //! same problem, so this example uses the reference's own sizes — 16M elements
-//! for saxpy, 4096x1024 for the other two — and reports the best of 25 launches,
-//! which is how `handwritten/common.h` times its side.
+//! for saxpy, 4096x1024 for the other two — and reports the median of 100
+//! launches, which is how `handwritten/common.h` times its side. The count is
+//! high because the first ~20 omp regions of any process on this box run under
+//! a flat cold-start transient; the median has to outvote them.
 //!
 //! Usage: `cargo run --release --example bench_m2 -- [saxpy|softmax|rms_norm]`
 
@@ -85,19 +87,22 @@ mod kernels {
     }
 }
 
-/// The best of `reps` launches, in milliseconds: the same statistic the
-/// handwritten references report.
+/// The median of `reps` launches, in milliseconds: the same statistic the
+/// handwritten references report. The median needs more than half the samples
+/// disturbed to move; a best-of lets one stray clock reading become the
+/// number, and `clock_gettime` produces those here.
 fn best_of<F: FnMut()>(reps: usize, mut run: F) -> f64 {
     // The first launch compiles and loads the kernel, which costs more than the
     // kernel itself; timing it would measure the compiler.
     run();
-    let mut best = f64::INFINITY;
+    let mut samples = Vec::with_capacity(reps);
     for _ in 0..reps {
         let started = Instant::now();
         run();
-        best = best.min(started.elapsed().as_secs_f64() * 1e3);
+        samples.push(started.elapsed().as_secs_f64() * 1e3);
     }
-    best
+    samples.sort_by(|a, b| a.partial_cmp(b).expect("finite durations"));
+    samples[reps / 2]
 }
 
 fn report(kernel: &str, ms: f64, work: f64, unit: &str) {
@@ -121,7 +126,7 @@ fn run_saxpy(device: &Device) -> sile::Result<()> {
     let mut y_part = y.partition_mut([BM, BN]);
     // `apply` consumes the launcher, so each repetition builds a fresh one:
     // what is timed is the launch, not the kernel's construction.
-    let ms = best_of(25, || {
+    let ms = best_of(100, || {
         kernels::saxpy::<BM, BN>(&mut y_part, 2.0, &x)
             .apply(&stream)
             .expect("saxpy launch")
@@ -138,7 +143,7 @@ fn run_softmax(device: &Device) -> sile::Result<()> {
     let x = Tensor::from_vec(vec![0.5f32; (rows * cols) as usize], [rows, cols], device)?;
     let mut y = Tensor::zeros([rows, cols], device)?;
     let mut y_part = y.partition_mut([BM, cols]);
-    let ms = best_of(25, || {
+    let ms = best_of(100, || {
         kernels::softmax::<BM, 1024>(&mut y_part, &x)
             .apply(&stream)
             .expect("softmax launch")
@@ -155,7 +160,7 @@ fn run_rms_norm(device: &Device) -> sile::Result<()> {
     let mut w = Tensor::from_vec(vec![1.0f32; cols as usize], [cols], device)?;
     let mut out = Tensor::zeros([rows, cols], device)?;
     let mut out_part = out.partition_mut([1, cols]);
-    let ms = best_of(25, || {
+    let ms = best_of(100, || {
         kernels::rms_norm::<1024, 64>(&x, &mut w, &mut out_part, 1e-6)
             .apply(&stream)
             .expect("rms_norm launch")

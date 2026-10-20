@@ -86,7 +86,7 @@ int main(int argc, char **argv) {
         uint32_t seed = 1;
         fill_uniform(&seed, x, rows * cols);
         struct bench_ctx ctx = {y, x, rows, cols};
-        double ms = bench_ms(run, &ctx, 25);
+        double ms = bench_ms(run, &ctx, 100);
         report("softmax", ms, (double)rows * (double)cols * 4.0 * sizeof(float),
                "GB/s");
         free(x);

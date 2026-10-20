@@ -69,7 +69,7 @@ int main(int argc, char **argv) {
         fill_uniform(&seed, x, rows * cols);
         fill_uniform(&seed, w, cols);
         struct bench_ctx ctx = {out, x, w, rows, cols, eps};
-        double ms = bench_ms(run, &ctx, 25);
+        double ms = bench_ms(run, &ctx, 100);
         report("rms_norm", ms, (double)rows * (double)cols * 3.0 * sizeof(float),
                "GB/s");
         free(x);
