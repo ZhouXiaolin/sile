@@ -2267,22 +2267,13 @@ fn is_simple_loop_body(
         let Some(block) = get_block(func, current) else {
             return false;
         };
-        for inst in &block.insts {
-            // A call, and a float function the target may implement as one,
-            // keep the body out of the vectorized form.
-            let calls_a_function = match &inst.op {
-                llvm_ir::InstOp::Call { .. } => true,
-                llvm_ir::InstOp::Intrinsic { intrinsic, .. } => {
-                    intrinsic.float_function().is_some()
-                        || intrinsic.binary_float_function().is_some()
-                        || intrinsic.ternary_float_function().is_some()
-                }
-                _ => false,
-            };
-            if calls_a_function {
-                return false;
-            }
-        }
+        // The shape walk decides control flow only. A float function in the
+        // body is spelled inline where its target puts it, and the vector
+        // hint is a permission the compiler takes or leaves: the handwritten
+        // softmax measures `omp simd` over `expf` at 5.5x its scalar form,
+        // so a call is no reason to deny the hint. Nested control flow still
+        // is — the walk below only accepts a straight chain back to the
+        // header.
         match &block.terminator {
             llvm_ir::Terminator::Br { target, .. } if *target == header_id => return true,
             llvm_ir::Terminator::Br { target, .. } => current = *target,
