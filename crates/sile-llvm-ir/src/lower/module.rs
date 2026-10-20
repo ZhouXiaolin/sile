@@ -94,6 +94,14 @@ enum Recipe {
         lhs_shape: Vec<i64>,
         rhs_shape: Vec<i64>,
     },
+    Cmp {
+        pred: llvm_ir::CmpPred,
+        shape: Vec<i64>,
+        lhs: Box<Recipe>,
+        rhs: Box<Recipe>,
+        lhs_shape: Vec<i64>,
+        rhs_shape: Vec<i64>,
+    },
     Un {
         opcode: Opcode,
         elem: llvm_ir::Type,
@@ -1286,6 +1294,28 @@ impl<'a> Lowerer<'a> {
                     self.elementwise_value(*opcode, elem, a, b)
                 }
             }
+            Recipe::Cmp {
+                pred,
+                shape: out_shape,
+                lhs,
+                rhs,
+                lhs_shape,
+                rhs_shape,
+            } => {
+                let lhs_index = self.aligned_index(index.clone(), out_shape, lhs_shape);
+                let a = self.recipe_element(lhs, lhs_index, lhs_shape);
+                let rhs_index = self.aligned_index(index, out_shape, rhs_shape);
+                let b = self.recipe_element(rhs, rhs_index, rhs_shape);
+                self.emit(
+                    llvm_ir::Type::I1,
+                    "cmp",
+                    llvm_ir::InstOp::Cmp {
+                        pred: *pred,
+                        lhs: a,
+                        rhs: b,
+                    },
+                )
+            }
             Recipe::Un {
                 opcode,
                 elem,
@@ -1937,13 +1967,11 @@ impl<'a> Lowerer<'a> {
             return Ok(());
         };
         let rhs_value = op.operands.get(1).copied();
-        let lhs = self.operand_of(lhs_value);
-        let rhs = rhs_value.map(|v| self.operand_of(v));
-        let lhs_tile = matches!(self.layouts.get(&lhs_value), Some(Layout::Tile { .. }));
-        let rhs_tile = rhs_value.is_some_and(|v| matches!(self.layouts.get(&v), Some(Layout::Tile { .. })));
         let pred = comparison_pred(&op);
 
         if shape.is_empty() {
+            let lhs = self.operand_of(lhs_value);
+            let rhs = rhs_value.map(|v| self.operand_of(v));
             let b = rhs.unwrap_or_else(|| llvm_ir::Operand::Const(llvm_ir::Constant::Int(0)));
             let value = self.emit(
                 elem.clone(),
@@ -1961,32 +1989,30 @@ impl<'a> Lowerer<'a> {
             return Ok(());
         }
 
-        let dst = self.alloc_tile(result, &shape, &elem);
-        let len = self.tile_len_of(result);
-        self.counted_loop("cmp", len, |lowerer, index| {
-            let a = if lhs_tile {
-                lowerer.tile_element(&lhs, &llvm_ir::Type::F32, index.clone())
-            } else {
-                lhs.clone()
-            };
-            let b = match (&rhs, rhs_tile) {
-                (Some(operand), true) => {
-                    lowerer.tile_element(operand, &llvm_ir::Type::F32, index.clone())
-                }
-                (Some(operand), false) => operand.clone(),
-                (None, _) => llvm_ir::Operand::Const(llvm_ir::Constant::Int(0)),
-            };
-            let value = lowerer.emit(
-                elem.clone(),
-                "cmp",
-                llvm_ir::InstOp::Cmp {
-                    pred,
-                    lhs: a,
-                    rhs: b,
-                },
-            );
-            lowerer.store_element(&dst, &elem, index, value);
-        });
+        // Elementwise like any other binary op: the compare stays lazy, and the
+        // consumer folds it per element with the operands' own element types.
+        let lhs_shape = self.shape_of(lhs_value);
+        let rhs_shape = rhs_value.map(|v| self.shape_of(v)).unwrap_or_default();
+        let no_operand = || {
+            Recipe::Ready(llvm_ir::Operand::Const(llvm_ir::Constant::Int(0)))
+        };
+        self.register_recipe(
+            result,
+            Recipe::Cmp {
+                pred,
+                shape: shape.clone(),
+                lhs: Box::new(self.recipe_of(lhs_value)),
+                rhs: Box::new(
+                    rhs_value
+                        .map(|v| self.recipe_of(v))
+                        .unwrap_or_else(no_operand),
+                ),
+                lhs_shape,
+                rhs_shape,
+            },
+            &shape,
+            &elem,
+        );
         Ok(())
     }
 
