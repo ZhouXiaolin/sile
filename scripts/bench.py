@@ -97,7 +97,9 @@ def main():
 
     rows = []
     for example in chosen:
-        exe = ROOT / "target" / args.profile / "examples" / f"{example}.exe"
+        exe = ROOT / "target" / args.profile / "examples" / example
+        if not exe.exists():
+            exe = exe.with_name(example + ".exe")
         if not exe.exists():
             print(f"warning: {example} is not built", file=sys.stderr)
             continue
