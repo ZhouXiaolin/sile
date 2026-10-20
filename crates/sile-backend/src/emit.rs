@@ -762,8 +762,10 @@ pub trait TargetDialect {
     /// MSL.
     fn signature(&self, name: &str, params: &[(String, String)]) -> String;
 
-    /// Lines emitted before the kernel body, after the declarations.
-    fn prelude_lines(&self) -> Vec<String>;
+    /// Lines emitted before the kernel body, after the declarations. The
+    /// function is what tells a helper apart from dead weight: a target spells
+    /// runtime support only for the intrinsics the body names.
+    fn prelude_lines(&self, func: &llvm_ir::Function) -> Vec<String>;
 
     /// Assignment of an intrinsic result, or a statement when it has none.
     fn intrinsic_stmt(
@@ -1296,7 +1298,7 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
 
 impl<D: TargetDialect> TextCodegen for TargetEmitter<'_, D> {
     fn emit_prelude(&mut self) {
-        for line in self.dialect.prelude_lines() {
+        for line in self.dialect.prelude_lines(self.func) {
             self.out.push_str(&line);
             self.out.push('\n');
         }

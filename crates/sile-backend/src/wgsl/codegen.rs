@@ -440,7 +440,7 @@ impl TargetDialect for WgslDialect<'_> {
         )
     }
 
-    fn prelude_lines(&self) -> Vec<String> {
+    fn prelude_lines(&self, _func: &llvm_ir::Function) -> Vec<String> {
         let mut lines = Vec::new();
         // A half storage is an optional WGSL capability, and the `f16` type it
         // names is only in scope under its enable directive, which must come

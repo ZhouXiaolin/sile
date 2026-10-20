@@ -67,9 +67,9 @@ impl emit::TargetDialect for CDialect {
         format!("void sile_llvm_ir_{name}({joined}) {{\n")
     }
 
-    /// C needs its headers, its per-thread launch state and its vector helpers,
-    /// in the order the kernel body depends on them.
-    fn prelude_lines(&self) -> Vec<String> {
+    /// C needs its headers, its per-thread launch state and — only when the
+    /// body spells a vector intrinsic — its vector helpers.
+    fn prelude_lines(&self, func: &llvm_ir::Function) -> Vec<String> {
         let mut lines = vec![
             "#include <stdint.h>".to_string(),
             "#include <stdbool.h>".to_string(),
@@ -101,32 +101,47 @@ impl emit::TargetDialect for CDialect {
         lines.push("#define llir_thread_id_2() (0)".to_string());
         lines.push("#define llir_barrier() ((void)0)".to_string());
         lines.push(String::new());
-        // Vector load/reduce helpers, used by the vectorized reduce loops.
-        lines.push("typedef struct { float v[4]; } llir_float4;".to_string());
-        lines.push(
-            "static inline llir_float4 llir_vec_load_4(const float* ptr, int64_t offset) {"
-                .to_string(),
-        );
-        lines.push("    llir_float4 r;".to_string());
-        lines.push(
-            "    r.v[0] = ptr[offset]; r.v[1] = ptr[offset+1]; r.v[2] = ptr[offset+2]; r.v[3] = ptr[offset+3];"
-                .to_string(),
-        );
-        lines.push("    return r;".to_string());
-        lines.push("}".to_string());
-        lines.push(
-            "static inline void llir_vec_store_4(float* ptr, int64_t offset, llir_float4 v) {"
-                .to_string(),
-        );
-        lines.push(
-            "    ptr[offset] = v.v[0]; ptr[offset+1] = v.v[1]; ptr[offset+2] = v.v[2]; ptr[offset+3] = v.v[3];"
-                .to_string(),
-        );
-        lines.push("}".to_string());
-        lines.push("static inline float llir_vec_reduce_add(llir_float4 v) {".to_string());
-        lines.push("    return v.v[0] + v.v[1] + v.v[2] + v.v[3];".to_string());
-        lines.push("}".to_string());
-        lines.push(String::new());
+        let spells_vectors = func.blocks.iter().any(|block| {
+            block.insts.iter().any(|inst| {
+                matches!(
+                    &inst.op,
+                    llvm_ir::InstOp::Intrinsic {
+                        intrinsic: llvm_ir::Intrinsic::VecLoad { .. }
+                            | llvm_ir::Intrinsic::VecStore { .. }
+                            | llvm_ir::Intrinsic::VecReduceAdd,
+                        ..
+                    }
+                )
+            })
+        });
+        if spells_vectors {
+            // Vector load/reduce helpers, used by the vectorized reduce loops.
+            lines.push("typedef struct { float v[4]; } llir_float4;".to_string());
+            lines.push(
+                "static inline llir_float4 llir_vec_load_4(const float* ptr, int64_t offset) {"
+                    .to_string(),
+            );
+            lines.push("    llir_float4 r;".to_string());
+            lines.push(
+                "    r.v[0] = ptr[offset]; r.v[1] = ptr[offset+1]; r.v[2] = ptr[offset+2]; r.v[3] = ptr[offset+3];"
+                    .to_string(),
+            );
+            lines.push("    return r;".to_string());
+            lines.push("}".to_string());
+            lines.push(
+                "static inline void llir_vec_store_4(float* ptr, int64_t offset, llir_float4 v) {"
+                    .to_string(),
+            );
+            lines.push(
+                "    ptr[offset] = v.v[0]; ptr[offset+1] = v.v[1]; ptr[offset+2] = v.v[2]; ptr[offset+3] = v.v[3];"
+                    .to_string(),
+            );
+            lines.push("}".to_string());
+            lines.push("static inline float llir_vec_reduce_add(llir_float4 v) {".to_string());
+            lines.push("    return v.v[0] + v.v[1] + v.v[2] + v.v[3];".to_string());
+            lines.push("}".to_string());
+            lines.push(String::new());
+        }
         lines
     }
 

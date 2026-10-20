@@ -171,7 +171,7 @@ impl TargetDialect for MetalDialect<'_> {
         out
     }
 
-    fn prelude_lines(&self) -> Vec<String> {
+    fn prelude_lines(&self, _func: &llvm_ir::Function) -> Vec<String> {
         vec![
             "#include <metal_stdlib>".to_string(),
             "using namespace metal;".to_string(),
