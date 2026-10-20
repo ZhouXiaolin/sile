@@ -1,0 +1,11 @@
+[package]
+name = "handwritten-bench"
+version.workspace = true
+edition.workspace = true
+
+# Runs the handwritten WGSL references (handwritten/*.wgsl) on wgpu, so the
+# M0 references can be checked and timed before the compiler can reach them.
+[dependencies]
+naga.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
