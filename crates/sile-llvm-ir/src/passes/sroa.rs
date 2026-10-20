@@ -60,7 +60,7 @@ enum Access {
 }
 
 /// The dimension extents of an allocation's element array, outermost first.
-fn array_dims(ty: &Type) -> Vec<usize> {
+pub(crate) fn array_dims(ty: &Type) -> Vec<usize> {
     let mut dims = Vec::new();
     let mut current = ty;
     while let Type::Array { len, elem } = current {

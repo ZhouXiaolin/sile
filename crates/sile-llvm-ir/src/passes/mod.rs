@@ -7,6 +7,7 @@ pub mod loop_simplify;
 pub mod loop_unroll;
 pub mod phi_alias;
 pub mod sroa;
+pub mod storage;
 pub mod verify;
 
 use crate::Function;
@@ -72,6 +73,9 @@ pub fn run_pipeline(mut func: Function, pipeline: &[LlvmIrPassKind]) -> Result<F
             LlvmIrPassKind::Licm => licm::run(func),
             LlvmIrPassKind::Sroa => sroa::run(func),
             LlvmIrPassKind::Dce => {
+                // Dead instructions are only the tail of it: the relay copies
+                // between tile storages die as whole allocations.
+                storage::run(&mut func);
                 canonicalize::eliminate_dead_insts(&mut func);
                 func
             }
