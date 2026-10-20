@@ -7,7 +7,7 @@
 - TileIR 是结构化 tile 语言：区域嵌套，`for`/`if` 是 SESE 区域（single-entry, single-exit）。类比 MLIR 的 `scf` 方言。
 - LLVM IR 是任意 CFG 上的 pruned SSA。
 - 结构化语言到 CFG 的下降是**保序模板变换**：每个区域算子映射到一个固定 CFG 模板。`for` → header/body/exit 三角；`if` → then/else/join 菱形；`yield` → join 前的拷贝。
-- SSA 构造是**独立阶段**，不是下降的一部分。依据 Cytron–Ferrante–Rosen–Wegman–Zadeck (TOPLAS 1991)：先把一切标量落在 alloca（stack IR，dominance 平凡成立），再按 dominance frontier 插 phi 并重命名。这就是 LLVM `mem2reg`。
+- SSA 构造是**独立阶段**，不是下降的一部分。依据 Cytron–Ferrante–Rosen–Wegman–Zadeck (TOPLAS 1991)：先把一切标量落在 alloca（stack IR，dominance 平凡成立），再按 dominance frontier 插 phi 并重命名。这就是 LLVM `mem2reg`。本管线只取其前半：SROA 对常数索引的数组槽做无 phi 的提升，标量槽不进 SSA（§3），连 phi 插入也省去。
 
 推论：**下降阶段禁止手写 phi 与块参数**。手写 SSA 要求每个发射点满足 Braun et al. (CC 2013) 的 sealed-block 不变量（"值的定义支配使用"逐点成立）；下降器逐算子发射，无法廉价维护该不变量。历史教训：手写 phi 的下降器在 `materialize`/`for`/`mma`/`if` 各处反复产生 dominance 破坏，逐点修补不可收敛。
 
@@ -31,7 +31,6 @@ stack LLVM IR
   │ VerifyInput               —— 结构合法
   │ Canonicalize              —— 消除平凡形式
   │ LoopSimplify              —— preheader / 单回边
-  │ Mem2Reg                   —— Cytron：标量 alloca → phi + rename
   │ SROA                      —— tile 数组 alloca 的可提升子集
   │ CSE / InstCombine / LICM / LoopUnroll / DCE
   │ VerifyOutput              —— dominance 与 SSA 终验
@@ -42,9 +41,9 @@ SSA LLVM IR
 C / WGSL / PTX / Metal
 ```
 
-- **Mem2Reg**（新增）：对无地址逃逸的标量 alloca 做 minimal-SSA：支配树 → 迭代 dominance frontier 插 phi → 支配树 DFS 重命名。数组 alloca 与被取址者不提升，留给 SROA。
+- **无 Mem2Reg**：标量 alloca（归纳变量、循环携带值）全程保持内存形式——emit 的计数循环模板正是按 header load / 回边 store 识别循环的，把它们提升为 SSA 值会引入 header phi、破坏零 phi 契约。`SROA::promote` 只提升常数索引的数组槽，对标量 alloca 返回 false。
 - **SROA**（已有）：把常数索引的 tile alloca 拆量并提升。unroll 之后收益最大。
-- **PhiAlias**（保留）：Mem2Reg 产生的平凡 phi（单前驱、同值）折叠。下降不再喂它手写 phi。
+- **PhiAlias**（保留）：下降与全部 pass 均不产生 phi；此 pass 折叠万一出现的平凡 phi（单前驱、同值），是零 phi 契约的安全网。
 
 ## 4. 后端 emit 契约
 

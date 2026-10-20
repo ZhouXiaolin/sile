@@ -1629,8 +1629,9 @@ impl<'a> Lowerer<'a> {
     /// The induction variable is `i64`, which is the shape the backends' `for`
     /// detection recognises and the one the `omp simd` hint is emitted for.
     /// Per the lowering design (`docs/LOWER_DESIGN.md`) the loop carries no
-    /// block parameters: the index lives in an alloca that `Mem2Reg` later
-    /// turns into a header phi, so every instruction here dominates its uses
+    /// block parameters: the index lives in an alloca and stays in memory —
+    /// the backends' `for` detection reads the header load and the back-edge
+    /// store — so every instruction here dominates its uses
     /// by construction.
     fn counted_loop(&mut self, prefix: &str, len: usize, mut body: impl FnMut(&mut Self, llvm_ir::Operand)) {
         // A recipe names values from the block that built it, so nothing lazy
@@ -2826,8 +2827,8 @@ impl<'a> Lowerer<'a> {
         // Per `docs/LOWER_DESIGN.md` the loop carries no block parameters: the
         // induction variable and every carried value live in allocas — the
         // entry writes them, the header reads them, the back edge rewrites
-        // them — and `Mem2Reg` later promotes the scalar allocas to a header
-        // phi.
+        // them — and they stay in memory: the backends' `for` detection
+        // matches on exactly that shape.
         // A recipe names values from the block that built it, so nothing lazy
         // may cross into the loop. Materialising before the header exists lets
         // the copy loops chain through the materialisations' exits into the

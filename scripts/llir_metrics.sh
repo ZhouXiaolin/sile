@@ -21,26 +21,24 @@ report_example() {
 
   (
     cd "$ROOT_DIR"
-    RUSTC_WRAPPER= SILE_PRINT_LLIR=1 rtk cargo run --example "$example" >"$out_file" 2>&1
+    RUSTC_WRAPPER= SILE_PRINT_LLVMIR=1 cargo run --example "$example" >"$out_file" 2>&1
   )
 
   extract_llir "$out_file" >"$llir_file"
 
   local lines
   local allocas
-  local tile_expr
-  local tile_store_fused
-  local tile_store
+  local phis
 
   lines="$(wc -l <"$llir_file" | tr -d ' ')"
   allocas="$(rg -c 'alloca' "$llir_file" || true)"
-  tile_expr="$(rg -c 'tile_expr_loop' "$llir_file" || true)"
-  tile_store_fused="$(rg -c 'tile_store_fused_loop' "$llir_file" || true)"
-  tile_store="$(rg -c 'tile_store_loop' "$llir_file" || true)"
+  # LOWER_DESIGN §5: the descent emits no phi; Mem2Reg is SROA's promote.
+  phis="$(rg -c ' phi ' "$llir_file" || true)"
 
-  printf '%-8s lines=%-4s allocas=%-2s tile_expr=%-2s tile_store_fused=%-2s tile_store=%-2s\n' \
-    "$example" "$lines" "$allocas" "${tile_expr:-0}" "${tile_store_fused:-0}" "${tile_store:-0}"
+  printf '%-8s lines=%-6s allocas=%-4s phi=%-3s\n' \
+    "$example" "$lines" "${allocas:-0}" "${phis:-0}"
 }
 
+report_example saxpy
 report_example softmax
-report_example matmul
+report_example gemm
