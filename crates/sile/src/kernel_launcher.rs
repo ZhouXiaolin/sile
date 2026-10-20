@@ -22,7 +22,7 @@ const PRINT_SOURCE_ENV: &str = "SILE_PRINT_SOURCE";
 /// once per distinct kernel and every target reuses it. Without this, a launch
 /// inside a loop re-runs the whole front end and both lowering stages on every
 /// iteration.
-type CompiledParts = (sile_hir::typeck::TypedKernel, sile_tile_ir::TileIrFunction, sile_llvm_ir::Function);
+type CompiledParts = (sile_hir::typeck::TypedKernel, sile_tile_ir::function_ir::TileIrFunction, sile_llvm_ir::Function);
 
 fn compile_cache() -> &'static Mutex<HashMap<String, Arc<CompiledParts>>> {
     static CACHE: OnceLock<Mutex<HashMap<String, Arc<CompiledParts>>>> = OnceLock::new();
@@ -364,10 +364,10 @@ fn maybe_print_backend_source(
 /// this launcher cannot resolve is an error, not a silent pass — a check that
 /// nothing evaluates is worse than no check, because the kernel relies on it.
 fn validate_launch_checks(
-    checks: &[sile_tile_ir::cutile::predicate::LaunchCheck],
+    checks: &[sile_hir::passes::predicate::LaunchCheck],
     args: &[KernelArg<'_>],
 ) -> Result<()> {
-    use sile_tile_ir::cutile::predicate::Atom;
+    use sile_hir::passes::predicate::Atom;
     for check in checks {
         let resolved = check.predicate.eval(&|atom: &Atom| match atom {
             Atom::Dim { param, axis } | Atom::ViewExtent { param, axis } => args

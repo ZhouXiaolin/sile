@@ -9,7 +9,7 @@ mod op_lowering;
 mod tile_memory;
 
 use crate as llvm_ir;
-use sile_tile_ir::{TileIrFunction, TileIrOp, TileIrParamKind, TileIrType, ValueId};
+use sile_tile_ir::function_ir::{TileIrFunction, TileIrOp, TileIrParamKind, TileIrType, ValueId};
 
 use std::collections::HashMap;
 
@@ -283,7 +283,7 @@ fn build_prologue_block(
                 });
                 ctx.buffer_shape_descs.insert(source_id, result_id);
                 let rank = match param.ty {
-                    sile_tile_ir::TileIrType::ShapeDesc { rank } => rank,
+                    sile_tile_ir::function_ir::TileIrType::ShapeDesc { rank } => rank,
                     _ => 0,
                 };
                 for dim in 0..rank {

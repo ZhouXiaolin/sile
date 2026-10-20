@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{BlockId, TileIrFunction, TileIrOp, TileIrTerminator, ValueId};
+use crate::function_ir::{BlockId, TileIrFunction, TileIrOp, TileIrTerminator, ValueId};
 
 pub fn verify_function(func: &TileIrFunction) -> Result<(), String> {
     let mut block_ids = HashSet::new();

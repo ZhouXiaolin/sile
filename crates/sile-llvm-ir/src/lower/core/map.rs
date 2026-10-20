@@ -1,6 +1,6 @@
 use crate as llvm_ir;
 
-use sile_tile_ir::*;
+use sile_tile_ir::function_ir::*;
 
 pub(crate) fn llvm_ir_value(value: ValueId) -> llvm_ir::ValueId {
     llvm_ir::ValueId(value.0)

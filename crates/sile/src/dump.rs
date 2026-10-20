@@ -20,7 +20,8 @@ use std::time::Instant;
 use sile_core::Result;
 use sile_hir::typeck::TypedKernel;
 use sile_llvm_ir::{Function as LlvmIrFunction, LlvmIrPassKind};
-use sile_tile_ir::{TileIrFunction, TileIrPassKind};
+use sile_tile_ir::function_ir::TileIrFunction;
+use sile_tile_ir::TileIrPassKind;
 
 use crate::compiler::{
     ACTIVE_HIR_TYPECK_PIPELINE, ACTIVE_LLVM_IR_PIPELINE, ACTIVE_TILE_IR_PIPELINE, CodegenTarget,

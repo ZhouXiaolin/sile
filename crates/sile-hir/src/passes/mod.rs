@@ -1,3 +1,7 @@
+pub mod access;
+pub mod bounds;
+pub mod predicate;
+pub mod value_ids;
 pub mod verify;
 
 use crate::Kernel;

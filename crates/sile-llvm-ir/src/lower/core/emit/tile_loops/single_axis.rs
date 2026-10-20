@@ -1,6 +1,6 @@
 use crate as llvm_ir;
 
-use sile_tile_ir::TileIrFunction;
+use sile_tile_ir::function_ir::TileIrFunction;
 use crate::lower::core::block::{BlockLowerer, LowerLlvmIrCtx};
 use crate::lower::core::emit::insts::{const_i64, emit_bin, emit_cmp};
 

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{TileIrFunction, TileIrInst, TileIrOp, TileIrType, TileMapExpr, ValueId};
+use crate::function_ir::{TileIrFunction, TileIrInst, TileIrOp, TileIrType, TileMapExpr, ValueId};
 
 pub fn run(mut func: TileIrFunction) -> TileIrFunction {
     let use_counts = build_use_counts(&func);

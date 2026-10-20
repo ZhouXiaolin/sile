@@ -1,6 +1,6 @@
 use crate as llvm_ir;
 
-use sile_tile_ir::ValueId;
+use sile_tile_ir::function_ir::ValueId;
 
 use crate::lower::core::block::BlockLowerer;
 use crate::lower::core::map::{llvm_ir_value, tile_ptr_type, tile_storage_type};

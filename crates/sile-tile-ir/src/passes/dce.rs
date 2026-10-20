@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::{TileIrFunction, TileIrOp};
+use crate::function_ir::{TileIrFunction, TileIrOp};
 
 /// Dead code elimination: remove instructions whose results are never used.
 pub fn run(mut func: TileIrFunction) -> TileIrFunction {
@@ -34,7 +34,7 @@ pub fn run(mut func: TileIrFunction) -> TileIrFunction {
 }
 
 /// Find all values that are transitively used by side-effecting instructions or terminators.
-fn find_live_values(func: &TileIrFunction) -> HashSet<crate::ValueId> {
+fn find_live_values(func: &TileIrFunction) -> HashSet<crate::function_ir::ValueId> {
     let mut live = HashSet::new();
     let mut worklist = Vec::new();
 

@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use sile_hir::{Expr, Kernel, Stmt};
+use crate::{Expr, Kernel, Stmt};
 
 /// The id of every binding, by name.
 ///
@@ -119,7 +119,7 @@ impl ValueIds {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sile_hir::{KernelOrigin, Param, ParamKind, ShapeExpr, Type};
+    use crate::{KernelOrigin, Param, ParamKind, ShapeExpr, Type};
 
     fn kernel(body: Vec<Stmt>) -> Kernel {
         Kernel {
@@ -128,7 +128,7 @@ mod tests {
             params: vec![Param {
                 name: "x".into(),
                 kind: ParamKind::Input,
-                ty: Type::tensor(sile_hir::ElemType::F32, ShapeExpr::Dynamic),
+                ty: Type::tensor(crate::ElemType::F32, ShapeExpr::Dynamic),
                 strides: None,
             }],
             body,

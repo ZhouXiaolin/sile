@@ -5,7 +5,7 @@ use super::core::{
     emit_select, llvm_ir_type, llvm_ir_value, load_tile_scalar_dynamic, lower_bin_op,
     resolve_operand,
 };
-use sile_tile_ir::*;
+use sile_tile_ir::function_ir::*;
 use crate::lower::tile_memory::emit_strided_element_index;
 
 pub(crate) fn lower_scalar_inst(
@@ -338,7 +338,7 @@ pub(crate) fn lower_scalar_inst(
 /// a gep plus a load, and repeats of the same `(descriptor, dim)` pair reuse the
 /// first load.
 fn load_shape_desc_dim(
-    shape: sile_tile_ir::ValueId,
+    shape: sile_tile_ir::function_ir::ValueId,
     dim: usize,
     ctx: &mut LowerLlvmIrCtx,
     out: &mut Vec<llvm_ir::Inst>,

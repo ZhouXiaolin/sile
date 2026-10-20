@@ -53,6 +53,10 @@ impl std::error::Error for TypeError {}
 pub struct TypedKernel {
     pub kernel: Kernel,
     pub locals: BTreeMap<String, Type>,
+    /// What the access-check pass can state about the kernel before anything
+    /// is emitted: which binding is which, which generics are flags, whether
+    /// the body instantiates its generics.
+    pub checks: crate::passes::access::KernelChecks,
 }
 
 /// Check the kernel body and record the type of every binding.
@@ -77,6 +81,7 @@ pub fn check_kernel(kernel: &Kernel) -> Result<TypedKernel, TypeError> {
     Ok(TypedKernel {
         kernel: kernel.clone(),
         locals,
+        checks: crate::passes::access::KernelChecks::of(kernel),
     })
 }
 

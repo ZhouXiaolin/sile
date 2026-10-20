@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate as llvm_ir;
 
-use sile_tile_ir::*;
+use sile_tile_ir::function_ir::*;
 
 use super::map::llvm_ir_value;
 

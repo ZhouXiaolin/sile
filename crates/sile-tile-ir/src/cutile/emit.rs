@@ -1,22 +1,34 @@
 //! Building the cutile-shaped program from a typed kernel.
 //!
-//! This file grows one construct at a time. Each step is checked against the
-//! golden text in `crates/sile/tests/fixtures/tileir/`, so a step is either
-//! exact or visibly absent.
+//! The emitter constructs the one Tile IR — [`crate::ir::Module`], the
+//! arena-structured port of cutile-ir — and the printer is
+//! [`crate::ir::fmt`]. Every step is checked against the golden text in
+//! `crates/sile/tests/fixtures/tileir/`, so a step is either exact or visibly
+//! absent.
 //!
 //! Nothing here may be reordered or folded away: a value's number is its
-//! position in the walk, so "cleaning up" the output renumbers everything after
-//! it. `crates/sile-tile-ir/TILEIR_ALIGNMENT.md` records the measured rules.
+//! allocation position in the module's value arena, so "cleaning up" the
+//! output renumbers everything after it. `crates/sile-tile-ir/TILEIR_ALIGNMENT.md`
+//! records the measured rules.
 
+use sile_hir::passes::access::{
+    shape_derived, shape_items, shape_names, AxisDecision, AxisExtent, TensorFacts,
+};
+use sile_hir::passes::predicate;
 use sile_hir::{ElemType, Kernel, ParamKind, ShapeExpr, Type};
 
-use super::{Format, Function, Module, Op, ScalarType, Stmt, TileElement, ValueId};
+use crate::ir::{
+    append_op, build_single_block_region, Attribute, Bounded, DenseElements, FuncType, Location,
+    Module as IrModule, OpBuilder, PaddingValue, PointerType, RegionId, ScalarType as IrScalar,
+    TileElementType, TileType, Type as IrType, Value as IrValue, ValueProducer, DYNAMIC,
+};
+use crate::opcode::Opcode;
 
 /// One tensor view extent: a literal, or the value an `assume` produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Extent {
     Literal(i64),
-    Value(ValueId),
+    Value(IrValue),
 }
 
 /// The strides a buffer of `shape` has in row-major order.
@@ -35,12 +47,12 @@ fn row_major_strides(shape: &[i64]) -> Vec<i64> {
 /// HIR spells an integer `i64` because that is what its front end carries;
 /// cutile's kernels and its tile block ids are `i32`, so that is what the text
 /// says. The width is a fact about this IR, not about the value.
-fn scalar_of(elem: ElemType) -> ScalarType {
+fn scalar_of(elem: ElemType) -> IrScalar {
     match elem {
-        ElemType::F32 => ScalarType::F32,
-        ElemType::F16 => ScalarType::F16,
-        ElemType::I64 => ScalarType::I32,
-        ElemType::Bool => ScalarType::I1,
+        ElemType::F32 => IrScalar::F32,
+        ElemType::F16 => IrScalar::F16,
+        ElemType::I64 => IrScalar::I32,
+        ElemType::Bool => IrScalar::I1,
     }
 }
 
@@ -67,54 +79,29 @@ fn declared_extents(shape: &ShapeExpr, consts: &[(String, i64)]) -> Vec<Option<i
 }
 
 struct Builder {
-    next_value: u32,
-    /// The access checks that failed at compile time.
-    ///
-    /// cutile decides a check whose index interval and tile grid are both
-    /// static before it emits anything, and a violation is a compile error
-    /// rather than a device assert (`checks/goals.rs` `fold_static`). The
-    /// emitter keeps walking so the message names every axis, and `emit`
-    /// hands the first one back.
-    errors: Vec<String>,
-    /// The access checks the compiler could not decide but the host can.
-    ///
-    /// These leave the kernel: the emitted text carries no `assert`, and the
-    /// launcher evaluates each predicate against the real tensor extents before
-    /// it launches. A check lands here when its goal ranges only over
-    /// launch-known quantities.
-    launch_checks: Vec<super::predicate::LaunchCheck>,
-    /// The goals already known true at this point in the body.
-    ///
-    /// A goal that is believed needs no check: the JIT rung of the proof ladder
-    /// is exactly "a dominating assumption entails it". Canonical predicates
-    /// make that a set membership, so the set is what the rung reads.
-    assumptions: Vec<super::predicate::Predicate>,
-    body: Vec<Stmt>,
-    args: Vec<(ValueId, super::Type)>,
+    /// The module under construction. Values are numbered by allocation, which
+    /// is the order the printer prints — so the emitter's walk order is the
+    /// output's numbering.
+    module: IrModule,
+    /// The entry region, attached to the `entry` op once the body is done.
+    entry_region: RegionId,
+    /// The blocks being written, innermost last. The entry block is the bottom
+    /// of the stack; a `for` or an `if` pushes its region's block for the
+    /// duration of its body.
+    blocks: Vec<crate::ir::BlockId>,
+    /// The checks' decisions: assumptions, intervals, terms, compile errors,
+    /// launch checks. Every judgment the printed text reflects is made there;
+    /// the emitter only consumes the answers.
+    access: sile_hir::passes::access::AccessAnalysis,
+    args: Vec<(IrValue, IrType)>,
     /// Every tensor parameter, by name, with what the body needs to reach it.
     tensors: Vec<(String, Tensor)>,
     /// The scalar parameters, by name: their entry value and element type.
-    scalars: Vec<(String, ValueId, ScalarType)>,
+    scalars: Vec<(String, IrValue, IrScalar)>,
     /// The tile a binding names, for every name the body has bound so far.
-    values: Vec<(String, ValueId, Option<super::Type>)>,
+    values: Vec<(String, IrValue, Option<IrType>)>,
     /// The type of every binding, as `sile-hir`'s checker recorded it.
     locals: std::collections::BTreeMap<String, Type>,
-    /// The canonical linear term of every integer binding, for the goals an
-    /// access check states.
-    ///
-    /// `bounds` answers "is this a single value"; a term answers "is this equal
-    /// to that", which is what a launch-stage goal needs. Both are filled from
-    /// the same places, and neither replaces the other.
-    terms: Vec<(String, super::predicate::Term)>,
-    /// The stable id of every binding, so an induction variable can be named by
-    /// its identity rather than by its name.
-    value_ids: super::value_ids::ValueIds,
-    /// The interval of every integer binding known at compile time.
-    ///
-    /// cutile folds an integer expression whose interval is a single value into
-    /// a `constant`, and discards the operation it had already allocated for it.
-    /// Reproducing the discarded ids needs the same intervals.
-    bounds: Vec<(String, super::bounds::Bounds)>,
     /// The tensors whose `shape()` has already become SSA values.
     ///
     /// cutile's `get_tensor_shape_meta` hands back the shape stored in the
@@ -125,32 +112,23 @@ struct Builder {
     /// Shapes bound to a name, which emit no values of their own.
     shape_bindings: Vec<(String, ShapeExpr)>,
     /// The three values `get_tile_block_id` produced, once the kernel asked.
-    program_id: Option<Vec<ValueId>>,
+    program_id: Option<Vec<IrValue>>,
     /// The `constant` a const generic already printed, by name.
-    const_constants: Vec<(String, ValueId)>,
+    const_constants: Vec<(String, IrValue)>,
     /// The id each const generic got in the prologue. A body operand that is a
     /// generic reads this value, which the prologue printed once.
-    prologue_generics: Vec<(String, ValueId)>,
+    prologue_generics: Vec<(String, IrValue)>,
     /// The offset a mutable partition added to every store through it.
-    store_offset: Option<ValueId>,
+    store_offset: Option<IrValue>,
     /// The block id the mutable partition fetched, which its stores index by.
-    store_block: Option<ValueId>,
-    /// Whether any partition has been built yet.
+    store_block: Option<IrValue>,
     /// The const generics a partition already fetched inside the body. A later
     /// integer fold reads them from here instead of printing them again, which
     /// is why `K / BK` in `gemm` costs one id and no operands.
     fetched_generics: Vec<String>,
-    /// The names bound by enclosing `for` loops. An index that is one of these
-    /// carries no proof against a dynamic extent, so the access needs a runtime
-    /// bound check.
-    loop_vars: Vec<String>,
     /// What each enclosing `for` carries, innermost last. An `if` inside a loop
     /// yields those values too: the region has to hand them on.
     loop_carried: Vec<Vec<String>>,
-    /// The loop variables whose iteration range is a compile-time constant. An
-    /// access indexed by one is proven non-negative; the others still test the
-    /// lower bound.
-    bounded_loop_vars: Vec<String>,
     /// Scratch space for a shape expression that appears in value position.
     shapes: Vec<(String, ShapeExpr)>,
 }
@@ -162,15 +140,15 @@ struct Tensor {
     /// parameter position, so the name is what ties a view back to one.
     name: String,
     /// The view a `partition` already built, when this tensor is one.
-    partition_view: Option<ValueId>,
+    partition_view: Option<IrValue>,
     /// The view the prologue built for it.
-    view: ValueId,
+    view: IrValue,
     /// The token `make_tensor_view` was given, which every access reuses.
-    token: ValueId,
+    token: IrValue,
     /// The extents the kernel declared — the tile a `load` reads, and the
     /// shape a `broadcast` to `y.shape()` names.
     tile: Vec<Option<i64>>,
-    element: ScalarType,
+    element: IrScalar,
     strides: Vec<i64>,
     /// Whether the view spans the whole buffer (a mutable parameter) or only
     /// its declared tile.
@@ -179,80 +157,12 @@ struct Tensor {
     view_shape: Vec<Extent>,
 }
 
-/// Whether a name denotes one component of the block id.
-///
-/// The launch grid bounds every component, so an access indexed by one needs no
-/// check. A value computed from a component has lost that bound.
-fn is_block_id_component(builder: &Builder, name: &str) -> bool {
-    let Some((_, value, _)) = builder.values.iter().find(|(bound, _, _)| bound == name) else {
-        return false;
-    };
-    builder
-        .program_id
-        .as_ref()
-        .is_some_and(|ids| ids.contains(value))
-}
-
-/// Whether a value is read out of a shape rather than computed.
-///
-/// cutile keeps a shape in metadata, so naming one of its entries does not make
-/// a value: the first broadcast of it pays for materialising the shape.
-mod shape_derived {
-    use sile_hir::{BuiltinOp, Expr, Stmt};
-
-    pub fn is_shape_derived(expr: &Expr) -> bool {
-        match expr {
-            Expr::Builtin { op, args } => match op {
-                BuiltinOp::ShapeDim => true,
-                BuiltinOp::Min
-                | BuiltinOp::Max
-                | BuiltinOp::Add
-                | BuiltinOp::Sub
-                | BuiltinOp::Mul
-                | BuiltinOp::Div
-                | BuiltinOp::CeilDiv
-                | BuiltinOp::Rem => args.iter().any(is_shape_derived),
-                _ => false,
-            },
-            _ => false,
-        }
-    }
-
-    /// Whether the binding named `name` holds a shape-derived value.
-    pub fn binding_is_shape_derived(body: &[Stmt], name: &str) -> bool {
-        fn walk(stmts: &[Stmt], name: &str) -> bool {
-            for stmt in stmts {
-                match stmt {
-                    Stmt::Let { name: bound, expr, .. } | Stmt::Assign { name: bound, expr, .. } => {
-                        if bound == name && is_shape_derived(expr) {
-                            return true;
-                        }
-                    }
-                    Stmt::ForLoop { body, .. } | Stmt::While { body, .. } | Stmt::Loop { body } => {
-                        if walk(body, name) {
-                            return true;
-                        }
-                    }
-                    Stmt::If { then_body, else_body, .. } => {
-                        if walk(then_body, name) || walk(else_body, name) {
-                            return true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            false
-        }
-        walk(body, name)
-    }
-}
-
 /// What a condition folds to.
 enum Folded {
     /// Decided while compiling: the comparison was folded away.
     Known(bool),
     /// A runtime value the region branches on.
-    Value(ValueId),
+    Value(IrValue),
 }
 
 /// Fold a condition the way cutile does.
@@ -290,7 +200,7 @@ fn fold_condition(
             _ => {}
         }
     }
-    if let Some(known) = literal_comparison(builder, expr, kernel) {
+    if let Some(known) = builder.access.literal_comparison(kernel, expr) {
         let Expr::Builtin { args, .. } = expr else {
             unreachable!()
         };
@@ -306,540 +216,89 @@ fn fold_condition(
     }
 }
 
-/// The value of a comparison between two compile-time constants.
-fn literal_comparison(
-    builder: &Builder,
-    expr: &sile_hir::Expr,
-    kernel: &Kernel,
-) -> Option<bool> {
-    use sile_hir::Expr;
-    let Expr::Builtin { op, args } = expr else {
-        return None;
-    };
-    let relation = match op {
-        sile_hir::BuiltinOp::Eq => "equal",
-        sile_hir::BuiltinOp::Ne => "not_equal",
-        sile_hir::BuiltinOp::Lt => "less_than",
-        sile_hir::BuiltinOp::Le => "less_than_or_equal",
-        sile_hir::BuiltinOp::Gt => "greater_than",
-        sile_hir::BuiltinOp::Ge => "greater_than_or_equal",
-        _ => return None,
-    };
-    let _ = builder;
-    let value_of_arg = |arg: &Expr| -> Option<i64> {
-        match arg {
-            Expr::ScalarI64(value) => Some(*value),
-            Expr::Var(name) => {
-                let (_, value) = kernel.const_params.iter().find(|(n, _)| n == name)?;
-                let printed = if flag_generics(kernel).iter().any(|flag| flag == name) {
-                    1
-                } else {
-                    *value
-                };
-                Some(printed)
-            }
-            _ => None,
-        }
-    };
-    let lhs = value_of_arg(args.first()?)?;
-    let rhs = value_of_arg(args.get(1)?)?;
-    Some(match relation {
-        "equal" => lhs == rhs,
-        "not_equal" => lhs != rhs,
-        "less_than" => lhs < rhs,
-        "less_than_or_equal" => lhs <= rhs,
-        "greater_than" => lhs > rhs,
-        _ => lhs >= rhs,
+/// The extents a view names, as the IR spells them: a dynamic one is `DYNAMIC`.
+fn ir_extents(extents: &[Extent]) -> Vec<i64> {
+    extents
+        .iter()
+        .map(|extent| match extent {
+            Extent::Literal(value) => *value,
+            Extent::Value(_) => DYNAMIC,
+        })
+        .collect()
+}
+
+/// The tile type of a scalar element and a shape.
+fn tile_type(element: IrScalar, shape: &[i64]) -> IrType {
+    IrType::Tile(TileType {
+        shape: shape.to_vec(),
+        element_type: TileElementType::Scalar(element),
     })
 }
 
-/// The runtime bound of a partition access, when cutile cannot discharge it.
-///
-/// `placement.rs` proves an access at compile time from the index's range. A
-/// loop counter carries a range, so its access is proven; a block id carries
-/// none, so cutile leaves it to the launch grid. An index whose range exceeds
-/// the tile count of a *dynamic* extent is the one case that costs ops:
-/// `ceil(extent / tile)` is only known at run time, so the check is emitted.
-/// Record what a `for` over `num_tiles(&p, axis)` proves about its variable.
-///
-/// The loop walks exactly the tiles of that axis, so every value it visits is
-/// inside the grid. Stating that as a predicate — rather than as an interval —
-/// is what lets a goal over tile counts be discharged: `TileCount` is an atom,
-/// and no arithmetic relationship to it is otherwise known.
-fn assume_loop_over_tile_count(
-    builder: &mut Builder,
-    kernel: &Kernel,
-    var: &str,
-    end: &sile_hir::Expr,
-) {
-    use sile_hir::{BuiltinOp, Expr};
-    use super::predicate::{Atom, Predicate, Term};
-    let Expr::Builtin {
-        op: BuiltinOp::NumTiles,
-        args,
-    } = end
-    else {
-        return;
-    };
-    let Some(Expr::Var(tensor_name)) = args.first() else {
-        return;
-    };
-    let axis = match args.get(1) {
-        Some(Expr::ScalarI64(axis)) => *axis as usize,
-        _ => return,
-    };
-    // The name may be a partition rather than the parameter itself, so the
-    // tensor it resolved to is what knows which parameter it came from.
-    let Some(tensor) = builder.tensors.iter().find(|(n, _)| n == tensor_name) else {
-        return;
-    };
-    let Some(param) = buffer_param_position(kernel, &tensor.1.name) else {
-        return;
-    };
-    let Some(tile) = tensor.1.tile.get(axis).copied().flatten().filter(|t| *t > 0) else {
-        return;
-    };
-    let Some(iv) = builder.value_ids.id(var) else {
-        return;
-    };
-    let index = Term::atom(Atom::Iv(iv));
-    let count = Term::atom(Atom::TileCount {
-        param,
-        axis,
-        tile: tile as i32,
-    });
-    // The loop's own bound: `0 <= i < num_tiles`. Both halves are believed, so
-    // an access indexed by `i` on this axis is discharged rather than checked.
-    if let Some(upper) = Predicate::lt(&index, &count) {
-        builder.assumptions.push(upper);
-    }
-    if let Some(lower) = Predicate::le(&Term::constant(0), &index) {
-        builder.assumptions.push(lower);
-    }
-}
-
-/// Whether the goal pair for this axis is already believed.
-///
-/// Both halves must be in the assumption set: an access needs `0 <= i` and
-/// `i < num_tiles`, and a loop over `num_tiles` states exactly that about its
-/// variable. Anything the assumptions do not name — a value derived from the
-/// variable, an index from another axis — is not decided here.
-fn believed_access(
-    builder: &Builder,
-    kernel: &Kernel,
-    index_arg: Option<&sile_hir::Expr>,
-    axis: usize,
-    tile: i64,
-    tensor_name: &str,
-) -> bool {
-    use super::predicate::{Atom, Predicate, Term};
-    let Some(index) = index_arg.and_then(|arg| index_expr(arg, axis)) else {
-        return false;
-    };
-    let Some(term) = term_of(builder, kernel, &index) else {
-        return false;
-    };
-    let Some(param) = buffer_param_position(kernel, tensor_name) else {
-        return false;
-    };
-    let count = Term::atom(Atom::TileCount {
-        param,
-        axis,
-        tile: tile as i32,
-    });
-    let upper = Predicate::lt(&term, &count);
-    let lower = Predicate::le(&Term::constant(0), &term);
-    [upper, lower].iter().all(|goal| {
-        goal.as_ref()
-            .is_some_and(|goal| builder.assumptions.contains(goal))
-    })
-}
-
-/// Decide one axis's access check from its index interval and the tile grid.
-///
-/// cutile's `fold_static` (`checks/goals.rs`) does this before emitting
-/// anything: the interval of the index, the static extent, and the tile extent
-/// give the number of tiles, and `0 <= start && end < num_tiles` proves the
-/// access. Anything else — a violation, or an index or extent this IR cannot
-/// range — is left to the device check, except that a violation is a compile
-/// error, which is the one case cutile refuses to compile.
-fn fold_static(
-    builder: &mut Builder,
-    kernel: &Kernel,
-    index_arg: Option<&sile_hir::Expr>,
-    axis: usize,
-    extent: i64,
-    tile: i64,
-) {
-    let Some(index) = index_arg.and_then(|arg| index_expr(arg, axis)) else {
-        return;
-    };
-    let Some(bounds) = bounds_of(builder, kernel, &index) else {
-        return;
-    };
-    let num_tiles = (extent + tile - 1) / tile;
-    if 0 <= bounds.start && bounds.end < num_tiles {
-        return;
-    }
-    // The JIT rung: a goal already believed needs no check at all. This is what
-    // a loop over `num_tiles` gives its body.
-    if let Some(term) = term_of(builder, kernel, &index) {
-        use super::predicate::{Predicate, Term};
-        let upper = Predicate::lt(&term, &Term::constant(num_tiles));
-        let lower = Predicate::le(&Term::constant(0), &term);
-        let believed = |goal: &Option<Predicate>| {
-            goal.as_ref()
-                .is_some_and(|goal| builder.assumptions.contains(goal))
-        };
-        if believed(&upper) && believed(&lower) {
-            return;
-        }
-    }
-    builder.errors.push(format!(
-        "Bounds check failed: 0 <= {} && {} < {}",
-        bounds.start, bounds.end, num_tiles
-    ));
-}
-
-/// The expression one axis of an index names.
-///
-/// A tuple index spells every axis. A shape index names one symbol per axis,
-/// and a symbol that is a const generic is that constant.
-fn index_expr(arg: &sile_hir::Expr, axis: usize) -> Option<sile_hir::Expr> {
-    match arg {
-        sile_hir::Expr::TileIndex(items) => items.get(axis).cloned(),
-        // A shape index names one symbol per axis; a symbol is that variable.
-        sile_hir::Expr::Shape(shape) => match shape_items(shape).get(axis) {
-            Some(ShapeExpr::Symbol(name)) => Some(sile_hir::Expr::Var(name.clone())),
-            _ => None,
+/// The scalar a tile type carries, when it carries one.
+fn tile_scalar(ty: &IrType) -> Option<IrScalar> {
+    match ty {
+        IrType::Tile(t) => match &t.element_type {
+            TileElementType::Scalar(s) => Some(*s),
+            TileElementType::Pointer(_) => None,
         },
         _ => None,
     }
 }
 
-/// Where a tensor parameter sits among the buffer parameters.
-///
-/// The launcher holds one argument per buffer, in declaration order, and the
-/// scalars travel elsewhere — so the position a launch check names is the
-/// buffer's, not the parameter list's.
-fn buffer_param_position(kernel: &Kernel, tensor_name: &str) -> Option<usize> {
-    kernel
-        .params
-        .iter()
-        .filter(|param| !matches!(param.ty, Type::Scalar(_)))
-        .position(|param| param.name == tensor_name)
-}
-
-/// The axes whose index is a compile-time literal, with its value.
-///
-/// An index arrives either as a tuple of expressions (`[0i64]`) or as a shape
-/// of symbols (`shape![4]`), and a literal can be spelled in both, so both are
-/// read here rather than at each use.
-fn literal_indices(arg: Option<&sile_hir::Expr>) -> Vec<(usize, i64)> {
-    match arg {
-        Some(sile_hir::Expr::TileIndex(items)) => items
-            .iter()
-            .enumerate()
-            .filter_map(|(axis, item)| match item {
-                sile_hir::Expr::ScalarI64(value) => Some((axis, *value)),
-                _ => None,
-            })
-            .collect(),
-        Some(sile_hir::Expr::Shape(shape)) => shape_items(shape)
-            .iter()
-            .enumerate()
-            .filter_map(|(axis, item)| match item {
-                ShapeExpr::Constant(value) => Some((axis, *value)),
-                _ => None,
-            })
-            .collect(),
+/// The shape a tile type carries, empty for a scalar tile.
+fn tile_shape(ty: &IrType) -> Vec<i64> {
+    match ty {
+        IrType::Tile(t) => t.shape.clone(),
         _ => Vec::new(),
     }
 }
 
-/// Move a constant index's access goal to the host.
-///
-/// The goal is `0 <= idx` and `idx < ceil(extent / tile)`, where the extent is
-/// the parameter's view extent — a launch-time fact. The predicate names the
-/// extent by an [`Atom::ViewExtent`], so the host can evaluate it once per
-/// launch; nothing about it is known at JIT time, which is why it cannot be
-/// decided here.
-fn hoist_literal_index(
-    builder: &mut Builder,
-    kernel: &Kernel,
-    tensor_name: &str,
-    value: i64,
-    axis: usize,
-    tile: i64,
-) {
-    use super::predicate::{Atom, Predicate, Term};
-    // The parameter position identifies the atom: a name would not survive
-    // inlining, and the host resolves by position. The host holds one entry per
-    // buffer parameter, in declaration order, so the index counts buffer
-    // parameters rather than every parameter.
-    let Some(param) = buffer_param_position(kernel, tensor_name) else {
-        return;
-    };
-    // `ceil(extent / tile)` is not affine, so it is an atom of its own: the
-    // host computes the quotient when it evaluates the goal. `TileCount` bakes
-    // the tile size into the atom's identity, because the same axis at two tile
-    // sizes is two different quantities.
-    let count = Term::atom(Atom::TileCount {
-        param,
-        axis,
-        tile: tile as i32,
-    });
-    let Some(upper) = Predicate::le(&Term::constant(value), &count) else {
-        return;
-    };
-    let Some(lower) = Predicate::le(&Term::constant(0), &Term::constant(value)) else {
-        return;
-    };
-    // The lower goal is over no atoms, so it is decided now.
-    if lower.eval(&|_| None) != Some(true) {
-        builder.errors.push(format!(
-            "Bounds check failed: 0 <= {value}"
-        ));
-        return;
-    }
-    builder.launch_checks.push(super::predicate::LaunchCheck {
-        predicate: upper,
-        cause: format!(
-            "partition access out of bounds: dim {axis}, block index >= ceil(?/{tile})"
-        ),
-    });
+/// The tensor view type of a tensor, as the IR spells it.
+fn tensor_view_type(element: IrScalar, view_shape: &[Extent], strides: &[i64]) -> IrType {
+    IrType::TensorView(crate::ir::TensorViewType {
+        element_type: element,
+        shape: ir_extents(view_shape),
+        strides: strides.to_vec(),
+    })
 }
 
-fn check_partition_access(
-    builder: &mut Builder,
-    tensor: &Tensor,
+/// The partition view type of a tensor, as the IR spells it.
+fn partition_view_type(
     tile: &[i64],
-    indices: &[ValueId],
-    index_arg: Option<&sile_hir::Expr>,
-    kernel: &Kernel,
-) {
-    // An index arrives as a tuple of expressions, or as a shape of symbol
-    // names; both name one value per axis.
-    let items: Vec<Option<String>> = match index_arg {
-        Some(sile_hir::Expr::TileIndex(items)) => items
-            .iter()
-            .map(|item| match item {
-                sile_hir::Expr::ScalarI64(_) => None,
-                // A bare `pid.k` is bounded by the launch grid.
-                sile_hir::Expr::Builtin {
-                    op: sile_hir::BuiltinOp::ProgramId,
-                    ..
-                } => None,
-                sile_hir::Expr::Var(name) => Some(name.clone()),
-                other => Some(format!("{other:?}")),
-            })
-            .collect(),
-        Some(sile_hir::Expr::Shape(shape)) => shape_items(shape)
-            .iter()
-            .map(|item| match item {
-                ShapeExpr::Constant(_) | ShapeExpr::Dynamic => None,
-                // A bare `pid.k` is bounded by the launch grid, which cutile
-                // trusts; a value derived from one is not.
-                ShapeExpr::Symbol(name) if is_block_id_component(builder, name) => None,
-                ShapeExpr::Symbol(name) => Some(name.clone()),
-                ShapeExpr::Tuple(_) => Some(format!("{item:?}")),
-            })
-            .collect(),
-        _ => return,
+    element: IrScalar,
+    view_shape: &[Extent],
+    strides: &[i64],
+    padding_zero: bool,
+) -> IrType {
+    let tensor_view = match tensor_view_type(element, view_shape, strides) {
+        IrType::TensorView(tv) => tv,
+        _ => unreachable!(),
     };
-    // A literal index over a dynamic extent is not decided by inspection: the
-    // extent is a launch-time fact, so the goal moves to the host. cutile makes
-    // the same call, and the check leaving the kernel is the whole point of the
-    // launch rung.
-    for (axis, value) in literal_indices(index_arg) {
-        let Some(Extent::Value(_)) = tensor.view_shape.get(axis) else {
-            continue;
-        };
-        let Some(tile_extent) = tile.get(axis).copied().filter(|t| *t > 0) else {
-            continue;
-        };
-        hoist_literal_index(builder, kernel, &tensor.name, value, axis, tile_extent);
-    }
-    for (axis, item) in items.iter().enumerate() {
-        // A literal index is proven by inspection; every other index carries no
-        // range cutile can use, so its access carries a check.
-        let Some(name) = item else {
-            continue;
-        };
-        // A loop counter is known non-negative, so its access needs only the
-        // upper comparison; a value derived from a block id has no range at
-        // all, so its access tests both sides.
-        let proven_non_negative = builder.bounded_loop_vars.iter().any(|bound| bound == name);
-        let Some(tile_extent) = tile.get(axis).copied().filter(|t| *t > 0) else {
-            continue;
-        };
-        // The extent as the view prints it. A literal one needs no emitted
-        // check: the index interval against the tile grid decides it now, and
-        // a violation is a compile error (`checks/goals.rs` `fold_static`).
-        // A dynamic one is a value the prologue assumed, so its check runs on
-        // the device.
-        // The JIT rung: a goal already believed needs no check. A loop over
-        // `num_tiles` walks exactly that axis's tiles, so the access it indexes
-        // is inside the grid by construction — nothing is emitted for it.
-        if believed_access(builder, kernel, index_arg, axis, tile_extent, &tensor.name) {
-            continue;
-        }
-        let extent = match tensor.view_shape.get(axis) {
-            Some(Extent::Value(value)) => *value,
-            Some(Extent::Literal(extent)) => {
-                fold_static(builder, kernel, index_arg, axis, *extent, tile_extent);
-                continue;
-            }
-            None => continue,
-        };
-        // `ceil(extent / tile)`, with the extent a run-time value. The tile
-        // extent is named again here, inside the check.
-        let tile_value = builder.i32_const(tile_extent);
-        let quotient = builder.value();
-        builder.push_op(Op {
-            results: vec![quotient],
-            format: Format::Plain,
-            opcode: "divi",
-            operands: vec![extent, tile_value],
-            result_types: vec![Builder::i32_tile()],
-            attrs: Vec::new(),
-            text: format!("{extent}, {tile_value} signed"),
-            operand_types: None,
-            indent: 0,
-        });
-        let remainder = builder.value();
-        builder.push_op(Op {
-            results: vec![remainder],
-            format: Format::Plain,
-            opcode: "remi",
-            operands: vec![extent, tile_value],
-            result_types: vec![Builder::i32_tile()],
-            attrs: Vec::new(),
-            text: format!("{extent}, {tile_value} signed"),
-            operand_types: None,
-            indent: 0,
-        });
-        let one = builder.i32_const(1);
-        let nonempty = builder.value();
-        builder.push_op(Op {
-            results: vec![nonempty],
-            format: Format::Plain,
-            opcode: "mini",
-            operands: vec![remainder, one],
-            result_types: vec![Builder::i32_tile()],
-            attrs: Vec::new(),
-            text: format!("{remainder}, {one} signed"),
-            operand_types: None,
-            indent: 0,
-        });
-        let count = builder.value();
-        builder.push_op(Op {
-            results: vec![count],
-            format: Format::Plain,
-            opcode: "addi",
-            operands: vec![quotient, nonempty],
-            result_types: vec![Builder::i32_tile()],
-            attrs: Vec::new(),
-            text: format!("{quotient}, {nonempty}"),
-            operand_types: None,
-            indent: 0,
-        });
-        let index = indices[axis];
-        let in_range = builder.value();
-        builder.push_op(Op {
-            results: vec![in_range],
-            format: Format::Plain,
-            opcode: "cmpi",
-            operands: vec![index, count],
-            result_types: vec![super::Type::Tile {
-                shape: Vec::new(),
-                element: TileElement::Scalar(ScalarType::I1),
-            }],
-            attrs: Vec::new(),
-            text: format!("less_than {index}, {count}, signed"),
-            operand_types: Some(vec![Builder::i32_tile()]),
-            indent: 0,
-        });
-        // The lower bound: an index cutile cannot prove non-negative is tested
-        // against zero as well, and the two predicates are combined.
-        let guard = if proven_non_negative {
-            in_range
-        } else {
-            let zero = builder.i32_const(0);
-            let non_negative = builder.value();
-            builder.push_op(Op {
-                results: vec![non_negative],
-                format: Format::Plain,
-                opcode: "cmpi",
-                operands: vec![index, zero],
-                result_types: vec![super::Type::Tile {
-                    shape: Vec::new(),
-                    element: TileElement::Scalar(ScalarType::I1),
-                }],
-                attrs: Vec::new(),
-                text: format!("greater_than_or_equal {index}, {zero}, signed"),
-                operand_types: Some(vec![Builder::i32_tile()]),
-                indent: 0,
-            });
-            let both = builder.value();
-            builder.push_op(Op {
-                results: vec![both],
-                format: Format::Plain,
-                opcode: "andi",
-                operands: vec![non_negative, in_range],
-                result_types: vec![super::Type::Tile {
-                    shape: Vec::new(),
-                    element: TileElement::Scalar(ScalarType::I1),
-                }],
-                attrs: Vec::new(),
-                text: format!("{non_negative}, {in_range}"),
-                operand_types: None,
-                indent: 0,
-            });
-            both
-        };
-        builder.push_op(Op {
-            results: Vec::new(),
-            format: Format::Assert,
-            opcode: "assert",
-            operands: vec![in_range],
-            result_types: vec![super::Type::Tile {
-                shape: Vec::new(),
-                element: TileElement::Scalar(ScalarType::I1),
-            }],
-            attrs: Vec::new(),
-            text: format!(
-                "{guard}, \"partition access out of bounds: dim {axis}, block index >= ceil(?/{tile_extent}){suffix}\"",
-                suffix = if proven_non_negative { "" } else { " or index < 0" },
-            ),
-            operand_types: None,
-            indent: 0,
-        });
-        let _ = kernel;
-    }
-}
-
-/// The extents a tensor view prints with.
-fn view_extents(tensor: &Tensor) -> Vec<Extent> {
-    tensor.view_shape.clone()
+    IrType::PartitionView(crate::ir::PartitionViewType {
+        tile_shape: tile.iter().map(|d| *d as i32).collect(),
+        tensor_view,
+        dim_map: (0..tile.len() as i32).collect(),
+        padding_value: padding_zero.then_some(PaddingValue::Zero),
+    })
 }
 
 impl Builder {
-    fn new(_kernel: &Kernel) -> Self {
+    fn new(typed: &sile_hir::typeck::TypedKernel) -> Self {
+        let mut module = IrModule::new(typed.kernel.origin.module.clone());
+        // The entry block exists from the start: parameters allocate their
+        // block-arg values into it as `declare_params` walks the list.
+        let (entry_region, entry_block, _) = build_single_block_region(&mut module, &[]);
         Self {
-            next_value: 0,
-            errors: Vec::new(),
-            terms: Vec::new(),
-            launch_checks: Vec::new(),
-            assumptions: Vec::new(),
-            value_ids: super::value_ids::ValueIds::default(),
-            body: Vec::new(),
+            module,
+            entry_region,
+            blocks: vec![entry_block],
+            access: sile_hir::passes::access::AccessAnalysis::new(&typed.checks),
             args: Vec::new(),
             tensors: Vec::new(),
             scalars: Vec::new(),
             values: Vec::new(),
-            locals: std::collections::BTreeMap::new(),
-            bounds: Vec::new(),
+            locals: typed.locals.clone(),
             shape_materialised: Vec::new(),
             shape_bindings: Vec::new(),
             program_id: None,
@@ -848,9 +307,7 @@ impl Builder {
             store_offset: None,
             store_block: None,
             fetched_generics: Vec::new(),
-            loop_vars: Vec::new(),
             loop_carried: Vec::new(),
-            bounded_loop_vars: Vec::new(),
             shapes: Vec::new(),
         }
     }
@@ -871,93 +328,143 @@ impl Builder {
             .unwrap_or_else(|| panic!("no type recorded for `{name}`"))
     }
 
-    fn value(&mut self) -> ValueId {
-        let id = ValueId(self.next_value);
-        self.next_value += 1;
-        id
+    /// The block being written.
+    fn block(&self) -> crate::ir::BlockId {
+        *self.blocks.last().unwrap()
     }
 
-    fn arg(&mut self, ty: super::Type) -> ValueId {
-        let value = self.value();
+    /// Build an operation and append it to the block being written. The
+    /// results it returns are numbered by allocation — building *is* naming.
+    fn append(&mut self, op: OpBuilder) -> Vec<IrValue> {
+        let block = self.block();
+        let (id, results) = op.build(&mut self.module);
+        append_op(&mut self.module, block, id);
+        results
+    }
+
+    fn append1(&mut self, op: OpBuilder) -> IrValue {
+        self.append(op)[0]
+    }
+
+    /// A fresh entry parameter.
+    fn arg(&mut self, ty: IrType) -> IrValue {
+        let block = self.block();
+        let value = self.module.alloc_value(
+            ty.clone(),
+            ValueProducer::BlockArg {
+                block,
+                arg_index: self.args.len() as u32,
+            },
+        );
+        self.module.block_mut(block).args.push((value, ty.clone()));
         self.args.push((value, ty));
         value
     }
 
-    /// `%t = constant <i1: v> : tile<i1>`
-    fn i32_const_i1(&mut self, value: bool) -> ValueId {
-        let id = self.value();
-        let ty = super::Type::Tile {
-            shape: Vec::new(),
-            element: TileElement::Scalar(ScalarType::I1),
-        };
-        self.push_op(Op {
-            results: vec![id],
-            format: Format::Constant,
-            opcode: "constant",
-            operands: Vec::new(),
-            result_types: vec![ty],
-            attrs: Vec::new(),
-            text: format!("<i1: {}>", if value { 1 } else { 0 }),
-            operand_types: None,
-            indent: 0,
-        });
-        id
+    /// A `constant` of any element and shape, one splatted value.
+    fn const_splat(&mut self, element: IrScalar, extents: &[i64], bytes: Vec<u8>) -> IrValue {
+        self.append1(
+            OpBuilder::new(Opcode::Constant, Location::Unknown)
+                .attr(
+                    "value",
+                    Attribute::DenseElements(DenseElements {
+                        element_type: tile_type(element, extents),
+                        shape: extents.to_vec(),
+                        data: bytes,
+                    }),
+                )
+                .result(tile_type(element, extents)),
+        )
     }
 
-    fn i32_tile() -> super::Type {
-        super::Type::Tile {
-            shape: Vec::new(),
-            element: TileElement::Scalar(ScalarType::I32),
-        }
+    /// `%t = constant <i1: v> : tile<i1>`
+    fn i32_const_i1(&mut self, value: bool) -> IrValue {
+        self.const_splat(IrScalar::I1, &[], vec![value as u8])
+    }
+
+    /// The rank-zero `tile<i32>` type.
+    fn i32_tile() -> IrType {
+        tile_type(IrScalar::I32, &[])
     }
 
     /// `%t = constant <i32: v> : tile<i32>`
-    fn i32_const(&mut self, value: i64) -> ValueId {
-        let result = self.value();
-        self.push_op(Op {
-            results: vec![result],
-            format: Format::Constant,
-            opcode: "constant",
-            operands: Vec::new(),
-            result_types: vec![Self::i32_tile()],
-            attrs: Vec::new(),
-            text: format!("<i32: {value}>"),
-            operand_types: None,
-            indent: 0,
-        });
-        result
+    fn i32_const(&mut self, value: i64) -> IrValue {
+        self.const_splat(IrScalar::I32, &[], (value as i32).to_le_bytes().to_vec())
     }
 
-    /// `%t = constant <f32: v> : tile<Nxf32>`
-    fn f32_const(&mut self, value: f32, extents: &[i64]) -> ValueId {
-        let result = self.value();
-        let _shape = extents
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("x");
-        self.push_op(Op {
-            results: vec![result],
-            format: Format::Constant,
-            opcode: "constant",
-            operands: Vec::new(),
-            result_types: vec![super::Type::Tile {
-                shape: extents.to_vec(),
-                element: TileElement::Scalar(ScalarType::F32),
-            }],
-            attrs: Vec::new(),
-            text: format!(
-                "<f32: {}>",
-                if value.fract() == 0.0 {
-                    format!("{value:.1}")
-                } else {
-                    value.to_string()
-                }
-            ),
-            operand_types: None,
-            indent: 0,
-        });
-        result
+    /// `%t = constant <f32: v> : tile<Nxf32>` — one splatted value.
+    fn f32_const(&mut self, value: f32, extents: &[i64]) -> IrValue {
+        let count: usize = extents.iter().product::<i64>().max(1) as usize;
+        let mut data = Vec::with_capacity(count * 4);
+        for _ in 0..count {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        self.const_splat(IrScalar::F32, extents, data)
+    }
+
+    /// A two-operand integer op: `signed` states the signedness division,
+    /// remainder and minimum print; `rounding` is the non-default rounding a
+    /// ceiling divide states.
+    fn int_binary(
+        &mut self,
+        opcode: Opcode,
+        lhs: IrValue,
+        rhs: IrValue,
+        signed: bool,
+        rounding: Option<i64>,
+    ) -> IrValue {
+        let mut op = OpBuilder::new(opcode, Location::Unknown)
+            .operand(lhs)
+            .operand(rhs);
+        if signed {
+            op = op.attr("signedness", Attribute::i32(1));
+        }
+        if let Some(rounding) = rounding {
+            op = op.attr("rounding", Attribute::i32(rounding));
+        }
+        self.append1(op.result(Self::i32_tile()))
+    }
+
+    /// A two-operand boolean op over `tile<i1>`.
+    fn bool_binary(&mut self, opcode: Opcode, lhs: IrValue, rhs: IrValue) -> IrValue {
+        self.append1(
+            OpBuilder::new(opcode, Location::Unknown)
+                .operand(lhs)
+                .operand(rhs)
+                .result(tile_type(IrScalar::I1, &[])),
+        )
+    }
+
+    /// A two-operand op whose result repeats the first operand's type.
+    fn same_binary(&mut self, opcode: Opcode, lhs: IrValue, rhs: IrValue, ty: IrType) -> IrValue {
+        self.append1(
+            OpBuilder::new(opcode, Location::Unknown)
+                .operand(lhs)
+                .operand(rhs)
+                .result(ty),
+        )
+    }
+
+    /// `%t = cmpi <pred> %lhs, %rhs, signed : tile<i32> -> tile<i1>` — the
+    /// rank-zero comparison the access checks are built from.
+    fn cmpi(&mut self, pred: i64, lhs: IrValue, rhs: IrValue) -> IrValue {
+        self.append1(
+            OpBuilder::new(Opcode::CmpI, Location::Unknown)
+                .attr("comparison_predicate", Attribute::i32(pred))
+                .attr("signedness", Attribute::i32(1))
+                .operand(lhs)
+                .operand(rhs)
+                .result(tile_type(IrScalar::I1, &[])),
+        )
+    }
+
+    /// `assert %c, "msg" : tile<i1>`
+    fn assert_op(&mut self, cond: IrValue, message: &str) {
+        self.append(
+            OpBuilder::new(Opcode::Assert, Location::Unknown)
+                .operand(cond)
+                .attr("message", Attribute::String(message.to_string())),
+        );
     }
 
     /// `program_id(axis)`: cutile's `program_id` is a plain Rust function, so
@@ -965,153 +472,201 @@ impl Builder {
     /// first, then the triple, then one `axis == k` test per arm the chain
     /// walks: each test names `k` and yields a constant predicate, and the
     /// compared id between them is allocated and dropped.
-    fn program_id_checked(&mut self, axis: i64) -> ValueId {
+    fn program_id_checked(&mut self, axis: i64) -> IrValue {
         self.i32_const(axis);
         let ids = self.block_id();
         let arms = axis.clamp(0, 2);
-        let mut last = ValueId(0);
+        let mut last: Option<IrValue> = None;
         for candidate in 0..=arms {
             self.i32_const(candidate);
             // The comparison is decided while compiling, so its id is spent
             // and its value is a constant.
             self.discard();
-            last = self.i32_const_i1(candidate == axis);
+            last = Some(self.i32_const_i1(candidate == axis));
         }
         // Only the `else` arm carries the assertion, and it tests the predicate
         // the last comparison already produced.
         if axis >= 2 {
-            self.push_op(Op {
-                results: Vec::new(),
-                format: Format::Plain,
-                opcode: "assert",
-                operands: vec![last],
-                result_types: Vec::new(),
-                attrs: Vec::new(),
-                text: format!("{last}, \"program_id: axis must be 0, 1, or 2\" : tile<i1>"),
-                operand_types: None,
-                indent: 0,
-            });
+            self.assert_op(last.unwrap(), "program_id: axis must be 0, 1, or 2");
         }
         ids[arms as usize]
     }
 
     /// `num_programs(axis)`: the same `if` chain as [`Self::program_id_checked`],
     /// over the grid extent triple and with its own assertion text.
-    fn num_programs(&mut self, axis: i64) -> ValueId {
+    fn num_programs(&mut self, axis: i64) -> IrValue {
         self.i32_const(axis);
-        let base = self.next_value;
-        self.next_value += 3;
-        let ids = (0..3).map(|i| ValueId(base + i)).collect::<Vec<_>>();
-        self.push_op(Op {
-            results: ids.clone(),
-            format: Format::Plain,
-            opcode: "get_num_tile_blocks",
-            operands: Vec::new(),
-            result_types: vec![Self::i32_tile(); 3],
-            attrs: Vec::new(),
-            text: String::new(),
-            operand_types: None,
-            indent: 0,
-        });
-        let assumed = ids.into_iter().map(|id| self.assume(id)).collect::<Vec<_>>();
+        let ids = self.append(
+            OpBuilder::new(Opcode::GetNumTileBlocks, Location::Unknown).results([
+                Self::i32_tile(),
+                Self::i32_tile(),
+                Self::i32_tile(),
+            ]),
+        );
+        let assumed = ids.iter().map(|&id| self.assume(id)).collect::<Vec<_>>();
         let arms = axis.clamp(0, 2);
-        let mut last = ValueId(0);
+        let mut last: Option<IrValue> = None;
         for candidate in 0..=arms {
             self.i32_const(candidate);
             self.discard();
-            last = self.i32_const_i1(candidate == axis);
+            last = Some(self.i32_const_i1(candidate == axis));
         }
         if axis >= 2 {
-            self.push_op(Op {
-                results: Vec::new(),
-                format: Format::Plain,
-                opcode: "assert",
-                operands: vec![last],
-                result_types: Vec::new(),
-                attrs: Vec::new(),
-                text: format!("{last}, \"num_programs: axis must be 0, 1, or 2\" : tile<i1>"),
-                operand_types: None,
-                indent: 0,
-            });
+            self.assert_op(last.unwrap(), "num_programs: axis must be 0, 1, or 2");
         }
         assumed[arms as usize]
     }
 
-    fn assume(&mut self, subject: ValueId) -> ValueId {
-        let result = self.value();
-        self.push_op(Op {
-            results: vec![result],
-            format: Format::Assume,
-            opcode: "assume",
-            operands: vec![subject],
-            result_types: vec![Self::i32_tile()],
-            attrs: Vec::new(),
-            text: format!("bounded<0, ?>, {subject}"),
-            operand_types: None,
-            indent: 0,
-        });
-        result
+    /// `%t = assume bounded<0, ?>, %a : tile<i32>`, or `bounded<0, N>` when the
+    /// interval is known.
+    fn assume_bounded(&mut self, subject: IrValue, ub: Option<i64>) -> IrValue {
+        self.append1(
+            OpBuilder::new(Opcode::Assume, Location::Unknown)
+                .attr(
+                    "predicate",
+                    Attribute::Bounded(Bounded {
+                        lb: Some(0),
+                        ub,
+                    }),
+                )
+                .operand(subject)
+                .result(Self::i32_tile()),
+        )
     }
 
-    fn make_token(&mut self) -> ValueId {
-        let result = self.value();
-        self.push_op(Op {
-            results: vec![result],
-            format: Format::MakeToken,
-            opcode: "make_token",
-            operands: Vec::new(),
-            result_types: vec![super::Type::Token],
-            attrs: Vec::new(),
-            text: String::new(),
-            operand_types: None,
-            indent: 0,
-        });
-        result
+    fn assume(&mut self, subject: IrValue) -> IrValue {
+        self.assume_bounded(subject, None)
     }
 
-    fn make_tensor_view(&mut self, ptr: ValueId, view: super::TensorView) -> ValueId {
-        let result = self.value();
-        let dynamic = view.shape.iter().any(|e| matches!(e, Extent::Value(_)));
-        let shape = view
-            .shape
+    fn make_token(&mut self) -> IrValue {
+        self.append1(
+            OpBuilder::new(Opcode::MakeToken, Location::Unknown).result(IrType::Token),
+        )
+    }
+
+    /// `%t = make_tensor_view %p, shape = [...], strides = [...] : ... -> ...`
+    ///
+    /// A dynamic extent is spelled `DYNAMIC` in the type and named by the next
+    /// dynamic operand; a fully static view names none.
+    fn make_tensor_view(
+        &mut self,
+        ptr: IrValue,
+        element: IrScalar,
+        view_shape: &[Extent],
+        strides: &[i64],
+    ) -> IrValue {
+        let dynamic: Vec<IrValue> = view_shape
             .iter()
-            .map(|e| match e {
-                Extent::Literal(v) => v.to_string(),
-                Extent::Value(v) => v.to_string(),
+            .filter_map(|extent| match extent {
+                Extent::Value(value) => Some(*value),
+                Extent::Literal(_) => None,
             })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let strides = view
-            .strides
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut text = format!("{ptr}, shape = [{shape}], strides = [{strides}]");
-        let view_ty = super::Type::TensorView(view);
-        if dynamic {
-            text.push_str(&format!(" : {} -> {view_ty}", Self::i32_tile()));
-        }
-        self.push_op(Op {
-            results: vec![result],
-            format: Format::MakeTensorView,
-            opcode: "make_tensor_view",
-            operands: vec![ptr],
-            result_types: vec![view_ty],
-            attrs: Vec::new(),
-            text,
-            operand_types: None,
-            indent: 0,
-        });
-        result
+            .collect();
+        self.append1(
+            OpBuilder::new(Opcode::MakeTensorView, Location::Unknown)
+                .operand(ptr)
+                .operands(dynamic.iter().copied())
+                .attr(
+                    "operandSegmentSizes",
+                    Attribute::Array(vec![
+                        Attribute::i32(1),
+                        Attribute::i32(dynamic.len() as i64),
+                        Attribute::i32(0),
+                    ]),
+                )
+                .result(tensor_view_type(element, view_shape, strides)),
+        )
     }
 
-    fn push_op(&mut self, op: Op) {
-        self.body.push(Stmt::Op(op));
+    /// `%t = make_partition_view %v : partition_view<...>`
+    ///
+    /// A read view carries `padding_value = zero`; a write view does not.
+    fn make_partition_view(
+        &mut self,
+        source: IrValue,
+        tile: &[i64],
+        element: IrScalar,
+        view_shape: &[Extent],
+        strides: &[i64],
+        padding_zero: bool,
+    ) -> IrValue {
+        self.append1(
+            OpBuilder::new(Opcode::MakePartitionView, Location::Unknown)
+                .operand(source)
+                .result(partition_view_type(
+                    tile,
+                    element,
+                    view_shape,
+                    strides,
+                    padding_zero,
+                )),
+        )
     }
 
-    fn push_stmt(&mut self, stmt: Stmt) {
-        self.body.push(stmt);
+    /// `%t, %u = load_view_tko weak %view[i, j] token = %tok : ...`
+    fn load_view_tko(
+        &mut self,
+        view: IrValue,
+        indices: &[IrValue],
+        token: IrValue,
+        tile: &[i64],
+        element: IrScalar,
+        view_ty: IrType,
+    ) -> (IrValue, IrType) {
+        let tile_ty = tile_type(element, tile);
+        let results = self.append(
+            OpBuilder::new(Opcode::LoadViewTko, Location::Unknown)
+                .attr("memory_ordering_semantics", Attribute::i32(0))
+                .operand(view)
+                .operands(indices.iter().copied())
+                .operand(token)
+                .attr(
+                    "operandSegmentSizes",
+                    Attribute::Array(vec![
+                        Attribute::i32(1),
+                        Attribute::i32(indices.len() as i64),
+                        Attribute::i32(1),
+                    ]),
+                )
+                .result(tile_ty.clone())
+                .result(IrType::Token),
+        );
+        let _ = view_ty;
+        (results[0], tile_ty)
+    }
+
+    /// `%t = store_view_tko weak %value, %view[i, j] token = %tok : ...`
+    ///
+    /// The store's printed type list ends at the token: value, view and index
+    /// types come from the operands, and `token` closes the line.
+    fn store_view_tko(
+        &mut self,
+        value: IrValue,
+        view: IrValue,
+        indices: &[IrValue],
+        token: IrValue,
+        value_ty: IrType,
+        view_ty: IrType,
+    ) {
+        self.append(
+            OpBuilder::new(Opcode::StoreViewTko, Location::Unknown)
+                .attr("memory_ordering_semantics", Attribute::i32(0))
+                .operand(value)
+                .operand(view)
+                .operands(indices.iter().copied())
+                .operand(token)
+                .attr(
+                    "operandSegmentSizes",
+                    Attribute::Array(vec![
+                        Attribute::i32(1),
+                        Attribute::i32(1),
+                        Attribute::i32(indices.len() as i64),
+                        Attribute::i32(1),
+                    ]),
+                )
+                .result(IrType::Token),
+        );
+        let _ = (value_ty, view_ty);
     }
 
     /// The id of an operation that was allocated and then proved constant.
@@ -1119,334 +674,75 @@ impl Builder {
     /// cutile allocates the operation, runs its interval transfer, and returns a
     /// fresh `constant` when the interval is a single value — the operation is
     /// never appended, so its id is printed nowhere. The gap is part of the
-    /// contract.
-    fn discard(&mut self) -> ValueId {
-        let id = ValueId(self.next_value);
-        self.next_value += 1;
-        id
+    /// contract: the arena keeps the allocated value, and the hole it leaves in
+    /// the numbering is what cutile's text shows. The sentinel producer never
+    /// matches a real operation, so the hole stays a hole.
+    fn discard(&mut self) -> IrValue {
+        self.module.alloc_value(
+            IrType::Token,
+            ValueProducer::OpResult {
+                op: crate::ir::OpId(u32::MAX),
+                result_index: 0,
+            },
+        )
     }
 
-    /// `%t = get_tile_block_id : tile<i32>` — three results — then one
+    /// `%t, %u, %w = get_tile_block_id : tile<i32>` — three results — then one
     /// `assume` per result. Every memory access asks for it again.
-    fn block_id(&mut self) -> Vec<ValueId> {
-        let base = self.next_value;
-        self.next_value += 3;
-        let ids = (0..3).map(|i| ValueId(base + i)).collect::<Vec<_>>();
-        self.push_op(Op {
-            results: ids.clone(),
-            format: Format::GetTileBlockId,
-            opcode: "get_tile_block_id",
-            operands: Vec::new(),
-            result_types: vec![Self::i32_tile(); 3],
-            attrs: Vec::new(),
-            text: String::new(),
-            operand_types: None,
-            indent: 0,
-        });
-        ids.into_iter().map(|id| self.assume(id)).collect()
+    fn block_id(&mut self) -> Vec<IrValue> {
+        let ids = self.append(
+            OpBuilder::new(Opcode::GetTileBlockId, Location::Unknown).results([
+                Self::i32_tile(),
+                Self::i32_tile(),
+                Self::i32_tile(),
+            ]),
+        );
+        ids.iter().map(|&id| self.assume(id)).collect()
     }
 
     fn reshape_typed(
         &mut self,
-        source: ValueId,
-        source_ty: &super::Type,
+        source: IrValue,
+        source_ty: &IrType,
         to: &[i64],
-    ) -> (ValueId, super::Type) {
-        let element = match source_ty {
-            super::Type::Tile { element, .. } => *element,
-            _ => TileElement::Scalar(ScalarType::F32),
+    ) -> (IrValue, IrType) {
+        let element = match tile_scalar(source_ty) {
+            Some(s) => s,
+            None => IrScalar::F32,
         };
-        let result = self.value();
-        let to_ty = super::Type::Tile {
-            shape: to.to_vec(),
-            element,
-        };
-        self.push_op(Op {
-            results: vec![result],
-            format: Format::Plain,
-            opcode: "reshape",
-            operands: vec![source],
-            result_types: vec![to_ty.clone()],
-            attrs: Vec::new(),
-            text: format!("{source}"),
-            operand_types: Some(vec![source_ty.clone()]),
-            indent: 0,
-        });
+        let to_ty = tile_type(element, to);
+        let result = self.append1(
+            OpBuilder::new(Opcode::Reshape, Location::Unknown)
+                .operand(source)
+                .result(to_ty.clone()),
+        );
         (result, to_ty)
     }
-
 
     fn broadcast(
         &mut self,
-        source: ValueId,
-        from: &[i64],
+        source: IrValue,
+        _from: &[i64],
         to: &[i64],
-        element: TileElement,
-    ) -> (ValueId, super::Type) {
-        let result = self.value();
-        let from_ty = super::Type::Tile {
-            shape: from.to_vec(),
-            element,
-        };
-        let to_ty = super::Type::Tile {
-            shape: to.to_vec(),
-            element,
-        };
-        self.push_op(Op {
-            results: vec![result],
-            format: Format::Plain,
-            opcode: "broadcast",
-            operands: vec![source],
-            result_types: vec![to_ty.clone()],
-            attrs: Vec::new(),
-            text: format!("{source}"),
-            operand_types: Some(vec![from_ty]),
-            indent: 0,
-        });
+        element: IrScalar,
+    ) -> (IrValue, IrType) {
+        let to_ty = tile_type(element, to);
+        let result = self.append1(
+            OpBuilder::new(Opcode::Broadcast, Location::Unknown)
+                .operand(source)
+                .result(to_ty.clone()),
+        );
         (result, to_ty)
     }
-
-    /// `%t = make_partition_view %v : partition_view<...>`
-    ///
-    /// A read view carries `padding_value = zero`; a write view does not.
-    fn make_partition_view(&mut self, tensor: &Tensor, tile: &[i64], padding_zero: bool) -> ValueId {
-        let view = super::TensorView {
-            element: tensor.element,
-            shape: view_extents(tensor),
-            strides: tensor.strides.clone(),
-        };
-        let ty = super::Type::PartitionView(super::PartitionView {
-            tile_shape: tile.to_vec(),
-            padding_zero,
-            tensor: view.clone(),
-        });
-        let result = self.value();
-        let source = tensor.view;
-        self.push_op(Op {
-            results: vec![result],
-            format: Format::MakePartitionView,
-            opcode: "make_partition_view",
-            operands: vec![source],
-            result_types: vec![ty.clone()],
-            attrs: Vec::new(),
-            text: format!("{source}"),
-            operand_types: None,
-            indent: 0,
-        });
-        result
-    }
-
-    /// `%t, %u = load_view_tko weak %view[i, j] token = %tok : ...`
-    fn load_view_tko(
-        &mut self,
-        view: ValueId,
-        indices: &[ValueId],
-        token: ValueId,
-        tile: &[i64],
-        element: ScalarType,
-        view_ty: super::Type,
-    ) -> (ValueId, super::Type) {
-        let base = self.next_value;
-        self.next_value += 2;
-        let results = vec![ValueId(base), ValueId(base + 1)];
-        let tile_ty = super::Type::Tile {
-            shape: tile.to_vec(),
-            element: TileElement::Scalar(element),
-        };
-        let index_text = indices
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        self.push_op(Op {
-            results: results.clone(),
-            format: Format::LoadViewTko,
-            opcode: "load_view_tko",
-            operands: [&[view][..], indices, &[token][..]].concat(),
-            result_types: vec![tile_ty.clone(), super::Type::Token],
-            attrs: Vec::new(),
-            text: format!("weak {view}[{index_text}] token = {token}"),
-            operand_types: Some(vec![view_ty, Self::i32_tile()]),
-            indent: 0,
-        });
-        (results[0], tile_ty)
-    }
-
-    /// `%t = store_view_tko weak %value, %view[i, j] token = %tok : ...`
-    fn store_view_tko(
-        &mut self,
-        value: ValueId,
-        view: ValueId,
-        indices: &[ValueId],
-        token: ValueId,
-        value_ty: super::Type,
-        view_ty: super::Type,
-    ) {
-        let result = self.value();
-        let index_text = indices
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        self.push_op(Op {
-            results: vec![result],
-            format: Format::StoreViewTko,
-            opcode: "store_view_tko",
-            operands: [&[value, view][..], indices, &[token][..]].concat(),
-            result_types: vec![super::Type::Token],
-            attrs: Vec::new(),
-            text: format!("weak {value}, {view}[{index_text}] token = {token}"),
-            operand_types: Some(vec![value_ty, view_ty, Self::i32_tile()]),
-            indent: 0,
-        });
-    }
 }
-
-/// The const generics cutile prints as `1` instead of their value.
-///
-/// A flag generic is one the body compares against a literal — cutile's own are
-/// `CAUSAL == 1i32` and `EVEN_K == 0i32` — and cutile's front end prints it as
-/// `1` on the branch where the comparison holds. Nothing else distinguishes a
-/// flag from an axis here: both arrive as an `i64` const generic.
-/// Whether the body partitions a buffer by generics that a parameter's own
-/// declared extents also name.
-///
-/// Such a partition instantiates the kernel's const generics, and cutile prints
-/// every one of them before the body runs. A generic only the partition names
-/// is not part of that instantiation.
-fn instantiates_generics(kernel: &Kernel) -> bool {
-    fn walk(stmt: &sile_hir::Stmt, kernel: &Kernel, declared: &[String]) -> bool {
-        match stmt {
-            sile_hir::Stmt::Let { expr, .. } => matches_partition(expr, declared),
-            sile_hir::Stmt::ForLoop { body, .. }
-            | sile_hir::Stmt::While { body, .. }
-            | sile_hir::Stmt::Loop { body } => {
-                body.iter().any(|stmt| walk(stmt, kernel, declared))
-            }
-            sile_hir::Stmt::If { then_body, else_body, .. } => {
-                then_body.iter().any(|stmt| walk(stmt, kernel, declared))
-                    || else_body.iter().any(|stmt| walk(stmt, kernel, declared))
-            }
-            _ => false,
-        }
-    }
-    fn matches_partition(expr: &sile_hir::Expr, declared: &[String]) -> bool {
-        let sile_hir::Expr::Builtin { op, args } = expr else {
-            return false;
-        };
-        if !matches!(
-            op,
-            sile_hir::BuiltinOp::Partition | sile_hir::BuiltinOp::PartitionMut
-        ) {
-            return false;
-        }
-        let Some(sile_hir::Expr::Shape(shape)) = args.get(1) else {
-            return false;
-        };
-        let mut names = Vec::new();
-        fn collect(shape: &sile_hir::ShapeExpr, names: &mut Vec<String>) {
-            match shape {
-                sile_hir::ShapeExpr::Symbol(name) => names.push(name.clone()),
-                sile_hir::ShapeExpr::Tuple(items) => {
-                    for item in items {
-                        collect(item, names);
-                    }
-                }
-                _ => {}
-            }
-        }
-        collect(shape, &mut names);
-        names.iter().any(|name| declared.contains(name))
-    }
-    let declared: Vec<String> = kernel
-        .params
-        .iter()
-        .filter_map(|param| match &param.ty {
-            sile_hir::Type::Tensor { shape, .. } => Some(shape.clone()),
-            _ => None,
-        })
-        .flat_map(|shape| shape_names(&shape))
-        .collect();
-    kernel
-        .body
-        .iter()
-        .any(|stmt| walk(stmt, kernel, &declared))
-}
-
-fn flag_generics(kernel: &Kernel) -> Vec<String> {
-    kernel
-        .const_params
-        .iter()
-        .map(|(name, _)| name.clone())
-        .filter(|name| compared_to_literal(&kernel.body, name))
-        .collect()
-}
-
-fn compared_to_literal(body: &[sile_hir::Stmt], name: &str) -> bool {
-    use sile_hir::BuiltinOp;
-    fn is_comparison(op: BuiltinOp) -> bool {
-        matches!(
-            op,
-            BuiltinOp::Eq | BuiltinOp::Ne | BuiltinOp::Lt | BuiltinOp::Le | BuiltinOp::Gt | BuiltinOp::Ge
-        )
-    }
-    fn walk_expr(expr: &sile_hir::Expr, name: &str) -> bool {
-        match expr {
-            sile_hir::Expr::Builtin { op, args } => {
-                (is_comparison(*op)
-                    && args.iter().any(|a| matches!(a, sile_hir::Expr::Var(v) if v == name))
-                    && args
-                        .iter()
-                        .any(|a| matches!(a, sile_hir::Expr::ScalarI64(_))))
-                    || args.iter().any(|a| walk_expr(a, name))
-            }
-            sile_hir::Expr::TileIndex(items) => items.iter().any(|a| walk_expr(a, name)),
-            _ => false,
-        }
-    }
-    fn walk_stmt(stmt: &sile_hir::Stmt, name: &str) -> bool {
-        use sile_hir::Stmt;
-        match stmt {
-            Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } => walk_expr(expr, name),
-            Stmt::Store { value, index, .. } => {
-                walk_expr(value, name) || index.as_ref().is_some_and(|i| walk_expr(i, name))
-            }
-            Stmt::AtomicAdd { index, value, .. } => {
-                walk_expr(index, name) || walk_expr(value, name)
-            }
-            Stmt::Print { args, .. } => args.iter().any(|arg| walk_expr(arg, name)),
-            Stmt::ForLoop { start, end, step, body, .. } => {
-                walk_expr(start, name)
-                    || walk_expr(end, name)
-                    || step.as_ref().is_some_and(|s| walk_expr(s, name))
-                    || body.iter().any(|s| walk_stmt(s, name))
-            }
-            Stmt::While { cond, body } => {
-                walk_expr(cond, name) || body.iter().any(|s| walk_stmt(s, name))
-            }
-            Stmt::Loop { body } => body.iter().any(|s| walk_stmt(s, name)),
-            Stmt::If { cond, then_body, else_body } => {
-                walk_expr(cond, name)
-                    || then_body.iter().any(|s| walk_stmt(s, name))
-                    || else_body.iter().any(|s| walk_stmt(s, name))
-            }
-            Stmt::Break | Stmt::Return | Stmt::Continue => false,
-        }
-    }
-    body.iter().any(|stmt| walk_stmt(stmt, name))
-}
-
 
 /// The element type of a HIR element type, as a tile spells it.
-fn tile_of(elem: ElemType, shape: &ShapeExpr, consts: &[(String, i64)]) -> super::Type {
+fn tile_of(elem: ElemType, shape: &ShapeExpr, consts: &[(String, i64)]) -> IrType {
     let dims = declared_extents(shape, consts)
         .into_iter()
         .map(|extent| extent.unwrap_or(-1))
         .collect::<Vec<_>>();
-    super::Type::Tile {
-        shape: dims,
-        element: TileElement::Scalar(scalar_of(elem)),
-    }
+    tile_type(scalar_of(elem), &dims)
 }
 
 /// The `constant` fetches of one shape argument, in source order.
@@ -1454,7 +750,7 @@ fn tile_of(elem: ElemType, shape: &ShapeExpr, consts: &[(String, i64)]) -> super
 /// A literal extent costs one `constant`; a const generic costs one carrying
 /// its value; a dynamic extent costs one carrying `-1`. Every call is a fresh
 /// fetch: cutile asks for the shape again for each operation that takes one.
-fn shape_consts(builder: &mut Builder, shape: &ShapeExpr, consts: &[(String, i64)]) -> Vec<ValueId> {
+fn shape_consts(builder: &mut Builder, shape: &ShapeExpr, consts: &[(String, i64)]) -> Vec<IrValue> {
     let items = match shape {
         ShapeExpr::Tuple(items) => items.clone(),
         other => vec![other.clone()],
@@ -1476,7 +772,7 @@ fn shape_consts(builder: &mut Builder, shape: &ShapeExpr, consts: &[(String, i64
                 if consts.iter().any(|(n, _)| n == name) {
                     builder.const_constants.retain(|(n, _)| n != name);
                     builder.const_constants.push((name.clone(), id));
-        builder.prologue_generics.push((name.clone(), id));
+                    builder.prologue_generics.push((name.clone(), id));
                 }
                 id
             }
@@ -1506,33 +802,27 @@ fn shape_extents(shape: &ShapeExpr, consts: &[(String, i64)]) -> Vec<i64> {
         .collect()
 }
 
-/// The `2r` shape arguments of a batch of expressions: each extent of each one,
-/// twice over.
-
 /// The program cutile prints for `kernel`.
 pub fn emit(
-    kernel: &Kernel,
-    locals: &std::collections::BTreeMap<String, Type>,
-) -> Result<(Module, Vec<super::predicate::LaunchCheck>), String> {
-    let mut builder = Builder::new(kernel);
-    builder.locals = locals.clone();
-    builder.value_ids = super::value_ids::ValueIds::of(kernel);
+    typed: &sile_hir::typeck::TypedKernel,
+) -> Result<(IrModule, Vec<predicate::LaunchCheck>), String> {
+    let kernel = &typed.kernel;
+    let mut builder = Builder::new(typed);
     declare_params(&mut builder, kernel);
     // A kernel whose body partitions a buffer by generics that its own
     // parameter types also name instantiates those generics up front: cutile
     // prints all of them once, before the body's first op. A shape built only
     // from generics the partition alone names (`BLOCK_SIZE` in `rms_norm`)
     // does not.
-    if instantiates_generics(kernel) {
+    if builder.access.instantiates_generics() {
         builder.fetched_generics = kernel
             .const_params
             .iter()
             .map(|(name, _)| name.clone())
             .collect();
-        let flags = flag_generics(kernel);
         for (name, value) in &kernel.const_params {
             // A flag generic prints `1`: the body only ever compares it.
-            let printed = if flags.iter().any(|flag| flag == name) {
+            let printed = if builder.access.flags().iter().any(|flag| flag == name) {
                 1
             } else {
                 *value
@@ -1547,29 +837,63 @@ pub fn emit(
     for stmt in &kernel.body {
         emit_stmt(&mut builder, stmt, kernel);
     }
-    builder.body.push(Stmt::Return);
+    // `return` closes the entry block.
+    let block = builder.block();
+    let (ret, _) = OpBuilder::new(Opcode::Return, Location::Unknown).build(&mut builder.module);
+    append_op(&mut builder.module, block, ret);
 
     // A failed access check is a compile error, not a device assert, so no
     // module is printed for it.
-    if let Some(error) = builder.errors.first() {
+    if let Some(error) = builder.access.errors.first() {
         return Err(error.clone());
     }
 
-    let module = Module {
-        name: kernel.origin.module.clone(),
-        functions: vec![Function {
-            name: format!("{}_entry", kernel.name),
-            di_name: kernel.name.clone(),
-            args: builder.args,
-            body: builder.body,
-        }],
-    };
-    Ok((module, builder.launch_checks))
+    // The entry operation wraps the block the emitter has been writing into.
+    let arg_types = builder.args.iter().map(|(_, ty)| ty.clone()).collect();
+    let (entry, _) = OpBuilder::new(Opcode::Entry, Location::Unknown)
+        .attr(
+            "sym_name",
+            Attribute::String(format!("{}_entry", kernel.name)),
+        )
+        .attr(
+            "function_type",
+            Attribute::Type(IrType::Func(FuncType {
+                inputs: arg_types,
+                results: Vec::new(),
+            })),
+        )
+        .attr("di_name", Attribute::String(kernel.name.clone()))
+        .region(builder.entry_region)
+        .build(&mut builder.module);
+    builder.module.functions.push(entry);
+
+    let module = builder.module;
+    let launch_checks = builder.access.launch_checks;
+    Ok((module, launch_checks))
+}
+
+/// What the checks read about one tensor: its parameter, its tile, and what
+/// each view axis is. The emitter holds the tensor's values; this is the slice
+/// of it a decision needs.
+fn tensor_facts(kernel: &Kernel, tensor: &Tensor) -> TensorFacts {
+    TensorFacts {
+        name: tensor.name.clone(),
+        param: sile_hir::passes::access::buffer_param_position(kernel, &tensor.name),
+        tile: tensor.tile.clone(),
+        view_axes: tensor
+            .view_shape
+            .iter()
+            .map(|extent| match extent {
+                Extent::Literal(v) => AxisExtent::Static(*v),
+                Extent::Value(_) => AxisExtent::Dynamic,
+            })
+            .collect(),
+    }
 }
 
 /// The entry parameters, in declaration order, and then one view per tensor.
 fn declare_params(builder: &mut Builder, kernel: &Kernel) {
-    let mut tensors: Vec<(String, Tensor, Vec<ValueId>, Vec<Option<i64>>, ElemType)> =
+    let mut tensors: Vec<(String, Tensor, Vec<IrValue>, Vec<Option<i64>>, ElemType)> =
         Vec::new();
     for param in &kernel.params {
         match &param.ty {
@@ -1587,10 +911,12 @@ fn declare_params(builder: &mut Builder, kernel: &Kernel) {
                     let dims = view_extents.iter().map(|e| e.unwrap_or(1)).collect::<Vec<_>>();
                     row_major_strides(&dims)
                 });
-                let ptr = builder.arg(super::Type::Tile {
+                let ptr = builder.arg(IrType::Tile(TileType {
                     shape: Vec::new(),
-                    element: TileElement::Pointer(scalar_of(*elem)),
-                });
+                    element_type: TileElementType::Pointer(Box::new(PointerType {
+                        pointee: scalar_of(*elem),
+                    })),
+                }));
                 let shape_args = (0..tile.len())
                     .map(|_| builder.arg(Builder::i32_tile()))
                     .collect::<Vec<_>>();
@@ -1621,11 +947,11 @@ fn declare_params(builder: &mut Builder, kernel: &Kernel) {
                 ));
             }
             Type::Scalar(elem) => {
-                let value = builder.arg(super::Type::Tile {
-                    shape: Vec::new(),
-                    element: TileElement::Scalar(scalar_of(*elem)),
-                });
+                let value = builder.arg(tile_type(scalar_of(*elem), &[]));
                 builder.scalars.push((param.name.clone(), value, scalar_of(*elem)));
+                if matches!(scalar_of(*elem), IrScalar::I32) {
+                    builder.access.bind_int(&param.name);
+                }
             }
             Type::Partition { .. } | Type::Shape(_) => {}
         }
@@ -1636,9 +962,8 @@ fn declare_params(builder: &mut Builder, kernel: &Kernel) {
     // Every const generic prints, in declaration order, whether or not the body
     // reads it: cutile emits one `constant` per generic. A flag generic is one
     // the body compares against a literal, and cutile prints `1` for it.
-    let flags = flag_generics(kernel);
     for (name, value) in &kernel.const_params {
-        let id = if flags.iter().any(|flag| flag == name) {
+        let id = if builder.access.flags().iter().any(|flag| flag == name) {
             builder.i32_const(1)
         } else {
             builder.i32_const(*value)
@@ -1663,12 +988,24 @@ fn declare_params(builder: &mut Builder, kernel: &Kernel) {
         let token = builder.make_token();
         let view = builder.make_tensor_view(
             tensor.view,
-            super::TensorView {
-                element: tensor.element,
-                shape: shape.clone(),
-                strides: tensor.strides.clone(),
-            },
+            tensor.element,
+            &shape,
+            &tensor.strides,
         );
+        // The checks read the tensor by name: which parameter it came from,
+        // its tile, and what each view axis is.
+        builder.access.register_tensor(sile_hir::passes::access::TensorFacts {
+            param: sile_hir::passes::access::buffer_param_position(kernel, &name),
+            tile: tensor.tile.clone(),
+            view_axes: view_extents
+                .iter()
+                .map(|extent| match extent {
+                    Some(v) => sile_hir::passes::access::AxisExtent::Static(*v),
+                    None => sile_hir::passes::access::AxisExtent::Dynamic,
+                })
+                .collect(),
+            name: name.clone(),
+        });
         builder.tensors.push((
             name.clone(),
             Tensor {
@@ -1695,12 +1032,24 @@ fn emit_stmt(builder: &mut Builder, stmt: &sile_hir::Stmt, kernel: &Kernel) {
                 return;
             }
             let (value, ty) = emit_expr(builder, expr, kernel);
+            let is_int = matches!(tile_scalar(&ty), Some(IrScalar::I32));
             builder.values.push((name.clone(), value, Some(ty)));
-            if let Some(bound) = bounds_of(builder, kernel, expr) {
-                builder.bounds.push((name.clone(), bound));
+            // What the binding proves — an interval, a term — is the checks'
+            // business, and so is whether the value is an integer, and whether
+            // it is a component of the block id.
+            builder.access.record_binding(kernel, name, expr);
+            if is_int {
+                builder.access.bind_int(name);
             }
-            if let Some(term) = term_of(builder, kernel, expr) {
-                builder.terms.push((name.clone(), term));
+            if matches!(
+                expr,
+                sile_hir::Expr::Builtin {
+                    op: sile_hir::BuiltinOp::ProgramId
+                        | sile_hir::BuiltinOp::ProgramIdAxis,
+                    ..
+                }
+            ) {
+                builder.access.mark_block_id(name);
             }
             // A partition binds a view of an existing tensor: record it as a
             // tensor of its own so a later `load` can read through it.
@@ -1721,6 +1070,24 @@ fn emit_stmt(builder: &mut Builder, stmt: &sile_hir::Stmt, kernel: &Kernel) {
                         // A partitioned read is padded like the buffer it came
                         // from: only a whole mutable buffer is unpadded.
                         derived.whole_buffer = false;
+                        let param =
+                            sile_hir::passes::access::buffer_param_position(kernel, &derived.name);
+                        let view_axes = derived
+                            .view_shape
+                            .iter()
+                            .map(|extent| match extent {
+                                Extent::Literal(v) => {
+                                    sile_hir::passes::access::AxisExtent::Static(*v)
+                                }
+                                Extent::Value(_) => sile_hir::passes::access::AxisExtent::Dynamic,
+                            })
+                            .collect();
+                        builder.access.register_tensor(sile_hir::passes::access::TensorFacts {
+                            name: name.clone(),
+                            param,
+                            tile: derived.tile.clone(),
+                            view_axes,
+                        });
                         builder.tensors.push((name.clone(), derived));
                     }
                 }
@@ -1728,6 +1095,7 @@ fn emit_stmt(builder: &mut Builder, stmt: &sile_hir::Stmt, kernel: &Kernel) {
         }
         Stmt::Assign { name, expr } => {
             let (value, ty) = emit_expr(builder, expr, kernel);
+            let is_int = matches!(tile_scalar(&ty), Some(IrScalar::I32));
             // The innermost binding of the name is the one being assigned.
             match builder.values.iter_mut().rev().find(|(bound, _, _)| bound == name) {
                 Some(entry) => {
@@ -1735,6 +1103,9 @@ fn emit_stmt(builder: &mut Builder, stmt: &sile_hir::Stmt, kernel: &Kernel) {
                     entry.2 = Some(ty);
                 }
                 None => builder.values.push((name.clone(), value, Some(ty))),
+            }
+            if is_int {
+                builder.access.bind_int(name);
             }
         }
         Stmt::Store { target, value, index } => {
@@ -1758,7 +1129,7 @@ fn emit_stmt(builder: &mut Builder, stmt: &sile_hir::Stmt, kernel: &Kernel) {
             };
             store_tile(builder, target, stored, stored_ty, store_index, kernel);
         }
-                // `for j in 0..n`: start and step are constants, the bound is a value.
+        // `for j in 0..n`: start and step are constants, the bound is a value.
         // The loop variable and its accumulator are region parameters.
         sile_hir::Stmt::ForLoop { var, start, end, step, body } => {
             // cutile evaluates the bound first, then the step: the folded
@@ -1767,7 +1138,7 @@ fn emit_stmt(builder: &mut Builder, stmt: &sile_hir::Stmt, kernel: &Kernel) {
             let (end_value, _) = emit_expr(builder, end, kernel);
             // A loop over `num_tiles` walks exactly that axis's tiles, so what
             // it visits is inside the grid by construction.
-            assume_loop_over_tile_count(builder, kernel, var, end);
+            builder.access.assume_loop_over_tile_count(kernel, var, end);
             let step_value = match step {
                 Some(step) => emit_expr(builder, step, kernel).0,
                 None => builder.i32_const(1),
@@ -1807,102 +1178,38 @@ fn emit_stmt(builder: &mut Builder, stmt: &sile_hir::Stmt, kernel: &Kernel) {
             // loop carries; the loop's own result comes after both.
             // The loop variable, the accumulator, then the assumption on the
             // variable; the loop's own result comes after all three.
-            let var_id = builder.value();
-            let vars = carried
-                .iter()
-                .map(|_| builder.value())
+            let arg_types = std::iter::once(Builder::i32_tile())
+                .chain(inits.iter().map(|(_, ty)| ty.clone()))
                 .collect::<Vec<_>>();
+            let (region_id, body_block, block_args) =
+                build_single_block_region(&mut builder.module, &arg_types);
+            let var_id = block_args[0];
+            let vars = &block_args[1..];
             // The bound is the number of iterations, which is the loop's own
             // end value less its start.
-            let bound = match (bounds_of(builder, kernel, start), bounds_of(builder, kernel, end)) {
+            let bound = match (
+                builder.access.bounds_of(kernel, start),
+                builder.access.bounds_of(kernel, end),
+            ) {
                 // The variable runs from zero to the last iteration, which is
                 // one less than the trip count.
-                (Some(start), Some(end)) => (end.end - start.start - 1).to_string(),
+                (Some(start), Some(end)) => Some(end.end - start.start - 1),
                 // A trip count the compiler cannot know prints `?`.
-                _ => "?".to_string(),
+                _ => None,
             };
-            let assumed_id = builder.value();
-            let header_placeholder = format!(
-                "    {}for {} in ({} to {}, step {}) : tile<i32>{}{} {{",
-                if carried.is_empty() {
-                    String::new()
-                } else {
-                    "@RESULT@ = ".to_string()
-                },
-                var_id,
-                start_value,
-                end_value,
-                step_value,
-                if inits.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        " iter_values({})",
-                        vars.iter()
-                            .zip(inits.iter())
-                            .map(|(v, (init, _))| format!("{v} = {init}"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                },
-                if inits.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        " -> ({})",
-                        inits
-                            .iter()
-                            .map(|(_, ty)| ty.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                },
-            );
-            builder.push_stmt(super::Stmt::Raw(header_placeholder));
-            let before = builder.body.len();
-            // The loop variable is assumed bounded as soon as the body opens.
+            builder.blocks.push(body_block);
             // The loop variable is assumed bounded as soon as the body opens;
             // the assumption does not spend an id of its own here.
-            builder.push_op(Op {
-                results: vec![assumed_id],
-                format: Format::Assume,
-                opcode: "assume",
-                operands: vec![var_id],
-                result_types: vec![Builder::i32_tile()],
-                attrs: Vec::new(),
-                text: format!("bounded<0, {bound}>, {var_id}"),
-                operand_types: None,
-                indent: 0,
-            });
-            let _ = assumed_id;
+            let assumed_id = builder.assume_bounded(var_id, bound);
             builder
                 .values
                 .push((var.clone(), assumed_id, Some(Builder::i32_tile())));
-            builder.loop_vars.push(var.clone());
+            // What the loop proves about its variable — the belief that it
+            // walks one axis's tiles, the interval, the term — is the checks'
+            // to keep.
+            builder.access.assume_loop_over_tile_count(kernel, var, end);
+            builder.access.enter_loop(kernel, var, bound);
             builder.loop_carried.push(carried.clone());
-            if bound != "?" {
-                builder.bounded_loop_vars.push(var.clone());
-                // The assumption states the interval, so record it: an access
-                // indexed by this variable can be decided without emitting a
-                // check.
-                if let Ok(end) = bound.parse::<i64>() {
-                    builder.bounds.push((
-                        var.clone(),
-                        super::bounds::Bounds {
-                            start: 0,
-                            end,
-                        },
-                    ));
-                }
-                // The variable's own value is an atom; its interval is the
-                // separate fact `bounds` holds.
-                if let Some(id) = builder.value_ids.id(&var) {
-                    builder.terms.push((
-                        var.clone(),
-                        super::predicate::Term::atom(super::predicate::Atom::Iv(id)),
-                    ));
-                }
-            }
             for (name, (_, ty)) in carried.iter().zip(inits.iter()) {
                 builder
                     .values
@@ -1912,62 +1219,36 @@ fn emit_stmt(builder: &mut Builder, stmt: &sile_hir::Stmt, kernel: &Kernel) {
             for stmt in body {
                 emit_stmt(builder, stmt, kernel);
             }
-            builder.loop_vars.retain(|name| name != var);
+            builder.access.exit_loop(var);
             builder.loop_carried.pop();
-            builder.bounded_loop_vars.retain(|name| name != var);
-            indent_from(builder, before);
             let final_values = carried
                 .iter()
                 .map(|name| value_of(builder, name))
                 .collect::<Vec<_>>();
-            let _ = &final_values;
-            // A loop with nothing to carry prints no result and spares the id.
+            // The region's `continue` terminator carries the final values.
+            let (cont, _) = OpBuilder::new(Opcode::Continue, Location::Unknown)
+                .operands(final_values.iter().copied())
+                .build(&mut builder.module);
+            append_op(&mut builder.module, body_block, cont);
+            builder.blocks.pop();
             // One result per carried value, allocated after the body: a
-            // region's results follow every op they dominate.
-            let result_ids = if carried.is_empty() {
-                Vec::new()
-            } else {
-                carried.iter().map(|_| builder.value()).collect::<Vec<_>>()
-            };
-            let trailer = if final_values.is_empty() {
-                "      continue\n    }".to_string()
-            } else {
-                format!(
-                    "      continue {} : {}\n    }}",
-                    final_values
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    inits
-                        .iter()
-                        .map(|(_, ty)| ty.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                )
-            };
-            builder.push_stmt(super::Stmt::Raw(trailer));
+            // region's results follow every op they dominate. A loop with
+            // nothing to carry prints no results — but the loop itself always
+            // prints.
+            let outer_block = builder.block();
+            let (loop_op, result_values) = OpBuilder::new(Opcode::For, Location::Unknown)
+                .operand(start_value)
+                .operand(end_value)
+                .operand(step_value)
+                .operands(inits.iter().map(|(value, _)| *value))
+                .results(inits.iter().map(|(_, ty)| ty.clone()))
+                .region(region_id)
+                .build(&mut builder.module);
+            append_op(&mut builder.module, outer_block, loop_op);
             // After the loop, the carried name denotes the loop's result.
-            for (name, result_id) in carried.iter().zip(result_ids.iter()) {
+            for (name, result_id) in carried.iter().zip(result_values.iter()) {
                 if let Some(entry) = builder.values.iter_mut().rev().find(|(b, _, _)| b == name) {
                     entry.1 = *result_id;
-                }
-            }
-            for stmt in builder.body.iter_mut().rev() {
-                if let super::Stmt::Raw(text) = stmt {
-                    if text.contains("@RESULT@") {
-                        if !result_ids.is_empty() {
-                            *text = text.replace(
-                                "@RESULT@",
-                                &result_ids
-                                    .iter()
-                                    .map(ToString::to_string)
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
-                            );
-                        }
-                        break;
-                    }
                 }
             }
         }
@@ -2016,22 +1297,16 @@ fn emit_stmt(builder: &mut Builder, stmt: &sile_hir::Stmt, kernel: &Kernel) {
                 .iter()
                 .filter_map(|name| emitted_type_of(builder, name))
                 .collect::<Vec<_>>();
-            let types_text = types
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            // The header names results the body has not printed yet, so it is
-            // written last: the region's ids follow every op it dominates.
-            let header_index = builder.body.len();
-            builder.push_stmt(super::Stmt::Raw(String::new()));
-            let before = builder.body.len();
             // The values the names held before the branch ran: that is what an
             // `if` without an `else` yields on the untaken side.
             let pre_values = carried
                 .iter()
                 .map(|name| value_of(builder, name))
                 .collect::<Vec<_>>();
+            // The then region: its body, then the yield that hands the values on.
+            let (then_region, then_block, _) =
+                build_single_block_region(&mut builder.module, &[]);
+            builder.blocks.push(then_block);
             for stmt in then_body {
                 emit_stmt(builder, stmt, kernel);
             }
@@ -2039,57 +1314,50 @@ fn emit_stmt(builder: &mut Builder, stmt: &sile_hir::Stmt, kernel: &Kernel) {
                 .iter()
                 .map(|name| value_of(builder, name))
                 .collect::<Vec<_>>();
+            let (then_yield, _) = OpBuilder::new(Opcode::Yield, Location::Unknown)
+                .operands(then_values.iter().copied())
+                .build(&mut builder.module);
+            append_op(&mut builder.module, then_block, then_yield);
+            builder.blocks.pop();
             // A branch that changes a value carries the old one on the other
             // side, so cutile prints an `else` even when the kernel has none.
             let changes = !assigned.iter().all(|name| !carried.contains(name));
             let has_else = !else_body.is_empty() || changes;
-            let yield_index = builder.body.len();
-            builder.push_stmt(super::Stmt::Raw(String::new()));
-            for stmt in else_body {
-                emit_stmt(builder, stmt, kernel);
-            }
-            let else_values = if else_body.is_empty() {
-                pre_values
-            } else {
-                carried
-                    .iter()
-                    .map(|name| value_of(builder, name))
-                    .collect::<Vec<_>>()
-            };
-            let result_ids = carried
-                .iter()
-                .map(|_| builder.value())
-                .collect::<Vec<_>>();
-            let ids_text = result_ids
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            let join = |values: &[ValueId]| {
-                values
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            if let super::Stmt::Raw(text) = &mut builder.body[header_index] {
-                *text = format!("    {ids_text} = if {cond_value} -> ({types_text}) {{");
-            }
-            if let super::Stmt::Raw(text) = &mut builder.body[yield_index] {
-                // `indent_from` adds the region's own indentation to every
-                // line below the header, so these start at column zero.
-                *text = if !has_else {
-                    format!("    yield {} : {types_text}\n  }}", join(&then_values))
+            let else_region = if has_else {
+                let (else_region, else_block, _) =
+                    build_single_block_region(&mut builder.module, &[]);
+                builder.blocks.push(else_block);
+                for stmt in else_body {
+                    emit_stmt(builder, stmt, kernel);
+                }
+                let else_values = if else_body.is_empty() {
+                    pre_values
                 } else {
-                    format!(
-                        "    yield {} : {types_text}\n  }} else {{\n    yield {} : {types_text}\n  }}",
-                        join(&then_values),
-                        join(&else_values)
-                    )
+                    carried
+                        .iter()
+                        .map(|name| value_of(builder, name))
+                        .collect::<Vec<_>>()
                 };
+                let (else_yield, _) = OpBuilder::new(Opcode::Yield, Location::Unknown)
+                    .operands(else_values.iter().copied())
+                    .build(&mut builder.module);
+                append_op(&mut builder.module, else_block, else_yield);
+                builder.blocks.pop();
+                Some(else_region)
+            } else {
+                None
+            };
+            // The region's results follow every op both branches print.
+            let mut op = OpBuilder::new(Opcode::If, Location::Unknown)
+                .operand(cond_value)
+                .results(types.iter().cloned())
+                .region(then_region);
+            if let Some(else_region) = else_region {
+                op = op.region(else_region);
             }
-            // The region's body prints two spaces deeper than the `if`.
-            indent_from(builder, before);
+            let (if_op, result_ids) = op.build(&mut builder.module);
+            let block = builder.block();
+            append_op(&mut builder.module, block, if_op);
             // After the region the carried names denote its results.
             for (name, result_id) in carried.iter().zip(result_ids.iter()) {
                 if let Some(entry) = builder.values.iter_mut().rev().find(|(b, _, _)| b == name) {
@@ -2102,18 +1370,12 @@ fn emit_stmt(builder: &mut Builder, stmt: &sile_hir::Stmt, kernel: &Kernel) {
         sile_hir::Stmt::Print { format, args } => {
             let mut text = String::new();
             let mut operands = Vec::new();
-            let mut types = Vec::new();
             let mut rest = format.as_str();
             for arg in args {
                 let (value, ty) = emit_expr(builder, arg, kernel);
                 operands.push(value);
-                types.push(ty.clone());
-                let letter = match &ty {
-                    super::Type::Tile { element: TileElement::Scalar(scalar), .. } => match scalar {
-                        ScalarType::F32 | ScalarType::F16 => "f",
-                        ScalarType::I1 => "i",
-                        _ => "i",
-                    },
+                let letter = match tile_scalar(&ty) {
+                    Some(IrScalar::F32) | Some(IrScalar::F16) => "f",
                     _ => "i",
                 };
                 // The placeholder becomes `%` and the letter; everything before
@@ -2129,34 +1391,14 @@ fn emit_stmt(builder: &mut Builder, stmt: &sile_hir::Stmt, kernel: &Kernel) {
                 }
             }
             text.push_str(rest);
-            let types_text = types
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            let operands_text = operands
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
             // A print yields a token. The id is real even though nothing reads
             // it, so it takes one like any other op.
-            let result = builder.value();
-            builder.push_op(Op {
-                results: vec![result],
-                format: Format::Plain,
-                opcode: "print_tko",
-                operands: operands.clone(),
-                result_types: vec![super::Type::Token],
-                attrs: Vec::new(),
-                text: if operands.is_empty() {
-                    format!("{text:?}")
-                } else {
-                    format!("{text:?}, {operands_text} : {types_text}")
-                },
-                operand_types: None,
-                indent: 0,
-            });
+            builder.append1(
+                OpBuilder::new(Opcode::Print, Location::Unknown)
+                    .attr("str", Attribute::String(text))
+                    .operands(operands)
+                    .result(IrType::Token),
+            );
         }
         // A loop's `continue` is the trailer the loop already printed.
         sile_hir::Stmt::Continue | sile_hir::Stmt::Break => {}
@@ -2193,7 +1435,7 @@ fn shape_of_expr(builder: &Builder, expr: &sile_hir::Expr) -> Option<ShapeExpr> 
     }
 }
 
-fn emitted_type_of(builder: &Builder, name: &str) -> Option<super::Type> {
+fn emitted_type_of(builder: &Builder, name: &str) -> Option<IrType> {
     builder
         .values
         .iter()
@@ -2202,7 +1444,7 @@ fn emitted_type_of(builder: &Builder, name: &str) -> Option<super::Type> {
         .and_then(|(_, _, ty)| ty.clone())
 }
 
-fn value_of(builder: &Builder, name: &str) -> ValueId {
+fn value_of(builder: &Builder, name: &str) -> IrValue {
     builder
         .values
         .iter()
@@ -2223,7 +1465,7 @@ fn emit_expr(
     builder: &mut Builder,
     expr: &sile_hir::Expr,
     kernel: &Kernel,
-) -> (ValueId, super::Type) {
+) -> (IrValue, IrType) {
     use sile_hir::Expr;
     match expr {
         Expr::Var(name) => {
@@ -2238,7 +1480,7 @@ fn emit_expr(
             {
                 // A flag generic prints `1`: cutile compares it against a
                 // literal, and the comparison reads the flag, not its value.
-                let printed = if flag_generics(kernel).iter().any(|flag| flag == name) {
+                let printed = if builder.access.flags().iter().any(|flag| flag == name) {
                     1
                 } else {
                     *generic
@@ -2268,13 +1510,7 @@ fn emit_expr(
                     if let Some((_, _, scalar)) =
                         builder.scalars.iter().find(|(_, id, _)| *id == value)
                     {
-                        return (
-                            value,
-                            super::Type::Tile {
-                                shape: Vec::new(),
-                                element: TileElement::Scalar(*scalar),
-                            },
-                        );
+                        return (value, tile_type(*scalar, &[]));
                     }
                     (value, result_type_of(builder, expr, kernel))
                 }
@@ -2282,31 +1518,24 @@ fn emit_expr(
         }
         Expr::Builtin { op, args } => emit_builtin(builder, *op, args, kernel),
         // A float literal in value position is a rank-0 `constant`.
-        Expr::ScalarF32(value) => (
-            builder.f32_const(*value, &[]),
-            super::Type::Tile {
-                shape: Vec::new(),
-                element: TileElement::Scalar(ScalarType::F32),
-            },
-        ),
+        Expr::ScalarF32(value) => (builder.f32_const(*value, &[]), tile_type(IrScalar::F32, &[])),
         // An integer literal in value position is a `constant`.
         Expr::ScalarI64(value) => (builder.i32_const(*value), Builder::i32_tile()),
         // A shape is metadata: binding one costs nothing and emits nothing.
         Expr::Shape(shape) => {
             builder.shapes.push((String::new(), shape.clone()));
-            (ValueId(0), super::Type::Token)
+            (IrValue(u32::MAX), IrType::Token)
         }
         other => panic!("the cutile emitter has no arm for {other:?}"),
     }
 }
-
 
 fn emit_builtin(
     builder: &mut Builder,
     op: sile_hir::BuiltinOp,
     args: &[sile_hir::Expr],
     kernel: &Kernel,
-) -> (ValueId, super::Type) {
+) -> (IrValue, IrType) {
     use sile_hir::{BuiltinOp, Expr};
     match op {
         // `a.broadcast(y.shape())` over a scalar: the target shape is asked for
@@ -2363,16 +1592,9 @@ fn emit_builtin(
             // then the target's again. A scalar needs a reshape first, below.
             // A rank-0 source is a scalar and needs the reshape; anything of
             // rank one or more broadcasts in place.
-            let source_is_tile = match &source_ty {
-                super::Type::Tile { shape, .. } => !shape.is_empty(),
-                _ => false,
-            };
+            let source_is_tile = !tile_shape(&source_ty).is_empty();
             if source_is_tile {
-                let (source_value, source_ty) = (scalar, source_ty);
-                let source_extents = match &source_ty {
-                    super::Type::Tile { shape, .. } => shape.clone(),
-                    _ => Vec::new(),
-                };
+                let source_extents = tile_shape(&source_ty);
                 // A `y.shape()` target is asked for twice with the source's
                 // extents between the two asks; a `shape![...]` literal is
                 // named once, after the source.
@@ -2387,26 +1609,19 @@ fn emit_builtin(
                 for value in &extents {
                     builder.i32_const(*value);
                 }
-                let result = builder.value();
-                let element = match &source_ty {
-                    super::Type::Tile { element, .. } => *element,
-                    _ => TileElement::Scalar(ScalarType::F32),
+                let element = match tile_scalar(&source_ty) {
+                    Some(s) => s,
+                    None => IrScalar::F32,
                 };
-                let result_ty = super::Type::Tile {
-                    shape: shape_extents(&target, &kernel.const_params),
+                let result_ty = tile_type(
                     element,
-                };
-                builder.push_op(Op {
-                    results: vec![result],
-                    format: Format::Plain,
-                    opcode: "broadcast",
-                    operands: vec![source_value],
-                    result_types: vec![result_ty.clone()],
-                    attrs: Vec::new(),
-                    text: format!("{source_value}"),
-                    operand_types: Some(vec![source_ty]),
-                    indent: 0,
-                });
+                    &shape_extents(&target, &kernel.const_params),
+                );
+                let result = builder.append1(
+                    OpBuilder::new(Opcode::Broadcast, Location::Unknown)
+                        .operand(scalar)
+                        .result(result_ty.clone()),
+                );
                 return (result, result_ty);
             }
             // A tile source under `y.shape()`: the target extents print first,
@@ -2442,14 +1657,11 @@ fn emit_builtin(
             for _ in 0..ones.len() + 1 {
                 builder.i32_const(1);
             }
-            let element = match &source_ty {
-                super::Type::Tile { element, .. } => *element,
-                _ => TileElement::Scalar(ScalarType::F32),
+            let element = match tile_scalar(&source_ty) {
+                Some(s) => s,
+                None => IrScalar::F32,
             };
-            let scalar_ty = super::Type::Tile {
-                shape: Vec::new(),
-                element,
-            };
+            let scalar_ty = tile_type(element, &[]);
             let (reshaped, _) = builder.reshape_typed(scalar, &scalar_ty, &ones);
             // Then the shape the broadcast names: `r` ones and `r` extents.
             for _ in 0..rank {
@@ -2468,22 +1680,11 @@ fn emit_builtin(
         // the result tile. A shape already asked for is not asked again.
         BuiltinOp::Constant => {
             // The value decides the element type: `true` gives an `i1` tile,
-            // `1.5` an `f32` one, `1` an `i32` one.
-            let (text, element) = match &args[0] {
-                // A whole float prints with its point: `2.0`, not `2`.
-                Expr::ScalarF32(value) => (
-                    if value.fract() == 0.0 {
-                        format!("{value:.1}")
-                    } else {
-                        value.to_string()
-                    },
-                    ScalarType::F32,
-                ),
-                Expr::ScalarBool(value) => (
-                    format!("{}", if *value { 1 } else { 0 }),
-                    ScalarType::I1,
-                ),
-                Expr::ScalarI64(value) => (format!("{value}"), ScalarType::I32),
+            // `1.5` an `f32` one, `1` an `i32` one. The literal is matched
+            // directly — routing a float through an integer round trip would
+            // drop its bit pattern.
+            let literal = match &args[0] {
+                Expr::ScalarF32(_) | Expr::ScalarBool(_) | Expr::ScalarI64(_) => &args[0],
                 other => panic!("`constant` of a non-literal: {other:?}"),
             };
             let (shape, buffer) = match args.last() {
@@ -2514,101 +1715,88 @@ fn emit_builtin(
                 }
                 _ => panic!("a constant with no shape"),
             };
-            let result = builder.value();
-            let ty = super::Type::Tile {
-                shape: extents.clone(),
-                element: TileElement::Scalar(element),
+            let count = extents.iter().product::<i64>().max(1) as usize;
+            let (result, element) = match literal {
+                Expr::ScalarF32(v) => (builder.f32_const(*v, &extents), IrScalar::F32),
+                Expr::ScalarBool(v) => (
+                    builder.const_splat(IrScalar::I1, &extents, vec![*v as u8; count]),
+                    IrScalar::I1,
+                ),
+                Expr::ScalarI64(v) => (
+                    builder.const_splat(
+                        IrScalar::I32,
+                        &extents,
+                        (*v as i32).to_le_bytes().repeat(count),
+                    ),
+                    IrScalar::I32,
+                ),
+                _ => unreachable!(),
             };
-            builder.push_op(Op {
-                results: vec![result],
-                format: Format::Constant,
-                opcode: "constant",
-                operands: Vec::new(),
-                result_types: vec![super::Type::Tile {
-                    shape: extents.clone(),
-                    element: TileElement::Scalar(element),
-                }],
-                attrs: Vec::new(),
-                text: format!("<{element}: {text}>"),
-                operand_types: None,
-                indent: 0,
-            });
-            (result, ty)
+            (result, tile_type(element, &extents))
         }
-        BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Mul if is_integer_expr(builder, kernel, args) => {
+        BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Mul
+            if builder.access.is_integer_expr(kernel, args) =>
+        {
             match fold_integer(builder, op, args, kernel) {
                 Some(folded) => folded,
                 None => binary(builder, args, integer_opcode(op), kernel),
             }
         }
-        BuiltinOp::Add => binary(builder, args, "addf", kernel),
+        BuiltinOp::Add => binary(builder, args, Opcode::AddF, kernel),
         // `a & b` over masks: one op, and the printer states only the result
         // type, never the operand types.
         BuiltinOp::And | BuiltinOp::Or | BuiltinOp::Xor => {
             let opcode = match op {
-                BuiltinOp::And => "andi",
-                BuiltinOp::Or => "ori",
-                _ => "xori",
+                BuiltinOp::And => Opcode::AndI,
+                BuiltinOp::Or => Opcode::OrI,
+                _ => Opcode::XOrI,
             };
             let (lhs, lhs_ty) = emit_expr(builder, &args[0], kernel);
             let (rhs, _) = emit_expr(builder, &args[1], kernel);
-            let result = builder.value();
-            builder.push_op(Op {
-                results: vec![result],
-                format: Format::Plain,
-                opcode,
-                operands: vec![lhs, rhs],
-                result_types: vec![lhs_ty.clone()],
-                attrs: Vec::new(),
-                text: format!("{lhs}, {rhs}"),
-                operand_types: None,
-                indent: 0,
-            });
+            let result = builder.same_binary(opcode, lhs, rhs, lhs_ty.clone());
             (result, lhs_ty)
         }
         // `max_tile(a, b)` / `min_tile(a, b)`: `maxf` states its rounding mode
         // and prints no operand types; `minf` is not used by these kernels.
         BuiltinOp::Max | BuiltinOp::Min => {
-            let integer = is_integer_expr(builder, kernel, args);
+            let integer = builder.access.is_integer_expr(kernel, args);
             let opcode = match (matches!(op, BuiltinOp::Max), integer) {
-                (true, false) => "maxf",
-                (true, true) => "maxi",
-                (false, false) => "minf",
-                (false, true) => "mini",
+                (true, false) => Opcode::MaxF,
+                (true, true) => Opcode::MaxI,
+                (false, false) => Opcode::MinF,
+                (false, true) => Opcode::MinI,
             };
             let (lhs, lhs_ty) = emit_expr(builder, &args[0], kernel);
             let (rhs, _) = emit_expr(builder, &args[1], kernel);
-            let result = builder.value();
-            builder.push_op(Op {
-                results: vec![result],
-                format: Format::Plain,
-                opcode,
-                operands: vec![lhs, rhs],
-                result_types: vec![lhs_ty.clone()],
-                attrs: Vec::new(),
-                // An integer minimum states its signedness; the float ones state
-                // a rounding mode.
-                text: if integer {
-                    format!("{lhs}, {rhs} signed")
-                } else {
-                    format!("{lhs}, {rhs} {{rounding_mode = 0}}")
-                },
-                operand_types: None,
-                indent: 0,
-            });
+            // An integer minimum states its signedness; the float ones state
+            // a rounding mode.
+            let result = if integer {
+                builder.append1(
+                    OpBuilder::new(opcode, Location::Unknown)
+                        .operand(lhs)
+                        .operand(rhs)
+                        .attr("signedness", Attribute::i32(1))
+                        .result(lhs_ty.clone()),
+                )
+            } else {
+                builder.append1(
+                    OpBuilder::new(opcode, Location::Unknown)
+                        .operand(lhs)
+                        .operand(rhs)
+                        .attr("rounding_mode", Attribute::i32(0))
+                        .result(lhs_ty.clone()),
+                )
+            };
             (result, lhs_ty)
         }
-        BuiltinOp::Mul => binary(builder, args, "mulf", kernel),
-        BuiltinOp::Sub => binary(builder, args, "subf", kernel),
-        // An integer operation whose interval is a single value never prints:
-        // cutile allocates the id, proves the interval exact, drops the
-        // operation and emits a `constant` instead. The dropped id stays a hole.
+        BuiltinOp::Mul => binary(builder, args, Opcode::MulF, kernel),
+        BuiltinOp::Sub => binary(builder, args, Opcode::SubF, kernel),
         // An integer operation whose interval is a single value never prints:
         // cutile allocates the id, proves the interval exact, drops the
         // operation and emits a `constant` instead. The dropped id stays a hole.
         // Floating point never folds, so only an integer expression qualifies.
         BuiltinOp::Div | BuiltinOp::Rem | BuiltinOp::CeilDiv
-            if is_integer_expr(builder, kernel, args) =>
+            if builder.access.is_integer_expr(kernel, args) =>
         {
             match fold_integer(builder, op, args, kernel) {
                 Some(folded) => folded,
@@ -2624,30 +1812,26 @@ fn emit_builtin(
         // A float division prints as `divf`; only the integer path above ever
         // reaches an integer opcode. `true_div` states the two attributes that
         // make it approximate.
-        BuiltinOp::Div => binary(builder, args, "divf", kernel),
+        BuiltinOp::Div => binary(builder, args, Opcode::DivF, kernel),
         BuiltinOp::TrueDiv => {
             let (lhs, ty) = emit_expr(builder, &args[0], kernel);
             let (rhs, _) = emit_expr(builder, &args[1], kernel);
-            let result = builder.value();
-            builder.push_op(Op {
-                results: vec![result],
-                format: Format::Plain,
-                opcode: "divf",
-                operands: vec![lhs, rhs],
-                result_types: vec![ty.clone()],
-                attrs: Vec::new(),
-                text: format!("{lhs}, {rhs} rounding<approx> flush_to_zero"),
-                operand_types: None,
-                indent: 0,
-            });
+            let result = builder.append1(
+                OpBuilder::new(Opcode::DivF, Location::Unknown)
+                    .operand(lhs)
+                    .operand(rhs)
+                    .attr("rounding_mode", Attribute::i32(4))
+                    .attr("flush_to_zero", Attribute::Bool(true))
+                    .result(ty.clone()),
+            );
             (result, ty)
         }
-        BuiltinOp::Rem => binary(builder, args, "remf", kernel),
+        BuiltinOp::Rem => binary(builder, args, Opcode::RemF, kernel),
         // `ceil_div(a, b)` prints as `divi ... rounding positive_inf`. A const
         // generic operand reads the value the prologue named, not a fresh
         // `constant`.
         BuiltinOp::CeilDiv => {
-            let operand = |builder: &mut Builder, expr: &sile_hir::Expr| -> ValueId {
+            let operand = |builder: &mut Builder, expr: &sile_hir::Expr| -> IrValue {
                 if let sile_hir::Expr::Var(name) = expr {
                     if kernel.const_params.iter().any(|(generic, _)| generic == name) {
                         if let Some((_, id)) =
@@ -2661,48 +1845,28 @@ fn emit_builtin(
             };
             let lhs = operand(builder, &args[0]);
             let rhs = operand(builder, &args[1]);
-            let result = builder.value();
-            builder.push_op(Op {
-                results: vec![result],
-                format: Format::Plain,
-                opcode: "divi",
-                operands: vec![lhs, rhs],
-                result_types: vec![Builder::i32_tile()],
-                attrs: Vec::new(),
-                text: format!("{lhs}, {rhs} signed rounding positive_inf"),
-                operand_types: None,
-                indent: 0,
-            });
+            let result = builder.int_binary(Opcode::DivI, lhs, rhs, true, Some(3));
             (result, Builder::i32_tile())
         }
         // `gt_tile(a, b)`: one predicate, ordered, with its comparison spelled.
         BuiltinOp::Gt => compare(builder, args, "greater_than", kernel),
         BuiltinOp::Lt => compare(builder, args, "less_than", kernel),
-        BuiltinOp::Ge => compare(builder, args, "greater_equal", kernel),
-        BuiltinOp::Le => compare(builder, args, "less_equal", kernel),
+        BuiltinOp::Ge => compare(builder, args, "greater_than_or_equal", kernel),
+        BuiltinOp::Le => compare(builder, args, "less_than_or_equal", kernel),
         BuiltinOp::Eq => compare(builder, args, "equal", kernel),
         BuiltinOp::Ne => compare(builder, args, "not_equal", kernel),
         // `select(cond, a, b)`: the condition first, then the two candidates.
         BuiltinOp::Select => {
-            let (cond, cond_ty) = emit_expr(builder, &args[0], kernel);
+            let (cond, _cond_ty) = emit_expr(builder, &args[0], kernel);
             let (then, ty) = emit_expr(builder, &args[1], kernel);
             let (other, _) = emit_expr(builder, &args[2], kernel);
-            let result = builder.value();
-            builder.push_op(Op {
-                results: vec![result],
-                format: Format::Plain,
-                opcode: "select",
-                operands: vec![cond, then, other],
-                result_types: Vec::new(),
-                attrs: Vec::new(),
-                text: format!(
-                    "{cond}, {then}, {other} : {}, {}",
-                    cond_ty,
-                    ty
-                ),
-                operand_types: None,
-                indent: 0,
-            });
+            let result = builder.append1(
+                OpBuilder::new(Opcode::Select, Location::Unknown)
+                    .operand(cond)
+                    .operand(then)
+                    .operand(other)
+                    .result(ty.clone()),
+            );
             (result, ty)
         }
         // `t.reshape(shape![...])`: cutile names the target's extents first,
@@ -2714,10 +1878,7 @@ fn emit_builtin(
                 None => panic!("no shape for a reshape: {:?}", args.get(1)),
             };
             // The reshape names the source tile's extents, then the target's.
-            let source_extents = match &source_ty {
-                super::Type::Tile { shape, .. } => shape.clone(),
-                _ => Vec::new(),
-            };
+            let source_extents = tile_shape(&source_ty);
             for extent in &source_extents {
                 builder.i32_const(*extent);
             }
@@ -2730,72 +1891,60 @@ fn emit_builtin(
         // constants come from the source tile's own shape.
         BuiltinOp::Transpose => {
             let (source, ty) = emit_expr(builder, &args[0], kernel);
-            let source_extents = match &ty {
-                super::Type::Tile { shape, element } => (shape.clone(), *element),
-                _ => (Vec::new(), TileElement::Scalar(ScalarType::F32)),
+            let (source_extents, element) = match &ty {
+                IrType::Tile(t) => (
+                    t.shape.clone(),
+                    match &t.element_type {
+                        TileElementType::Scalar(s) => *s,
+                        TileElementType::Pointer(_) => IrScalar::F32,
+                    },
+                ),
+                _ => (Vec::new(), IrScalar::F32),
             };
-            for extent in &source_extents.0 {
+            for extent in &source_extents {
                 builder.i32_const(*extent);
             }
-            let permutation: Vec<usize> = (0..source_extents.0.len()).rev().collect();
+            let permutation: Vec<usize> = (0..source_extents.len()).rev().collect();
             let permuted = permutation
                 .iter()
-                .map(|axis| source_extents.0[*axis])
+                .map(|axis| source_extents[*axis])
                 .collect::<Vec<_>>();
-            let result = builder.value();
-            let result_ty = super::Type::Tile {
-                shape: permuted,
-                element: source_extents.1,
-            };
-            builder.push_op(Op {
-                results: vec![result],
-                format: Format::Plain,
-                opcode: "permute",
-                operands: vec![source],
-                result_types: vec![result_ty.clone()],
-                attrs: Vec::new(),
-                text: format!(
-                    "{source} [{}]",
-                    permutation
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                operand_types: Some(vec![ty]),
-                indent: 0,
-            });
+            let result_ty = tile_type(element, &permuted);
+            let result = builder.append1(
+                OpBuilder::new(Opcode::Permute, Location::Unknown)
+                    .operand(source)
+                    .attr(
+                        "permutation",
+                        Attribute::Array(
+                            permutation
+                                .iter()
+                                .map(|axis| Attribute::i32(*axis as i64))
+                                .collect(),
+                        ),
+                    )
+                    .result(result_ty.clone()),
+            );
             (result, result_ty)
         }
         BuiltinOp::Unary(kind) => {
             let (source, ty) = emit_expr(builder, &args[0], kernel);
             let opcode = match kind {
-                sile_hir::UnaryOp::Exp => "exp",
-                sile_hir::UnaryOp::Exp2 => "exp2",
-                sile_hir::UnaryOp::Log => "log",
-                sile_hir::UnaryOp::Log2 => "log2",
-                sile_hir::UnaryOp::Sqrt => "sqrt",
-                sile_hir::UnaryOp::Rsqrt => "rsqrt",
-                sile_hir::UnaryOp::Abs => "absf",
-                sile_hir::UnaryOp::Neg => "negf",
+                sile_hir::UnaryOp::Exp => Opcode::Exp,
+                sile_hir::UnaryOp::Exp2 => Opcode::Exp2,
+                sile_hir::UnaryOp::Log => Opcode::Log,
+                sile_hir::UnaryOp::Log2 => Opcode::Log2,
+                sile_hir::UnaryOp::Sqrt => Opcode::Sqrt,
+                sile_hir::UnaryOp::Rsqrt => Opcode::Rsqrt,
+                sile_hir::UnaryOp::Abs => Opcode::AbsF,
+                sile_hir::UnaryOp::Neg => Opcode::NegF,
                 other => panic!("the cutile emitter has no arm for Unary({other:?})"),
             };
-            let result = builder.value();
-            builder.push_op(Op {
-                results: vec![result],
-                format: Format::Plain,
-                opcode,
-                operands: vec![source],
-                result_types: vec![ty.clone()],
-                attrs: Vec::new(),
-                // `sqrt` states its rounding mode; the others name themselves.
-                text: match kind {
-                    sile_hir::UnaryOp::Sqrt => format!("{source} rounding<negative_inf>"),
-                    _ => format!("{source}"),
-                },
-                operand_types: None,
-                indent: 0,
-            });
+            // `sqrt` states its rounding mode; the others name themselves.
+            let mut op = OpBuilder::new(opcode, Location::Unknown).operand(source);
+            if matches!(kind, sile_hir::UnaryOp::Sqrt) {
+                op = op.attr("rounding_mode", Attribute::i32(2));
+            }
+            let result = builder.append1(op.result(ty.clone()));
             (result, ty)
         }
         // `x.partition(shape)`: cutile compiles the shape argument (its
@@ -2859,29 +2008,27 @@ fn emit_builtin(
             }
             // A mutable source is written whole, so it is not padded.
             let padding_zero = !tensor.whole_buffer;
-            let mut view = tensor.clone();
-            view.tile = tile.iter().map(|e| Some(*e)).collect();
-            let id = builder.make_partition_view(&view, &tile, padding_zero);
+            let id = builder.make_partition_view(
+                tensor.view,
+                &tile,
+                tensor.element,
+                &tensor.view_shape,
+                &tensor.strides,
+                padding_zero,
+            );
             // A *mutable* partition offsets every access by the tile block it
             // was built in: cutile asks for the block id again and multiplies
             // the block's row by the tile's row extent.
             if matches!(op, BuiltinOp::PartitionMut) {
                 // The block id here is not assumed: cutile reads it straight
                 // into the offset arithmetic.
-                let base = builder.next_value;
-                builder.next_value += 3;
-                let ids = (0..3).map(|i| ValueId(base + i)).collect::<Vec<_>>();
-                builder.push_op(Op {
-                    results: ids.clone(),
-                    format: Format::GetTileBlockId,
-                    opcode: "get_tile_block_id",
-                    operands: Vec::new(),
-                    result_types: vec![Builder::i32_tile(); 3],
-                    attrs: Vec::new(),
-                    text: String::new(),
-                    operand_types: None,
-                    indent: 0,
-                });
+                let ids = builder.append(
+                    OpBuilder::new(Opcode::GetTileBlockId, Location::Unknown).results([
+                        Builder::i32_tile(),
+                        Builder::i32_tile(),
+                        Builder::i32_tile(),
+                    ]),
+                );
                 // The offset on each axis is the block id times the ratio of the
                 // buffer's extent to the tile's: cutile computes
                 // `ceil(outer / nested)` per axis and skips the multiply when
@@ -2900,19 +2047,12 @@ fn emit_builtin(
                         ids[axis]
                     } else {
                         let ratio_value = builder.i32_const(ratio);
-                        let product = builder.value();
-                        builder.push_op(Op {
-                            results: vec![product],
-                            format: Format::Plain,
-                            opcode: "muli",
-                            operands: vec![ids[axis], ratio_value],
-                            result_types: vec![Builder::i32_tile()],
-                            attrs: Vec::new(),
-                            text: format!("{}, {ratio_value}", ids[axis]),
-                            operand_types: None,
-                            indent: 0,
-                        });
-                        product
+                        builder.same_binary(
+                            Opcode::MulI,
+                            ids[axis],
+                            ratio_value,
+                            Builder::i32_tile(),
+                        )
                     };
                     last = Some(offset);
                 }
@@ -2920,15 +2060,13 @@ fn emit_builtin(
                 // The store's row index is this block id, not the prologue's.
                 builder.store_block = ids.first().copied();
             }
-            let ty = super::Type::PartitionView(super::PartitionView {
-                tile_shape: tile.clone(),
+            let ty = partition_view_type(
+                &tile,
+                tensor.element,
+                &tensor.view_shape,
+                &tensor.strides,
                 padding_zero,
-                tensor: super::TensorView {
-                    element: tensor.element,
-                    shape: view_extents(&tensor),
-                    strides: tensor.strides.clone(),
-                },
-            });
+            );
             (id, ty)
         }
         // Reading a one-element tile back as a scalar names the tile's rank as
@@ -2937,17 +2075,11 @@ fn emit_builtin(
         // prints nothing, but the value it yields is a rank-zero tile.
         BuiltinOp::TileToScalar => {
             let (value, ty) = emit_expr(builder, &args[0], kernel);
-            let element = match &ty {
-                super::Type::Tile { element, .. } => *element,
-                _ => TileElement::Scalar(ScalarType::F32),
+            let element = match tile_scalar(&ty) {
+                Some(s) => s,
+                None => IrScalar::F32,
             };
-            (
-                value,
-                super::Type::Tile {
-                    shape: Vec::new(),
-                    element,
-                },
-            )
+            (value, tile_type(element, &[]))
         }
         // A scalar tile is the same value to cutile: the conversion names
         // nothing, because the tile and the scalar print alike.
@@ -2969,50 +2101,33 @@ fn emit_builtin(
                                 .unwrap_or(&0),
                         );
                         builder.const_constants.push((name.clone(), id));
-        builder.prologue_generics.push((name.clone(), id));
+                        builder.prologue_generics.push((name.clone(), id));
                         id
                     }
                 },
                 other => emit_expr(builder, other, kernel).0,
             };
-            let result = builder.value();
-            let ty = super::Type::Tile {
-                shape: Vec::new(),
-                element: TileElement::Scalar(ScalarType::F32),
-            };
-            builder.push_op(Op {
-                results: vec![result],
-                format: Format::Plain,
-                opcode: "itof",
-                operands: vec![source],
-                result_types: vec![ty.clone()],
-                attrs: Vec::new(),
-                text: format!("{source} signed"),
-                operand_types: Some(vec![Builder::i32_tile()]),
-                indent: 0,
-            });
+            let ty = tile_type(IrScalar::F32, &[]);
+            let result = builder.append1(
+                OpBuilder::new(Opcode::IToF, Location::Unknown)
+                    .operand(source)
+                    .attr("signedness", Attribute::i32(1))
+                    .result(ty.clone()),
+            );
             (result, ty)
         }
         // `mma(a, b, acc)`: one op, three tile operands, in that order.
         BuiltinOp::Mma => {
-            let (lhs, lhs_ty) = emit_expr(builder, &args[0], kernel);
-            let (rhs, rhs_ty) = emit_expr(builder, &args[1], kernel);
+            let (lhs, _) = emit_expr(builder, &args[0], kernel);
+            let (rhs, _) = emit_expr(builder, &args[1], kernel);
             let (acc, acc_ty) = emit_expr(builder, &args[2], kernel);
-            let result = builder.value();
-            builder.push_op(Op {
-                results: vec![result],
-                format: Format::Plain,
-                opcode: "mmaf",
-                operands: vec![lhs, rhs, acc],
-                result_types: Vec::new(),
-                attrs: Vec::new(),
-                // `mmaf` states no result type after the arrow.
-                text: format!(
-                    "{lhs}, {rhs}, {acc} : {lhs_ty}, {rhs_ty}, {acc_ty}"
-                ),
-                operand_types: None,
-                indent: 0,
-            });
+            let result = builder.append1(
+                OpBuilder::new(Opcode::MmaF, Location::Unknown)
+                    .operand(lhs)
+                    .operand(rhs)
+                    .operand(acc)
+                    .result(acc_ty.clone()),
+            );
             (result, acc_ty)
         }
         // `iota(shape![N])`: one op naming the element type, then the tile it
@@ -3024,22 +2139,10 @@ fn emit_builtin(
                 None => ShapeExpr::Tuple(Vec::new()),
             };
             let extents = shape_extents(&shape, &kernel.const_params);
-            let result = builder.value();
-            let ty = super::Type::Tile {
-                shape: extents.clone(),
-                element: TileElement::Scalar(ScalarType::I32),
-            };
-            builder.push_op(Op {
-                results: vec![result],
-                format: Format::Plain,
-                opcode: "iota",
-                operands: Vec::new(),
-                result_types: vec![ty.clone()],
-                attrs: Vec::new(),
-                text: String::new(),
-                operand_types: None,
-                indent: 0,
-            });
+            let ty = tile_type(IrScalar::I32, &extents);
+            let result = builder.append1(
+                OpBuilder::new(Opcode::Iota, Location::Unknown).result(ty.clone()),
+            );
             (result, ty)
         }
         // `q.shape()[axis]`: cutile asks the view for its rank first — the
@@ -3080,32 +2183,14 @@ fn emit_builtin(
             };
             // The axis is an ordinary argument: cutile names it first.
             builder.i32_const(axis as i64);
-            let view_ty = super::Type::PartitionView(super::PartitionView {
-                tile_shape: tensor.tile.iter().map(|e| e.unwrap_or(-1)).collect(),
-                padding_zero: !tensor.whole_buffer,
-                tensor: super::TensorView {
-                    element: tensor.element,
-                    shape: view_extents(&tensor),
-                    strides: tensor.strides.clone(),
-                },
-            });
             // One result per axis: the index-space shape of the view, one
             // extent per rank.
             let rank = tensor.tile.len();
-            let base = builder.next_value;
-            builder.next_value += rank as u32;
-            let ids = (0..rank).map(|i| ValueId(base + i as u32)).collect::<Vec<_>>();
-            builder.push_op(Op {
-                results: ids.clone(),
-                format: Format::Plain,
-                opcode: "get_index_space_shape",
-                operands: vec![tensor.view],
-                result_types: vec![Builder::i32_tile()],
-                attrs: Vec::new(),
-                text: format!("{}", tensor.view),
-                operand_types: Some(vec![view_ty]),
-                indent: 0,
-            });
+            let ids = builder.append(
+                OpBuilder::new(Opcode::GetIndexSpaceShape, Location::Unknown)
+                    .operand(tensor.view)
+                    .results((0..rank).map(|_| Builder::i32_tile())),
+            );
             (ids[axis], Builder::i32_tile())
         }
         // `get_tile_block_id()`: three values, each assumed bounded. The kernel
@@ -3123,7 +2208,7 @@ fn emit_builtin(
             };
             match ids.get(index).copied() {
                 Some(id) => (id, Builder::i32_tile()),
-                None => (ValueId(0), Builder::i32_tile()),
+                None => panic!("program id component {index} does not exist"),
             }
         }
         // `program_id(axis)`: CuTile writes this helper as a plain function
@@ -3146,29 +2231,22 @@ fn emit_builtin(
             };
             (builder.num_programs(index), Builder::i32_tile())
         }
-        // `fma(a, b, c)` lowers to `mulf a, b` then `addf c, product`: the
-        // accumulator is the left operand of the sum.
         // `fma(a, b, c)`: one op, three operands, in that order.
         BuiltinOp::Fma => {
             let (a, ty) = emit_expr(builder, &args[0], kernel);
             let (b, _) = emit_expr(builder, &args[1], kernel);
             let (c, _) = emit_expr(builder, &args[2], kernel);
-            let result = builder.value();
-            builder.push_op(Op {
-                results: vec![result],
-                format: Format::Plain,
-                opcode: "fma",
-                operands: vec![a, b, c],
-                result_types: vec![ty.clone()],
-                attrs: Vec::new(),
-                text: format!("{a}, {b}, {c}"),
-                operand_types: None,
-                indent: 0,
-            });
+            let result = builder.append1(
+                OpBuilder::new(Opcode::Fma, Location::Unknown)
+                    .operand(a)
+                    .operand(b)
+                    .operand(c)
+                    .result(ty.clone()),
+            );
             (result, ty)
         }
-        BuiltinOp::ReduceMax => reduce(builder, args, "maxf", "-inf", kernel),
-        BuiltinOp::ReduceSum => reduce(builder, args, "addf", "0", kernel),
+        BuiltinOp::ReduceMax => reduce(builder, args, Opcode::MaxF, -f64::INFINITY, kernel),
+        BuiltinOp::ReduceSum => reduce(builder, args, Opcode::AddF, 0.0, kernel),
         BuiltinOp::LoadLike => load_like(builder, args, kernel),
         BuiltinOp::Load => load(builder, args, kernel),
         other => panic!("the cutile emitter has no arm for {other:?}"),
@@ -3195,22 +2273,19 @@ fn shape_from_extents(extents: &[Option<i64>]) -> ShapeExpr {
 fn reduce(
     builder: &mut Builder,
     args: &[sile_hir::Expr],
-    combine: &'static str,
-    identity: &'static str,
+    combine: Opcode,
+    identity: f64,
     kernel: &Kernel,
-) -> (ValueId, super::Type) {
+) -> (IrValue, IrType) {
     let (source, source_ty) = emit_expr(builder, &args[0], kernel);
     let axis = match args.get(1) {
         Some(sile_hir::Expr::ScalarI64(axis)) => *axis,
         _ => 0,
     };
-    let shape = match &source_ty {
-        super::Type::Tile { shape, .. } => shape.clone(),
-        _ => Vec::new(),
-    };
-    let element = match &source_ty {
-        super::Type::Tile { element, .. } => *element,
-        _ => TileElement::Scalar(ScalarType::F32),
+    let shape = tile_shape(&source_ty);
+    let element = match tile_scalar(&source_ty) {
+        Some(s) => s,
+        None => IrScalar::F32,
     };
     let reduced = shape
         .iter()
@@ -3218,52 +2293,60 @@ fn reduce(
         .filter(|(index, _)| *index != axis as usize)
         .map(|(_, extent)| *extent)
         .collect::<Vec<_>>();
-    // The region's two parameters are allocated first; the result follows them.
-    let arg_a = builder.value();
-    let arg_b = builder.value();
-    let body = builder.value();
-    let result = builder.value();
-    let lhs = super::Type::Tile {
-        shape: Vec::new(),
-        element,
-    };
-    // `maxf` states its rounding mode; `addf` does not.
-    let rounding = if combine == "maxf" {
-        " {rounding_mode = 0}"
-    } else {
-        ""
-    };
-    let text = format!(
-        "    {result} = reduce {source} dim={axis} identities=[{identity}] : {source_ty} -> {result_ty} {{\n\
-         \x20   ^bb0({arg_a}: {lhs}, {arg_b}: {lhs}):\n\
-         \x20     {body} = {combine} {arg_a}, {arg_b}{rounding} : {lhs}\n\
-         \x20     yield {body} : {lhs}\n\
-         \x20   }}",
-        result_ty = super::Type::Tile {
-            shape: reduced.clone(),
-            element,
-        },
+    let lhs = tile_type(element, &[]);
+    // The region's two parameters are allocated first; the combining op and the
+    // reduce's own result follow them.
+    let (region_id, body_block, block_args) = build_single_block_region(
+        &mut builder.module,
+        &[lhs.clone(), lhs.clone()],
     );
-    builder.push_stmt(Stmt::Raw(text));
-    (
-        result,
-        super::Type::Tile {
-            shape: reduced,
-            element,
-        },
-    )
+    let arg_a = block_args[0];
+    let arg_b = block_args[1];
+    builder.blocks.push(body_block);
+    // `maxf` states its rounding mode; `addf` does not.
+    let mut op = OpBuilder::new(combine, Location::Unknown)
+        .operand(arg_a)
+        .operand(arg_b);
+    if combine == Opcode::MaxF {
+        op = op.attr("rounding_mode", Attribute::i32(0));
+    }
+    let (body_op, body_values) = op.result(lhs.clone()).build(&mut builder.module);
+    append_op(&mut builder.module, body_block, body_op);
+    let (yield_op, _) = OpBuilder::new(Opcode::Yield, Location::Unknown)
+        .operand(body_values[0])
+        .build(&mut builder.module);
+    append_op(&mut builder.module, body_block, yield_op);
+    builder.blocks.pop();
+    let result_ty = tile_type(element, &reduced);
+    let block = builder.block();
+    let (reduce_op, results) = OpBuilder::new(Opcode::Reduce, Location::Unknown)
+        .operand(source)
+        .attr("dim", Attribute::i32(axis))
+        .attr(
+            "identities",
+            Attribute::Array(vec![if combine == Opcode::MaxF {
+                Attribute::Float(identity, IrType::Scalar(IrScalar::F32))
+            } else {
+                Attribute::Integer(identity as i64, IrType::Scalar(IrScalar::I32))
+            }]),
+        )
+        .result(result_ty.clone())
+        .region(region_id)
+        .build(&mut builder.module);
+    append_op(&mut builder.module, block, reduce_op);
+    (results[0], result_ty)
 }
 
-/// The integer spelling of a comparison relation.
-fn integer_relation(relation: &'static str) -> &'static str {
+/// The number of a comparison relation, as the IR spells the predicate.
+fn relation_number(relation: &str) -> i64 {
     match relation {
-        "greater_than" => "greater_than",
-        "greater_equal" => "greater_than_or_equal",
-        "less_than" => "less_than",
-        "less_equal" => "less_than_or_equal",
-        "equal" => "equal",
-        "not_equal" => "not_equal",
-        other => other,
+        "equal" => 0,
+        "not_equal" => 1,
+        "less_than" => 2,
+        "less_than_or_equal" => 3,
+        "greater_than" => 4,
+        "greater_than_or_equal" => 5,
+        other => panic!("no comparison predicate named `{other}`"),
     }
 }
 
@@ -3273,271 +2356,80 @@ fn compare(
     args: &[sile_hir::Expr],
     relation: &'static str,
     kernel: &Kernel,
-) -> (ValueId, super::Type) {
+) -> (IrValue, IrType) {
     let (lhs, ty) = emit_expr(builder, &args[0], kernel);
     let (rhs, _) = emit_expr(builder, &args[1], kernel);
-    let shape = match &ty {
-        super::Type::Tile { shape, .. } => shape.clone(),
-        _ => Vec::new(),
-    };
+    let shape = tile_shape(&ty);
     // An integer comparison states its signedness and drops `ordered`; the
     // float one keeps `ordered` and has no signedness to state.
     let integer = matches!(
-        &ty,
-        super::Type::Tile {
-            element: TileElement::Scalar(ScalarType::I32 | ScalarType::I64),
-            ..
-        }
+        tile_scalar(&ty),
+        Some(IrScalar::I32) | Some(IrScalar::I64)
     );
-    let result = builder.value();
-    builder.push_op(Op {
-        results: vec![result],
-        format: Format::Plain,
-        opcode: if integer { "cmpi" } else { "cmpf" },
-        operands: vec![lhs, rhs],
-        result_types: vec![super::Type::Tile {
-            shape: shape.clone(),
-            element: TileElement::Scalar(ScalarType::I1),
-        }],
-        attrs: Vec::new(),
-        text: if integer {
-            format!("{} {lhs}, {rhs}, signed", integer_relation(relation))
-        } else {
-            format!("{relation} ordered {lhs}, {rhs}")
-        },
-        operand_types: Some(vec![ty.clone()]),
-        indent: 0,
-    });
-    (
-        result,
-        super::Type::Tile {
-            shape,
-            element: TileElement::Scalar(ScalarType::I1),
-        },
-    )
-}
-
-/// Print the statements added after `from` two spaces deeper.
-fn indent_from(builder: &mut Builder, from: usize) {
-    for stmt in builder.body.iter_mut().skip(from) {
-        match stmt {
-            super::Stmt::Raw(text) => {
-                *text = text
-                    .lines()
-                    .map(|line| format!("  {line}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-            }
-            super::Stmt::Op(op) => op.indent += 2,
-            super::Stmt::Return => {}
-        }
-    }
-}
-
-/// Whether an operation works on integers.
-/// Whether a division's operands are integers.
-///
-/// A bound is one witness, but not the only one: a block id and a shape extent
-/// are integers whose range cutile leaves unknown, and their division still
-/// prints as `divi`, not `divf`.
-fn is_integer_expr(builder: &Builder, kernel: &Kernel, args: &[sile_hir::Expr]) -> bool {
-    fn integer(builder: &Builder, kernel: &Kernel, expr: &sile_hir::Expr) -> bool {
-        use sile_hir::Expr;
-        match expr {
-            Expr::ScalarI64(_) => true,
-            Expr::Var(name) => {
-                if kernel.const_params.iter().any(|(n, _)| n == name) {
-                    return true;
-                }
-                // A scalar parameter of integer type divides as an integer.
-                if let Some((_, _, scalar)) = builder.scalars.iter().find(|(n, _, _)| n == name) {
-                    return matches!(scalar, ScalarType::I32 | ScalarType::I64);
-                }
-                match builder
-                    .values
-                    .iter()
-                    .rev()
-                    .find(|(bound, _, _)| bound == name)
-                    .and_then(|(_, _, ty)| ty.clone())
-                {
-                    Some(super::Type::Tile { element, .. }) => {
-                        matches!(element, TileElement::Scalar(ScalarType::I32))
-                    }
-                    _ => builder.bounds.iter().any(|(n, _)| n == name),
-                }
-            }
-            Expr::Builtin { op, args } => match op {
-                sile_hir::BuiltinOp::ProgramId | sile_hir::BuiltinOp::ShapeDim => true,
-                sile_hir::BuiltinOp::Add
-                | sile_hir::BuiltinOp::Sub
-                | sile_hir::BuiltinOp::Mul
-                | sile_hir::BuiltinOp::Div
-                | sile_hir::BuiltinOp::Rem
-                | sile_hir::BuiltinOp::CeilDiv
-                | sile_hir::BuiltinOp::Min
-                | sile_hir::BuiltinOp::Max => args
-                    .iter()
-                    .all(|arg| integer(builder, kernel, arg)),
-                _ => false,
-            },
-            _ => false,
-        }
-    }
-    args.iter().all(|arg| integer(builder, kernel, arg))
+    let pred = relation_number(relation);
+    let result_ty = tile_type(IrScalar::I1, &shape);
+    let result = if integer {
+        builder.append1(
+            OpBuilder::new(Opcode::CmpI, Location::Unknown)
+                .attr("comparison_predicate", Attribute::i32(pred))
+                .attr("signedness", Attribute::i32(1))
+                .operand(lhs)
+                .operand(rhs)
+                .result(result_ty.clone()),
+        )
+    } else {
+        builder.append1(
+            OpBuilder::new(Opcode::CmpF, Location::Unknown)
+                .attr("comparison_predicate", Attribute::i32(pred))
+                .attr("comparison_ordering", Attribute::i32(1))
+                .operand(lhs)
+                .operand(rhs)
+                .result(result_ty.clone()),
+        )
+    };
+    (result, result_ty)
 }
 
 /// The attribute an integer opcode prints after its operands.
 ///
 /// Divide, remainder and minimum state their signedness; add and multiply do
 /// not. A ceiling divide additionally states its rounding direction.
-fn integer_suffix(op: sile_hir::BuiltinOp) -> &'static str {
+#[derive(Clone, Copy)]
+enum IntSuffix {
+    None,
+    Signed,
+    SignedPositiveInf,
+}
+
+fn integer_suffix(op: sile_hir::BuiltinOp) -> IntSuffix {
     match op {
-        sile_hir::BuiltinOp::Rem | sile_hir::BuiltinOp::Div => "signed",
-        sile_hir::BuiltinOp::CeilDiv => "signed rounding positive_inf",
-        _ => "",
+        sile_hir::BuiltinOp::Rem | sile_hir::BuiltinOp::Div => IntSuffix::Signed,
+        sile_hir::BuiltinOp::CeilDiv => IntSuffix::SignedPositiveInf,
+        _ => IntSuffix::None,
     }
 }
 
-fn integer_opcode(op: sile_hir::BuiltinOp) -> &'static str {
+fn integer_opcode(op: sile_hir::BuiltinOp) -> Opcode {
     match op {
-        sile_hir::BuiltinOp::Add => "addi",
-        sile_hir::BuiltinOp::Sub => "subi",
-        sile_hir::BuiltinOp::Mul => "muli",
-        sile_hir::BuiltinOp::Rem => "remi",
-        sile_hir::BuiltinOp::CeilDiv | sile_hir::BuiltinOp::Div => "divi",
-        _ => "addi",
+        sile_hir::BuiltinOp::Add => Opcode::AddI,
+        sile_hir::BuiltinOp::Sub => Opcode::SubI,
+        sile_hir::BuiltinOp::Mul => Opcode::MulI,
+        sile_hir::BuiltinOp::Rem => Opcode::RemI,
+        sile_hir::BuiltinOp::CeilDiv | sile_hir::BuiltinOp::Div => Opcode::DivI,
+        _ => Opcode::AddI,
     }
 }
 
-/// The canonical linear term of an integer expression.
-///
-/// This is the fragment the predicate algebra reasons over: a sum of atoms with
-/// coefficients, plus a constant. Anything outside the fragment — a product of
-/// two unknowns, a remainder — is not formed, so a goal over it sinks to a later
-/// stage instead of being decided wrongly.
-fn term_of(
-    builder: &Builder,
-    kernel: &Kernel,
-    expr: &sile_hir::Expr,
-) -> Option<super::predicate::Term> {
-    use sile_hir::Expr;
-    use super::predicate::Term;
-    match expr {
-        Expr::ScalarI64(value) => Some(Term::constant(*value)),
-        Expr::Var(name) => {
-            if let Some((_, term)) = builder.terms.iter().rev().find(|(n, _)| n == name) {
-                return Some(term.clone());
-            }
-            // An induction variable is a name for its own value: `1 * iv`. The
-            // id is the binding's, not the name's, so a shadowed name still
-            // names the value the body means.
-            if builder.loop_vars.iter().any(|var| var == name) {
-                return builder
-                    .value_ids
-                    .id(name)
-                    .map(|id| Term::atom(super::predicate::Atom::Iv(id)));
-            }
-            // A const generic is a JIT-time constant.
-            kernel
-                .const_params
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, value)| Term::constant(*value))
-        }
-        Expr::Builtin { op, args } => {
-            let lhs = term_of(builder, kernel, args.first()?)?;
-            let rhs = match args.get(1) {
-                Some(rhs) => term_of(builder, kernel, rhs)?,
-                None => Term::constant(0),
-            };
-            match op {
-                sile_hir::BuiltinOp::Add => lhs.add(&rhs),
-                sile_hir::BuiltinOp::Sub => lhs.sub(&rhs),
-                sile_hir::BuiltinOp::Mul => {
-                    // Only a constant times a term stays linear.
-                    match (lhs.as_constant(), rhs.as_constant()) {
-                        (Some(k), _) => rhs.mul_const(k),
-                        (_, Some(k)) => lhs.mul_const(k),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-/// The interval of an integer expression, when the emitter can prove one.
-fn bounds_of(
-    builder: &Builder,
-    kernel: &Kernel,
-    expr: &sile_hir::Expr,
-) -> Option<super::bounds::Bounds> {
-    use sile_hir::Expr;
-    match expr {
-        Expr::ScalarI64(value) => Some(super::bounds::Bounds::exact(*value)),
-        Expr::Var(name) => {
-            if let Some((_, bound)) = builder.bounds.iter().rev().find(|(n, _)| n == name) {
-                return Some(*bound);
-            }
-            // A const generic is a known integer.
-            kernel
-                .const_params
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, value)| super::bounds::Bounds::exact(*value))
-        }
-        // `num_tiles(&p, axis)`: the tile count of that axis, which is
-        // `ceil(extent / tile)` and exact when both are static.
-        Expr::Builtin {
-            op: sile_hir::BuiltinOp::NumTiles,
-            args,
-        } => {
-            let Expr::Var(name) = args.first()? else {
-                return None;
-            };
-            let axis = match args.get(1)? {
-                Expr::ScalarI64(axis) => *axis as usize,
-                _ => return None,
-            };
-            let tensor = builder.tensors.iter().find(|(n, _)| n == name)?.1.clone();
-            let extent = match tensor.view_shape.get(axis)? {
-                Extent::Literal(value) => *value,
-                Extent::Value(_) => return None,
-            };
-            let tile = tensor.tile.get(axis)?.filter(|t| *t > 0)?;
-            Some(super::bounds::Bounds::exact((extent + tile - 1) / tile))
-        }
-        Expr::Builtin { op, args } => {
-            let lhs = bounds_of(builder, kernel, args.first()?)?;
-            let rhs = match args.get(1) {
-                Some(rhs) => bounds_of(builder, kernel, rhs)?,
-                None => super::bounds::Bounds::exact(0),
-            };
-            super::bounds::transfer(*op, lhs, rhs)
-        }
-        _ => None,
-    }
-}
-
-/// An integer operation that folds: the id is allocated, then dropped, and a
-/// `constant` takes its place.
+/// An integer operation that folds: the checks pass the value it folds to, and
+/// the emitter allocates the id, drops it, and prints a `constant` in its
+/// place.
 fn fold_integer(
     builder: &mut Builder,
     op: sile_hir::BuiltinOp,
     args: &[sile_hir::Expr],
     kernel: &Kernel,
-) -> Option<(ValueId, super::Type)> {
-    let lhs = bounds_of(builder, kernel, args.first()?)?;
-    let rhs = match args.get(1) {
-        Some(rhs) => bounds_of(builder, kernel, rhs)?,
-        None => super::bounds::Bounds::exact(0),
-    };
-    let bounds = super::bounds::transfer(op, lhs, rhs)?;
-    if !bounds.is_exact() {
-        return None;
-    }
+) -> Option<(IrValue, IrType)> {
+    let value = builder.access.fold_integer_value(op, args, kernel)?;
     // Every operand prints unless the body already fetched that generic; only
     // the folded operation itself always disappears, leaving its id as a hole.
     for arg in args {
@@ -3553,30 +2445,30 @@ fn fold_integer(
         let _ = emit_expr(builder, arg, kernel);
     }
     builder.discard();
-    let value = builder.i32_const(bounds.start);
+    let value = builder.i32_const(value);
     Some((value, Builder::i32_tile()))
 }
 
 fn binary(
     builder: &mut Builder,
     args: &[sile_hir::Expr],
-    opcode: &'static str,
+    opcode: Opcode,
     kernel: &Kernel,
-) -> (ValueId, super::Type) {
-    binary_suffixed(builder, args, opcode, "", kernel)
+) -> (IrValue, IrType) {
+    binary_suffixed(builder, args, opcode, IntSuffix::None, kernel)
 }
 
 /// The same, with the trailing attribute an opcode states after its operands.
 fn binary_suffixed(
     builder: &mut Builder,
     args: &[sile_hir::Expr],
-    opcode: &'static str,
-    suffix: &'static str,
+    opcode: Opcode,
+    suffix: IntSuffix,
     kernel: &Kernel,
-) -> (ValueId, super::Type) {
+) -> (IrValue, IrType) {
     // A const generic names the value the prologue printed once, so an operand
     // that is one reads that id instead of spending a new `constant`.
-    let operand = |builder: &mut Builder, expr: &sile_hir::Expr| -> (ValueId, super::Type) {
+    let operand = |builder: &mut Builder, expr: &sile_hir::Expr| -> (IrValue, IrType) {
         if let sile_hir::Expr::Var(name) = expr {
             if let Some((_, id)) = builder.prologue_generics.iter().find(|(n, _)| n == name) {
                 return (*id, Builder::i32_tile());
@@ -3589,44 +2481,41 @@ fn binary_suffixed(
     // Integer operands take the integer opcode: `addi`, not `addf`. Only the
     // float spellings have an integer twin, and only these three do.
     let integer_twin = match opcode {
-        "addf" => Some("addi"),
-        "subf" => Some("subi"),
-        "mulf" => Some("muli"),
+        Opcode::AddF => Some(Opcode::AddI),
+        Opcode::SubF => Some(Opcode::SubI),
+        Opcode::MulF => Some(Opcode::MulI),
         _ => None,
     };
-    let opcode = match (integer_twin, &ty) {
-        (Some(twin), super::Type::Tile { element: TileElement::Scalar(ScalarType::I32), .. }) => {
-            twin
-        }
+    let opcode = match (integer_twin, tile_scalar(&ty)) {
+        (Some(twin), Some(IrScalar::I32)) => twin,
         _ => opcode,
     };
-    let result = builder.value();
-    builder.push_op(Op {
-        results: vec![result],
-        format: Format::Plain,
-        opcode,
-        operands: vec![lhs, rhs],
-        result_types: vec![ty.clone()],
-        attrs: Vec::new(),
-        text: if suffix.is_empty() {
-            format!("{lhs}, {rhs}")
-        } else {
-            format!("{lhs}, {rhs} {suffix}")
-        },
-        operand_types: None,
-        indent: 0,
-    });
+    let mut op = OpBuilder::new(opcode, Location::Unknown)
+        .operand(lhs)
+        .operand(rhs);
+    match (opcode, suffix) {
+        (Opcode::DivI, IntSuffix::SignedPositiveInf) => {
+            op = op
+                .attr("signedness", Attribute::i32(1))
+                .attr("rounding", Attribute::i32(3));
+        }
+        (Opcode::DivI | Opcode::RemI | Opcode::MinI | Opcode::MaxI, IntSuffix::Signed) => {
+            op = op.attr("signedness", Attribute::i32(1));
+        }
+        _ => {}
+    }
+    let result = builder.append1(op.result(ty.clone()));
     (result, ty)
 }
 
 /// The type of an expression whose value the emitter already has.
-fn result_type_of(builder: &Builder, expr: &sile_hir::Expr, kernel: &Kernel) -> super::Type {
+fn result_type_of(builder: &Builder, expr: &sile_hir::Expr, kernel: &Kernel) -> IrType {
     use sile_hir::Expr;
     match expr {
         Expr::Var(name) => match builder.locals.get(name) {
             Some(Type::Tile { elem, shape }) => tile_of(*elem, shape, &kernel.const_params),
             Some(Type::Tensor { elem, shape }) => tile_of(*elem, shape, &kernel.const_params),
-            _ => super::Type::Token,
+            _ => IrType::Token,
         },
         _ => panic!("no recorded type for {expr:?}"),
     }
@@ -3645,7 +2534,7 @@ fn tile_shape_of(builder: &Builder, name: &str, kernel: &Kernel) -> Vec<i64> {
 }
 
 /// `x.load_like(y)`: the tile of `x` sized like `y`.
-fn load_like(builder: &mut Builder, args: &[sile_hir::Expr], kernel: &Kernel) -> (ValueId, super::Type) {
+fn load_like(builder: &mut Builder, args: &[sile_hir::Expr], kernel: &Kernel) -> (IrValue, IrType) {
     use sile_hir::Expr;
     // `load_tile_mut(z)` names only its source: it reads the tile the buffer
     // already declares, the same way `load` does.
@@ -3677,7 +2566,7 @@ fn load_like(builder: &mut Builder, args: &[sile_hir::Expr], kernel: &Kernel) ->
 }
 
 /// `y.load()`: the tile the program owns, of its own declared shape.
-fn load(builder: &mut Builder, args: &[sile_hir::Expr], kernel: &Kernel) -> (ValueId, super::Type) {
+fn load(builder: &mut Builder, args: &[sile_hir::Expr], kernel: &Kernel) -> (IrValue, IrType) {
     use sile_hir::Expr;
     let Expr::Var(source) = &args[0] else {
         panic!("`load` of a non-buffer: {args:?}");
@@ -3687,8 +2576,6 @@ fn load(builder: &mut Builder, args: &[sile_hir::Expr], kernel: &Kernel) -> (Val
     read_tile_indexed(builder, source, &dims, false, args.get(1), kernel)
 }
 
-/// The four steps of a tile read: shape constants, the block id, the partition
-/// view, and the load itself.
 /// The four steps of a tile read: shape constants, the block id, the partition
 /// view, and the load itself.
 ///
@@ -3701,7 +2588,7 @@ fn read_tile(
     tile: &[i64],
     with_source: bool,
     kernel: &Kernel,
-) -> (ValueId, super::Type) {
+) -> (IrValue, IrType) {
     read_tile_indexed(builder, source, tile, with_source, None, kernel)
 }
 
@@ -3711,35 +2598,6 @@ fn tile_shape_of_extents(extents: &[Option<i64>]) -> Vec<i64> {
     extents.iter().map(|e| e.unwrap_or(-1)).collect()
 }
 
-/// Every symbol a shape names, in order, without repeats.
-fn shape_names(shape: &ShapeExpr) -> Vec<String> {
-    fn walk(shape: &ShapeExpr, names: &mut Vec<String>) {
-        match shape {
-            ShapeExpr::Symbol(name) => {
-                if !names.contains(name) {
-                    names.push(name.clone());
-                }
-            }
-            ShapeExpr::Tuple(items) => {
-                for item in items {
-                    walk(item, names);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut names = Vec::new();
-    walk(shape, &mut names);
-    names
-}
-
-fn shape_items(shape: &ShapeExpr) -> Vec<ShapeExpr> {
-    match shape {
-        ShapeExpr::Tuple(items) => items.clone(),
-        other => vec![other.clone()],
-    }
-}
-
 fn read_tile_indexed(
     builder: &mut Builder,
     source: &str,
@@ -3747,7 +2605,7 @@ fn read_tile_indexed(
     with_source: bool,
     index_arg: Option<&sile_hir::Expr>,
     kernel: &Kernel,
-) -> (ValueId, super::Type) {
+) -> (IrValue, IrType) {
     let tensor = builder.tensor(source).clone();
     let tile_shape = ShapeExpr::Tuple(
         tile.iter().map(|d| ShapeExpr::Constant(*d)).collect::<Vec<_>>(),
@@ -3791,16 +2649,58 @@ fn read_tile_indexed(
             if ids.len() >= tile.len() {
                 // The tile's own extents follow the indices.
                 shape_consts(builder, &tile_shape, &kernel.const_params);
-                check_partition_access(builder, &tensor, tile, &ids, index_arg, kernel);
-                let view_ty = super::Type::PartitionView(super::PartitionView {
-                    tile_shape: tile.to_vec(),
-                    padding_zero: true,
-                    tensor: super::TensorView {
-                        element: tensor.element,
-                        shape: view_extents(&tensor),
-                        strides: tensor.strides.clone(),
-                    },
-                });
+                // The checks pass decides each axis; the emitter only prints
+                // the assert a `Device` decision names.
+                let facts = tensor_facts(kernel, &tensor);
+                for (axis, decision) in builder
+                    .access
+                    .decide_access(kernel, &facts, tile, index_arg)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let AxisDecision::Device { proven_non_negative } = decision else {
+                        continue;
+                    };
+                    // `ceil(extent / tile)`, with the extent a run-time value.
+                    // The tile extent is named again here, inside the check.
+                    let extent = match tensor.view_shape.get(axis) {
+                        Some(Extent::Value(value)) => *value,
+                        _ => unreachable!("a device check names a dynamic extent"),
+                    };
+                    let tile_value = builder.i32_const(tile[axis]);
+                    let quotient = builder.int_binary(Opcode::DivI, extent, tile_value, true, None);
+                    let remainder = builder.int_binary(Opcode::RemI, extent, tile_value, true, None);
+                    let one = builder.i32_const(1);
+                    let nonempty = builder.int_binary(Opcode::MinI, remainder, one, true, None);
+                    let count = builder.int_binary(Opcode::AddI, quotient, nonempty, false, None);
+                    let index = ids[axis];
+                    let in_range = builder.cmpi(2, index, count);
+                    // The lower bound: an index cutile cannot prove
+                    // non-negative is tested against zero as well, and the two
+                    // predicates are combined.
+                    let guard = if proven_non_negative {
+                        in_range
+                    } else {
+                        let zero = builder.i32_const(0);
+                        let non_negative = builder.cmpi(5, index, zero);
+                        builder.bool_binary(Opcode::AndI, non_negative, in_range)
+                    };
+                    builder.assert_op(
+                        guard,
+                        &format!(
+                            "partition access out of bounds: dim {axis}, block index >= ceil(?/{}){suffix}",
+                            tile[axis],
+                            suffix = if proven_non_negative { "" } else { " or index < 0" },
+                        ),
+                    );
+                }
+                let view_ty = partition_view_type(
+                    tile,
+                    tensor.element,
+                    &tensor.view_shape,
+                    &tensor.strides,
+                    true,
+                );
                 return builder.load_view_tko(view, &ids[..tile.len()], tensor.token, tile, tensor.element, view_ty);
             }
         }
@@ -3808,15 +2708,13 @@ fn read_tile_indexed(
             Some(ids) => ids,
             None => builder.block_id(),
         };
-        let view_ty = super::Type::PartitionView(super::PartitionView {
-            tile_shape: tile.to_vec(),
-            padding_zero: true,
-            tensor: super::TensorView {
-                element: tensor.element,
-                shape: view_extents(&tensor),
-                strides: tensor.strides.clone(),
-            },
-        });
+        let view_ty = partition_view_type(
+            tile,
+            tensor.element,
+            &tensor.view_shape,
+            &tensor.strides,
+            true,
+        );
         return builder.load_view_tko(view, &indices[..tile.len()], tensor.token, tile, tensor.element, view_ty);
     }
     let source_shape = shape_from_extents(&tensor.tile);
@@ -3833,25 +2731,30 @@ fn read_tile_indexed(
     // A view of a mutable buffer is not padded: its elements are all real,
     // whereas a read-only input may be read past its own extent.
     let padding_zero = !tensor.whole_buffer;
-    let view = builder.make_partition_view(&tensor, tile, padding_zero);
-    let view_ty = super::Type::PartitionView(super::PartitionView {
-        tile_shape: tile.to_vec(),
+    let view = builder.make_partition_view(
+        tensor.view,
+        tile,
+        tensor.element,
+        &tensor.view_shape,
+        &tensor.strides,
         padding_zero,
-        tensor: super::TensorView {
-            element: tensor.element,
-            shape: view_extents(&tensor),
-            strides: tensor.strides.clone(),
-        },
-    });
+    );
+    let view_ty = partition_view_type(
+        tile,
+        tensor.element,
+        &tensor.view_shape,
+        &tensor.strides,
+        padding_zero,
+    );
     builder.load_view_tko(view, &indices[..tile.len()], tensor.token, tile, tensor.element, view_ty)
 }
 
 fn store_tile(
     builder: &mut Builder,
     target: &str,
-    value: ValueId,
-    value_ty: super::Type,
-    store_index: Vec<ValueId>,
+    value: IrValue,
+    value_ty: IrType,
+    store_index: Vec<IrValue>,
     kernel: &Kernel,
 ) {
     let tensor = builder.tensor(target).clone();
@@ -3873,48 +2776,33 @@ fn store_tile(
                 // the kernel named is the offset inside it.
                 let block_row = block;
                 let row = indices[0];
-                let sum = builder.value();
-                builder.push_op(Op {
-                    results: vec![sum],
-                    format: Format::Plain,
-                    opcode: "addi",
-                    operands: vec![block_row, row],
-                    result_types: vec![Builder::i32_tile()],
-                    attrs: Vec::new(),
-                    text: format!("{block_row}, {row}"),
-                    operand_types: None,
-                    indent: 0,
-                });
-                indices[0] = sum;
+                indices[0] = builder.same_binary(
+                    Opcode::AddI,
+                    block_row,
+                    row,
+                    Builder::i32_tile(),
+                );
             }
         }
         if let Some(offset) = builder.store_offset {
             if indices.len() >= 2 {
                 let column = indices[1];
-                let sum = builder.value();
-                builder.push_op(Op {
-                    results: vec![sum],
-                    format: Format::Plain,
-                    opcode: "addi",
-                    operands: vec![offset, column],
-                    result_types: vec![Builder::i32_tile()],
-                    attrs: Vec::new(),
-                    text: format!("{offset}, {column}"),
-                    operand_types: None,
-                    indent: 0,
-                });
+                let sum = builder.same_binary(
+                    Opcode::AddI,
+                    offset,
+                    column,
+                    Builder::i32_tile(),
+                );
                 indices = vec![indices[0], sum];
             }
         }
-        let view_ty = super::Type::PartitionView(super::PartitionView {
-            tile_shape: tile.clone(),
-            padding_zero: false,
-            tensor: super::TensorView {
-                element: tensor.element,
-                shape: view_extents(&tensor),
-                strides: tensor.strides.clone(),
-            },
-        });
+        let view_ty = partition_view_type(
+            &tile,
+            tensor.element,
+            &tensor.view_shape,
+            &tensor.strides,
+            false,
+        );
         return builder.store_view_tko(value, view, &indices, tensor.token, value_ty, view_ty);
     }
     // The same shape fetches a load makes, then the block id and the write view.
@@ -3925,15 +2813,20 @@ fn store_tile(
     }
     let indices = builder.block_id();
     shape_consts(builder, &tile_shape, &kernel.const_params);
-    let view = builder.make_partition_view(&tensor, &tile, false);
-    let view_ty = super::Type::PartitionView(super::PartitionView {
-        tile_shape: tile.clone(),
-        padding_zero: false,
-        tensor: super::TensorView {
-            element: tensor.element,
-            shape: view_extents(&tensor),
-            strides: tensor.strides.clone(),
-        },
-    });
+    let view = builder.make_partition_view(
+        tensor.view,
+        &tile,
+        tensor.element,
+        &tensor.view_shape,
+        &tensor.strides,
+        false,
+    );
+    let view_ty = partition_view_type(
+        &tile,
+        tensor.element,
+        &tensor.view_shape,
+        &tensor.strides,
+        false,
+    );
     builder.store_view_tko(value, view, &indices[..tile.len()], tensor.token, value_ty, view_ty);
 }

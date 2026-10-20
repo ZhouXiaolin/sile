@@ -9,7 +9,7 @@ use crate as llvm_ir;
 use llvm_ir::{BinOp as LBinOp, CastOp, CmpPred, Intrinsic, Operand, Type};
 
 use super::core::{LowerLlvmIrCtx, llvm_ir_value, resolve_operand};
-use sile_tile_ir::*;
+use sile_tile_ir::function_ir::*;
 
 /// How an op reaches LLVM IR, once its operands are resolved.
 pub(crate) enum Lowering {

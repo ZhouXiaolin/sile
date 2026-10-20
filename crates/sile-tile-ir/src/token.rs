@@ -24,7 +24,7 @@
 //! strongly it orders against other operations is a third: the
 //! [`MemoryOrdering`] of the atomics vocabulary.
 
-use crate::{Opcode, TileIrOp, TileIrType, ValueId};
+use crate::function_ir::{Opcode, TileIrOp, TileIrType, ValueId};
 
 /// The token a store waits for, or nothing when it waits for nothing.
 ///
@@ -40,9 +40,9 @@ pub struct TkoSemantics {
     /// The token this op waits for.
     pub token: TokenOperand,
     /// How strongly this op orders against other memory operations.
-    pub ordering: crate::MemoryOrdering,
+    pub ordering: crate::function_ir::MemoryOrdering,
     /// How widely this op's effect is visible.
-    pub scope: crate::MemoryScope,
+    pub scope: crate::function_ir::MemoryScope,
 }
 
 impl Default for TkoSemantics {
@@ -52,8 +52,8 @@ impl Default for TkoSemantics {
         // block. Widening either is a decision an op states.
         Self {
             token: None,
-            ordering: crate::MemoryOrdering::Weak,
-            scope: crate::MemoryScope::TileBlock,
+            ordering: crate::function_ir::MemoryOrdering::Weak,
+            scope: crate::function_ir::MemoryScope::TileBlock,
         }
     }
 }
@@ -70,13 +70,13 @@ impl TkoSemantics {
     /// The same semantics made visible device-wide.
     pub fn with_device_scope(self) -> Self {
         Self {
-            scope: crate::MemoryScope::Device,
+            scope: crate::function_ir::MemoryScope::Device,
             ..self
         }
     }
 
     /// The same semantics at the given ordering.
-    pub fn with_ordering(self, ordering: crate::MemoryOrdering) -> Self {
+    pub fn with_ordering(self, ordering: crate::function_ir::MemoryOrdering) -> Self {
         Self { ordering, ..self }
     }
 }
@@ -187,7 +187,7 @@ impl LoopToken {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MemoryOrdering, MemoryScope};
+    use crate::function_ir::{MemoryOrdering, MemoryScope};
 
     #[test]
     fn make_token_defines_a_token() {

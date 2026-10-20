@@ -25,7 +25,8 @@ pub use sile_tile_ir::passes::{
     run_default_pipeline as run_tile_ir_passes, run_default_pipeline as run_default_tile_ir_pipeline,
     run_pipeline as run_tile_ir_pipeline,
 };
-pub use sile_tile_ir::{TileIrFunction, format_tile_ir, lower_to_tile_ir};
+pub use sile_tile_ir::function_ir::TileIrFunction;
+pub use sile_tile_ir::{format_tile_ir, lower_to_tile_ir};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HirToTileIrPassKind {

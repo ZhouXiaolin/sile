@@ -11,7 +11,7 @@ use crate::lower::core::{
 };
 
 use super::tile_memory::{build_buffer_index_base, emit_buffer_store, emit_strided_element_index};
-use sile_tile_ir::{CmpOp, TileIrFunction, TileIrOp, TileIrType, TileMapExpr, UnaryOp, ValueId};
+use sile_tile_ir::function_ir::{CmpOp, TileIrFunction, TileIrOp, TileIrType, TileMapExpr, UnaryOp, ValueId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CoordOperandKey {
@@ -178,11 +178,11 @@ pub(crate) fn lower_tile_map_inst(
     // scalars is one comparison and one choice. The result type says which of
     // the two this map is, and the scalar one needs neither storage nor a loop.
     let result_ty = builder.tile_ir().types.get(&result).cloned();
-    if !matches!(result_ty, Some(sile_tile_ir::TileIrType::Tile { .. })) {
+    if !matches!(result_ty, Some(sile_tile_ir::function_ir::TileIrType::Tile { .. })) {
         // A map that produces one value produces a count or an element, and the
         // result type says which: `min(mask_start, k_seqlen_tiles)` compares two
         // counts and yields a count, which is what the division after it needs.
-        let count = matches!(result_ty, Some(sile_tile_ir::TileIrType::I64));
+        let count = matches!(result_ty, Some(sile_tile_ir::function_ir::TileIrType::I64));
         let zero = const_i64(0);
         builder.with_current_insts(|ctx, tile_ir, out| {
             let mut bases = HashMap::new();
@@ -392,10 +392,10 @@ fn eval_tile_scalar(
                     out,
                 );
                 let bin_op = match op {
-                    TileIrOp::AddF { .. } => sile_tile_ir::BinOp::Add,
-                    TileIrOp::SubF { .. } => sile_tile_ir::BinOp::Sub,
-                    TileIrOp::MulF { .. } => sile_tile_ir::BinOp::Mul,
-                    TileIrOp::DivF { .. } => sile_tile_ir::BinOp::Div,
+                    TileIrOp::AddF { .. } => sile_tile_ir::function_ir::BinOp::Add,
+                    TileIrOp::SubF { .. } => sile_tile_ir::function_ir::BinOp::Sub,
+                    TileIrOp::MulF { .. } => sile_tile_ir::function_ir::BinOp::Mul,
+                    TileIrOp::DivF { .. } => sile_tile_ir::function_ir::BinOp::Div,
                     _ => unreachable!(),
                 };
                 return emit_bin(ctx, out, lower_bin_op(bin_op), lhs, rhs, llvm_ir::Type::F32);

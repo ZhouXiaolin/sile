@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate as llvm_ir;
 
-use sile_tile_ir::*;
+use sile_tile_ir::function_ir::*;
 
 use super::block_scalar::lower_scalar_inst;
 use super::block_terminator::lower_terminator;

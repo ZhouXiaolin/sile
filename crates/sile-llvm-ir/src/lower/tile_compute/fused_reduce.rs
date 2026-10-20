@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate as llvm_ir;
 
-use sile_tile_ir::TileMapExpr;
-use sile_tile_ir::ValueId;
+use sile_tile_ir::function_ir::TileMapExpr;
+use sile_tile_ir::function_ir::ValueId;
 use crate::lower::core::{
     BlockLowerer, REDUCE_UNROLL_THRESHOLD, alloc_tile_result, buffer_elem_of, buffer_rank_of,
     const_f32, const_i64, emit_bin, emit_cmp, emit_gep, emit_load, emit_store,

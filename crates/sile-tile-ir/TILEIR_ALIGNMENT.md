@@ -105,22 +105,34 @@ backends consume.
 
 ## The emitter
 
-`sile-tile-ir` gains `cutile::Module` / `cutile::Op` / `cutile::Type`: a
-cutile-shaped IR whose only job is to print the same text. It is separate from
-`sile-tile-ir::ir` because that one carries what the C, WGPU and PTX lowerings
-read (shape descriptors, buffer ranks, `stride_shape_idx`), and those fields
-have no place in cutile's text.
+There is one Tile IR: `sile-tile-ir::ir`, the arena-structured port of
+cutile-ir. `cutile::emit` lowers a typed kernel into an `ir::Module`, and
+`Module::to_mlir_text` prints that module byte for byte the way cutile-rs does.
+There is no separate text IR: the module the printer reads is the module the
+lowering built.
+
+cutile-rs's judgments are not here. They live in `sile-hir` as passes —
+`passes::access` (the four-rung proof ladder), `passes::predicate` (the
+predicate algebra and the launch checks), `passes::bounds` (interval
+transfer), `passes::value_ids` (stable binding ids). The check-time facts —
+binding ids, flag generics, instantiation — are computed once by
+`KernelChecks::of` and carried on `TypedKernel`; the walk-state (believed
+goals, intervals, terms, compile errors) advances beside the lowering, which
+consumes the decisions and decides nothing itself.
 
 The pass order is one walk, not four:
 
-1. `cutile::Module` is built from `Kernel::origin` — the source text and the
-   entry index — replaying the walk cutile's front end makes: expand each
-   parameter into entry parameters, then prologue, then the body expression by
-   expression, fetching each shape argument as a fresh `constant`.
-2. The body needs typed values while it is built, so the walk runs against
-   `sile-hir::typeck::TypedKernel` and uses its types; it does not consult
-   `sile-tile-ir::ir` at all.
-3. `format` prints it.
+1. `ir::Module` is built from the typed kernel, replaying the walk cutile's
+   front end makes: expand each parameter into entry parameters, then
+   prologue, then the body expression by expression, fetching each shape
+   argument as a fresh `constant`. A value's number is its allocation
+   position in the module's value arena.
+2. Operations are appended with `OpBuilder`; regions are real regions — a
+   `for` carries its induction variable and carried values as block
+   parameters, an `if` yields, a `reduce` combines in its own block. An
+   operation the checks fold away is allocated and then left as a hole, which
+   is what cutile's numbering shows.
+3. `to_mlir_text` prints it.
 
 Consequences to keep in mind:
 

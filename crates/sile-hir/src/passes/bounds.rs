@@ -10,7 +10,7 @@
 //! of both operands, which is sound for a monotone operation and is what
 //! cutile does for `add`, `sub` and `mul`.
 
-use sile_hir::BuiltinOp;
+use crate::BuiltinOp;
 
 /// An inclusive interval `[start, end]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

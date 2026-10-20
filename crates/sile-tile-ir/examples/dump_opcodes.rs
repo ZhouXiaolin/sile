@@ -4,7 +4,7 @@
 //! real if the two name sets are equal, so this makes that check a diff.
 
 fn main() {
-    for op in sile_tile_ir::Opcode::ALL {
+    for op in sile_tile_ir::function_ir::Opcode::ALL {
         println!("{}", op.name());
     }
 }

@@ -1,6 +1,6 @@
 use crate as llvm_ir;
 
-use sile_tile_ir::TileIrFunction;
+use sile_tile_ir::function_ir::TileIrFunction;
 use crate::lower::core::block::{BlockLowerer, LowerLlvmIrCtx};
 
 mod grid;

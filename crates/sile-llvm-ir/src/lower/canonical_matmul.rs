@@ -4,7 +4,7 @@ use super::core::{
     BlockLowerer, LowerLlvmIrCtx, buffer_elem_of, const_f32, const_i64, emit_bin, emit_cast,
     emit_cmp, emit_gep, emit_load, emit_shape_dim, emit_store, llvm_ir_block, resolve_operand,
 };
-use sile_tile_ir::{
+use sile_tile_ir::function_ir::{
     BinOp, CmpOp, TileIrBlock, TileIrFunction, TileIrInst, TileIrOp, TileIrParamKind,
     TileIrTerminator, ValueId,
 };

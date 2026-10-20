@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use sile_hir::typeck::TypedKernel;
 use sile_hir::{BuiltinOp, Expr, ShapeExpr, Stmt};
 
-use crate::ir::*;
+use crate::function_ir::*;
 
 /// Lower a type-checked HIR kernel to Tile IR.
 pub fn lower_to_tile_ir(typed: &TypedKernel) -> TileIrFunction {
@@ -1951,8 +1951,8 @@ fn lower_builtin(op: BuiltinOp, args: &[Expr], ctx: &mut LowerCtx<'_>) -> ValueI
             // spelled as a 0/1 constant.
             let reverse = args.get(2).map(|arg| eval_i64(arg, ctx)).unwrap_or(0) != 0;
             let combiner = match op {
-                BuiltinOp::ScanSum => crate::ir::ReduceCombiner::Sum,
-                _ => crate::ir::ReduceCombiner::Prod,
+                BuiltinOp::ScanSum => crate::function_ir::ReduceCombiner::Sum,
+                _ => crate::function_ir::ReduceCombiner::Prod,
             };
             ctx.emit(
                 TileIrOp::Scan {

@@ -1,7 +1,7 @@
 use crate::token::TkoSemantics;
 use std::fmt::Write;
 
-use crate::ir::*;
+use crate::function_ir::*;
 
 /// The name a unary float operation prints under. The name is the operation:
 /// `exp`, `log2`, and the rest are the spellings every target uses.
@@ -314,10 +314,10 @@ fn format_tile_ir_op(op: &TileIrOp) -> String {
             ..
         } => {
             let combiner = match combiner {
-                crate::ir::ReduceCombiner::Sum => "sum",
-                crate::ir::ReduceCombiner::Prod => "prod",
-                crate::ir::ReduceCombiner::Max => "max",
-                crate::ir::ReduceCombiner::Min => "min",
+                crate::function_ir::ReduceCombiner::Sum => "sum",
+                crate::function_ir::ReduceCombiner::Prod => "prod",
+                crate::function_ir::ReduceCombiner::Max => "max",
+                crate::function_ir::ReduceCombiner::Min => "min",
             };
             format!(
                 "scan {value} {{dim = {axis}, combiner = \"{combiner}\", reverse = {reverse}, input_shape = [{in_rows}, {in_cols}]}}"
@@ -646,11 +646,11 @@ fn comparison_predicate_name(op: CmpOp) -> &'static str {
 /// Print the ordering word a memory op states, as CuTile prints it.
 fn format_tko_ordering(semantics: &TkoSemantics) -> String {
     let word = match semantics.ordering {
-        crate::MemoryOrdering::Weak => "weak",
-        crate::MemoryOrdering::Relaxed => "relaxed",
-        crate::MemoryOrdering::Acquire => "acquire",
-        crate::MemoryOrdering::Release => "release",
-        crate::MemoryOrdering::AcqRel => "acq_rel",
+        crate::function_ir::MemoryOrdering::Weak => "weak",
+        crate::function_ir::MemoryOrdering::Relaxed => "relaxed",
+        crate::function_ir::MemoryOrdering::Acquire => "acquire",
+        crate::function_ir::MemoryOrdering::Release => "release",
+        crate::function_ir::MemoryOrdering::AcqRel => "acq_rel",
     };
     word.to_string()
 }

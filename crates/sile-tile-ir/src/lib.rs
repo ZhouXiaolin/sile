@@ -1,4 +1,5 @@
 pub mod cutile;
+pub mod function_ir;
 pub mod ir;
 pub mod lower;
 pub mod opcode;
@@ -6,6 +7,9 @@ pub mod passes;
 pub mod print;
 pub mod token;
 
+// The one Tile IR: the arena-structured port of cutile-ir. The backend's
+// function-shaped IR stays behind its own path — the lowerings that consume it
+// name `function_ir::` explicitly.
 pub use ir::*;
 pub use token::TkoSemantics;
 pub use lower::lower_to_tile_ir;

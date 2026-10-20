@@ -1,7 +1,7 @@
 use crate as llvm_ir;
 
 use super::core::{LowerLlvmIrCtx, llvm_ir_block, resolve_operand};
-use sile_tile_ir::*;
+use sile_tile_ir::function_ir::*;
 
 pub(crate) fn lower_terminator(
     term: &TileIrTerminator,

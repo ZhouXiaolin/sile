@@ -3,7 +3,7 @@ pub mod pointwise_fusion;
 pub mod tile_expr_cse;
 pub mod verify;
 
-use crate::TileIrFunction;
+use crate::function_ir::TileIrFunction;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TileIrPassKind {

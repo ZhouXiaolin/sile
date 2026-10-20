@@ -1,13 +1,13 @@
 use crate as llvm_ir;
 
-use sile_tile_ir::ValueId;
+use sile_tile_ir::function_ir::ValueId;
 use crate::lower::core::{
     BlockLowerer, LowerLlvmIrCtx, REDUCE_UNROLL_THRESHOLD, alloc_tile_result, const_i64, emit_bin,
     emit_cmp, emit_gep, emit_select, emit_store, load_tile_scalar_dynamic, lower_nested_tile_loop,
     lower_reduce_extent_loop, resolve_operand,
 };
 
-pub use sile_tile_ir::ReduceCombiner;
+pub use sile_tile_ir::function_ir::ReduceCombiner;
 
 pub(crate) fn reduce_combine(
     ctx: &mut LowerLlvmIrCtx,

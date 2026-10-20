@@ -115,11 +115,8 @@ pub mod typeck {
     pub use sile_hir::typeck::*;
 }
 pub mod tileir {
-    pub use sile_tile_ir::ir::*;
-    pub use sile_tile_ir::{
-        TileIrBlock, TileIrFunction, TileIrInst, TileIrOp, TileIrParam, TileIrTerminator,
-        TileIrType, format_tile_ir, lower_to_tile_ir,
-    };
+    pub use sile_tile_ir::function_ir::*;
+    pub use sile_tile_ir::{format_tile_ir, lower_to_tile_ir};
 }
 pub mod llvmir {
     pub use sile_llvm_ir::{
