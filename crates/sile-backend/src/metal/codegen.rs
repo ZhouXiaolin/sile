@@ -315,6 +315,44 @@ impl TargetDialect for MetalDialect<'_> {
                 let v = format_operand(vector);
                 format!("{} = {v}[0] + {v}[1] + {v}[2] + {v}[3];", name())
             }
+            // A tile-level fold is a loop here, the same way WGSL spells it:
+            // MSL has no reduction directive either.
+            llvm_ir::Intrinsic::TileReduce {
+                reduce,
+                extent,
+                inner,
+                outer,
+            } => {
+                let [source] = args else {
+                    return Err(sile_core::Error::Compile(
+                        "tile_reduce intrinsic expects one argument".into(),
+                    ));
+                };
+                let src = format_operand(source);
+                let dst = name();
+                let span = *extent * *inner;
+                let combine = match reduce {
+                    llvm_ir::TileReduceOp::Sum => "racc + rv",
+                    llvm_ir::TileReduceOp::Product => "racc * rv",
+                    llvm_ir::TileReduceOp::Max => "max(racc, rv)",
+                    llvm_ir::TileReduceOp::Min => "min(racc, rv)",
+                };
+                return Ok(vec![
+                    format!("for (int64_t ro = 0; ro < {outer}; ++ro) {{"),
+                    format!("  float racc = {src}[ro * {span}];"),
+                    format!("  for (int64_t ri = 1; ri < {span}; ++ri) {{"),
+                    format!("    float rv = {src}[ro * {span} + ri];"),
+                    format!("    racc = {combine};"),
+                    "  }".to_string(),
+                    format!("  {dst}[ro] = racc;"),
+                    "}".to_string(),
+                ]);
+            }
+            llvm_ir::Intrinsic::TileMma { .. } => {
+                return Err(sile_core::Error::Compile(
+                    "MSL has no tile-level matrix multiply yet".into(),
+                ));
+            }
         };
         Ok(vec![line])
     }

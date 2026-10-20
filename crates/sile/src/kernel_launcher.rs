@@ -7,9 +7,8 @@ use sile_backend::metal::MetalBackend;
 use sile_core::{Device, KernelArg, LaunchConfig, Result, Stream};
 use sile_hir::Kernel;
 use sile_llvm_ir::format_llvm_ir;
-use sile_tile_ir::format_tile_ir;
 
-use crate::compiler::{CodegenTarget, compile_backend, compile_kernel_to_llvm_ir};
+use crate::compiler::{CodegenTarget, compile_backend, compile_kernel_to_module};
 
 const PRINT_TILE_IR_ENV: &str = "SILE_PRINT_TILEIR";
 const PRINT_LLVM_IR_ENV: &str = "SILE_PRINT_LLVMIR";
@@ -22,7 +21,11 @@ const PRINT_SOURCE_ENV: &str = "SILE_PRINT_SOURCE";
 /// once per distinct kernel and every target reuses it. Without this, a launch
 /// inside a loop re-runs the whole front end and both lowering stages on every
 /// iteration.
-type CompiledParts = (sile_hir::typeck::TypedKernel, sile_tile_ir::function_ir::TileIrFunction, sile_llvm_ir::Function);
+type CompiledParts = (
+    sile_hir::typeck::TypedKernel,
+    sile_tile_ir::ir::Module,
+    sile_llvm_ir::Function,
+);
 
 fn compile_cache() -> &'static Mutex<HashMap<String, Arc<CompiledParts>>> {
     static CACHE: OnceLock<Mutex<HashMap<String, Arc<CompiledParts>>>> = OnceLock::new();
@@ -54,7 +57,7 @@ fn compiled_parts(kernel: &Kernel) -> Result<Arc<CompiledParts>> {
         }
     }
 
-    let parts = Arc::new(compile_kernel_to_llvm_ir(kernel)?);
+    let parts = Arc::new(compile_kernel_to_module(kernel)?);
     compile_cache()
         .lock()
         .unwrap()
@@ -213,7 +216,7 @@ impl<'a> KernelLauncher<'a> {
         };
 
         let parts = compiled_parts(&self.kernel)?;
-        let (typed, tile_ir_func, llvm_ir_func) = parts.as_ref();
+        let (typed, tile_ir_module, llvm_ir_func) = parts.as_ref();
 
         // The access checks the compiler moved out of the kernel run here,
         // before anything is launched. A check that cannot be resolved is an
@@ -224,7 +227,7 @@ impl<'a> KernelLauncher<'a> {
         validate_launch_checks(&checks, &self.args)?;
 
         if should_print(PRINT_TILE_IR_ENV) {
-            eprintln!("{}", format_tile_ir(tile_ir_func));
+            eprintln!("{}", tile_ir_module.to_mlir_text());
         }
         if should_print(PRINT_LLVM_IR_ENV) {
             eprintln!("{}", format_llvm_ir(llvm_ir_func));

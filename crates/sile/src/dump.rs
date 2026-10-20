@@ -20,12 +20,9 @@ use std::time::Instant;
 use sile_core::Result;
 use sile_hir::typeck::TypedKernel;
 use sile_llvm_ir::{Function as LlvmIrFunction, LlvmIrPassKind};
-use sile_tile_ir::function_ir::TileIrFunction;
-use sile_tile_ir::TileIrPassKind;
-
 use crate::compiler::{
-    ACTIVE_HIR_TYPECK_PIPELINE, ACTIVE_LLVM_IR_PIPELINE, ACTIVE_TILE_IR_PIPELINE, CodegenTarget,
-    compile_backend, run_hir_analysis_pipeline,
+    ACTIVE_HIR_TYPECK_PIPELINE, ACTIVE_LLVM_IR_PIPELINE, CodegenTarget, compile_backend,
+    run_hir_analysis_pipeline,
 };
 
 /// The environment variable that turns dumping on and names its directory.
@@ -92,7 +89,9 @@ pub fn dump_kernel(kernel: &sile_hir::Kernel, root: &Path) -> Result<()> {
     // IR happens to say: that is the text the alignment fixtures compare, so it
     // is the one worth recording.
     let started = Instant::now();
-    let mut tile_ir: TileIrFunction = sile_tile_ir::lower_to_tile_ir(&typed);
+    let mut module: sile_tile_ir::ir::Module = sile_tile_ir::cutile::emit::emit(&typed)
+        .map_err(|err| sile_core::Error::Shape(err))?
+        .0;
     stages.push(Stage {
         label: "tileir-00-lowered".into(),
         text: crate::tileir_text::emit(&typed)
@@ -113,33 +112,10 @@ pub fn dump_kernel(kernel: &sile_hir::Kernel, root: &Path) -> Result<()> {
     // failure becomes a stage of its own and every stage so far is written.
     let mut failure: Option<String> = None;
 
-    for (index, kind) in ACTIVE_TILE_IR_PIPELINE.iter().enumerate() {
-        let started = Instant::now();
-        match sile_tile_ir::run_tile_ir_pipeline(tile_ir.clone(), &[*kind]) {
-            Ok(next) => tile_ir = next,
-            Err(err) => {
-                let label = format!("tileir-{:02}-{}-FAILED", index + 1, tile_ir_pass_name(*kind));
-                stages.push(Stage {
-                    label,
-                    text: err.clone(),
-                    micros: started.elapsed().as_micros(),
-                });
-                failure = Some(err);
-                break;
-            }
-        }
-        let micros = started.elapsed().as_micros();
-        let label = format!("tileir-{:02}-{}", index + 1, tile_ir_pass_name(*kind));
-        stages.push(Stage {
-            label,
-            text: sile_tile_ir::format_tile_ir(&tile_ir),
-            micros,
-        });
-    }
-
     // ── LLVM IR, one snapshot per pass ────────────────────────────
     let started = Instant::now();
-    let mut llvm_ir: LlvmIrFunction = sile_llvm_ir::lower_tile_ir_to_llvm_ir(&tile_ir);
+    let mut llvm_ir: LlvmIrFunction =
+        sile_llvm_ir::lower_module_to_llvm_ir(&module).map_err(sile_core::Error::Compile)?;
     let lowered_micros = started.elapsed().as_micros();
     stages.push(Stage {
         label: "llvmir-00-lowered".into(),
@@ -249,16 +225,6 @@ fn target_name(target: CodegenTarget) -> &'static str {
         CodegenTarget::Metal => "metal",
         CodegenTarget::Wgsl => "wgsl",
         CodegenTarget::Ptx => "ptx",
-    }
-}
-
-fn tile_ir_pass_name(kind: TileIrPassKind) -> &'static str {
-    match kind {
-        TileIrPassKind::VerifyInput => "verify-input",
-        TileIrPassKind::PointwiseFusion => "pointwise-fusion",
-        TileIrPassKind::TileExprCse => "tile-expr-cse",
-        TileIrPassKind::Dce => "dce",
-        TileIrPassKind::VerifyOutput => "verify-output",
     }
 }
 

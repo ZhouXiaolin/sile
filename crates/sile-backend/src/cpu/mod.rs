@@ -1,6 +1,13 @@
 pub mod codegen;
 
-use std::{ffi::c_void, fs, process::Command};
+use std::{
+    collections::HashMap,
+    ffi::c_void,
+    fs,
+    path::PathBuf,
+    process::Command,
+    sync::{Mutex, OnceLock},
+};
 
 use libloading::Library;
 use sile_llvm_ir::Function as LlvmIrFunction;
@@ -9,8 +16,43 @@ use tempfile::tempdir;
 use self::codegen::generate as generate_llvm_ir_kernel;
 use sile_core::{KernelArg, LaunchConfig, Result, Stream};
 
-type KernelFn =
-    unsafe extern "C" fn(*const *const c_void, i64, i64, *const i64, i64, *const f32, *const i64);
+type KernelFn = unsafe extern "C" fn(
+    *const *const c_void,
+    i64,
+    i64,
+    *const i64,
+    i64,
+    *const f32,
+    *const i64,
+    *const i64,
+);
+
+/// Compiled kernels, keyed by the source they were built from.
+///
+/// `cc -O2` costs tens of milliseconds, which dwarfs a short kernel's own
+/// runtime: a 16M-element saxpy runs in 2.7 ms. Keeping the loaded library
+/// means the second launch of a kernel measures the kernel, not the compiler.
+fn loaded_libraries() -> &'static Mutex<HashMap<String, &'static Library>> {
+    static LIBRARIES: OnceLock<Mutex<HashMap<String, &'static Library>>> = OnceLock::new();
+    LIBRARIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Generated C source, keyed by the address of the IR it was lowered from.
+///
+/// The address is a plain `usize` so the map can live in a `static`: the
+/// function outlives the cache entry, which is only read back for that same
+/// function.
+fn generated_sources() -> &'static Mutex<HashMap<usize, String>> {
+    static SOURCES: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
+    SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The temporary directory each cached library was built in. It has to outlive
+/// the library: the `.so` is mapped from it.
+fn kept_directories() -> &'static Mutex<Vec<PathBuf>> {
+    static DIRECTORIES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    DIRECTORIES.get_or_init(|| Mutex::new(Vec::new()))
+}
 
 pub struct CpuBackend;
 
@@ -56,6 +98,15 @@ impl CpuBackend {
         launch: &LaunchConfig,
         llvm_ir_mode: bool,
     ) -> Result<()> {
+        // A cached library serves every launch of the same source.
+        let library = {
+            let libraries = loaded_libraries().lock().unwrap();
+            libraries.get(c_code).copied()
+        };
+        if let Some(library) = library {
+            return Self::launch(library, kernel_name, args, scalars, scalars_i64, launch, llvm_ir_mode);
+        }
+
         let dir = tempdir()?;
         let c_path = dir.path().join(format!("{}.c", kernel_name));
         let ext = if cfg!(target_os = "macos") {
@@ -130,9 +181,31 @@ impl CpuBackend {
             )));
         }
 
+        // The library is leaked on purpose: it is cached by source text and
+        // outlives every launch, so its directory must too.
+        let kept = dir.keep();
+        let library: &'static Library = Box::leak(Box::new(
+            unsafe { Library::new(&so_path) }.map_err(|e| sile_core::Error::Compile(e.to_string()))?,
+        ));
+        kept_directories().lock().unwrap().push(kept);
+        loaded_libraries()
+            .lock()
+            .unwrap()
+            .insert(c_code.to_string(), library);
+        Self::launch(library, kernel_name, args, scalars, scalars_i64, launch, llvm_ir_mode)
+    }
+
+    /// Call one entry point in an already-loaded kernel library.
+    fn launch(
+        library: &'static Library,
+        kernel_name: &str,
+        args: &[KernelArg<'_>],
+        scalars: &[f32],
+        scalars_i64: &[i64],
+        launch: &LaunchConfig,
+        llvm_ir_mode: bool,
+    ) -> Result<()> {
         unsafe {
-            let library =
-                Library::new(&so_path).map_err(|e| sile_core::Error::Compile(e.to_string()))?;
             let symbol_name = format!("sile_kernel_{}", kernel_name);
             let func: libloading::Symbol<KernelFn> = library
                 .get(symbol_name.as_bytes())
@@ -156,6 +229,12 @@ impl CpuBackend {
                 args[0].shape[0] / num_threadgroups
             };
 
+            let grid: [i64; 3] = [
+                launch.grid[0] as i64,
+                launch.grid[1] as i64,
+                launch.grid[2] as i64,
+            ];
+
             func(
                 buffers.as_ptr(),
                 num_threadgroups,
@@ -164,6 +243,7 @@ impl CpuBackend {
                 shapes.len() as i64,
                 scalars.as_ptr(),
                 scalars_i64.as_ptr(),
+                grid.as_ptr(),
             );
         }
 
@@ -179,7 +259,20 @@ impl CpuBackend {
         launch: &LaunchConfig,
         _stream: &Stream,
     ) -> Result<()> {
-        let c_code = Self::compile_llvm_ir_kernel(func)?;
+        // Generating the C source costs more than a short kernel runs for, and
+        // the same function is lowered on every launch. The IR value is stable
+        // for a compiled kernel, so its address identifies the source.
+        let c_code = {
+            let mut sources = generated_sources().lock().unwrap();
+            match sources.get(&(func as *const LlvmIrFunction as usize)) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let generated = Self::compile_llvm_ir_kernel(func)?;
+                    sources.insert(func as *const LlvmIrFunction as usize, generated.clone());
+                    generated
+                }
+            }
+        };
         self.execute_compiled_source(
             &func.name,
             &c_code,

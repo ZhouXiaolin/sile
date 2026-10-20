@@ -18,6 +18,14 @@ impl Value {
     pub fn index(self) -> u32 {
         self.0
     }
+
+    /// The handle for arena slot `index`.
+    ///
+    /// A lowering walks the value arena to answer "which value did this op
+    /// produce", so it needs the handle for a slot it found by index.
+    pub fn new(index: u32) -> Self {
+        Self(index)
+    }
 }
 
 /// Metadata stored for each value in the module's value arena.
@@ -41,6 +49,17 @@ pub enum ValueProducer {
 /// Index-based handle to an operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OpId(pub(crate) u32);
+
+impl OpId {
+    /// The handle for arena slot `index`.
+    pub fn new(index: u32) -> Self {
+        Self(index)
+    }
+
+    pub fn index(self) -> u32 {
+        self.0
+    }
+}
 
 /// Index-based handle to a block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -187,6 +187,29 @@ pub enum SyncScope {
     Device,
 }
 
+/// How a tile-level fold combines two elements.
+///
+/// A target spells these differently — a C `#pragma omp simd reduction`, a
+/// WGSL loop — so the intrinsic names the operation, not its spelling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TileReduceOp {
+    Sum,
+    Product,
+    Max,
+    Min,
+}
+
+impl TileReduceOp {
+    pub const fn name(self) -> &'static str {
+        match self {
+            TileReduceOp::Sum => "sum",
+            TileReduceOp::Product => "product",
+            TileReduceOp::Max => "max",
+            TileReduceOp::Min => "min",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Intrinsic {
     ThreadId {
@@ -243,6 +266,25 @@ pub enum Intrinsic {
     /// Horizontal reduction: sum all elements of a vector into a scalar.
     /// Args: [vector]. Result type must be scalar.
     VecReduceAdd,
+    /// Fold one axis of a tile. Args: [tile]. `reduce` is the combining
+    /// opcode, `extent` the folded axis length, `inner` the number of
+    /// elements after it, `outer` the number of output elements. The target
+    /// picks the shape of the loop nest, or `#pragma omp simd reduction`.
+    TileReduce {
+        reduce: TileReduceOp,
+        extent: u64,
+        inner: u64,
+        outer: u64,
+    },
+    /// `dst = lhs @ rhs + acc` over whole tiles. Args: [lhs, rhs, acc] with
+    /// `m`, `n`, `k` the multiply's extents and `rhs_cols` the right operand's
+    /// row stride. Kept whole so the target can choose a micro-kernel.
+    TileMma {
+        m: u64,
+        n: u64,
+        k: u64,
+        rhs_cols: u64,
+    },
 }
 
 impl Intrinsic {

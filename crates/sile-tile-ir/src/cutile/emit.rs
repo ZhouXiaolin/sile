@@ -200,12 +200,17 @@ fn fold_condition(
             _ => {}
         }
     }
-    if let Some(known) = builder.access.literal_comparison(kernel, expr) {
+    // A comparison against a literal decides the branch by the generic's own
+    // value, which the IR prints as `1` for a flag. The printed value is what
+    // the comparison reads, but it is not what the branch means: folding
+    // `if CAUSAL == 1` to the taken arm for every instantiation made the
+    // unmasked run execute the masked body.
+    if let Some(known) = true_literal_comparison(kernel, expr)
+        .or_else(|| builder.access.literal_comparison(kernel, expr))
+    {
         let Expr::Builtin { args, .. } = expr else {
             unreachable!()
         };
-        // The value the comparison is decided against is named, then the
-        // comparison itself is folded away.
         let _ = emit_expr(builder, &args[1], kernel);
         builder.discard();
         builder.i32_const_i1(known);
@@ -214,6 +219,37 @@ fn fold_condition(
     match emit_expr(builder, expr, kernel) {
         (value, _) => Folded::Value(value),
     }
+}
+
+/// A comparison between a const generic and a literal, decided by the
+/// generic's declared value rather than by the `1` the IR prints for a flag.
+fn true_literal_comparison(kernel: &Kernel, expr: &sile_hir::Expr) -> Option<bool> {
+    use sile_hir::{BuiltinOp, Expr};
+    let Expr::Builtin { op, args } = expr else {
+        return None;
+    };
+    let value_of = |arg: &Expr| -> Option<i64> {
+        match arg {
+            Expr::ScalarI64(value) => Some(*value),
+            Expr::Var(name) => kernel
+                .const_params
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, value)| *value),
+            _ => None,
+        }
+    };
+    let lhs = value_of(args.first()?)?;
+    let rhs = value_of(args.get(1)?)?;
+    Some(match op {
+        BuiltinOp::Eq => lhs == rhs,
+        BuiltinOp::Ne => lhs != rhs,
+        BuiltinOp::Lt => lhs < rhs,
+        BuiltinOp::Le => lhs <= rhs,
+        BuiltinOp::Gt => lhs > rhs,
+        BuiltinOp::Ge => lhs >= rhs,
+        _ => return None,
+    })
 }
 
 /// The extents a view names, as the IR spells them: a dynamic one is `DYNAMIC`.

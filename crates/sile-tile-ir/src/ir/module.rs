@@ -83,6 +83,27 @@ impl Module {
         id
     }
 
+    /// Number of operations in the arena.
+    pub fn num_ops(&self) -> usize {
+        self.operations.len()
+    }
+
+    /// Every operation, in allocation order.
+    pub fn ops(&self) -> impl Iterator<Item = (OpId, &Operation)> {
+        self.operations
+            .iter()
+            .enumerate()
+            .map(|(i, op)| (OpId(i as u32), op))
+    }
+
+    /// Every value, in allocation order.
+    pub fn values(&self) -> impl Iterator<Item = (Value, &ValueData)> {
+        self.values
+            .iter()
+            .enumerate()
+            .map(|(i, data)| (Value(i as u32), data))
+    }
+
     pub fn op(&self, id: OpId) -> &Operation {
         &self.operations[id.0 as usize]
     }

@@ -665,6 +665,109 @@ impl TargetDialect for WgslDialect<'_> {
                     v = format_operand(vector)
                 )
             }
+            // WGSL has no reduction directive, so a tile-level fold is the
+            // loop it would have become anyway. Keeping the shape here means
+            // the lowering does not decide how the target folds.
+            llvm_ir::Intrinsic::TileReduce {
+                reduce,
+                extent,
+                inner,
+                outer,
+            } => {
+                let [source] = args else {
+                    return Err(sile_core::Error::Compile(
+                        "WGSL tile_reduce expects one argument".into(),
+                    ));
+                };
+                let src = self.buffer_element(
+                    source,
+                    &|id| value_name(id),
+                    &|op| format_operand(op),
+                );
+                let dst = name();
+                let span = *extent * *inner;
+                // The identity is the first element of each fold: every
+                // combining operation here is one the first element absorbs.
+                let combine = match reduce {
+                    llvm_ir::TileReduceOp::Sum => |acc: String, v: String| format!("{acc} + {v}"),
+                    llvm_ir::TileReduceOp::Product => {
+                        |acc: String, v: String| format!("{acc} * {v}")
+                    }
+                    llvm_ir::TileReduceOp::Max => {
+                        |acc: String, v: String| format!("select({v}, {acc}, {acc} > {v})")
+                    }
+                    llvm_ir::TileReduceOp::Min => {
+                        |acc: String, v: String| format!("select({v}, {acc}, {acc} < {v})")
+                    }
+                };
+                // WGSL indexes an array with an `i32`, so the fold's counters
+                // are `i32` rather than the `i64` the rest of the lowering uses.
+                let mut lines = vec![format!("var {dst}: array<f32, {}>;", outer)];
+                lines.push(format!(
+                    "for (var ro: i32 = 0; ro < {outer}; ro = ro + 1) {{"
+                ));
+                lines.push(format!("  var racc = {src}[ro * {span}];"));
+                lines.push(format!(
+                    "  for (var ri: i32 = 1; ri < {span}; ri = ri + 1) {{"
+                ));
+                lines.push(format!(
+                    "    let rv = {src}[ro * {span} + ri];"
+                ));
+                lines.push(format!("    racc = {};", combine("racc".into(), "rv".into())));
+                lines.push("  }".to_string());
+                lines.push(format!("  {dst}[ro] = racc;"));
+                lines.push("}".to_string());
+                return Ok(lines);
+            }
+            // WGSL has no matrix instruction, so the multiply is the loop
+            // nest the target's own compiler vectorises. The tiles arrive as
+            // `var` arrays, which are indexed with an `i32`.
+            llvm_ir::Intrinsic::TileMma { m, n, k, rhs_cols } => {
+                let [lhs, rhs, ..] = args else {
+                    return Err(sile_core::Error::Compile(
+                        "WGSL tile_mma expects at least two arguments".into(),
+                    ));
+                };
+                let acc = args.get(2);
+                let buffer = |operand: &llvm_ir::Operand| {
+                    self.buffer_element(operand, &|id| value_name(id), &|op| format_operand(op))
+                };
+                let (lhs, rhs) = (buffer(lhs), buffer(rhs));
+                let dst = name();
+                let (m, n, k, rhs_cols) = (*m, *n, *k, *rhs_cols);
+                let seed = match acc {
+                    Some(_) => format!("{dst}[mo * {n} + no]"),
+                    None => "0.0f".to_string(),
+                };
+                let mut lines = vec![format!("var {dst}: array<f32, {}>;", m * n)];
+                if let Some(accumulator) = acc {
+                    let source = buffer(accumulator);
+                    lines.push(format!(
+                        "for (var mi: i32 = 0; mi < {}; mi = mi + 1) {{",
+                        m * n
+                    ));
+                    lines.push(format!("  {dst}[mi] = {source}[mi];"));
+                    lines.push("}".to_string());
+                }
+                lines.push(format!(
+                    "for (var mo: i32 = 0; mo < {m}; mo = mo + 1) {{"
+                ));
+                lines.push(format!(
+                    "  for (var no: i32 = 0; no < {n}; no = no + 1) {{"
+                ));
+                lines.push(format!("    var racc = {seed};"));
+                lines.push(format!(
+                    "    for (var ko: i32 = 0; ko < {k}; ko = ko + 1) {{"
+                ));
+                lines.push(format!(
+                    "      racc = racc + {lhs}[mo * {k} + ko] * {rhs}[ko * {rhs_cols} + no];"
+                ));
+                lines.push("    }".to_string());
+                lines.push(format!("    {dst}[mo * {n} + no] = racc;"));
+                lines.push("  }".to_string());
+                lines.push("}".to_string());
+                return Ok(lines);
+            }
         };
         Ok(vec![line])
     }

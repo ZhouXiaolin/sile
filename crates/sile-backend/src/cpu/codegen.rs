@@ -114,6 +114,15 @@ impl emit::TargetDialect for CDialect {
         );
         lines.push("    return r;".to_string());
         lines.push("}".to_string());
+        lines.push(
+            "static inline void llir_vec_store_4(float* ptr, int64_t offset, llir_float4 v) {"
+                .to_string(),
+        );
+        lines.push(
+            "    ptr[offset] = v.v[0]; ptr[offset+1] = v.v[1]; ptr[offset+2] = v.v[2]; ptr[offset+3] = v.v[3];"
+                .to_string(),
+        );
+        lines.push("}".to_string());
         lines.push("static inline float llir_vec_reduce_add(llir_float4 v) {".to_string());
         lines.push("    return v.v[0] + v.v[1] + v.v[2] + v.v[3];".to_string());
         lines.push("}".to_string());
@@ -133,6 +142,88 @@ impl emit::TargetDialect for CDialect {
         intrinsic: &llvm_ir::Intrinsic,
         args: &[llvm_ir::Operand],
     ) -> sile_core::Result<Vec<String>> {
+        // A tile-level fold keeps its shape here rather than in the lowering:
+        // this is the layer that knows whether the target has a reduction
+        // instruction or wants a loop.
+        if let llvm_ir::Intrinsic::TileReduce {
+            reduce,
+            extent,
+            inner,
+            outer,
+        } = intrinsic
+        {
+            let [source] = args else {
+                return Err(sile_core::Error::Compile(
+                    "tile_reduce expects one argument".into(),
+                ));
+            };
+            let id = result.ok_or_else(|| {
+                sile_core::Error::Compile("tile_reduce needs a result".into())
+            })?;
+            let dst = value_name(id);
+            let src = format_operand(source);
+            // The reduction a target can fuse into one directive, or a loop
+            // nest over the folded axis.
+            // `max`/`min` are not C operators, so the fold spells them as a
+            // conditional the compiler turns back into a max instruction.
+            let combine = match reduce {
+                llvm_ir::TileReduceOp::Sum => "racc + rv",
+                llvm_ir::TileReduceOp::Product => "racc * rv",
+                llvm_ir::TileReduceOp::Max => "(racc > rv ? racc : rv)",
+                llvm_ir::TileReduceOp::Min => "(racc < rv ? racc : rv)",
+            };
+            let (extent, inner, outer) = (*extent, *inner, *outer);
+            let span = extent * inner;
+            // A fold of one contiguous run is exactly what an OpenMP reduction
+            // clause is for: the compiler is free to vectorise it, which is the
+            // whole point of keeping the reduction whole until here.
+            // OpenMP names the arithmetic clauses by their operator.
+            let clause = match reduce {
+                llvm_ir::TileReduceOp::Sum => "+",
+                llvm_ir::TileReduceOp::Product => "*",
+                llvm_ir::TileReduceOp::Max => "max",
+                llvm_ir::TileReduceOp::Min => "min",
+            };
+            let mut lines = Vec::new();
+            lines.push(format!("for (int64_t ro = 0; ro < {outer}; ++ro) {{"));
+            lines.push(format!("  float racc = {src}[ro * {span}];"));
+            lines.push(format!("  #pragma omp simd reduction({clause}:racc)"));
+            lines.push(format!("  for (int64_t ri = 1; ri < {span}; ++ri) {{"));
+            lines.push(format!("    float rv = {src}[ro * {span} + ri];"));
+            lines.push(format!("    racc = {combine};"));
+            lines.push("  }".to_string());
+            lines.push(format!("  {dst}[ro] = racc;"));
+            lines.push("}".to_string());
+            return Ok(lines);
+        }
+        // A tile-level multiply becomes the loop nest the C compiler turns into
+        // its own vector code. The tiles arrive as pointers to their storage.
+        if let llvm_ir::Intrinsic::TileMma { m, n, k, rhs_cols } = intrinsic {
+            let id = result.ok_or_else(|| {
+                sile_core::Error::Compile("tile_mma needs a result".into())
+            })?;
+            let dst = value_name(id);
+            let lhs = format_operand(&args[0]);
+            let rhs = format_operand(&args[1]);
+            let acc = args.get(2).map(|arg| format_operand(arg));
+            let (m, n, k, rhs_cols) = (*m, *n, *k, *rhs_cols);
+            let mut lines = Vec::new();
+            lines.push(format!("for (int64_t mo = 0; mo < {m}; ++mo) {{"));
+            lines.push(format!("  for (int64_t no = 0; no < {n}; ++no) {{"));
+            lines.push(match &acc {
+                Some(acc) => format!("    float racc = {acc}[mo * {n} + no];"),
+                None => "    float racc = 0.0f;".to_string(),
+            });
+            lines.push(format!("    for (int64_t ko = 0; ko < {k}; ++ko) {{"));
+            lines.push(format!(
+                "      racc += {lhs}[mo * {k} + ko] * {rhs}[ko * {rhs_cols} + no];"
+            ));
+            lines.push("    }".to_string());
+            lines.push(format!("    {dst}[mo * {n} + no] = racc;"));
+            lines.push("  }".to_string());
+            lines.push("}".to_string());
+            return Ok(lines);
+        }
         let joined = args
             .iter()
             .map(|arg| format_operand(arg))
@@ -222,7 +313,8 @@ fn generate_wrapper(func: &llvm_ir::Function) -> sile_core::Result<String> {
     out.push_str("    const int64_t* shapes,\n");
     out.push_str("    int64_t num_shapes,\n");
     out.push_str("    const float* scalars,\n");
-    out.push_str("    const int64_t* scalars_i64\n");
+    out.push_str("    const int64_t* scalars_i64,\n");
+    out.push_str("    const int64_t* grid\n");
     out.push_str(") {\n");
 
     let mut buffer_idx = 0usize;
@@ -249,54 +341,37 @@ fn generate_wrapper(func: &llvm_ir::Function) -> sile_core::Result<String> {
     out.push_str("  int64_t sile_total_tiles = num_threadgroups;\n");
     out.push('\n');
 
-    // A tiled output is dispatched flat, one program per tile, so the single
-    // index splits into the output's logical grid axes the same way MSL and
-    // WGSL split it. Those axes are the output's axes the tile does not cover:
-    // a rank-2 output addresses one tile with a row and a column, and a rank-3
-    // output addresses a plane of tiles, so a plane axis comes first. Each
-    // count is the buffer's extent along that axis divided by the tile's, and
-    // comes from the shape descriptor and the tile ABI.
-    //
-    // Only a *tiled* output splits. A kernel that stores no tile owns one grid
-    // slot per program, and its launch index is the program id: `rms_norm`
-    // writes a row through a `[1, BLOCK_SIZE]` view, so reading a column count
-    // out of that store would split an index that was never flat.
+    // How many axes the launch index splits into: the output's rank, since a
+    // flat index splits along every axis the output addresses. The extents come
+    // from the grid below.
     let axes = output
         .as_ref()
         .map(|output| {
-            let abi = output.param.abi.as_ref();
-            let offset = abi.map(|abi| abi.shape_offset).unwrap_or(0);
-            let rank = abi.map(|abi| abi.rank).unwrap_or(2).max(1);
-            let mut axes: Vec<String> = (0..rank.saturating_sub(2))
-                .map(|axis| format!("shapes[{}]", offset + axis))
-                .collect();
-            if rank >= 2 {
-                axes.push(format!(
-                    "shapes[{}] / {}",
-                    offset + rank - 2,
-                    output.rows.max(1)
-                ));
-            }
-            axes.push(format!(
-                "shapes[{}] / {}",
-                offset + rank - 1,
-                output.cols.max(1)
-            ));
-            axes
+            let rank = output
+                .param
+                .abi
+                .as_ref()
+                .map(|abi| abi.rank)
+                .unwrap_or(2)
+                .max(1);
+            vec![0usize; rank]
         })
         .unwrap_or_default();
-    for (axis, extent) in axes.iter().enumerate() {
-        out.push_str(&format!("  int64_t sile_tiles_{axis} = {extent};\n"));
+
+    // The grid is the launch's, not this kernel's guess. A store tile says how
+    // much one program writes; it does not say how many programs there are. The
+    // host partitions the buffer, so the two can differ — `rms_norm` stores one
+    // `[1, BLOCK_SIZE]` tile per program while the host hands it whole rows —
+    // and deriving the split from the store would then drop work or read past
+    // the buffer. The launcher knows the grid, so it passes it in.
+    for axis in 0..3 {
+        out.push_str(&format!("  int64_t sile_tiles_{axis} = grid[{axis}];\n"));
     }
 
     // Publish the tile counts so `GridDim(axis)` inside the kernel reads the
     // same bound the split below uses.
     for axis in 0..3 {
-        let value = axes
-            .get(axis)
-            .map(|_| format!("sile_tiles_{axis}"))
-            .unwrap_or_else(|| "1".to_string());
-        out.push_str(&format!("  sile_grid_{axis} = {value};\n"));
+        out.push_str(&format!("  sile_grid_{axis} = sile_tiles_{axis};\n"));
     }
 
     out.push_str("  #pragma omp parallel for schedule(static)\n");
@@ -411,7 +486,7 @@ fn c_storage_decl(ty: &llvm_ir::Type, name: &str) -> String {
 fn c_ptr_decl(pointee: &llvm_ir::Type, name: &str) -> String {
     let dims = array_dims(pointee);
     let base = array_base_type(pointee);
-    if dims.is_empty() {
+    if dims.len() <= 1 {
         format!("{}* {} = NULL", base, name)
     } else {
         let suffix = dims[1..]
@@ -427,7 +502,12 @@ fn c_ptr_storage_bind_decl(pointee: &llvm_ir::Type, name: &str, storage_name: &s
     let dims = array_dims(pointee);
     let base = array_base_type(pointee);
     if dims.is_empty() {
-        format!("{}* {} = &{}", base, name, storage_name)
+        // A scalar slot's storage is the variable itself, so the pointer the
+        // loads and stores name is its address.
+        return format!("{}* {} = &{}", c_type(pointee), name, storage_name);
+    }
+    if dims.len() <= 1 {
+        format!("{}* {} = {}", base, name, storage_name)
     } else {
         let suffix = dims[1..]
             .iter()
@@ -506,5 +586,10 @@ fn intrinsic_name(intrinsic: &llvm_ir::Intrinsic) -> String {
         llvm_ir::Intrinsic::VecLoad { len } => format!("llir_vec_load_{}", len),
         llvm_ir::Intrinsic::VecStore { len } => format!("llir_vec_store_{}", len),
         llvm_ir::Intrinsic::VecReduceAdd => "llir_vec_reduce_add".to_string(),
+        // Both tile-level forms are expanded into loops by `intrinsic_stmt`, so
+        // no helper carries their name.
+        llvm_ir::Intrinsic::TileReduce { .. } | llvm_ir::Intrinsic::TileMma { .. } => {
+            unreachable!("a tile-level intrinsic is expanded, not called")
+        }
     }
 }

@@ -417,19 +417,25 @@ fn value_types(func: &llvm_ir::Function) -> HashMap<llvm_ir::ValueId, llvm_ir::T
             let Some(id) = inst.result else {
                 continue;
             };
-            // An alloca's result type is the pointer to the storage, which the
-            // instruction records as the allocation type.
-            let ty = match &inst.op {
-                llvm_ir::InstOp::Alloca {
-                    alloc_ty,
-                    addr_space,
-                } => llvm_ir::Type::ptr(addr_space.clone(), alloc_ty.clone()),
-                _ => inst.ty.clone(),
-            };
-            types.insert(id, ty);
+            types.insert(id, result_type(inst));
         }
     }
     types
+}
+
+/// The type of the value an instruction defines.
+///
+/// An `alloca`'s result is a pointer to the storage it owns; the instruction
+/// records the allocation type instead, so the pointer is rebuilt here. Every
+/// other instruction's result has the type it recorded.
+pub fn result_type(inst: &llvm_ir::Inst) -> llvm_ir::Type {
+    match &inst.op {
+        llvm_ir::InstOp::Alloca {
+            alloc_ty,
+            addr_space,
+        } => llvm_ir::Type::ptr(addr_space.clone(), alloc_ty.clone()),
+        _ => inst.ty.clone(),
+    }
 }
 
 /// How much one index of a Gep advances, in leaf elements.
@@ -967,6 +973,21 @@ pub fn collect_storage_values(func: &llvm_ir::Function) -> HashSet<llvm_ir::Valu
                 values.insert(param.id);
             }
         }
+        // A tile-level fold writes its output into storage of its own, the way
+        // an `alloca` does: the target emits the array, not a pointer to one.
+        for inst in &block.insts {
+            if matches!(
+                inst.op,
+                llvm_ir::InstOp::Intrinsic {
+                    intrinsic:
+                        llvm_ir::Intrinsic::TileReduce { .. } | llvm_ir::Intrinsic::TileMma { .. },
+                    ..
+                }
+            ) && let Some(id) = inst.result
+            {
+                values.insert(id);
+            }
+        }
     }
     values
 }
@@ -1176,7 +1197,7 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
                     && !seen.contains(&id)
                 {
                     seen.push(id);
-                    lines.push((id, inst.ty.clone()));
+                    lines.push((id, result_type(inst)));
                 }
             }
         }

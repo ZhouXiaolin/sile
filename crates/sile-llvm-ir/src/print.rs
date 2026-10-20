@@ -754,6 +754,23 @@ fn format_intrinsic(
             &[operand(0)],
             footer,
         ),
+        Intrinsic::TileReduce {
+            reduce,
+            extent,
+            inner,
+            outer,
+        } => format_runtime_call(
+            &format!("sile.tile.reduce.{}.{extent}.{inner}.{outer}", reduce.name()),
+            result_ty,
+            &[operand(0)],
+            footer,
+        ),
+        Intrinsic::TileMma { m, n, k, rhs_cols } => format_runtime_call(
+            &format!("sile.tile.mma.{m}.{n}.{k}.{rhs_cols}"),
+            result_ty,
+            &[operand(0), operand(1), operand(2)],
+            footer,
+        ),
     }
 }
 
