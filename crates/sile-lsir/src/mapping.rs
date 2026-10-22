@@ -2798,11 +2798,15 @@ fn build_tree_reduce(
 }
 
 fn identity(reduce: TileReduceOp) -> f64 {
+    // The same unit the TileIR fold carries: Max/Min seed ±inf so a fold
+    // over data containing infinities still folds correctly. The C, MSL and
+    // WGSL serial spellings start from `src[0]` instead, so only the
+    // workgroup-tree partial here consumes this value.
     match reduce {
         TileReduceOp::Sum => 0.0,
         TileReduceOp::Product => 1.0,
-        TileReduceOp::Max => -f64::from(f32::MAX),
-        TileReduceOp::Min => f64::from(f32::MAX),
+        TileReduceOp::Max => -f64::INFINITY,
+        TileReduceOp::Min => f64::INFINITY,
     }
 }
 

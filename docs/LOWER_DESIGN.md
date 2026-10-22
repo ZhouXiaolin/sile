@@ -7,9 +7,9 @@
 - TileIR 是结构化 tile 语言：区域嵌套，`for`/`if` 是 SESE 区域（single-entry, single-exit）。类比 MLIR 的 `scf` 方言。
 - LSIR 是任意 CFG 上的 pruned SSA。
 - 结构化语言到 CFG 的下降是**保序模板变换**：每个区域算子映射到一个固定 CFG 模板。`for` → header/body/exit 三角；`if` → then/else/join 菱形；`yield` → join 前的拷贝。
-- SSA 构造是**独立阶段**，不是下降的一部分。依据 Cytron–Ferrante–Rosen–Wegman–Zadeck (TOPLAS 1991)：先把一切标量落在 alloca（stack IR，dominance 平凡成立），再按 dominance frontier 插 phi 并重命名。这就是 LLVM `mem2reg`。本管线只取其前半：SROA 对常数索引的数组槽做无 phi 的提升，标量槽不进 SSA（§3），连 phi 插入也省去。
+- SSA 构造是**独立阶段**，不是下降的一部分。依据 Cytron–Ferrante–Rosen–Wegman–Zadeck (TOPLAS 1991)：先把一切标量落在 alloca（stack IR，dominance 平凡成立），再按 dominance frontier 插 phi 并重命名。这就是 LLVM `mem2reg`。本管线只取其前半：SROA 对常数索引的数组槽做无 phi 的提升，标量槽在下降阶段不进 SSA，留待管线的 ScalarPromote（§3）进入块参数形 SSA。
 
-推论：**下降阶段禁止手写 phi 与块参数**。手写 SSA 要求每个发射点满足 Braun et al. (CC 2013) 的 sealed-block 不变量（"值的定义支配使用"逐点成立）；下降器逐算子发射，无法廉价维护该不变量。历史教训：手写 phi 的下降器在 `materialize`/`for`/`mma`/`if` 各处反复产生 dominance 破坏，逐点修补不可收敛。
+推论：**下降阶段禁止手写 phi 与块参数**。 Braun et al. (CC 2013) 证明从 SSA 按需构造可以廉价维护 sealed-block 不变量，但那是有框架支撑的逐点构造；本下降器是逐算子的保序模板发射器，没有那个框架，历史上手写 phi 的下降器在 `materialize`/`for`/`mma`/`if` 各处反复产生 dominance 破坏，逐点修补不可收敛。零 phi 下沉把 dominance 正确性从逐发射点的不变量变成 alloca 即入口的构造性质（INV3），破坏面为零。
 
 ## 2. 下降器四条不变量
 

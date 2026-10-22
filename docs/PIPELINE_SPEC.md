@@ -46,13 +46,15 @@ emitter 只消费判定、不做判定（cutile `proof_analysis.rs` 的铁律，
 | Triton | sile 对应物 | 状态 |
 |---|---|---|
 | TTIR（结构化 tile 级，语义冻结） | arena TileIR，零 pass，1 个 dominance 校验 | 已就位，冻结 |
-| TTGIR（布局分配、线程映射、shared、convert_layout） | `crates/sile-lsir/src/mapping.rs` 的映射 pass 族：`MappingPolicy` 参数化五阶段 `policy/threads/reduce/mma/cleanup`，dump 段 `lsir-15..19-mapping-*` | 已就位（M3，2026-10-22 完成） |
-| 标量 LSIR + 优化（对标 Triton 的 LLVM IR 槽位） | 自研 SSA `sile_lsir::Function` + 14 pass | 已就位，链序不动 |
+| TTGIR（布局分配、线程映射、shared、convert_layout） | `crates/sile-lsir/src/mapping.rs` 的映射 pass 族：`MappingPolicy` 参数化五阶段 `policy/threads/reduce/mma/cleanup`，dump 段 `lsir-15..19-mapping-*` | 骨架就位（M3，2026-10-22；WGSL 单端验证子集，措辞边界见 §2.1） |
+| 标量 LSIR + 优化（对标 Triton 的 LLVM IR 槽位） | 自研 SSA `sile_lsir::Function` + 14 pass | 已就位，链序原则见 §2.2 |
 | 各端 codegen | `TargetDialect` 拼写器 + per-target 契约 verify | 已就位，保持 |
 
 **LSIR（Lowered Scalar IR）**：路线 2 中段 IR 的本名（2026-10-21 更名，原名「LLVM IR」是误称）。它是自研 SSA IR（`sile_lsir::Function`）：无 libllvm 依赖、不产 bitcode、喂不进 NVPTX/llc。文本形式模仿 LLVM IR（print 的目标是 `llvm-as` 可接受，intrinsic 拼写沿用 `@llvm.*`）——这是格式选择，不是依赖；保留文本兼容是未来接真 LLVM 后端的钩子。在那之前，标量优化全部由 LSIR 上的 pass 自担（这也是「M4 前需自写标量提升」的根因）。
 
-TileLang 的启示只取一条：TileReduce/TileMma 这类 tile 级原语必须活到映射层（BACKEND_PLAN 原则 3），不引入 schedule 概念。
+TileLang 的启示只取一条：TileReduce/TileMma 这类 tile 级原语必须活到映射层（BACKEND_PLAN 原则 3），不引入 schedule 概念。措辞边界（审计 2026-10-22）：TileLang 的原语与 schedule 是一体两面，本管线取的是「tile 原语独立于线程映射存在」这半面；映射族的 shared/staging/树归约手段与 TileLang 的 schedule 思想同源，不声称只受 Triton 影响。
+
+映射族与 TTGIR 的对应关系（措辞降级，审计 2026-10-22）：映射族是 **WGSL 单端验证过的 TTGIR 子集**——有线程映射、shared staging、树归约、barrier 契约；没有 per-value layout、convert_layout、swizzle、布局推断（policy 是每 target 全局常量）、pipelining/warp specialization。说「TTGIR 对应物已就位」时读作：骨架就位，布局系统未建。
 
 ### 2.2 拓扑定稿
 
@@ -70,10 +72,25 @@ sile_lsir::Function
   │         TileReduce 树归约+barrier、TileMma→mma.sync、Shared 布局
   │   不变量：映射只改放置，不改语义（抄 cutile：hoist never changes
   │         whether a kernel traps）。dump 段命名 lsir-1x-mapping-*
-  │ 现有 14 pass，链序不动：
+  │ 现有 14 pass，链序及排序原则：
   │   VerifyInput → Canonicalize → LoopSimplify → PhiAlias → Cse
   │   → InstCombine → LoopUnroll → InstCombine → Licm → Sroa
   │   → ScalarPromote → Dce → Cse → VerifyOutput
+  │
+  │   链序原则（审计定稿 2026-10-22，依据 docs/ACADEMIC_GROUNDING_AUDIT.md）：
+  │   1. 验证边界：结构合法性入口验一次、终态验一次（VerifyInput/VerifyOutput），
+  │      中间 pass 只依赖各自的局部前提。
+  │   2. 先规范化、再分析：Cse/InstCombine 在循环分析之前，让循环体的
+  │      指令数与形式稳定（LoopSimplify/LoopUnroll 都吃规范化后的形状）。
+  │   3. 循环先成形、再动内容：LoopSimplify（preheader/单回边）先于一切
+  │      需要插入 preheader 的 pass（LoopUnroll/Licm）。
+  │   4. 标量提升最后做、一次做够：LoopUnroll 展开后槽的赋值点全部可见，
+  │      Sroa（数组槽）→ ScalarPromote（标量槽）按可提升面从大到小收尾；
+  │      提前提升会在 unroll 前引入不必要的块参数连锁。
+  │   5. 删除性 pass 靠后：Dce/Cse 在所有引入新指令的 pass 之后，只关尾灯。
+  │   6. barrier 安全：映射族在标量管线之后由后端调度（backend compile_inner），
+  │      barrier 不暴露给任何可 hoist/可删除的标量 pass；标量端安全网是
+  │      canonicalize 的不可移除表与 cse 的写-kill 全清单（含 Barrier）。
   ▼
 各端：TargetDialect 拼写器 + 契约 verify（fail-closed）
   ├─ C    cc -O2 -fopenmp   ├─ WGSL naga→wgpu
