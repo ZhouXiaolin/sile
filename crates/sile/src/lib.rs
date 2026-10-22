@@ -118,26 +118,26 @@ pub mod tileir {
     pub use sile_tile_ir::cutile::emit::emit;
     pub use sile_tile_ir::ir::*;
 }
-pub mod llvmir {
-    pub use sile_llvm_ir::{
+pub mod lsir {
+    pub use sile_lsir::{
         AddressSpace, BasicBlock, BinOp, BlockId, BlockParam, CastOp, CmpPred, Constant, Function,
         Inst, InstOp, Intrinsic, Metadata, Operand, Param, ParamAbi, SyncScope, Terminator, Type,
-        ValueId, format_llvm_ir,
+        ValueId, format_lsir,
     };
 }
 pub mod compiler;
 pub mod dump;
 pub mod codegen {
-    pub mod llvmir_c {
+    pub mod lsir_c {
         pub use sile_backend::cpu::codegen::*;
     }
-    pub mod llvmir_metal {
+    pub mod lsir_metal {
         pub use sile_backend::metal::codegen::*;
     }
-    pub mod llvmir_ptx {
+    pub mod lsir_ptx {
         pub use sile_backend::ptx::codegen::*;
     }
-    pub mod llvmir_wgsl {
+    pub mod lsir_wgsl {
         pub use sile_backend::wgsl::codegen::*;
     }
 }

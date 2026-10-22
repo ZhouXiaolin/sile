@@ -944,7 +944,7 @@ dependencies = [
  "sile-backend",
  "sile-core",
  "sile-hir",
- "sile-llvm-ir",
+ "sile-lsir",
  "sile-macros",
  "sile-tile-ir",
  "thiserror 2.0.18",
@@ -959,7 +959,7 @@ dependencies = [
  "naga",
  "pollster",
  "sile-core",
- "sile-llvm-ir",
+ "sile-lsir",
  "tempfile",
  "wgpu",
 ]
@@ -978,7 +978,7 @@ name = "sile-hir"
 version = "0.1.0"
 
 [[package]]
-name = "sile-llvm-ir"
+name = "sile-lsir"
 version = "0.1.0"
 dependencies = [
  "sile-tile-ir",

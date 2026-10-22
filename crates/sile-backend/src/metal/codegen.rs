@@ -2,13 +2,17 @@ use crate::emit::{
     self, OutputBuffer, StructuredCfgMessages, TargetDialect, array_dims, find_output_buffer,
     find_output_param,
 };
-use sile_llvm_ir as llvm_ir;
+use sile_lsir as lsir;
 
 const SHAPES_PARAM_NAME: &str = "__sile_shapes";
 
-pub fn generate(func: &llvm_ir::Function) -> sile_core::Result<String> {
+pub fn generate(func: &lsir::Function) -> sile_core::Result<String> {
     let dialect = MetalDialect::new(func)?;
-    emit::generate_text(emit::TargetEmitter::new(func, dialect))
+    emit::generate_text(emit::TargetEmitter::new(
+        func,
+        dialect,
+        lsir::VectorPolicy::None,
+    ))
 }
 
 /// The MSL dialect: one spelling table, plus the tile arithmetic that MSL reads
@@ -17,15 +21,15 @@ pub fn generate(func: &llvm_ir::Function) -> sile_core::Result<String> {
 /// `grid_dim` and `block_id` divide the flat thread index into tiles, which is
 /// what the tile ABI promises the target can reconstruct.
 struct MetalDialect<'a> {
-    func: &'a llvm_ir::Function,
+    func: &'a lsir::Function,
     output: Option<OutputBuffer<'a>>,
     /// The output even when it stores no tile, so the launch index still has a
     /// place to come from.
-    output_param: Option<&'a llvm_ir::Param>,
+    output_param: Option<&'a lsir::Param>,
 }
 
 impl<'a> MetalDialect<'a> {
-    fn new(func: &'a llvm_ir::Function) -> sile_core::Result<Self> {
+    fn new(func: &'a lsir::Function) -> sile_core::Result<Self> {
         Ok(Self {
             func,
             output: find_output_buffer(func),
@@ -41,7 +45,7 @@ impl<'a> MetalDialect<'a> {
             .map(|param| param.name.as_str())
             .ok_or_else(|| {
                 sile_core::Error::Compile(
-                    "Metal backend requires explicit __sile_shapes parameter in LLVM IR".into(),
+                    "Metal backend requires explicit __sile_shapes parameter in LSIR".into(),
                 )
             })
     }
@@ -134,17 +138,17 @@ impl<'a> MetalDialect<'a> {
 impl TargetDialect for MetalDialect<'_> {
     /// A tile is an address here, so a parameter takes a copy of the elements
     /// rather than the address of storage the next iteration overwrites.
-    fn param_assign(&self, ty: &llvm_ir::Type, name: &str, arg: &str) -> String {
+    fn param_assign(&self, ty: &lsir::Type, name: &str, arg: &str) -> String {
         emit::copy_assign(ty, name, arg)
     }
 
-    fn var_decl(&self, ty: &llvm_ir::Type, name: &str, _is_alloca: bool) -> Option<String> {
+    fn var_decl(&self, ty: &lsir::Type, name: &str, _is_alloca: bool) -> Option<String> {
         // MSL has no function-local pointer storage, so a private pointer binds
         // to a `thread` local array. Unlike C, every private pointer behaves the
         // same way here, whether it came from an `alloca` or a `gep`.
         match ty {
-            llvm_ir::Type::Ptr {
-                addr_space: llvm_ir::AddressSpace::Private,
+            lsir::Type::Ptr {
+                addr_space: lsir::AddressSpace::Private,
                 pointee,
             } => {
                 let storage_name = format!("{name}_storage");
@@ -158,7 +162,7 @@ impl TargetDialect for MetalDialect<'_> {
         }
     }
 
-    fn param_decl(&self, ty: &llvm_ir::Type, _name: &str) -> String {
+    fn param_decl(&self, ty: &lsir::Type, _name: &str) -> String {
         metal_type(ty)
     }
 
@@ -171,7 +175,7 @@ impl TargetDialect for MetalDialect<'_> {
         out
     }
 
-    fn prelude_lines(&self, _func: &llvm_ir::Function) -> Vec<String> {
+    fn prelude_lines(&self, _func: &lsir::Function) -> Vec<String> {
         vec![
             "#include <metal_stdlib>".to_string(),
             "using namespace metal;".to_string(),
@@ -186,23 +190,28 @@ impl TargetDialect for MetalDialect<'_> {
 
     fn intrinsic_stmt(
         &self,
-        result: Option<llvm_ir::ValueId>,
-        value_name: impl Fn(llvm_ir::ValueId) -> String,
-        format_operand: impl Fn(&llvm_ir::Operand) -> String,
-        intrinsic: &llvm_ir::Intrinsic,
-        args: &[llvm_ir::Operand],
+        result: Option<lsir::ValueId>,
+        value_name: impl Fn(lsir::ValueId) -> String,
+        format_operand: impl Fn(&lsir::Operand) -> String,
+        intrinsic: &lsir::Intrinsic,
+        args: &[lsir::Operand],
     ) -> sile_core::Result<Vec<String>> {
-        let result = result.ok_or_else(|| {
-            sile_core::Error::Compile(format!(
-                "{intrinsic:?} in LLVM IR Metal codegen must produce a result"
-            ))
-        })?;
-        let name = || value_name(result);
+        // A vector store is a plain assignment and takes no result; every
+        // other intrinsic names one.
+        let named = match intrinsic {
+            lsir::Intrinsic::VecStore { .. } => None,
+            _ => Some(result.ok_or_else(|| {
+                sile_core::Error::Compile(format!(
+                    "{intrinsic:?} in LSIR Metal codegen must produce a result"
+                ))
+            })?),
+        };
+        let name = || value_name(named.expect("every other intrinsic names its result"));
         let line = match intrinsic {
-            llvm_ir::Intrinsic::BlockId { dim } => {
+            lsir::Intrinsic::BlockId { dim } => {
                 format!("{} = {};", name(), self.logical_block_id_expr(*dim)?)
             }
-            llvm_ir::Intrinsic::ThreadId { dim } => format!(
+            lsir::Intrinsic::ThreadId { dim } => format!(
                 "{} = (int64_t)gid.{};",
                 name(),
                 match dim {
@@ -211,28 +220,28 @@ impl TargetDialect for MetalDialect<'_> {
                     _ => "z",
                 }
             ),
-            llvm_ir::Intrinsic::GridDim { dim } => {
+            lsir::Intrinsic::GridDim { dim } => {
                 format!("{} = {};", name(), self.grid_dim_expr(*dim)?)
             }
-            llvm_ir::Intrinsic::Barrier { .. } => {
+            lsir::Intrinsic::Barrier { .. } => {
                 return Err(sile_core::Error::Compile(
-                    "barrier intrinsic is not yet supported in LLVM IR Metal codegen".into(),
+                    "barrier intrinsic is not yet supported in LSIR Metal codegen".into(),
                 ));
             }
-            llvm_ir::Intrinsic::Exp
-            | llvm_ir::Intrinsic::Exp2
-            | llvm_ir::Intrinsic::Log
-            | llvm_ir::Intrinsic::Log2
-            | llvm_ir::Intrinsic::Sqrt
-            | llvm_ir::Intrinsic::Abs
-            | llvm_ir::Intrinsic::Sin
-            | llvm_ir::Intrinsic::Cos
-            | llvm_ir::Intrinsic::Tan
-            | llvm_ir::Intrinsic::Sinh
-            | llvm_ir::Intrinsic::Cosh
-            | llvm_ir::Intrinsic::Tanh
-            | llvm_ir::Intrinsic::Ceil
-            | llvm_ir::Intrinsic::Floor => {
+            lsir::Intrinsic::Exp
+            | lsir::Intrinsic::Exp2
+            | lsir::Intrinsic::Log
+            | lsir::Intrinsic::Log2
+            | lsir::Intrinsic::Sqrt
+            | lsir::Intrinsic::Abs
+            | lsir::Intrinsic::Sin
+            | lsir::Intrinsic::Cos
+            | lsir::Intrinsic::Tan
+            | lsir::Intrinsic::Sinh
+            | lsir::Intrinsic::Cosh
+            | lsir::Intrinsic::Tanh
+            | lsir::Intrinsic::Ceil
+            | lsir::Intrinsic::Floor => {
                 let [arg] = args else {
                     return Err(sile_core::Error::Compile(
                         "a float function takes one argument".into(),
@@ -243,7 +252,7 @@ impl TargetDialect for MetalDialect<'_> {
                     .expect("a float function has a name");
                 format!("{} = metal::{}({});", name(), function, format_operand(arg))
             }
-            llvm_ir::Intrinsic::Pow | llvm_ir::Intrinsic::Atan2 => {
+            lsir::Intrinsic::Pow | lsir::Intrinsic::Atan2 => {
                 let [lhs, rhs] = args else {
                     return Err(sile_core::Error::Compile(
                         "a binary float function takes two arguments".into(),
@@ -260,7 +269,7 @@ impl TargetDialect for MetalDialect<'_> {
                     format_operand(rhs)
                 )
             }
-            llvm_ir::Intrinsic::Fma => {
+            lsir::Intrinsic::Fma => {
                 let [a, b, c] = args else {
                     return Err(sile_core::Error::Compile(
                         "a ternary float function takes three arguments".into(),
@@ -278,7 +287,7 @@ impl TargetDialect for MetalDialect<'_> {
                     format_operand(c)
                 )
             }
-            llvm_ir::Intrinsic::VecLoad { len } => {
+            lsir::Intrinsic::VecLoad { len } => {
                 let [ptr, offset] = args else {
                     return Err(sile_core::Error::Compile(
                         "vec_load intrinsic expects [ptr, offset] arguments".into(),
@@ -292,7 +301,7 @@ impl TargetDialect for MetalDialect<'_> {
                     format_operand(offset)
                 )
             }
-            llvm_ir::Intrinsic::VecStore { len } => {
+            lsir::Intrinsic::VecStore { len } => {
                 let [ptr, offset, value] = args else {
                     return Err(sile_core::Error::Compile(
                         "vec_store intrinsic expects [ptr, offset, value] arguments".into(),
@@ -306,7 +315,7 @@ impl TargetDialect for MetalDialect<'_> {
                     format_operand(value)
                 )
             }
-            llvm_ir::Intrinsic::VecReduceAdd => {
+            lsir::Intrinsic::VecReduceAdd => {
                 let [vector] = args else {
                     return Err(sile_core::Error::Compile(
                         "vec_reduce_add intrinsic expects one argument".into(),
@@ -317,7 +326,7 @@ impl TargetDialect for MetalDialect<'_> {
             }
             // A tile-level fold is a loop here, the same way WGSL spells it:
             // MSL has no reduction directive either.
-            llvm_ir::Intrinsic::TileReduce {
+            lsir::Intrinsic::TileReduce {
                 reduce,
                 extent,
                 inner,
@@ -332,10 +341,10 @@ impl TargetDialect for MetalDialect<'_> {
                 let dst = name();
                 let span = *extent * *inner;
                 let combine = match reduce {
-                    llvm_ir::TileReduceOp::Sum => "racc + rv",
-                    llvm_ir::TileReduceOp::Product => "racc * rv",
-                    llvm_ir::TileReduceOp::Max => "max(racc, rv)",
-                    llvm_ir::TileReduceOp::Min => "min(racc, rv)",
+                    lsir::TileReduceOp::Sum => "racc + rv",
+                    lsir::TileReduceOp::Product => "racc * rv",
+                    lsir::TileReduceOp::Max => "max(racc, rv)",
+                    lsir::TileReduceOp::Min => "min(racc, rv)",
                 };
                 return Ok(vec![
                     format!("for (int64_t ro = 0; ro < {outer}; ++ro) {{"),
@@ -348,7 +357,7 @@ impl TargetDialect for MetalDialect<'_> {
                     "}".to_string(),
                 ]);
             }
-            llvm_ir::Intrinsic::TileMma { .. } => {
+            lsir::Intrinsic::TileMma { .. } => {
                 return Err(sile_core::Error::Compile(
                     "MSL has no tile-level matrix multiply yet".into(),
                 ));
@@ -359,14 +368,14 @@ impl TargetDialect for MetalDialect<'_> {
 
     fn extra_inst_stmt(
         &mut self,
-        inst: &llvm_ir::Inst,
-        _value_name: impl Fn(llvm_ir::ValueId) -> String,
-        format_operand: impl Fn(&llvm_ir::Operand) -> String,
+        inst: &lsir::Inst,
+        _value_name: impl Fn(lsir::ValueId) -> String,
+        format_operand: impl Fn(&lsir::Operand) -> String,
     ) -> sile_core::Result<Vec<String>> {
         // MSL has no `memcpy` builtin and no ordinary function calls, so both
         // become explicit loops or an error.
         match &inst.op {
-            llvm_ir::InstOp::Memcpy { dst, src, size } => Ok(vec![
+            lsir::InstOp::Memcpy { dst, src, size } => Ok(vec![
                 format!(
                     "for (int64_t copy_i = 0; copy_i < {}; ++copy_i) {{",
                     format_operand(size)
@@ -378,32 +387,32 @@ impl TargetDialect for MetalDialect<'_> {
                 ),
                 "}".to_string(),
             ]),
-            llvm_ir::InstOp::AtomicAdd { ptr, value } => Ok(vec![format!(
+            lsir::InstOp::AtomicAdd { ptr, value } => Ok(vec![format!(
                 "atomic_fetch_add_explicit((device atomic_float*)({}), {}, memory_order_relaxed);",
                 format_operand(ptr),
                 format_operand(value)
             )]),
-            llvm_ir::InstOp::Call { func, .. } => Err(sile_core::Error::Compile(format!(
-                "LLVM IR Metal codegen does not support call instructions: {func}"
+            lsir::InstOp::Call { func, .. } => Err(sile_core::Error::Compile(format!(
+                "LSIR Metal codegen does not support call instructions: {func}"
             ))),
             // An intrinsic never reaches here: the shared emitter dispatches it
             // to `intrinsic_stmt` before this match is consulted.
-            llvm_ir::InstOp::Intrinsic { .. } => Err(sile_core::Error::Compile(
-                "LLVM IR Metal codegen cannot spell an intrinsic in extra_inst_stmt".into(),
+            lsir::InstOp::Intrinsic { .. } => Err(sile_core::Error::Compile(
+                "LSIR Metal codegen cannot spell an intrinsic in extra_inst_stmt".into(),
             )),
             // An alloca is the declaration the emitter already wrote, and a
             // `gep` is spelled at its use: neither leaves a statement here.
-            llvm_ir::InstOp::Alloca { .. } | llvm_ir::InstOp::Gep { .. } => Ok(vec![]),
+            lsir::InstOp::Alloca { .. } | lsir::InstOp::Gep { .. } => Ok(vec![]),
             // The shared lowering spells these the same way on every target. A
             // result-less operator reaching here would otherwise be dropped,
             // and the kernel would read an undefined name.
-            llvm_ir::InstOp::Bin { .. }
-            | llvm_ir::InstOp::Cmp { .. }
-            | llvm_ir::InstOp::Cast { .. }
-            | llvm_ir::InstOp::Load { .. }
-            | llvm_ir::InstOp::Select { .. }
-            | llvm_ir::InstOp::Store { .. } => Err(sile_core::Error::Compile(format!(
-                "LLVM IR Metal codegen cannot spell the instruction {:?}; the shared lowering was expected to take it",
+            lsir::InstOp::Bin { .. }
+            | lsir::InstOp::Cmp { .. }
+            | lsir::InstOp::Cast { .. }
+            | lsir::InstOp::Load { .. }
+            | lsir::InstOp::Select { .. }
+            | lsir::InstOp::Store { .. } => Err(sile_core::Error::Compile(format!(
+                "LSIR Metal codegen cannot spell the instruction {:?}; the shared lowering was expected to take it",
                 inst.op
             ))),
         }
@@ -412,36 +421,36 @@ impl TargetDialect for MetalDialect<'_> {
     fn messages(&self) -> StructuredCfgMessages {
         StructuredCfgMessages {
             preheader_must_branch: "structured Metal loop preheader must end with a branch",
-            missing_loop_header: "missing LLVM IR structured Metal loop header",
+            missing_loop_header: "missing LSIR structured Metal loop header",
             header_must_cond_br: "structured Metal loop header must end with a conditional branch",
             loop_backedge_mismatch: "structured Metal loop body did not produce the expected backedge",
-            unsupported_cond_br: "LLVM IR Metal codegen only supports structured conditional branches",
-            unsupported_switch: "LLVM IR Metal codegen does not yet support switch terminators",
+            unsupported_cond_br: "LSIR Metal codegen only supports structured conditional branches",
+            unsupported_switch: "LSIR Metal codegen does not yet support switch terminators",
         }
     }
 }
 
-fn metal_var_decl(ty: &llvm_ir::Type, name: &str) -> String {
+fn metal_var_decl(ty: &lsir::Type, name: &str) -> String {
     match ty {
-        llvm_ir::Type::I1 => format!("bool {} = false", name),
-        llvm_ir::Type::I32 => format!("int32_t {} = 0", name),
-        llvm_ir::Type::I64 => format!("int64_t {} = 0", name),
-        llvm_ir::Type::F32 => format!("float {} = 0.0f", name),
-        llvm_ir::Type::F64 => format!("double {} = 0.0", name),
-        llvm_ir::Type::Ptr {
+        lsir::Type::I1 => format!("bool {} = false", name),
+        lsir::Type::I32 => format!("int32_t {} = 0", name),
+        lsir::Type::I64 => format!("int64_t {} = 0", name),
+        lsir::Type::F32 => format!("float {} = 0.0f", name),
+        lsir::Type::F64 => format!("double {} = 0.0", name),
+        lsir::Type::Ptr {
             addr_space,
             pointee,
         } => metal_ptr_zero_decl(addr_space, pointee, name),
-        llvm_ir::Type::Vector { len, elem: _ } => {
+        lsir::Type::Vector { len, elem: _ } => {
             format!("float{} {} = {{0}}", len, name)
         }
         other => format!("{} {}", metal_type(other), name),
     }
 }
 
-fn metal_storage_decl(ty: &llvm_ir::Type, name: &str) -> String {
+fn metal_storage_decl(ty: &lsir::Type, name: &str) -> String {
     match ty {
-        llvm_ir::Type::Array { .. } => {
+        lsir::Type::Array { .. } => {
             let dims = array_dims(ty);
             let base = array_base_type(ty);
             format!(
@@ -458,7 +467,7 @@ fn metal_storage_decl(ty: &llvm_ir::Type, name: &str) -> String {
     }
 }
 
-fn metal_private_ptr_bind_decl(pointee: &llvm_ir::Type, name: &str, storage_name: &str) -> String {
+fn metal_private_ptr_bind_decl(pointee: &lsir::Type, name: &str, storage_name: &str) -> String {
     let dims = array_dims(pointee);
     let base = array_base_type(pointee);
     if dims.is_empty() {
@@ -474,8 +483,8 @@ fn metal_private_ptr_bind_decl(pointee: &llvm_ir::Type, name: &str, storage_name
 }
 
 fn metal_ptr_zero_decl(
-    addr_space: &llvm_ir::AddressSpace,
-    pointee: &llvm_ir::Type,
+    addr_space: &lsir::AddressSpace,
+    pointee: &lsir::Type,
     name: &str,
 ) -> String {
     let dims = array_dims(pointee);
@@ -493,26 +502,26 @@ fn metal_ptr_zero_decl(
     }
 }
 
-fn metal_addr_qual(addr_space: &llvm_ir::AddressSpace) -> &'static str {
+fn metal_addr_qual(addr_space: &lsir::AddressSpace) -> &'static str {
     match addr_space {
-        llvm_ir::AddressSpace::Generic => "",
-        llvm_ir::AddressSpace::Private => "thread ",
-        llvm_ir::AddressSpace::Global => "device ",
-        llvm_ir::AddressSpace::Constant => "constant ",
-        llvm_ir::AddressSpace::Shared => "threadgroup ",
+        lsir::AddressSpace::Generic => "",
+        lsir::AddressSpace::Private => "thread ",
+        lsir::AddressSpace::Global => "device ",
+        lsir::AddressSpace::Constant => "constant ",
+        lsir::AddressSpace::Shared => "threadgroup ",
     }
 }
 
-fn metal_type(ty: &llvm_ir::Type) -> String {
+fn metal_type(ty: &lsir::Type) -> String {
     match ty {
-        llvm_ir::Type::Void => "void".into(),
-        llvm_ir::Type::I1 => "bool".into(),
-        llvm_ir::Type::I32 => "int32_t".into(),
-        llvm_ir::Type::I64 => "int64_t".into(),
-        llvm_ir::Type::F16 => "half".into(),
-        llvm_ir::Type::F32 => "float".into(),
-        llvm_ir::Type::F64 => "double".into(),
-        llvm_ir::Type::Ptr {
+        lsir::Type::Void => "void".into(),
+        lsir::Type::I1 => "bool".into(),
+        lsir::Type::I32 => "int32_t".into(),
+        lsir::Type::I64 => "int64_t".into(),
+        lsir::Type::F16 => "half".into(),
+        lsir::Type::F32 => "float".into(),
+        lsir::Type::F64 => "double".into(),
+        lsir::Type::Ptr {
             addr_space,
             pointee,
         } => format!(
@@ -520,21 +529,21 @@ fn metal_type(ty: &llvm_ir::Type) -> String {
             metal_addr_qual(addr_space),
             metal_scalar_type(pointee)
         ),
-        llvm_ir::Type::Vector { len, elem } => format!("{}{}", metal_scalar_type(elem), len),
-        llvm_ir::Type::Array { len, elem } => format!("{}[{}]", metal_type(elem), len),
+        lsir::Type::Vector { len, elem } => format!("{}{}", metal_scalar_type(elem), len),
+        lsir::Type::Array { len, elem } => format!("{}[{}]", metal_type(elem), len),
     }
 }
 
-fn metal_scalar_type(ty: &llvm_ir::Type) -> String {
+fn metal_scalar_type(ty: &lsir::Type) -> String {
     match ty {
-        llvm_ir::Type::Array { .. } => array_base_type(ty),
+        lsir::Type::Array { .. } => array_base_type(ty),
         other => metal_type(other),
     }
 }
 
-fn array_base_type(ty: &llvm_ir::Type) -> String {
+fn array_base_type(ty: &lsir::Type) -> String {
     let mut current = ty;
-    while let llvm_ir::Type::Array { elem, .. } = current {
+    while let lsir::Type::Array { elem, .. } = current {
         current = elem;
     }
     metal_type(current)

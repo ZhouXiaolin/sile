@@ -21,7 +21,7 @@ report_example() {
 
   (
     cd "$ROOT_DIR"
-    RUSTC_WRAPPER= SILE_PRINT_LLVMIR=1 cargo run --example "$example" >"$out_file" 2>&1
+    RUSTC_WRAPPER= SILE_PRINT_LSIR=1 cargo run --example "$example" >"$out_file" 2>&1
   )
 
   extract_llir "$out_file" >"$llir_file"

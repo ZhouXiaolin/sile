@@ -154,6 +154,7 @@ impl<T: HostElem> Tensor<T> {
             elem_size: T::ELEM_SIZE,
             shape: &self.shape,
             device: &self.device,
+            written: false,
         }
     }
 
@@ -164,6 +165,7 @@ impl<T: HostElem> Tensor<T> {
             elem_size: T::ELEM_SIZE,
             shape: &self.shape,
             device: &self.device,
+            written: true,
         }
     }
 

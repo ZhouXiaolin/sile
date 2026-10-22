@@ -1,6 +1,6 @@
 //! Stage-by-stage IR dumping for analysis, off by default.
 //!
-//! A launch runs one pipeline: HIR, then Tile IR, then LLVM IR, then a text
+//! A launch runs one pipeline: HIR, then Tile IR, then LSIR, then a text
 //! backend. The pipeline is the compiler; a reader who wants to know what each
 //! pass did has to see the IR after every one of them, not only at the end.
 //!
@@ -19,9 +19,9 @@ use std::time::Instant;
 
 use sile_core::Result;
 use sile_hir::typeck::TypedKernel;
-use sile_llvm_ir::{Function as LlvmIrFunction, LlvmIrPassKind};
+use sile_lsir::{Function as LsirFunction, LsirPassKind};
 use crate::compiler::{
-    ACTIVE_HIR_TYPECK_PIPELINE, ACTIVE_LLVM_IR_PIPELINE, CodegenTarget, compile_backend,
+    ACTIVE_HIR_TYPECK_PIPELINE, ACTIVE_LSIR_PIPELINE, CodegenTarget, compile_backend,
     run_hir_analysis_pipeline,
 };
 
@@ -89,7 +89,7 @@ pub fn dump_kernel(kernel: &sile_hir::Kernel, root: &Path) -> Result<()> {
     // IR happens to say: that is the text the alignment fixtures compare, so it
     // is the one worth recording.
     let started = Instant::now();
-    let mut module: sile_tile_ir::ir::Module = sile_tile_ir::cutile::emit::emit(&typed)
+    let module: sile_tile_ir::ir::Module = sile_tile_ir::cutile::emit::emit(&typed)
         .map_err(|err| sile_core::Error::Shape(err))?
         .0;
     stages.push(Stage {
@@ -112,26 +112,26 @@ pub fn dump_kernel(kernel: &sile_hir::Kernel, root: &Path) -> Result<()> {
     // failure becomes a stage of its own and every stage so far is written.
     let mut failure: Option<String> = None;
 
-    // ── LLVM IR, one snapshot per pass ────────────────────────────
+    // ── LSIR, one snapshot per pass ────────────────────────────
     let started = Instant::now();
-    let mut llvm_ir: LlvmIrFunction =
-        sile_llvm_ir::lower_module_to_llvm_ir(&module).map_err(sile_core::Error::Compile)?;
+    let mut lsir: LsirFunction =
+        sile_lsir::lower_module_to_lsir(&module).map_err(sile_core::Error::Compile)?;
     let lowered_micros = started.elapsed().as_micros();
     stages.push(Stage {
-        label: "llvmir-00-lowered".into(),
-        text: sile_llvm_ir::format_llvm_ir(&llvm_ir),
+        label: "lsir-00-lowered".into(),
+        text: sile_lsir::format_lsir(&lsir),
         micros: lowered_micros,
     });
 
-    for (index, kind) in ACTIVE_LLVM_IR_PIPELINE.iter().enumerate() {
+    for (index, kind) in ACTIVE_LSIR_PIPELINE.iter().enumerate() {
         if failure.is_some() {
             break;
         }
         let started = Instant::now();
-        match sile_llvm_ir::run_llvm_ir_pipeline(llvm_ir.clone(), &[*kind]) {
-            Ok(next) => llvm_ir = next,
+        match sile_lsir::run_lsir_pipeline(lsir.clone(), &[*kind]) {
+            Ok(next) => lsir = next,
             Err(err) => {
-                let label = format!("llvmir-{:02}-{}-FAILED", index + 1, llvm_ir_pass_name(*kind));
+                let label = format!("lsir-{:02}-{}-FAILED", index + 1, lsir_pass_name(*kind));
                 stages.push(Stage {
                     label,
                     text: err.clone(),
@@ -142,16 +142,56 @@ pub fn dump_kernel(kernel: &sile_hir::Kernel, root: &Path) -> Result<()> {
             }
         }
         let micros = started.elapsed().as_micros();
-        let label = format!("llvmir-{:02}-{}", index + 1, llvm_ir_pass_name(*kind));
+        let label = format!("lsir-{:02}-{}", index + 1, lsir_pass_name(*kind));
         stages.push(Stage {
             label,
-            text: sile_llvm_ir::format_llvm_ir(&llvm_ir),
+            text: sile_lsir::format_lsir(&lsir),
             micros,
         });
     }
 
+    // ── Mapping, one snapshot per stage ────────────────────────
+    //
+    // The mapping is per-target, and WGSL is the one parallel target, so the
+    // dump follows the policy WGSL would run. The mapping here is for reading:
+    // the backend sources below compile from the unmapped function, because
+    // `compile_backend` maps per target itself and the serial targets must not
+    // see a function that already carries a thread index.
+    let mapping_policy =
+        sile_backend::mapping::policy_for(CodegenTarget::Wgsl, &lsir);
+    if mapping_policy.is_parallel() {
+        let mut mapped = lsir.clone();
+        for (index, stage) in sile_lsir::mapping::MAPPING_STAGES.iter().enumerate() {
+            if failure.is_some() {
+                break;
+            }
+            let started = Instant::now();
+            match sile_lsir::mapping::run_stage(mapped.clone(), &mapping_policy, index) {
+                Ok(next) => {
+                    mapped = next;
+                }
+                Err(err) => {
+                    stages.push(Stage {
+                        label: format!("lsir-{}-mapping-{stage}-FAILED", index + 15),
+                        text: err.clone(),
+                        micros: started.elapsed().as_micros(),
+                    });
+                    // The dump records the refusal and stops the mapping walk;
+                    // it is not a compile failure. The backend sources below
+                    // map (or fall back to serial) on their own.
+                    break;
+                }
+            }
+            stages.push(Stage {
+                label: format!("lsir-{}-mapping-{stage}", index + 15),
+                text: sile_lsir::format_lsir(&mapped),
+                micros: started.elapsed().as_micros(),
+            });
+        }
+    }
+
     // ── Backend sources ───────────────────────────────────────────
-    // Every target is generated from the same final LLVM IR, so the three (or
+    // Every target is generated from the same final LSIR, so the three (or
     // four) files next to each other are the whole multi-target surface of one
     // kernel.
     for target in [
@@ -161,7 +201,7 @@ pub fn dump_kernel(kernel: &sile_hir::Kernel, root: &Path) -> Result<()> {
         CodegenTarget::Ptx,
     ] {
         let started = Instant::now();
-        match compile_backend(&llvm_ir, target) {
+        match compile_backend(&lsir, target) {
             Ok(artifact) => {
                 let (name, source) = match artifact {
                     sile_backend::BackendArtifact::CSource(source) => ("c", source),
@@ -228,19 +268,20 @@ fn target_name(target: CodegenTarget) -> &'static str {
     }
 }
 
-fn llvm_ir_pass_name(kind: LlvmIrPassKind) -> &'static str {
+fn lsir_pass_name(kind: LsirPassKind) -> &'static str {
     match kind {
-        LlvmIrPassKind::VerifyInput => "verify-input",
-        LlvmIrPassKind::Canonicalize => "canonicalize",
-        LlvmIrPassKind::LoopSimplify => "loop-simplify",
-        LlvmIrPassKind::PhiAlias => "phi-alias",
-        LlvmIrPassKind::Cse => "cse",
-        LlvmIrPassKind::InstCombine => "instcombine",
-        LlvmIrPassKind::LoopUnroll => "loop-unroll",
-        LlvmIrPassKind::Licm => "licm",
-        LlvmIrPassKind::Sroa => "sroa",
-        LlvmIrPassKind::Dce => "dce",
-        LlvmIrPassKind::VerifyOutput => "verify-output",
+        LsirPassKind::VerifyInput => "verify-input",
+        LsirPassKind::Canonicalize => "canonicalize",
+        LsirPassKind::LoopSimplify => "loop-simplify",
+        LsirPassKind::PhiAlias => "phi-alias",
+        LsirPassKind::Cse => "cse",
+        LsirPassKind::InstCombine => "instcombine",
+        LsirPassKind::LoopUnroll => "loop-unroll",
+        LsirPassKind::Licm => "licm",
+        LsirPassKind::Sroa => "sroa",
+        LsirPassKind::ScalarPromote => "scalar-promote",
+        LsirPassKind::Dce => "dce",
+        LsirPassKind::VerifyOutput => "verify-output",
     }
 }
 

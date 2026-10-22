@@ -1,11 +1,11 @@
-# TileIR → LLVM IR 下降设计
+# TileIR → LSIR 下降设计
 
-本文界定 sile 编译器中段的两级契约：TileIR（结构化）下降为 LLVM IR（CFG/SSA），LLVM IR 发射为四后端（C/WGSL/PTX/Metal）。所有实现以本文为准；实现与本文冲突时，改实现。
+本文界定 sile 编译器中段的两级契约：TileIR（结构化）下降为 LSIR（CFG/SSA），LSIR 发射为四后端（C/WGSL/PTX/Metal）。所有实现以本文为准；实现与本文冲突时，改实现。
 
 ## 1. 理论定位
 
 - TileIR 是结构化 tile 语言：区域嵌套，`for`/`if` 是 SESE 区域（single-entry, single-exit）。类比 MLIR 的 `scf` 方言。
-- LLVM IR 是任意 CFG 上的 pruned SSA。
+- LSIR 是任意 CFG 上的 pruned SSA。
 - 结构化语言到 CFG 的下降是**保序模板变换**：每个区域算子映射到一个固定 CFG 模板。`for` → header/body/exit 三角；`if` → then/else/join 菱形；`yield` → join 前的拷贝。
 - SSA 构造是**独立阶段**，不是下降的一部分。依据 Cytron–Ferrante–Rosen–Wegman–Zadeck (TOPLAS 1991)：先把一切标量落在 alloca（stack IR，dominance 平凡成立），再按 dominance frontier 插 phi 并重命名。这就是 LLVM `mem2reg`。本管线只取其前半：SROA 对常数索引的数组槽做无 phi 的提升，标量槽不进 SSA（§3），连 phi 插入也省去。
 
@@ -27,23 +27,25 @@ INV4 **下降零 phi**。下降器的输出不含 phi 与块参数。循环变�
 TileIR
   │ 下降（本设计 §2）          —— 结构保序，零 phi，全 alloca
   ▼
-stack LLVM IR
+stack LSIR
   │ VerifyInput               —— 结构合法
   │ Canonicalize              —— 消除平凡形式
   │ LoopSimplify              —— preheader / 单回边
   │ SROA                      —— tile 数组 alloca 的可提升子集
+  │ ScalarPromote             —— 私有标量槽 → 块参数（mem2reg 的标量半边）
   │ CSE / InstCombine / LICM / LoopUnroll / DCE
   │ VerifyOutput              —— dominance 与 SSA 终验
   ▼
-SSA LLVM IR
+SSA LSIR
   │ emit（模式匹配，见 §4）
   ▼
 C / WGSL / PTX / Metal
 ```
 
-- **无 Mem2Reg**：标量 alloca（归纳变量、循环携带值）全程保持内存形式——emit 的计数循环模板正是按 header load / 回边 store 识别循环的，把它们提升为 SSA 值会引入 header phi、破坏零 phi 契约。`SROA::promote` 只提升常数索引的数组槽，对标量 alloca 返回 false。
-- **SROA**（已有）：把常数索引的 tile alloca 拆量并提升。unroll 之后收益最大。
-- **PhiAlias**（保留）：下降与全部 pass 均不产生 phi；此 pass 折叠万一出现的平凡 phi（单前驱、同值），是零 phi 契约的安全网。
+- **零 phi 契约只管下降器，不管 pass**：`INV4` 约束的是下降输出，不是管线终态。`ScalarPromote`（Sroa 之后、Dce 之前）把私有标量槽提升为块参数——phi 的块参数形——正是把零 phi 的代价清掉的那一步。放置用迭代支配边界，按活跃性剪枝（槽在某块未赋值时不插参数），再沿支配树重命名。支配与支配边界来自 `passes/cfg.rs`。
+- **SROA**（已有）：把常数索引的 tile alloca 拆量并提升。unroll 之后收益最大。它只处理数组槽；标量槽归 `ScalarPromote`。
+- **PhiAlias**（保留）：下降器不产生 phi；此 pass 折叠万一出现的平凡 phi（单前驱、同值），是零 phi 契约的安全网。
+- **emit 认两种计数循环形态**：alloca 形（header load / 回边 store）与提升后的块参数形（header 参数 / 边参数）。两者都拼 `for` 并保留向量化提示，`verify_structured_shapes` 同时接受。
 
 ## 4. 后端 emit 契约
 
@@ -63,4 +65,4 @@ verify 增设形状检查（可选，M2 落）：判定输入符合三形状文�
 
 - 八个数值示例（saxpy/softmax/rms_norm/gemm/gemm_static/batch_matmul/flash_attention/flash_attention_causal）C target 全绿。
 - `scripts/check_tileir_alignment.sh` 17/17。
-- 下降器输出经 `llvmir-00-lowered` 抽查：无 `phi`。
+- 下降器输出经 `lsir-00-lowered` 抽查：无 `phi`。

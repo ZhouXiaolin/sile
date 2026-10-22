@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::cfg;
 use super::sroa::array_dims;
-use crate::{AddressSpace, Function, Inst, InstOp, Operand, Terminator, Type, ValueId};
+use crate::{AddressSpace, Function, Inst, InstOp, Metadata, Operand, Terminator, Type, ValueId};
 
 pub fn run(func: &mut Function) {
     loop {
@@ -444,7 +444,8 @@ fn forward_copy_loads(func: &mut Function) -> bool {
     // One rewrite per relayed load site, resolved while the function is
     // still shared: the source base to re-address with, the source gep's
     // type, and the index list the load already uses.
-    let mut rewrites: HashMap<ValueId, (Operand, Type, Vec<Operand>)> = HashMap::new();
+    let mut rewrites: HashMap<ValueId, (Operand, Type, Vec<Operand>, Vec<Metadata>)> =
+        HashMap::new();
     for block in &func.blocks {
         for inst in &block.insts {
             let InstOp::Load { ptr } = &inst.op else {
@@ -464,7 +465,12 @@ fn forward_copy_loads(func: &mut Function) -> bool {
             };
             rewrites.insert(
                 *gep_id,
-                (plan.src_base.clone(), plan.src_ty.clone(), indices.clone()),
+                (
+                    plan.src_base.clone(),
+                    plan.src_ty.clone(),
+                    indices.clone(),
+                    inst_by_result[gep_id].metadata.clone(),
+                ),
             );
         }
     }
@@ -477,7 +483,7 @@ fn forward_copy_loads(func: &mut Function) -> bool {
         let mut spelled = Vec::with_capacity(block.insts.len());
         for mut inst in std::mem::take(&mut block.insts) {
             if let InstOp::Load { ptr: Operand::Value(gep_id) } = &inst.op {
-                if let Some((src_base, src_ty, indices)) = rewrites.get(gep_id) {
+                if let Some((src_base, src_ty, indices, stamped)) = rewrites.get(gep_id) {
                     // The load keeps its index; the address becomes the
                     // source's.
                     let gep = Inst {
@@ -488,7 +494,10 @@ fn forward_copy_loads(func: &mut Function) -> bool {
                             base: src_base.clone(),
                             indices: indices.clone(),
                         },
-                        metadata: Vec::new(),
+                        // The re-addressing answers the slot the load did, so
+                        // the load's words carry over: a stamped access keeps
+                        // its claim after it moves.
+                        metadata: stamped.clone(),
                     };
                     next_id += 1;
                     spelled.push(gep);

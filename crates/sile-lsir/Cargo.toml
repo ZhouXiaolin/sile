@@ -1,5 +1,5 @@
 [package]
-name = "sile-llvm-ir"
+name = "sile-lsir"
 version.workspace = true
 edition.workspace = true
 

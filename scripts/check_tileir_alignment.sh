@@ -6,7 +6,7 @@
 # The fixtures under crates/sile/tests/fixtures/tileir/ are the printed Tile IR
 # of the matching cutile-rs kernel (cutile/tests/tileir_alignment.rs, compiled
 # with the same generics and strides). This script dumps sile's own Tile IR and
-# diffs the two byte for byte. Exit status is 0 only when all 11 match.
+# diffs the two byte for byte. Exit status is 0 only when every fixture matches.
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)

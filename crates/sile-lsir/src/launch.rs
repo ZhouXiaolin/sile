@@ -27,6 +27,19 @@ impl LaunchShape {
         max_invocations: 1,
     };
 
+    /// `threads` invocations along the flat element axis, one row of them.
+    ///
+    /// The mapping's loops are flat: a tile's elements are one linear run and
+    /// the element a thread owns is decided by a remainder, so the two axes
+    /// carry no separate meaning yet. The shape stays two-axed for the target
+    /// that spells a 2-D workgroup later.
+    pub fn flat(threads: u32) -> Self {
+        Self {
+            threads: [1, threads.max(1)],
+            max_invocations: threads.max(1),
+        }
+    }
+
     /// How many invocations this shape gives one tile.
     pub fn count(&self) -> u32 {
         self.threads[0].saturating_mul(self.threads[1])

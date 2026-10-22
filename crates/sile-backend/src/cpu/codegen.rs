@@ -2,10 +2,14 @@ use crate::emit::{
     self, StructuredCfgMessages, array_dims, find_output_buffer, is_descriptor_param,
     is_scalars_i64_param, is_scalars_param, is_shapes_param,
 };
-use sile_llvm_ir as llvm_ir;
+use sile_lsir as lsir;
 
-pub fn generate(func: &llvm_ir::Function) -> sile_core::Result<String> {
-    let mut code = emit::generate_text(CTargetEmitter::new(func, CDialect::new()))?;
+pub fn generate(func: &lsir::Function) -> sile_core::Result<String> {
+    let mut code = emit::generate_text(CTargetEmitter::new(
+        func,
+        CDialect::new(),
+        lsir::VectorPolicy::OmpSimd,
+    ))?;
     let wrapper = generate_wrapper(func)?;
     code.push('\n');
     code.push_str(&wrapper);
@@ -31,16 +35,16 @@ impl CDialect {
 impl emit::TargetDialect for CDialect {
     /// A tile is an address here, so a parameter takes a copy of the elements
     /// rather than the address of storage the next iteration overwrites.
-    fn param_assign(&self, ty: &llvm_ir::Type, name: &str, arg: &str) -> String {
+    fn param_assign(&self, ty: &lsir::Type, name: &str, arg: &str) -> String {
         emit::copy_assign(ty, name, arg)
     }
 
-    fn var_decl(&self, ty: &llvm_ir::Type, name: &str, is_alloca: bool) -> Option<String> {
+    fn var_decl(&self, ty: &lsir::Type, name: &str, is_alloca: bool) -> Option<String> {
         // An `alloca` is the only C local that owns storage. A `gep` into a
         // driver buffer has the same type but borrows, so it stays a pointer.
         match ty {
-            llvm_ir::Type::Ptr {
-                addr_space: llvm_ir::AddressSpace::Private,
+            lsir::Type::Ptr {
+                addr_space: lsir::AddressSpace::Private,
                 pointee,
             } if is_alloca => {
                 let storage_name = format!("{name}_storage");
@@ -54,7 +58,7 @@ impl emit::TargetDialect for CDialect {
         }
     }
 
-    fn param_decl(&self, ty: &llvm_ir::Type, _name: &str) -> String {
+    fn param_decl(&self, ty: &lsir::Type, _name: &str) -> String {
         c_param_type(ty)
     }
 
@@ -64,12 +68,12 @@ impl emit::TargetDialect for CDialect {
             .map(|(ty, param_name)| format!("{ty} {param_name}"))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("void sile_llvm_ir_{name}({joined}) {{\n")
+        format!("void sile_lsir_{name}({joined}) {{\n")
     }
 
     /// C needs its headers, its per-thread launch state and — only when the
     /// body spells a vector intrinsic — its vector helpers.
-    fn prelude_lines(&self, func: &llvm_ir::Function) -> Vec<String> {
+    fn prelude_lines(&self, func: &lsir::Function) -> Vec<String> {
         let mut lines = vec![
             "#include <stdint.h>".to_string(),
             "#include <stdbool.h>".to_string(),
@@ -105,10 +109,10 @@ impl emit::TargetDialect for CDialect {
             block.insts.iter().any(|inst| {
                 matches!(
                     &inst.op,
-                    llvm_ir::InstOp::Intrinsic {
-                        intrinsic: llvm_ir::Intrinsic::VecLoad { .. }
-                            | llvm_ir::Intrinsic::VecStore { .. }
-                            | llvm_ir::Intrinsic::VecReduceAdd,
+                    lsir::InstOp::Intrinsic {
+                        intrinsic: lsir::Intrinsic::VecLoad { .. }
+                            | lsir::Intrinsic::VecStore { .. }
+                            | lsir::Intrinsic::VecReduceAdd,
                         ..
                     }
                 )
@@ -151,16 +155,16 @@ impl emit::TargetDialect for CDialect {
 
     fn intrinsic_stmt(
         &self,
-        result: Option<llvm_ir::ValueId>,
-        value_name: impl Fn(llvm_ir::ValueId) -> String,
-        format_operand: impl Fn(&llvm_ir::Operand) -> String,
-        intrinsic: &llvm_ir::Intrinsic,
-        args: &[llvm_ir::Operand],
+        result: Option<lsir::ValueId>,
+        value_name: impl Fn(lsir::ValueId) -> String,
+        format_operand: impl Fn(&lsir::Operand) -> String,
+        intrinsic: &lsir::Intrinsic,
+        args: &[lsir::Operand],
     ) -> sile_core::Result<Vec<String>> {
         // A tile-level fold keeps its shape here rather than in the lowering:
         // this is the layer that knows whether the target has a reduction
         // instruction or wants a loop.
-        if let llvm_ir::Intrinsic::TileReduce {
+        if let lsir::Intrinsic::TileReduce {
             reduce,
             extent,
             inner,
@@ -182,10 +186,10 @@ impl emit::TargetDialect for CDialect {
             // `max`/`min` are not C operators, so the fold spells them as a
             // conditional the compiler turns back into a max instruction.
             let combine = match reduce {
-                llvm_ir::TileReduceOp::Sum => "racc + rv",
-                llvm_ir::TileReduceOp::Product => "racc * rv",
-                llvm_ir::TileReduceOp::Max => "(racc > rv ? racc : rv)",
-                llvm_ir::TileReduceOp::Min => "(racc < rv ? racc : rv)",
+                lsir::TileReduceOp::Sum => "racc + rv",
+                lsir::TileReduceOp::Product => "racc * rv",
+                lsir::TileReduceOp::Max => "(racc > rv ? racc : rv)",
+                lsir::TileReduceOp::Min => "(racc < rv ? racc : rv)",
             };
             let (extent, inner, outer) = (*extent, *inner, *outer);
             let span = extent * inner;
@@ -194,12 +198,30 @@ impl emit::TargetDialect for CDialect {
             // whole point of keeping the reduction whole until here.
             // OpenMP names the arithmetic clauses by their operator.
             let clause = match reduce {
-                llvm_ir::TileReduceOp::Sum => "+",
-                llvm_ir::TileReduceOp::Product => "*",
-                llvm_ir::TileReduceOp::Max => "max",
-                llvm_ir::TileReduceOp::Min => "min",
+                lsir::TileReduceOp::Sum => "+",
+                lsir::TileReduceOp::Product => "*",
+                lsir::TileReduceOp::Max => "max",
+                lsir::TileReduceOp::Min => "min",
             };
             let mut lines = Vec::new();
+            if outer == 1 {
+                // One row folds flat. The general spelling's `ro * span`
+                // index defeats the compiler's data-reference analysis here
+                // — its trip count is a known one, and the vectoriser gives
+                // up on the loads before the reduction clause applies.
+                // The brace keeps two flat folds in one function from both
+                // declaring `racc` in the function's own scope.
+                lines.push("{".to_string());
+                lines.push(format!("  float racc = {src}[0];"));
+                lines.push(format!("  #pragma omp simd reduction({clause}:racc)"));
+                lines.push(format!("  for (int64_t ri = 1; ri < {span}; ++ri) {{"));
+                lines.push(format!("    float rv = {src}[ri];"));
+                lines.push(format!("    racc = {combine};"));
+                lines.push("  }".to_string());
+                lines.push(format!("  {dst}[0] = racc;"));
+                lines.push("}".to_string());
+                return Ok(lines);
+            }
             lines.push(format!("for (int64_t ro = 0; ro < {outer}; ++ro) {{"));
             lines.push(format!("  float racc = {src}[ro * {span}];"));
             lines.push(format!("  #pragma omp simd reduction({clause}:racc)"));
@@ -213,7 +235,7 @@ impl emit::TargetDialect for CDialect {
         }
         // A tile-level multiply becomes the loop nest the C compiler turns into
         // its own vector code. The tiles arrive as pointers to their storage.
-        if let llvm_ir::Intrinsic::TileMma { m, n, k, rhs_cols } = intrinsic {
+        if let lsir::Intrinsic::TileMma { m, n, k, rhs_cols } = intrinsic {
             let id = result.ok_or_else(|| {
                 sile_core::Error::Compile("tile_mma needs a result".into())
             })?;
@@ -239,6 +261,28 @@ impl emit::TargetDialect for CDialect {
             lines.push("}".to_string());
             return Ok(lines);
         }
+        // The fused multiply-add spells as plain multiply and add: the
+        // baseline C target has no FMA instruction, and the `fmaf` library
+        // call the literal spelling produces sits in the way of the
+        // vectorizer. The compiler contracts the pair back into a hardware
+        // FMA wherever the build target has one.
+        if let lsir::Intrinsic::Fma = intrinsic {
+            let [a, b, c] = args else {
+                return Err(sile_core::Error::Compile(
+                    "a fused multiply-add takes three arguments".into(),
+                ));
+            };
+            let id = result.ok_or_else(|| {
+                sile_core::Error::Compile("a fused multiply-add needs a result".into())
+            })?;
+            return Ok(vec![format!(
+                "{} = {} * {} + {};",
+                value_name(id),
+                format_operand(a),
+                format_operand(b),
+                format_operand(c)
+            )]);
+        }
         let joined = args
             .iter()
             .map(|arg| format_operand(arg))
@@ -253,25 +297,25 @@ impl emit::TargetDialect for CDialect {
 
     fn extra_inst_stmt(
         &mut self,
-        inst: &llvm_ir::Inst,
-        value_name: impl Fn(llvm_ir::ValueId) -> String,
-        format_operand: impl Fn(&llvm_ir::Operand) -> String,
+        inst: &lsir::Inst,
+        value_name: impl Fn(lsir::ValueId) -> String,
+        format_operand: impl Fn(&lsir::Operand) -> String,
     ) -> sile_core::Result<Vec<String>> {
         // C is the only target that keeps an alloca as a real local array, so
         // it is the only one that skips the instruction and copies bytes.
         match &inst.op {
-            llvm_ir::InstOp::Alloca { .. } => Ok(vec![]),
-            llvm_ir::InstOp::Memcpy { dst, src, size } => Ok(vec![format!(
+            lsir::InstOp::Alloca { .. } => Ok(vec![]),
+            lsir::InstOp::Memcpy { dst, src, size } => Ok(vec![format!(
                 "memcpy({}, {}, {});",
                 format_operand(dst),
                 format_operand(src),
                 format_operand(size)
             )]),
-            llvm_ir::InstOp::AtomicAdd { ptr, value } => Ok(vec![
+            lsir::InstOp::AtomicAdd { ptr, value } => Ok(vec![
                 "#pragma omp atomic update".to_string(),
                 format!("(*{}) += {};", format_operand(ptr), format_operand(value)),
             ]),
-            llvm_ir::InstOp::Call { func, args } => {
+            lsir::InstOp::Call { func, args } => {
                 let joined = args
                     .iter()
                     .map(|arg| format_operand(arg))
@@ -284,22 +328,22 @@ impl emit::TargetDialect for CDialect {
             }
             // An intrinsic never reaches here: the shared emitter dispatches it
             // to `intrinsic_stmt` before this match is consulted.
-            llvm_ir::InstOp::Intrinsic { .. } => Err(sile_core::Error::Compile(
-                "LLVM IR C codegen cannot spell an intrinsic in extra_inst_stmt".into(),
+            lsir::InstOp::Intrinsic { .. } => Err(sile_core::Error::Compile(
+                "LSIR C codegen cannot spell an intrinsic in extra_inst_stmt".into(),
             )),
             // The shared lowering spells these the same way on every target —
             // or folds a gep away when the load or store reading through it is
             // its only use. A result-less operator reaching here would
             // otherwise be dropped, and the kernel would read an undefined
             // name.
-            llvm_ir::InstOp::Gep { .. } => Ok(vec![]),
-            llvm_ir::InstOp::Bin { .. }
-            | llvm_ir::InstOp::Cmp { .. }
-            | llvm_ir::InstOp::Cast { .. }
-            | llvm_ir::InstOp::Load { .. }
-            | llvm_ir::InstOp::Select { .. }
-            | llvm_ir::InstOp::Store { .. } => Err(sile_core::Error::Compile(format!(
-                "LLVM IR C codegen cannot spell the instruction {:?}; the shared lowering was expected to take it",
+            lsir::InstOp::Gep { .. } => Ok(vec![]),
+            lsir::InstOp::Bin { .. }
+            | lsir::InstOp::Cmp { .. }
+            | lsir::InstOp::Cast { .. }
+            | lsir::InstOp::Load { .. }
+            | lsir::InstOp::Select { .. }
+            | lsir::InstOp::Store { .. } => Err(sile_core::Error::Compile(format!(
+                "LSIR C codegen cannot spell the instruction {:?}; the shared lowering was expected to take it",
                 inst.op
             ))),
         }
@@ -308,16 +352,16 @@ impl emit::TargetDialect for CDialect {
     fn messages(&self) -> StructuredCfgMessages {
         StructuredCfgMessages {
             preheader_must_branch: "structured C loop preheader must end with a branch",
-            missing_loop_header: "missing LLVM IR C loop header",
+            missing_loop_header: "missing LSIR C loop header",
             header_must_cond_br: "structured C loop header must end with a conditional branch",
             loop_backedge_mismatch: "structured C loop body did not produce the expected backedge",
-            unsupported_cond_br: "LLVM IR C codegen only supports structured conditional branches",
-            unsupported_switch: "LLVM IR C codegen does not yet support structured switch lowering",
+            unsupported_cond_br: "LSIR C codegen only supports structured conditional branches",
+            unsupported_switch: "LSIR C codegen does not yet support structured switch lowering",
         }
     }
 }
 
-fn generate_wrapper(func: &llvm_ir::Function) -> sile_core::Result<String> {
+fn generate_wrapper(func: &lsir::Function) -> sile_core::Result<String> {
     let mut out = String::new();
     let output = find_output_buffer(func);
 
@@ -425,7 +469,7 @@ fn generate_wrapper(func: &llvm_ir::Function) -> sile_core::Result<String> {
         }
     }
     out.push_str(&format!(
-        "        sile_llvm_ir_{}({});\n",
+        "        sile_lsir_{}({});\n",
         func.name,
         func.params
             .iter()
@@ -451,35 +495,35 @@ fn generate_wrapper(func: &llvm_ir::Function) -> sile_core::Result<String> {
     Ok(out)
 }
 
-fn c_param_type(ty: &llvm_ir::Type) -> String {
+fn c_param_type(ty: &lsir::Type) -> String {
     match ty {
-        llvm_ir::Type::Ptr { pointee, .. } => match pointee.as_ref() {
-            llvm_ir::Type::F32 => "float*".to_string(),
+        lsir::Type::Ptr { pointee, .. } => match pointee.as_ref() {
+            lsir::Type::F32 => "float*".to_string(),
             other => format!("{}*", c_type(other)),
         },
         other => c_type(other),
     }
 }
 
-fn c_var_decl(ty: &llvm_ir::Type, name: &str) -> String {
+fn c_var_decl(ty: &lsir::Type, name: &str) -> String {
     match ty {
-        llvm_ir::Type::I1 => format!("bool {}", name),
-        llvm_ir::Type::I32 => format!("int32_t {}", name),
-        llvm_ir::Type::I64 => format!("int64_t {}", name),
-        llvm_ir::Type::F32 => format!("float {}", name),
-        llvm_ir::Type::F64 => format!("double {}", name),
-        llvm_ir::Type::Ptr { pointee, .. } => match pointee.as_ref() {
-            llvm_ir::Type::Array { .. } => c_ptr_decl(pointee, name),
+        lsir::Type::I1 => format!("bool {}", name),
+        lsir::Type::I32 => format!("int32_t {}", name),
+        lsir::Type::I64 => format!("int64_t {}", name),
+        lsir::Type::F32 => format!("float {}", name),
+        lsir::Type::F64 => format!("double {}", name),
+        lsir::Type::Ptr { pointee, .. } => match pointee.as_ref() {
+            lsir::Type::Array { .. } => c_ptr_decl(pointee, name),
             other => format!("{}* {} = NULL", c_type(other), name),
         },
         other => format!("{} {}", c_type(other), name),
     }
 }
 
-fn c_storage_decl(ty: &llvm_ir::Type, name: &str) -> String {
+fn c_storage_decl(ty: &lsir::Type, name: &str) -> String {
     match ty {
-        llvm_ir::Type::Array { len, elem } => match elem.as_ref() {
-            llvm_ir::Type::Array { .. } => {
+        lsir::Type::Array { len, elem } => match elem.as_ref() {
+            lsir::Type::Array { .. } => {
                 let dims = array_dims(ty);
                 let base = array_base_type(ty);
                 format!(
@@ -498,7 +542,7 @@ fn c_storage_decl(ty: &llvm_ir::Type, name: &str) -> String {
     }
 }
 
-fn c_ptr_decl(pointee: &llvm_ir::Type, name: &str) -> String {
+fn c_ptr_decl(pointee: &lsir::Type, name: &str) -> String {
     let dims = array_dims(pointee);
     let base = array_base_type(pointee);
     if dims.len() <= 1 {
@@ -513,7 +557,7 @@ fn c_ptr_decl(pointee: &llvm_ir::Type, name: &str) -> String {
     }
 }
 
-fn c_ptr_storage_bind_decl(pointee: &llvm_ir::Type, name: &str, storage_name: &str) -> String {
+fn c_ptr_storage_bind_decl(pointee: &lsir::Type, name: &str, storage_name: &str) -> String {
     let dims = array_dims(pointee);
     let base = array_base_type(pointee);
     if dims.is_empty() {
@@ -533,77 +577,77 @@ fn c_ptr_storage_bind_decl(pointee: &llvm_ir::Type, name: &str, storage_name: &s
     }
 }
 
-fn c_type(ty: &llvm_ir::Type) -> String {
+fn c_type(ty: &lsir::Type) -> String {
     match ty {
-        llvm_ir::Type::Void => "void".to_string(),
-        llvm_ir::Type::I1 => "bool".to_string(),
-        llvm_ir::Type::I32 => "int32_t".to_string(),
-        llvm_ir::Type::I64 => "int64_t".to_string(),
+        lsir::Type::Void => "void".to_string(),
+        lsir::Type::I1 => "bool".to_string(),
+        lsir::Type::I32 => "int32_t".to_string(),
+        lsir::Type::I64 => "int64_t".to_string(),
         // The half storage is the C float of that width, not its bit pattern:
         // a load widens and a store narrows, which is the arithmetic the tile
         // around it assumes.
-        llvm_ir::Type::F16 => "_Float16".to_string(),
-        llvm_ir::Type::F32 => "float".to_string(),
-        llvm_ir::Type::F64 => "double".to_string(),
-        llvm_ir::Type::Ptr { pointee, .. } => format!("{}*", c_type(pointee)),
-        llvm_ir::Type::Vector { len: _, elem: _ } => "llir_float4".to_string(),
-        llvm_ir::Type::Array { len, elem } => format!("{}[{}]", c_type(elem), len),
+        lsir::Type::F16 => "_Float16".to_string(),
+        lsir::Type::F32 => "float".to_string(),
+        lsir::Type::F64 => "double".to_string(),
+        lsir::Type::Ptr { pointee, .. } => format!("{}*", c_type(pointee)),
+        lsir::Type::Vector { len: _, elem: _ } => "llir_float4".to_string(),
+        lsir::Type::Array { len, elem } => format!("{}[{}]", c_type(elem), len),
     }
 }
 
-fn array_base_type(ty: &llvm_ir::Type) -> String {
+fn array_base_type(ty: &lsir::Type) -> String {
     let mut current = ty;
-    while let llvm_ir::Type::Array { elem, .. } = current {
+    while let lsir::Type::Array { elem, .. } = current {
         current = elem;
     }
     c_type(current)
 }
 
-fn intrinsic_name(intrinsic: &llvm_ir::Intrinsic) -> String {
+fn intrinsic_name(intrinsic: &lsir::Intrinsic) -> String {
     match intrinsic {
-        llvm_ir::Intrinsic::ThreadId { dim } => format!("llir_thread_id_{}", dim),
-        llvm_ir::Intrinsic::BlockId { dim } => format!("llir_block_id_{}", dim),
-        llvm_ir::Intrinsic::GridDim { dim } => format!("llir_grid_dim_{}", dim),
-        llvm_ir::Intrinsic::Barrier { .. } => "llir_barrier".to_string(),
+        lsir::Intrinsic::ThreadId { dim } => format!("llir_thread_id_{}", dim),
+        lsir::Intrinsic::BlockId { dim } => format!("llir_block_id_{}", dim),
+        lsir::Intrinsic::GridDim { dim } => format!("llir_grid_dim_{}", dim),
+        lsir::Intrinsic::Barrier { .. } => "llir_barrier".to_string(),
         // The C library spells the float form of each one-argument float
         // function with an `f` on the end: `expf`, `log2f`, and the rest.
-        llvm_ir::Intrinsic::Exp
-        | llvm_ir::Intrinsic::Exp2
-        | llvm_ir::Intrinsic::Log
-        | llvm_ir::Intrinsic::Log2
-        | llvm_ir::Intrinsic::Sqrt
-        | llvm_ir::Intrinsic::Abs
-        | llvm_ir::Intrinsic::Sin
-        | llvm_ir::Intrinsic::Cos
-        | llvm_ir::Intrinsic::Tan
-        | llvm_ir::Intrinsic::Sinh
-        | llvm_ir::Intrinsic::Cosh
-        | llvm_ir::Intrinsic::Tanh
-        | llvm_ir::Intrinsic::Ceil
-        | llvm_ir::Intrinsic::Floor => format!(
+        lsir::Intrinsic::Exp
+        | lsir::Intrinsic::Exp2
+        | lsir::Intrinsic::Log
+        | lsir::Intrinsic::Log2
+        | lsir::Intrinsic::Sqrt
+        | lsir::Intrinsic::Abs
+        | lsir::Intrinsic::Sin
+        | lsir::Intrinsic::Cos
+        | lsir::Intrinsic::Tan
+        | lsir::Intrinsic::Sinh
+        | lsir::Intrinsic::Cosh
+        | lsir::Intrinsic::Tanh
+        | lsir::Intrinsic::Ceil
+        | lsir::Intrinsic::Floor => format!(
             "{}f",
             intrinsic
                 .float_function()
                 .expect("a float function has a name")
         ),
-        llvm_ir::Intrinsic::Pow | llvm_ir::Intrinsic::Atan2 => format!(
+        lsir::Intrinsic::Pow | lsir::Intrinsic::Atan2 => format!(
             "{}f",
             intrinsic
                 .binary_float_function()
                 .expect("a binary float function has a name")
         ),
-        llvm_ir::Intrinsic::Fma => format!(
+        lsir::Intrinsic::Fma => format!(
             "{}f",
             intrinsic
                 .ternary_float_function()
                 .expect("a ternary float function has a name")
         ),
-        llvm_ir::Intrinsic::VecLoad { len } => format!("llir_vec_load_{}", len),
-        llvm_ir::Intrinsic::VecStore { len } => format!("llir_vec_store_{}", len),
-        llvm_ir::Intrinsic::VecReduceAdd => "llir_vec_reduce_add".to_string(),
+        lsir::Intrinsic::VecLoad { len } => format!("llir_vec_load_{}", len),
+        lsir::Intrinsic::VecStore { len } => format!("llir_vec_store_{}", len),
+        lsir::Intrinsic::VecReduceAdd => "llir_vec_reduce_add".to_string(),
         // Both tile-level forms are expanded into loops by `intrinsic_stmt`, so
         // no helper carries their name.
-        llvm_ir::Intrinsic::TileReduce { .. } | llvm_ir::Intrinsic::TileMma { .. } => {
+        lsir::Intrinsic::TileReduce { .. } | lsir::Intrinsic::TileMma { .. } => {
             unreachable!("a tile-level intrinsic is expanded, not called")
         }
     }

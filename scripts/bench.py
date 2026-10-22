@@ -71,8 +71,8 @@ def median_timing(timing_runs):
     return merged
 
 
-def last_llvm_metrics(metrics):
-    keys = sorted(key for key in metrics if key.startswith("llvmir-"))
+def last_lsir_metrics(metrics):
+    keys = sorted(key for key in metrics if key.startswith("lsir-"))
     if not keys:
         return ["0"] * 7
     return metrics[keys[-1]]
@@ -139,7 +139,7 @@ def main():
 
         timing = median_timing(read_tsv(d / "timing.tsv") for d in kernel_dirs)
         metrics = read_tsv(stage_dir / "metrics.tsv")
-        final = last_llvm_metrics(metrics)
+        final = last_lsir_metrics(metrics)
 
         sizes = {}
         for target in ("c", "metal", "wgsl", "ptx"):
@@ -160,7 +160,7 @@ def main():
                 "e2e_ms": round(elapsed_ms),
                 "hir_us": stage_sum(timing, "hir-"),
                 "tileir_us": stage_sum(timing, "tileir-"),
-                "llvmir_us": stage_sum(timing, "llvmir-"),
+                "lsir_us": stage_sum(timing, "lsir-"),
                 "source_us": stage_sum(timing, "source-"),
                 "slowest_stage": slowest[0],
                 "slowest_us": int(slowest[1][0]),
@@ -178,8 +178,8 @@ def main():
         )
         print(
             f"{example:<24} exit={exit_code} {round(elapsed_ms):>7} ms  "
-            f"compile={rows[-1]['hir_us'] + rows[-1]['tileir_us'] + rows[-1]['llvmir_us'] + rows[-1]['source_us']:>9} us  "
-            f"slowest={slowest[0]}({int(slowest[1][0])}us)  llvm-ir lines={rows[-1]['ir_lines']:>5}"
+            f"compile={rows[-1]['hir_us'] + rows[-1]['tileir_us'] + rows[-1]['lsir_us'] + rows[-1]['source_us']:>9} us  "
+            f"slowest={slowest[0]}({int(slowest[1][0])}us)  lsir lines={rows[-1]['ir_lines']:>5}"
         )
 
     summary_path = out_dir / "summary.tsv"

@@ -4,7 +4,7 @@ use crate::{
     BasicBlock, BlockId, Constant, Function, Inst, InstOp, Intrinsic, Operand, Terminator, ValueId,
 };
 
-/// Canonical LLVM IR rewrites live here.
+/// Canonical LSIR rewrites live here.
 ///
 /// The active implementation starts with a narrow, profitable rewrite: sink
 /// materialized pointwise tile-expression loops into their scalar consumers so

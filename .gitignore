@@ -9,3 +9,7 @@
 # benchmark and tooling outputs
 dumps/
 .dsh-acl-report/
+
+# coding-agent workspace state
+.pi/
+.qwen/

@@ -1,13 +1,13 @@
-# Tile IR → LLVM IR → backend 计划书
+# Tile IR → LSIR → backend 计划书
 
-状态：定稿待执行。前身结论见 `crates/sile-tile-ir/TILEIR_ALIGNMENT.md`（Tile IR 文本已与 cutile-rs 逐字节对齐，17/17）。
+状态：执行中（2026-10-22 刷新）。M0、M1、M2 已完成；M2.5（标量提升）、M3（映射 pass 族 + WGSL）已完成；M4 未开始。pass 拓扑的规范裁决见 `docs/PIPELINE_SPEC.md`。前身结论见 `crates/sile-tile-ir/TILEIR_ALIGNMENT.md`（Tile IR 文本已与 cutile-rs 逐字节对齐，17/17）。
 
 ## 1. 目标
 
 把编译管线从 arena Tile IR 接到可执行后端，为 `examples/` 里的每个计算生成与手写最优实现同级性能、语义一致的代码：
 
 ```
-TypedKernel → arena Tile IR（冻结）→ LLVM IR（重建）→ C / CUDA(PTX) / WGSL（改造）
+TypedKernel → arena Tile IR（冻结）→ LSIR（重建）→ C / CUDA(PTX) / WGSL（改造）
 ```
 
 量化验收：
@@ -20,10 +20,10 @@ TypedKernel → arena Tile IR（冻结）→ LLVM IR（重建）→ C / CUDA(PTX
 
 1. **arena Tile IR 是唯一标准输入，冻结。** 它是 cutile-rs 的 `cutile-ir` 的移植，文本导出逐字节对齐。下游不许绕过它，也不许为迁就下游而改它。
 2. **下游全部可大改，不写兼容桥。** TileIrFunction 直接退役，不做 desugar 过渡层。旧 lowering 不逐行翻译，算法可搬的搬，骨架重建。
-3. **tile 级语义保留到最后一刻。** reduce、mma 是 tile 上的集合操作，不在 lowering 时拆散成标量循环。LLVM IR 保留它们为 tile 级原语，由 backend 按 target 选并行形态。这条是并行归约的前提：归约的 tile 级语义一旦在 lowering 摊平，backend 就再也无力并行它（现状 `fused_reduce` 零触发的根因）。
+3. **tile 级语义保留到最后一刻。** reduce、mma 是 tile 上的集合操作，不在 lowering 时拆散成标量循环。LSIR 保留它们为 tile 级原语，由 backend 按 target 选并行形态。这条是并行归约的前提：归约的 tile 级语义一旦在 lowering 摊平，backend 就再也无力并行它（现状 `fused_reduce` 零触发的根因）。
 4. **映射决策集中在一层。** tile→线程/循环/共享内存的决策只在 device lowering 做；backend 是方言拼写器（C/WGSL/PTX 语法、验证、运行时）。cutile 的 `tileiras` 承担的角色由这一层承担。
 5. **手写参照定标。** 每个性能目标先写尽力最优的 C/WGSL 参照，作为数值 oracle、形态靶子和性能基准。没有参照就没有"类似性能"的定义。
-6. **最好的代码是没有代码。** 复用已有的：LLVM IR pass 家族（cse/licm/instcombine）、backend 的结构化 CFG 发射器与四方言、naga 验证、四个运行时、bench.py/compare.py。
+6. **最好的代码是没有代码。** 复用已有的：LSIR pass 家族（cse/licm/instcombine）、backend 的结构化 CFG 发射器与四方言、naga 验证、四个运行时、bench.py/compare.py。
 
 ## 3. 现状与差距
 
@@ -31,12 +31,12 @@ TypedKernel → arena Tile IR（冻结）→ LLVM IR（重建）→ C / CUDA(PTX
 
 cutile-rs 在 Tile IR 之后没有任何可执行自研路径：它把 Tile IR 字节码交给闭源 `tileiras` 换 cubin，拒绝生成 PTX，没有解释器、LLVM、WGSL。tile→线程映射、shared memory、barrier 全在黑盒里。可搬的只有：host 侧 grid 推导（`ceil(extent/tile)`，已对齐）、launch check 宿主求值（已搬为 `predicate::LaunchCheck`）、两级 JIT 缓存键设计、fixtures 的 IR 形态作语义样本。**device 端全部自研。**
 
-### 3.2 现有管线的两个断层
+### 3.2 管线状态（2026-10-21 刷新）
 
-现链路：`HIR → lower_to_tile_ir → TileIrFunction → sile-llvm-ir/lower（~7800 行）→ sile-backend → 执行`。
+现链路：`TypedKernel → cutile::emit → arena ir::Module → lower_module_to_lsir → LSIR passes（13 项）→ sile-backend`（编排见 `crates/sile/src/compiler.rs`）。
 
-- **断层一（双轨）**：真编译走 TileIrFunction，与 arena Tile IR 平行。arena Tile IR 目前只导出文本。"唯一 Tile IR"在编译链上未成立。
-- **断层二（质量）**：现有产物的实测形态——一个 invocation 独占一个 tile（WGSL `workgroup_size(1)`、PTX 一 block 一线程、CPU `threads_per_group=1`）；shared memory 全程未用；barrier 在 GPU target 被 `verify.rs` 主动拒绝；唯一向量化路径（`VecLoad4`+`VecReduceAdd`）在所有 bench 上零触发；C 侧 vec helper 写进每个文件却零调用；tile 中间量以栈数组反复拷贝（`v11[i][j] = v9[i][j]`）。
+- **断层一（双轨）——已解决**：`TileIrFunction` 与 `lower_to_tile_ir` 已删除（a63ecb3），编译链上只剩 arena Tile IR；cutile-rs 的判定上移为 sile-hir passes（d101b31），emitter 只消费判定。
+- **断层二（质量）——仍存在**：WGSL `workgroup_size(1)`、PTX 一 block 一线程；shared memory 全程未用；barrier 仍被 `verify_gpu_contract` 无条件拒绝；`VecLoad`/`VecStore` 已定义但 lowering 从不发射；TileMma 在 C/WGSL/Metal 为串行循环、在 PTX 未实现。映射决策的收拢方案见 `docs/PIPELINE_SPEC.md`。
 
 ### 3.3 一个重要资产
 
@@ -53,8 +53,8 @@ TypedKernel（HIR，不动）
 ir::Module                      arena Tile IR，唯一、冻结
    │ device lowering（重建：结构化遍历 region 树）
    ▼
-sile_llvm_ir::Function          物理化设备 IR（形态扩展，见 4.2）
-   │ 既有 LLVM IR passes（cse / licm / instcombine / sroa / ...，保留）
+sile_lsir::Function          物理化设备 IR（形态扩展，见 4.2）
+   │ 既有 LSIR passes（cse / licm / instcombine / sroa / ...，保留）
    ▼
 sile-backend（改造物化规则，见 4.3）
    ├─ C    → cc -O2 -fopenmp → .so → libloading（运行时已有）
@@ -63,9 +63,9 @@ sile-backend（改造物化规则，见 4.3）
    └─ Metal（既有）
 ```
 
-### 4.2 LLVM IR 形态：物理化设备 IR
+### 4.2 LSIR 形态：物理化设备 IR
 
-sile_llvm_ir::Function 保留为 lowering 的目标语言（backend 的输入契约不变，方言层少动），扩展其原语面：
+sile_lsir::Function 保留为 lowering 的目标语言（backend 的输入契约不变，方言层少动），扩展其原语面：
 
 | 原语 | 现状 | 改动 |
 |---|---|---|
@@ -97,18 +97,18 @@ sile_llvm_ir::Function 保留为 lowering 的目标语言（backend 的输入契
 - `sile-tile-ir/src/function_ir.rs`（1407 行）
 - `sile-tile-ir/src/print.rs`（function_ir 的文本打印）
 - `sile-tile-ir/src/passes/`（dce / pointwise_fusion / tile_expr_cse / verify——均吃 TileIrFunction）
-- `sile-llvm-ir/src/lower/*`（旧 lowering，~7800 行）
+- `sile-lsir/src/lower/*`（旧 lowering，~7800 行）
 
 改造：
 
-- `sile-llvm-ir/src/lower/`：重建为吃 `ir::Module` 的新 lowering（入口 `lower_module_to_llvm_ir(&ir::Module) -> Function`）。
-- `crates/sile/src/compiler.rs`：管线编排去掉 HirToTileIr/TileIrToLlvmIr 的 function_ir 段，返回 `(ir::Module, Function)`。
+- `sile-lsir/src/lower/`：重建为吃 `ir::Module` 的新 lowering（入口 `lower_module_to_lsir(&ir::Module) -> Function`）。
+- `crates/sile/src/compiler.rs`：管线编排去掉 HirToTileIr/TileIrToLsir 的 function_ir 段，返回 `(ir::Module, Function)`。
 - `crates/sile/src/dump.rs`：Tile IR 阶段 dump 改为 `to_mlir_text()`；TileIrPassKind 段移除。
 - `crates/sile/src/kernel_launcher.rs`：`CompiledParts` 的 TileIrFunction → 诊断文本或 `ir::Module`。
 - `crates/sile/src/lib.rs`：`tileir` 模块 re-export 清理。
 - `sile-backend/src/verify.rs`：解除对 Barrier 的无条件拒绝，改为"有 Shared/Barrier 时校验配套约束"。
 
-保留不动：HIR 全家、`cutile::emit`、arena `ir`、LLVM IR passes、backend 方言发射层、四个运行时、scripts 工具链。
+保留不动：HIR 全家、`cutile::emit`、arena `ir`、LSIR passes、backend 方言发射层、四个运行时、scripts 工具链。
 
 ### 4.5 阶段与验收
 
@@ -116,8 +116,9 @@ sile_llvm_ir::Function 保留为 lowering 的目标语言（backend 的输入契
 |---|---|---|
 | M0（并行推进） | 手写 golden：saxpy / softmax / rms_norm / gemm 的 C 与 WGSL（参数化尺寸：小尺寸自检、大尺寸 bench），对拍骨架 | 参照自身数值正确、可 bench |
 | M1 | 退役 + 新 lowering：结构化遍历，elementwise→reduce→mma 顺序实现，C 端先全通；启动 4.4 全部删除 | examples 在 C target 数值对拍全绿；17/17 对齐不动 |
-| M2 | C 端质量：TileReduce→`omp simd reduction`、tile 中转拷贝消去、VecLoad 触发 | saxpy/softmax/rms_norm 达手写 C 的 80%+ |
-| M3 | WGSL：workgroup_size>1、`var<workgroup>`、TileReduce 树归约 + barrier、token→barrier | softmax/rms_norm/gemm 达手写 WGSL 的 80%+，naga 验证过 |
+| M2 | C 端质量：TileReduce→`omp simd reduction`、tile 中转拷贝消去、VecLoad 触发 | saxpy/softmax/rms_norm 达手写 C 的 80%+ — **已完成 2026-10-21：99.5% / 87.1% / 86.7%** |
+| M2.5 | 标量提升 pass（`ScalarPromote`）：私有标量槽 → 块参数 | PTX 不再每迭代 `ld.local`/`st.local`；四端数值不变 — **已完成 2026-10-21** |
+| M3 | 映射 pass 族（`crates/sile-lsir/src/mapping.rs`，dump 段 `lsir-15..19-mapping-*`）+ WGSL workgroup_size>1、`var<workgroup>`、树归约 + barrier | softmax/rms_norm/gemm 达手写 WGSL 的 80%+，naga 验证过 — **已完成 2026-10-22：同窗口 A/B softmax 96–103% / rms_norm 112–128% / gemm ≈100%** |
 | M4 | PTX/cuda：shared 布局、`mma.sync`、barrier；host 侧搬 cutile-rs JIT 缓存键 | gemm 对齐手写 CUDA 参照 |
 
 顺序理由：C 先行（运行时最简单、迭代最快）；WGSL 次之（naga 编译期验证兜底，"多线程 tile"的语义模型在它上面踩对）；PTX 最后（方言最重，模型对了只剩拼写）。
@@ -125,13 +126,16 @@ sile_llvm_ir::Function 保留为 lowering 的目标语言（backend 的输入契
 ### 4.6 风险与取舍
 
 1. **退役期间 WGSL/PTX 退化**：M1 完成时 WGSL/PTX 输出暂为串行正确版（tile 物化规则只做了 C 端），M3/M4 恢复。期间 bench 的 GPU 对比列不可用。
-2. **Tile IR 级 pass 暂失**：dce/fusion/cse 曾在 TileIrFunction 上跑。M1 后由 LLVM IR 层既有 pass 兜底；arena IR 上的 pass（含 cutile 的 dominance/verify）在后续版本重建，不阻塞主线。
+2. **Tile IR 级 pass 暂失**：dce/fusion/cse 曾在 TileIrFunction 上跑。M1 后由 LSIR 层既有 pass 兜底；arena IR 上的 pass（含 cutile 的 dominance/verify）在后续版本重建，不阻塞主线。
 3. **验收线分 kernel 设定**：gemm 的手写上限（blocked+micro-kernel / Tensor Core）远高于朴素实现，80% 线以各 kernel 的手写参照为准，不做全局一刀切。
 4. **Mma 原语的抽象层级**：`Mma{m,n,k}` 若在 C/WGSL 上退化实现成本过高，允许 lowering 对非 PTX target 提前拆为 FMA 循环，但拆解必须发生在 backend 可见的 tile 级 op 之后（保留未来换形态的自由），此例外需在 lowering 中以显式开关呈现，不得静默。
 
-## 5. 立即执行项
+## 5. 立即执行项（2026-10-22 状态：1–6 已完成；下一步为 M4）
 
 1. M0 前四个 kernel 的手写 C/WGSL + 对拍骨架（`handwritten/`）。
-2. M1 新 lowering 骨架 + saxpy 端到端（arena Module → LLVM IR → C → 数值对）。
+2. M1 新 lowering 骨架 + saxpy 端到端（arena Module → LSIR → C → 数值对）。
 3. 4.4 退役清单执行。
 4. softmax / rms_norm（TileReduce 并行归约）→ gemm（Mma）依次接入。
+5. 标量提升 pass（M2.5）已落地：`sile-lsir/src/passes/scalar_promote.rs`，链序 `Sroa → ScalarPromote → Dce`。
+6. M3 已落地：映射 pass 族在 `crates/sile-lsir/src/mapping.rs`（五阶段 `policy/threads/reduce/mma/cleanup`，`MappingPolicy` 参数化），`launch.rs` 已接线；WGSL 侧解除 `verify_gpu_contract` 对 Barrier 的无条件拒绝，改为有 Shared/Barrier 时校验配套。阶段间的两个词 `Metadata::OwnerOrdered` / `Metadata::ReduceRelay` 由 builder 显式打戳，模块头写明了它们的存活规则。
+7. 下一步 M4：PTX/cuda（shared 布局、`mma.sync`、barrier）。

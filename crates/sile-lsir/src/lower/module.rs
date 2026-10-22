@@ -1,4 +1,4 @@
-//! The device lowering: arena Tile IR (`ir::Module`) into `sile_llvm_ir::Function`.
+//! The device lowering: arena Tile IR (`ir::Module`) into `sile_lsir::Function`.
 //!
 //! This is the one lowering. The arena `Module` is the only Tile IR — it is the
 //! port of cutile-ir that `cutile::emit` produces, and the text fixtures compare
@@ -28,10 +28,12 @@
 //!
 //! # Regions
 //!
-//! `for`, `if` and `reduce` carry real regions. The first two become LLVM IR
-//! blocks with block arguments — which is exactly what the arena's block
-//! arguments already are — and the third becomes a nested accumulation loop.
-//! There is no control-flow recovery, because the structure is in the input.
+//! `for`, `if` and `reduce` carry real regions. The first two become LSIR
+//! blocks in the zero-phi shape — loop variables and carried values live in
+//! entry-block allocas, read at the header and written on the back edge, with
+//! no block arguments or phis — and the third becomes a nested accumulation
+//! loop. There is no control-flow recovery, because the structure is in the
+//! input. (`docs/LOWER_DESIGN.md` §2 is the contract.)
 
 use std::collections::HashMap;
 
@@ -41,10 +43,10 @@ use sile_tile_ir::ir::{
     Value, ValueProducer,
 };
 
-use crate as llvm_ir;
+use crate as lsir;
 
-/// Lower a Tile IR module into the LLVM IR function a backend consumes.
-pub fn lower_module_to_llvm_ir(module: &Module) -> Result<llvm_ir::Function, String> {
+/// Lower a Tile IR module into the LSIR function a backend consumes.
+pub fn lower_module_to_lsir(module: &Module) -> Result<lsir::Function, String> {
     let entry_op = *module
         .functions
         .first()
@@ -52,7 +54,7 @@ pub fn lower_module_to_llvm_ir(module: &Module) -> Result<llvm_ir::Function, Str
     Lowerer::new(module, entry_op)?.run()
 }
 
-/// How one SSA value is spelled in LLVM IR.
+/// How one SSA value is spelled in LSIR.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Layout {
     /// One element: the operand is the value itself.
@@ -70,24 +72,24 @@ enum Layout {
 #[derive(Clone)]
 enum Recipe {
     /// A value that already exists: a scalar, or a tile in memory.
-    Ready(llvm_ir::Operand),
+    Ready(lsir::Operand),
     /// One element of a stored tile, at the row-major index asked for.
     Element {
-        base: llvm_ir::Operand,
-        elem: llvm_ir::Type,
+        base: lsir::Operand,
+        elem: lsir::Type,
     },
     /// The element of a global buffer a view names, before the tile origin is
     /// added: the consumer's index is the tile-relative one.
     ViewElement {
         view: View,
-        indices: Vec<llvm_ir::Operand>,
-        elem: llvm_ir::Type,
+        indices: Vec<lsir::Operand>,
+        elem: lsir::Type,
         shape: Vec<i64>,
     },
     Bin {
         opcode: Opcode,
         ceil_div: bool,
-        elem: llvm_ir::Type,
+        elem: lsir::Type,
         shape: Vec<i64>,
         lhs: Box<Recipe>,
         rhs: Box<Recipe>,
@@ -95,7 +97,7 @@ enum Recipe {
         rhs_shape: Vec<i64>,
     },
     Cmp {
-        pred: llvm_ir::CmpPred,
+        pred: lsir::CmpPred,
         shape: Vec<i64>,
         lhs: Box<Recipe>,
         rhs: Box<Recipe>,
@@ -104,17 +106,17 @@ enum Recipe {
     },
     Un {
         opcode: Opcode,
-        elem: llvm_ir::Type,
+        elem: lsir::Type,
         shape: Vec<i64>,
         source: Box<Recipe>,
     },
     Fma {
-        elem: llvm_ir::Type,
+        elem: lsir::Type,
         shape: Vec<i64>,
         parts: Vec<Recipe>,
     },
     Select {
-        elem: llvm_ir::Type,
+        elem: lsir::Type,
         shape: Vec<i64>,
         parts: Vec<Recipe>,
     },
@@ -149,8 +151,6 @@ struct View {
     tile: Vec<i64>,
     /// The element stride of each tensor axis.
     strides: Vec<i64>,
-    /// The tensor's shape, `-1` where dynamic.
-    shape: Vec<i64>,
     /// True when the view was made from a mutable source.
     ///
     /// A mutable partition offsets every access by the tile block it was built
@@ -161,11 +161,11 @@ struct View {
 }
 
 struct Pending {
-    id: llvm_ir::BlockId,
+    id: lsir::BlockId,
     name: String,
-    params: Vec<llvm_ir::BlockParam>,
-    insts: Vec<llvm_ir::Inst>,
-    terminator: Option<llvm_ir::Terminator>,
+    params: Vec<lsir::BlockParam>,
+    insts: Vec<lsir::Inst>,
+    terminator: Option<lsir::Terminator>,
 }
 
 struct Lowerer<'a> {
@@ -173,12 +173,12 @@ struct Lowerer<'a> {
     entry_op: OpId,
     entry_block: BlockId,
     /// Where each value's current spelling lives.
-    operands: HashMap<Value, llvm_ir::Operand>,
+    operands: HashMap<Value, lsir::Operand>,
     layouts: HashMap<Value, Layout>,
     /// The element type of each tile value.
-    elem_types: HashMap<Value, llvm_ir::Type>,
+    elem_types: HashMap<Value, lsir::Type>,
     /// Tile values: their shape and element type.
-    tiles: HashMap<Value, (Vec<i64>, llvm_ir::Type)>,
+    tiles: HashMap<Value, (Vec<i64>, lsir::Type)>,
     /// A view's tile grid, keyed by the partition view's result value.
     views: HashMap<Value, View>,
     /// The buffer a value names, following views to their base.
@@ -189,14 +189,17 @@ struct Lowerer<'a> {
     /// `recipes` until its loop returns, so `materialize_all` — which every
     /// `counted_loop` runs — must skip it or rematerialize it forever.
     materializing: Vec<Value>,
+    /// The value a store loop folds itself, so `materialize_all` — which the
+    /// loop's prologue runs — leaves that one value lazy for the body.
+    fuse_keep: Option<Value>,
     /// Buffers a `partition_mut` names, so a store through their view uses the
     /// block id as its row rather than the printed coordinate.
     mutable_buffers: std::collections::HashSet<Value>,
     /// A buffer argument's `shapes` slot and rank.
     shape_offsets: HashMap<Value, (usize, usize)>,
-    shapes_param: Option<llvm_ir::Operand>,
-    scalars_param: Option<llvm_ir::Operand>,
-    scalars_i64_param: Option<llvm_ir::Operand>,
+    shapes_param: Option<lsir::Operand>,
+    scalars_param: Option<lsir::Operand>,
+    scalars_i64_param: Option<lsir::Operand>,
     /// Ops that produced no code because they are compile-time only.
     blocks: Vec<Pending>,
     current: usize,
@@ -228,6 +231,7 @@ impl<'a> Lowerer<'a> {
             mutable_buffers: std::collections::HashSet::new(),
             recipes: HashMap::new(),
             materializing: Vec::new(),
+            fuse_keep: None,
             shape_offsets: HashMap::new(),
             shapes_param: None,
             scalars_param: None,
@@ -240,7 +244,7 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    fn run(mut self) -> Result<llvm_ir::Function, String> {
+    fn run(mut self) -> Result<lsir::Function, String> {
         let name = self.entry_name();
 
         // The entry block comes first: the prologue the parameter pass emits
@@ -258,7 +262,7 @@ impl<'a> Lowerer<'a> {
         attach_tile_abi(&mut params, &stores, &self.shape_offsets);
 
         let blocks = self.finish();
-        Ok(llvm_ir::Function {
+        Ok(lsir::Function {
             name,
             params,
             blocks,
@@ -282,14 +286,14 @@ impl<'a> Lowerer<'a> {
 
     // ---------------------------------------------------------------- blocks
 
-    fn new_block(&mut self, name: &str, params: Vec<(&str, llvm_ir::Type)>) -> llvm_ir::BlockId {
-        let id = llvm_ir::BlockId(self.next_block);
+    fn new_block(&mut self, name: &str, params: Vec<(&str, lsir::Type)>) -> lsir::BlockId {
+        let id = lsir::BlockId(self.next_block);
         self.next_block += 1;
         let block_params = params
             .into_iter()
             .map(|(prefix, ty)| {
                 let (value, name) = self.fresh(prefix);
-                llvm_ir::BlockParam {
+                lsir::BlockParam {
                     id: value,
                     name,
                     ty,
@@ -307,33 +311,33 @@ impl<'a> Lowerer<'a> {
         id
     }
 
-    fn switch_to(&mut self, id: llvm_ir::BlockId) {
+    fn switch_to(&mut self, id: lsir::BlockId) {
         self.current = self
             .blocks
             .iter()
             .position(|b| b.id == id)
-            .expect("LLVM IR block must exist");
+            .expect("LSIR block must exist");
     }
 
-    fn current_id(&self) -> llvm_ir::BlockId {
+    fn current_id(&self) -> lsir::BlockId {
         self.blocks[self.current].id
     }
 
-    fn set_terminator(&mut self, term: llvm_ir::Terminator) {
+    fn set_terminator(&mut self, term: lsir::Terminator) {
         self.blocks[self.current].terminator = Some(term);
     }
 
-    fn finish(mut self) -> Vec<llvm_ir::BasicBlock> {
+    fn finish(mut self) -> Vec<lsir::BasicBlock> {
         for block in &mut self.blocks {
             if block.terminator.is_none() {
                 // A block the walk created but never emitted into is an exit:
                 // a counted loop's join, or the tail of a region.
-                block.terminator = Some(llvm_ir::Terminator::Ret { value: None });
+                block.terminator = Some(lsir::Terminator::Ret { value: None });
             }
         }
         self.blocks
             .into_iter()
-            .map(|b| llvm_ir::BasicBlock {
+            .map(|b| lsir::BasicBlock {
                 id: b.id,
                 name: b.name,
                 params: b.params,
@@ -343,32 +347,28 @@ impl<'a> Lowerer<'a> {
             .collect()
     }
 
-    fn fresh(&mut self, prefix: &str) -> (llvm_ir::ValueId, String) {
-        let id = llvm_ir::ValueId(self.next_value);
+    fn fresh(&mut self, prefix: &str) -> (lsir::ValueId, String) {
+        let id = lsir::ValueId(self.next_value);
         self.next_value += 1;
         (id, format!("{prefix}{}", id.0))
     }
 
     /// Emit one instruction and return its result.
-    fn emit(&mut self, ty: llvm_ir::Type, prefix: &str, op: llvm_ir::InstOp) -> llvm_ir::Operand {
+    fn emit(&mut self, ty: lsir::Type, prefix: &str, op: lsir::InstOp) -> lsir::Operand {
         let (id, name) = self.fresh(prefix);
-        self.blocks[self.current].insts.push(llvm_ir::Inst {
+        self.blocks[self.current].insts.push(lsir::Inst {
             result: Some(id),
             result_name: Some(name),
             ty,
             op,
             metadata: Vec::new(),
         });
-        llvm_ir::Operand::Value(id)
-    }
-
-    fn const_i64(&mut self, value: i64) -> llvm_ir::Operand {
-        llvm_ir::Operand::Const(llvm_ir::Constant::Int(value))
+        lsir::Operand::Value(id)
     }
 
     // ---------------------------------------------------------------- params
 
-    fn build_params(&mut self) -> Result<Vec<llvm_ir::Param>, String> {
+    fn build_params(&mut self) -> Result<Vec<lsir::Param>, String> {
         let args = self.module.block(self.entry_block).args.clone();
 
         // The shape channel: every tensor view's dynamic extents, in view
@@ -410,17 +410,17 @@ impl<'a> Lowerer<'a> {
             let elem = elem_of(pointer.pointee);
             let rank = self.buffer_rank(*value);
             let (id, name) = self.fresh("arg");
-            self.operands.insert(*value, llvm_ir::Operand::Value(id));
+            self.operands.insert(*value, lsir::Operand::Value(id));
             self.layouts.insert(*value, Layout::Scalar);
             self.elem_types.insert(*value, elem.clone());
             self.shape_offsets.insert(*value, (offset, rank));
             buffers.push((*value, offset));
             offset += rank;
-            params.push(llvm_ir::Param {
+            params.push(lsir::Param {
                 id,
                 name: format!("{name}_buffer"),
-                ty: llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, elem),
-                abi: Some(llvm_ir::ParamAbi {
+                ty: lsir::Type::ptr(lsir::AddressSpace::Global, elem),
+                abi: Some(lsir::ParamAbi {
                     rank,
                     shape_offset: offset - rank,
                     tile: None,
@@ -431,12 +431,12 @@ impl<'a> Lowerer<'a> {
         // The shape descriptor is unconditional: every backend binds it, and
         // it is found by name, so the name is the ABI.
         let (shapes_id, _) = self.fresh("arg");
-        let shapes_param = llvm_ir::Operand::Value(shapes_id);
+        let shapes_param = lsir::Operand::Value(shapes_id);
         self.shapes_param = Some(shapes_param.clone());
-        params.push(llvm_ir::Param {
+        params.push(lsir::Param {
             id: shapes_id,
-            name: llvm_ir::SHAPES_PARAM_NAME.into(),
-            ty: llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, llvm_ir::Type::I64),
+            name: lsir::SHAPES_PARAM_NAME.into(),
+            ty: lsir::Type::ptr(lsir::AddressSpace::Constant, lsir::Type::I64),
             abi: None,
         });
 
@@ -473,20 +473,20 @@ impl<'a> Lowerer<'a> {
         let has_int = scalars.iter().any(|(_, s)| s.is_integer());
 
         let (scalars_id, _) = self.fresh("arg");
-        self.scalars_param = Some(llvm_ir::Operand::Value(scalars_id));
-        params.push(llvm_ir::Param {
+        self.scalars_param = Some(lsir::Operand::Value(scalars_id));
+        params.push(lsir::Param {
             id: scalars_id,
-            name: llvm_ir::SCALARS_PARAM_NAME.into(),
-            ty: llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, llvm_ir::Type::F32),
+            name: lsir::SCALARS_PARAM_NAME.into(),
+            ty: lsir::Type::ptr(lsir::AddressSpace::Constant, lsir::Type::F32),
             abi: None,
         });
         if has_int {
             let (id, _) = self.fresh("arg");
-            self.scalars_i64_param = Some(llvm_ir::Operand::Value(id));
-            params.push(llvm_ir::Param {
+            self.scalars_i64_param = Some(lsir::Operand::Value(id));
+            params.push(lsir::Param {
                 id,
-                name: llvm_ir::SCALARS_I64_PARAM_NAME.into(),
-                ty: llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, llvm_ir::Type::I64),
+                name: lsir::SCALARS_I64_PARAM_NAME.into(),
+                ty: lsir::Type::ptr(lsir::AddressSpace::Constant, lsir::Type::I64),
                 abi: None,
             });
         }
@@ -503,14 +503,14 @@ impl<'a> Lowerer<'a> {
             }
             if let Some(slot) = shape_args.iter().position(|v| v == value) {
                 let ptr = self.emit(
-                    llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, llvm_ir::Type::I64),
+                    lsir::Type::ptr(lsir::AddressSpace::Constant, lsir::Type::I64),
                     "shp",
-                    llvm_ir::InstOp::Gep {
+                    lsir::InstOp::Gep {
                         base: shapes_param.clone(),
-                        indices: vec![llvm_ir::Operand::Const(llvm_ir::Constant::Int(slot as i64))],
+                        indices: vec![lsir::Operand::Const(lsir::Constant::Int(slot as i64))],
                     },
                 );
-                let loaded = self.emit(llvm_ir::Type::I64, "dim", llvm_ir::InstOp::Load { ptr });
+                let loaded = self.emit(lsir::Type::I64, "dim", lsir::InstOp::Load { ptr });
                 self.operands.insert(*value, loaded);
                 self.layouts.insert(*value, Layout::Scalar);
                 continue;
@@ -526,7 +526,7 @@ impl<'a> Lowerer<'a> {
                         .filter(|(_, s)| s.is_float())
                         .position(|(v, _)| v == value)
                         .unwrap_or(0),
-                    llvm_ir::Type::F32,
+                    lsir::Type::F32,
                 )
             } else {
                 (
@@ -538,18 +538,18 @@ impl<'a> Lowerer<'a> {
                         .filter(|(_, s)| s.is_integer())
                         .position(|(v, _)| v == value)
                         .unwrap_or(0),
-                    llvm_ir::Type::I64,
+                    lsir::Type::I64,
                 )
             };
             let ptr = self.emit(
-                llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, elem_ty.clone()),
+                lsir::Type::ptr(lsir::AddressSpace::Constant, elem_ty.clone()),
                 "sc",
-                llvm_ir::InstOp::Gep {
+                lsir::InstOp::Gep {
                     base: channel,
-                    indices: vec![llvm_ir::Operand::Const(llvm_ir::Constant::Int(index as i64))],
+                    indices: vec![lsir::Operand::Const(lsir::Constant::Int(index as i64))],
                 },
             );
-            let loaded = self.emit(elem_ty, "sv", llvm_ir::InstOp::Load { ptr });
+            let loaded = self.emit(elem_ty, "sv", lsir::InstOp::Load { ptr });
             self.operands.insert(*value, loaded);
             self.layouts.insert(*value, Layout::Scalar);
         }
@@ -565,14 +565,13 @@ impl<'a> Lowerer<'a> {
             let Some(result) = self.op_result(op_id, 0) else {
                 continue;
             };
-            let (tile, buffer, strides, shape, mutable) = match self.module.value_type(result) {
+            let (tile, buffer, strides, mutable) = match self.module.value_type(result) {
                 Type::PartitionView(pv) => {
                     let tv = &pv.tensor_view;
                     (
                         pv.tile_shape.iter().map(|d| *d as i64).collect::<Vec<_>>(),
                         self.sources.get(&source).copied().unwrap_or(source),
                         tv.strides.clone(),
-                        tv.shape.clone(),
                         matches!(self.module.value_type(result), Type::PartitionView(pv) if pv.padding_value.is_none()),
                     )
                 }
@@ -584,7 +583,6 @@ impl<'a> Lowerer<'a> {
                     buffer,
                     tile,
                     strides,
-                    shape,
                     mutable,
                 },
             );
@@ -756,7 +754,7 @@ fn dynamic_operands(module: &Module, op: OpId) -> (Vec<Value>, Vec<Value>) {
 }
 
 fn attach_tile_abi(
-    params: &mut [llvm_ir::Param],
+    params: &mut [lsir::Param],
     stores: &HashMap<Value, (usize, usize)>,
     shape_offsets: &HashMap<Value, (usize, usize)>,
 ) {
@@ -764,7 +762,7 @@ fn attach_tile_abi(
         let Some(abi) = param.abi.as_mut() else {
             continue;
         };
-        // Match the LLVM IR parameter back to its Tile IR buffer through the
+        // Match the LSIR parameter back to its Tile IR buffer through the
         // shape offset, which is unique per buffer.
         let buffer = shape_offsets
             .iter()
@@ -774,13 +772,13 @@ fn attach_tile_abi(
     }
 }
 
-fn elem_of(ty: ScalarType) -> llvm_ir::Type {
+fn elem_of(ty: ScalarType) -> lsir::Type {
     match ty {
-        ScalarType::F16 | ScalarType::BF16 => llvm_ir::Type::F16,
-        ScalarType::F32 | ScalarType::TF32 => llvm_ir::Type::F32,
-        ScalarType::F64 => llvm_ir::Type::F64,
-        ScalarType::I1 => llvm_ir::Type::I1,
-        _ => llvm_ir::Type::I64,
+        ScalarType::F16 | ScalarType::BF16 => lsir::Type::F16,
+        ScalarType::F32 | ScalarType::TF32 => lsir::Type::F32,
+        ScalarType::F64 => lsir::Type::F64,
+        ScalarType::I1 => lsir::Type::I1,
+        _ => lsir::Type::I64,
     }
 }
 
@@ -788,12 +786,12 @@ fn elem_of(ty: ScalarType) -> llvm_ir::Type {
 ///
 /// An `i32` constant arrives as four bytes and widens to `i64` in the body, so
 /// reading its dense data as the widened type would step past it.
-fn storage_elem_of(ty: ScalarType) -> llvm_ir::Type {
+fn storage_elem_of(ty: ScalarType) -> lsir::Type {
     match ty {
-        ScalarType::I1 => llvm_ir::Type::I1,
+        ScalarType::I1 => lsir::Type::I1,
         // The IR has three integer widths: `i1`, `i32` and `i64`. Anything
         // narrower than `i32` is stored as four bytes.
-        ScalarType::I4 | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 => llvm_ir::Type::I32,
+        ScalarType::I4 | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 => lsir::Type::I32,
         other => elem_of(other),
     }
 }
@@ -809,7 +807,7 @@ fn scalar_of(ty: &Type) -> Option<ScalarType> {
     }
 }
 
-fn tile_shape(ty: &Type) -> Option<(Vec<i64>, llvm_ir::Type)> {
+fn tile_shape(ty: &Type) -> Option<(Vec<i64>, lsir::Type)> {
     match ty {
         Type::Tile(TileType {
             shape,
@@ -901,7 +899,7 @@ impl<'a> Lowerer<'a> {
             Opcode::If => self.lower_if(op_id),
             Opcode::Yield | Opcode::Continue => Ok(()),
             Opcode::Return => {
-                self.set_terminator(llvm_ir::Terminator::Ret { value: None });
+                self.set_terminator(lsir::Terminator::Ret { value: None });
                 // A `return` closes the block: anything the arena prints after
                 // it belongs to a block that is no longer reachable.
                 self.returned = true;
@@ -916,20 +914,22 @@ impl<'a> Lowerer<'a> {
     }
 
     /// A `constant` is a splat of one value over the tile's shape.
-    fn lower_constant(&mut self, op_id: OpId) -> Result<(), String> {
-        let op = self.module.op(op_id).clone();
-        let Some(result) = self.op_result(op_id, 0) else {
-            return Ok(());
+    /// The scalar a tile-typed constant names, when `value` is one.
+    ///
+    /// The bytes carry the element type the arena recorded, which is not the
+    /// one this lowering widens to: an `i32` constant arrives as four bytes
+    /// and reads back as an `i64`. Reading it as the widened type would step
+    /// past the data and lose the value.
+    fn tile_constant_scalar(&self, value: Value) -> Option<lsir::Constant> {
+        let producer = self.module.value_data(value).producer;
+        let ValueProducer::OpResult { op, result_index: 0 } = producer else {
+            return None;
         };
-        let Some((shape, elem)) = tile_shape(self.module.value_type(result)) else {
-            return Ok(());
-        };
-        let len: usize = shape.iter().map(|d| (*d).max(1) as usize).product();
-        // The bytes carry the element type the arena recorded, which is not the
-        // one this lowering widens to: an `i32` constant arrives as four bytes
-        // and reads back as an `i64`. Reading it as the widened type would step
-        // past the data and lose the value.
-        let value = op
+        if self.module.op(op).opcode != Opcode::Constant {
+            return None;
+        }
+        self.module
+            .op(op)
             .attributes
             .iter()
             .find(|(k, _)| k == "value")
@@ -943,11 +943,23 @@ impl<'a> Lowerer<'a> {
                 },
                 _ => None,
             })
-            .unwrap_or(llvm_ir::Constant::Float(0.0));
+    }
+
+    fn lower_constant(&mut self, op_id: OpId) -> Result<(), String> {
+        let Some(result) = self.op_result(op_id, 0) else {
+            return Ok(());
+        };
+        let Some((shape, elem)) = tile_shape(self.module.value_type(result)) else {
+            return Ok(());
+        };
+        let len: usize = shape.iter().map(|d| (*d).max(1) as usize).product();
+        let value = self
+            .tile_constant_scalar(result)
+            .unwrap_or(lsir::Constant::Float(0.0));
 
         if len == 1 && shape.is_empty() {
             self.operands
-                .insert(result, llvm_ir::Operand::Const(value));
+                .insert(result, lsir::Operand::Const(value));
             self.layouts.insert(result, Layout::Scalar);
             self.elem_types.insert(result, elem.clone());
             self.tiles.insert(result, (shape, elem));
@@ -959,7 +971,7 @@ impl<'a> Lowerer<'a> {
         // wants the value, not an array of one.
         if len == 1 {
             self.operands
-                .insert(result, llvm_ir::Operand::Const(value));
+                .insert(result, lsir::Operand::Const(value));
             self.layouts.insert(result, Layout::Scalar);
             self.elem_types.insert(result, elem.clone());
             self.tiles.insert(result, (shape, elem));
@@ -967,23 +979,23 @@ impl<'a> Lowerer<'a> {
         }
 
         let alloc = self.emit(
-            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, elem.clone()),
+            lsir::Type::ptr(lsir::AddressSpace::Private, elem.clone()),
             "tile",
-            llvm_ir::InstOp::Alloca {
-                alloc_ty: llvm_ir::Type::array(len, elem.clone()),
-                addr_space: llvm_ir::AddressSpace::Private,
+            lsir::InstOp::Alloca {
+                alloc_ty: lsir::Type::array(len, elem.clone()),
+                addr_space: lsir::AddressSpace::Private,
             },
         );
         for index in 0..len {
             let ptr = self.emit(
-                llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, elem.clone()),
+                lsir::Type::ptr(lsir::AddressSpace::Private, elem.clone()),
                 "gep",
-                llvm_ir::InstOp::Gep {
+                lsir::InstOp::Gep {
                     base: alloc.clone(),
-                    indices: vec![llvm_ir::Operand::Const(llvm_ir::Constant::Int(index as i64))],
+                    indices: vec![lsir::Operand::Const(lsir::Constant::Int(index as i64))],
                 },
             );
-            self.store_void(ptr, llvm_ir::Operand::Const(value.clone()));
+            self.store_void(ptr, lsir::Operand::Const(value.clone()));
         }
         self.operands.insert(result, alloc);
         self.layouts.insert(result, Layout::Tile { len });
@@ -1036,11 +1048,10 @@ impl<'a> Lowerer<'a> {
             return Ok(());
         };
         let buffer = self.sources.get(&source).copied().unwrap_or(source);
-        let (tile, strides, shape, mutable) = match self.module.value_type(result) {
+        let (tile, strides, mutable) = match self.module.value_type(result) {
             Type::PartitionView(pv) => (
                 pv.tile_shape.iter().map(|d| *d as i64).collect::<Vec<_>>(),
                 pv.tensor_view.strides.clone(),
-                pv.tensor_view.shape.clone(),
                 pv.padding_value.is_none(),
             ),
             _ => return Ok(()),
@@ -1051,7 +1062,6 @@ impl<'a> Lowerer<'a> {
                 buffer,
                 tile,
                 strides,
-                shape,
                 mutable,
             },
         );
@@ -1075,38 +1085,38 @@ impl<'a> Lowerer<'a> {
                 .copied()
                 .map(|axis| self.operand_of(axis))
                 .and_then(|operand| match operand {
-                    llvm_ir::Operand::Const(llvm_ir::Constant::Int(v)) => Some(v.clamp(0, 2) as u8),
+                    lsir::Operand::Const(lsir::Constant::Int(v)) => Some(v.clamp(0, 2) as u8),
                     _ => None,
                 })
                 .unwrap_or(0);
             let value = self.emit(
-                llvm_ir::Type::I64,
+                lsir::Type::I64,
                 "pid",
-                llvm_ir::InstOp::Intrinsic {
-                    intrinsic: llvm_ir::Intrinsic::BlockId { dim },
+                lsir::InstOp::Intrinsic {
+                    intrinsic: lsir::Intrinsic::BlockId { dim },
                     args: Vec::new(),
                 },
             );
             if let Some(result) = self.op_result(op_id, 0) {
                 self.operands.insert(result, value);
                 self.layouts.insert(result, Layout::Scalar);
-                self.elem_types.insert(result, llvm_ir::Type::I64);
+                self.elem_types.insert(result, lsir::Type::I64);
             }
             return Ok(());
         }
         for (axis, _) in op.result_types.iter().enumerate().take(3) {
             let value = self.emit(
-                llvm_ir::Type::I64,
+                lsir::Type::I64,
                 "pid",
-                llvm_ir::InstOp::Intrinsic {
-                    intrinsic: llvm_ir::Intrinsic::BlockId { dim: axis as u8 },
+                lsir::InstOp::Intrinsic {
+                    intrinsic: lsir::Intrinsic::BlockId { dim: axis as u8 },
                     args: Vec::new(),
                 },
             );
             if let Some(result) = self.op_result(op_id, axis) {
                 self.operands.insert(result, value);
                 self.layouts.insert(result, Layout::Scalar);
-                self.elem_types.insert(result, llvm_ir::Type::I64);
+                self.elem_types.insert(result, lsir::Type::I64);
             }
         }
         Ok(())
@@ -1116,17 +1126,17 @@ impl<'a> Lowerer<'a> {
         let op = self.module.op(op_id).clone();
         for axis in 0..op.result_types.len().min(3) {
             let value = self.emit(
-                llvm_ir::Type::I64,
+                lsir::Type::I64,
                 "grid",
-                llvm_ir::InstOp::Intrinsic {
-                    intrinsic: llvm_ir::Intrinsic::GridDim { dim: axis as u8 },
+                lsir::InstOp::Intrinsic {
+                    intrinsic: lsir::Intrinsic::GridDim { dim: axis as u8 },
                     args: Vec::new(),
                 },
             );
             if let Some(result) = self.op_result(op_id, axis) {
                 self.operands.insert(result, value);
                 self.layouts.insert(result, Layout::Scalar);
-                self.elem_types.insert(result, llvm_ir::Type::I64);
+                self.elem_types.insert(result, lsir::Type::I64);
             }
         }
         Ok(())
@@ -1146,16 +1156,16 @@ impl<'a> Lowerer<'a> {
         let shapes = self.shapes_param.clone().expect("shapes parameter");
         for axis in 0..op.result_types.len().min(rank) {
             let ptr = self.emit(
-                llvm_ir::Type::ptr(llvm_ir::AddressSpace::Constant, llvm_ir::Type::I64),
+                lsir::Type::ptr(lsir::AddressSpace::Constant, lsir::Type::I64),
                 "shp",
-                llvm_ir::InstOp::Gep {
+                lsir::InstOp::Gep {
                     base: shapes.clone(),
-                    indices: vec![llvm_ir::Operand::Const(llvm_ir::Constant::Int(
+                    indices: vec![lsir::Operand::Const(lsir::Constant::Int(
                         (offset + axis) as i64,
                     ))],
                 },
             );
-            let mut value = self.emit(llvm_ir::Type::I64, "dim", llvm_ir::InstOp::Load { ptr });
+            let mut value = self.emit(lsir::Type::I64, "dim", lsir::InstOp::Load { ptr });
             // The *index space* is counted in tiles, not elements: an axis with
             // extent 32 and a tile extent of 8 has four positions. A plain
             // `get_tensor_shape` reads the extent itself, so only the index
@@ -1168,19 +1178,19 @@ impl<'a> Lowerer<'a> {
                     .filter(|extent| *extent > 1)
             {
                 value = self.emit(
-                    llvm_ir::Type::I64,
+                    lsir::Type::I64,
                     "tiles",
-                    llvm_ir::InstOp::Bin {
-                        op: llvm_ir::BinOp::Div,
+                    lsir::InstOp::Bin {
+                        op: lsir::BinOp::Div,
                         lhs: value,
-                        rhs: llvm_ir::Operand::Const(llvm_ir::Constant::Int(tile_extent)),
+                        rhs: lsir::Operand::Const(lsir::Constant::Int(tile_extent)),
                     },
                 );
             }
             if let Some(result) = self.op_result(op_id, axis) {
                 self.operands.insert(result, value);
                 self.layouts.insert(result, Layout::Scalar);
-                self.elem_types.insert(result, llvm_ir::Type::I64);
+                self.elem_types.insert(result, lsir::Type::I64);
             }
         }
         Ok(())
@@ -1193,18 +1203,18 @@ impl<'a> Lowerer<'a> {
 
 impl<'a> Lowerer<'a> {
     /// Allocate a private array for a result tile, and record its layout.
-    fn alloc_tile(&mut self, result: Value, shape: &[i64], elem: &llvm_ir::Type) -> llvm_ir::Operand {
+    fn alloc_tile(&mut self, result: Value, shape: &[i64], elem: &lsir::Type) -> lsir::Operand {
         let len = shape
             .iter()
             .map(|d| (*d).max(1) as usize)
             .product::<usize>()
             .max(1);
         let alloc = self.emit(
-            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, elem.clone()),
+            lsir::Type::ptr(lsir::AddressSpace::Private, elem.clone()),
             "tile",
-            llvm_ir::InstOp::Alloca {
-                alloc_ty: llvm_ir::Type::array(len, elem.clone()),
-                addr_space: llvm_ir::AddressSpace::Private,
+            lsir::InstOp::Alloca {
+                alloc_ty: lsir::Type::array(len, elem.clone()),
+                addr_space: lsir::AddressSpace::Private,
             },
         );
         self.operands.insert(result, alloc.clone());
@@ -1221,30 +1231,30 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn elem_of_value(&self, value: Value) -> llvm_ir::Type {
+    fn elem_of_value(&self, value: Value) -> lsir::Type {
         self.elem_types
             .get(&value)
             .cloned()
-            .unwrap_or(llvm_ir::Type::F32)
+            .unwrap_or(lsir::Type::F32)
     }
 
-    fn operand_of(&self, value: Value) -> llvm_ir::Operand {
+    fn operand_of(&self, value: Value) -> lsir::Operand {
         self.operands
             .get(&value)
             .cloned()
-            .unwrap_or_else(|| llvm_ir::Operand::Value(llvm_ir::ValueId(value.index())))
+            .unwrap_or_else(|| lsir::Operand::Value(lsir::ValueId(value.index())))
     }
 
     /// `operand` as an `i64`, converting a float.
-    fn as_i64(&mut self, operand: llvm_ir::Operand, elem: &llvm_ir::Type) -> llvm_ir::Operand {
-        if matches!(elem, llvm_ir::Type::F32 | llvm_ir::Type::F64) {
+    fn as_i64(&mut self, operand: lsir::Operand, elem: &lsir::Type) -> lsir::Operand {
+        if matches!(elem, lsir::Type::F32 | lsir::Type::F64) {
             return self.emit(
-                llvm_ir::Type::I64,
+                lsir::Type::I64,
                 "forb",
-                llvm_ir::InstOp::Cast {
-                    op: llvm_ir::CastOp::Fptosi,
+                lsir::InstOp::Cast {
+                    op: lsir::CastOp::Fptosi,
                     value: operand,
-                    to: llvm_ir::Type::I64,
+                    to: lsir::Type::I64,
                 },
             );
         }
@@ -1256,10 +1266,9 @@ impl<'a> Lowerer<'a> {
     fn recipe_element(
         &mut self,
         recipe: &Recipe,
-        index: llvm_ir::Operand,
-        row: Option<&llvm_ir::Operand>,
-        shape: &[i64],
-    ) -> llvm_ir::Operand {
+        index: lsir::Operand,
+        row: Option<&lsir::Operand>,
+    ) -> lsir::Operand {
         match recipe {
             Recipe::Ready(operand) => operand.clone(),
             Recipe::Element { base, elem } => self.tile_element(base, elem, index),
@@ -1269,11 +1278,9 @@ impl<'a> Lowerer<'a> {
                 elem,
                 shape: view_shape,
             } => {
-                let cols = view_shape.last().copied().unwrap_or(1).max(1);
-                let col = self.rem_i64(index.clone(), self.const_operand(cols));
-                let view_row = self.div_i64(index, self.const_operand(cols));
+                let (view_row, col) = self.split_row_col(index, view_shape);
                 let ptr = self.view_element_ptr(view, indices, view_row, col, elem);
-                self.emit(elem.clone(), "ld", llvm_ir::InstOp::Load { ptr })
+                self.emit(elem.clone(), "ld", lsir::InstOp::Load { ptr })
             }
             Recipe::Bin {
                 opcode,
@@ -1287,10 +1294,10 @@ impl<'a> Lowerer<'a> {
             } => {
                 let lhs_row = aligned_row(row, out_shape, lhs_shape);
                 let lhs_index = self.aligned_index(index.clone(), out_shape, lhs_shape);
-                let a = self.recipe_element(lhs, lhs_index, lhs_row, lhs_shape);
+                let a = self.recipe_element(lhs, lhs_index, lhs_row);
                 let rhs_row = aligned_row(row, out_shape, rhs_shape);
                 let rhs_index = self.aligned_index(index, out_shape, rhs_shape);
-                let b = self.recipe_element(rhs, rhs_index, rhs_row, rhs_shape);
+                let b = self.recipe_element(rhs, rhs_index, rhs_row);
                 if *ceil_div {
                     self.ceil_div(elem, a, b)
                 } else {
@@ -1307,14 +1314,14 @@ impl<'a> Lowerer<'a> {
             } => {
                 let lhs_row = aligned_row(row, out_shape, lhs_shape);
                 let lhs_index = self.aligned_index(index.clone(), out_shape, lhs_shape);
-                let a = self.recipe_element(lhs, lhs_index, lhs_row, lhs_shape);
+                let a = self.recipe_element(lhs, lhs_index, lhs_row);
                 let rhs_row = aligned_row(row, out_shape, rhs_shape);
                 let rhs_index = self.aligned_index(index, out_shape, rhs_shape);
-                let b = self.recipe_element(rhs, rhs_index, rhs_row, rhs_shape);
+                let b = self.recipe_element(rhs, rhs_index, rhs_row);
                 self.emit(
-                    llvm_ir::Type::I1,
+                    lsir::Type::I1,
                     "cmp",
-                    llvm_ir::InstOp::Cmp {
+                    lsir::InstOp::Cmp {
                         pred: *pred,
                         lhs: a,
                         rhs: b,
@@ -1324,43 +1331,43 @@ impl<'a> Lowerer<'a> {
             Recipe::Un {
                 opcode,
                 elem,
-                shape: source_shape,
+                shape: _,
                 source,
             } => {
-                let value = self.recipe_element(source, index, row, source_shape);
+                let value = self.recipe_element(source, index, row);
                 self.unary_value(*opcode, elem, value)
             }
             Recipe::Fma {
                 elem,
-                shape: part_shape,
+                shape: _,
                 parts,
             } => {
                 let values = parts
                     .iter()
-                    .map(|part| self.recipe_element(part, index.clone(), row, part_shape))
+                    .map(|part| self.recipe_element(part, index.clone(), row))
                     .collect::<Vec<_>>();
                 self.emit(
                     elem.clone(),
                     "fma",
-                    llvm_ir::InstOp::Intrinsic {
-                        intrinsic: llvm_ir::Intrinsic::Fma,
+                    lsir::InstOp::Intrinsic {
+                        intrinsic: lsir::Intrinsic::Fma,
                         args: values,
                     },
                 )
             }
             Recipe::Select {
                 elem,
-                shape: part_shape,
+                shape: _,
                 parts,
             } => {
                 let values = parts
                     .iter()
-                    .map(|part| self.recipe_element(part, index.clone(), row, part_shape))
+                    .map(|part| self.recipe_element(part, index.clone(), row))
                     .collect::<Vec<_>>();
                 self.emit(
                     elem.clone(),
                     "sel",
-                    llvm_ir::InstOp::Select {
+                    lsir::InstOp::Select {
                         cond: values[0].clone(),
                         on_true: values[1].clone(),
                         on_false: values[2].clone(),
@@ -1383,7 +1390,7 @@ impl<'a> Lowerer<'a> {
                 };
                 // A reshape or a permute reinterprets the axes, so the row
                 // coordinate the caller handed down no longer names a row.
-                self.recipe_element(source, mapped, None, source_shape)
+                self.recipe_element(source, mapped, None)
             }
             Recipe::Broadcast {
                 shape: out_shape,
@@ -1405,11 +1412,11 @@ impl<'a> Lowerer<'a> {
                 {
                     row.clone()
                 } else if source_len == 1 {
-                    llvm_ir::Operand::Const(llvm_ir::Constant::Int(0))
+                    lsir::Operand::Const(lsir::Constant::Int(0))
                 } else {
                     broadcast_index(self, out_shape, source_shape, index, source_len)
                 };
-                self.recipe_element(source, mapped, None, source_shape)
+                self.recipe_element(source, mapped, None)
             }
         }
     }
@@ -1418,12 +1425,11 @@ impl<'a> Lowerer<'a> {
     fn tile_value_at(
         &mut self,
         value: Value,
-        index: llvm_ir::Operand,
-        row: Option<&llvm_ir::Operand>,
-        shape: &[i64],
-    ) -> llvm_ir::Operand {
+        index: lsir::Operand,
+        row: Option<&lsir::Operand>,
+    ) -> lsir::Operand {
         match self.recipes.get(&value).cloned() {
-            Some(recipe) => self.recipe_element(&recipe, index, row, shape),
+            Some(recipe) => self.recipe_element(&recipe, index, row),
             None => {
                 let base = self.operand_of(value);
                 let elem = self.elem_of_value(value);
@@ -1442,8 +1448,8 @@ impl<'a> Lowerer<'a> {
         &mut self,
         value: Value,
         shape: &[i64],
-        elem: &llvm_ir::Type,
-    ) -> llvm_ir::Operand {
+        elem: &lsir::Type,
+    ) -> lsir::Operand {
         let dst = self.alloc_tile(value, shape, elem);
         let len = self.tile_len_of(value);
         self.materializing.push(value);
@@ -1468,13 +1474,13 @@ impl<'a> Lowerer<'a> {
                     let flat = lowerer.add_i64(lowerer.const_operand(row * cols), col);
                     let row_at = lowerer.const_operand(row);
                     let element =
-                        lowerer.tile_value_at(value, flat.clone(), Some(&row_at), shape);
+                        lowerer.tile_value_at(value, flat.clone(), Some(&row_at));
                     lowerer.store_element(&dst, elem, flat, element);
                 });
             }
         } else {
             self.counted_loop("mt", len, |lowerer, index| {
-                let element = lowerer.tile_value_at(value, index.clone(), None, shape);
+                let element = lowerer.tile_value_at(value, index.clone(), None);
                 lowerer.store_element(&dst, elem, index, element);
             });
         }
@@ -1484,16 +1490,95 @@ impl<'a> Lowerer<'a> {
     }
 
     /// `value`'s tile in memory, materialising it first when it is still lazy.
-    fn operand_of_tile(&mut self, value: Value) -> llvm_ir::Operand {
+    fn operand_of_tile(&mut self, value: Value) -> lsir::Operand {
         if self.recipes.contains_key(&value) {
             let (shape, elem) = self
                 .tiles
                 .get(&value)
                 .cloned()
-                .unwrap_or((Vec::new(), llvm_ir::Type::F32));
+                .unwrap_or((Vec::new(), lsir::Type::F32));
             return self.materialize(value, &shape, &elem);
         }
         self.operand_of(value)
+    }
+
+    /// Fold a lazy value straight into `dst` storage.
+    ///
+    /// The loop-carried accumulator is the reason this exists: its next value
+    /// reads the carry itself, so a materialisation to fresh storage plus the
+    /// copy loop onto the carry would turn every iteration into two loops over
+    /// the tile.
+    fn materialize_into(
+        &mut self,
+        dst: &lsir::Operand,
+        value: Value,
+        elem: &lsir::Type,
+    ) {
+        let len = self.tile_len_of(value);
+        self.materializing.push(value);
+        self.counted_loop("mi", len, |lowerer, index| {
+            let element = lowerer.tile_value_at(value, index.clone(), None);
+            lowerer.store_element(dst, elem, index, element);
+        });
+        self.materializing.pop();
+        self.recipes.remove(&value);
+    }
+
+    /// True when folding `recipe` reads the carry slot only at the index the
+    /// fold itself writes.
+    ///
+    /// In-place materialisation is a read-modify-write of one slot per index,
+    /// and every read is emitted before that index's write. That stays sound
+    /// exactly while each op's operands keep the output's shape: then every
+    /// fold reads its own index. A broadcast or a reindex reads the slot at a
+    /// remapped index — some of those reads would land after their slot was
+    /// overwritten this iteration.
+    fn carry_safe(recipe: &Recipe, slot: &lsir::Operand, shape: &[i64]) -> bool {
+        match recipe {
+            Recipe::Ready(operand) => operand != slot,
+            Recipe::Element { .. } | Recipe::ViewElement { .. } => true,
+            Recipe::Bin {
+                shape: out,
+                lhs,
+                rhs,
+                lhs_shape,
+                rhs_shape,
+                ..
+            }
+            | Recipe::Cmp {
+                shape: out,
+                lhs,
+                rhs,
+                lhs_shape,
+                rhs_shape,
+                ..
+            } => {
+                out.as_slice() == shape
+                    && lhs_shape.as_slice() == shape
+                    && rhs_shape.as_slice() == shape
+                    && Self::carry_safe(lhs, slot, shape)
+                    && Self::carry_safe(rhs, slot, shape)
+            }
+            Recipe::Un {
+                shape: out,
+                source,
+                ..
+            } => out.as_slice() == shape && Self::carry_safe(source, slot, shape),
+            Recipe::Fma {
+                shape: out,
+                parts,
+                ..
+            }
+            | Recipe::Select {
+                shape: out,
+                parts,
+                ..
+            } => {
+                out.as_slice() == shape
+                    && parts.iter().all(|part| Self::carry_safe(part, slot, shape))
+            }
+            Recipe::Reindex { .. } | Recipe::Broadcast { .. } => false,
+        }
     }
 
     /// Force every lazy value to storage.
@@ -1506,7 +1591,14 @@ impl<'a> Lowerer<'a> {
             .recipes
             .keys()
             .copied()
-            .filter(|value| !self.materializing.contains(value))
+            .filter(|value| {
+                !self.materializing.contains(value)
+                    && self.fuse_keep != Some(*value)
+                    && !self
+                        .recipes
+                        .get(value)
+                        .is_some_and(|recipe| Self::recipe_invariant(recipe))
+            })
             .collect();
         for value in pending {
             // A sibling earlier in the snapshot can already have materialised
@@ -1520,7 +1612,7 @@ impl<'a> Lowerer<'a> {
                 .tiles
                 .get(&value)
                 .cloned()
-                .unwrap_or((Vec::new(), llvm_ir::Type::F32));
+                .unwrap_or((Vec::new(), lsir::Type::F32));
             self.materialize(value, &shape, &elem);
         }
     }
@@ -1557,20 +1649,24 @@ impl<'a> Lowerer<'a> {
         result: Value,
         recipe: Recipe,
         shape: &[i64],
-        elem: &llvm_ir::Type,
+        elem: &lsir::Type,
     ) {
         let len = shape
             .iter()
             .map(|d| (*d).max(1) as usize)
             .product::<usize>()
             .max(1);
+        // Scalar code reads a one-element tile through a pointer, and writing it
+        // costs a single store, so deferring it buys nothing. An invariant
+        // recipe is the exception: its fold yields the scalar itself with no
+        // storage, and materialising here would delete the recipe and force
+        // every later broadcast of it to copy the stored copy.
+        let eager = len == 1 && !Self::recipe_invariant(&recipe);
         self.recipes.insert(result, recipe);
         self.layouts.insert(result, Layout::Tile { len });
         self.elem_types.insert(result, elem.clone());
         self.tiles.insert(result, (shape.to_vec(), elem.clone()));
-        // Scalar code reads a one-element tile through a pointer, and writing it
-        // costs a single store, so deferring it buys nothing.
-        if len == 1 {
+        if eager {
             self.materialize(result, shape, elem);
         }
     }
@@ -1579,14 +1675,14 @@ impl<'a> Lowerer<'a> {
     fn unary_value(
         &mut self,
         opcode: Opcode,
-        elem: &llvm_ir::Type,
-        value: llvm_ir::Operand,
-    ) -> llvm_ir::Operand {
+        elem: &lsir::Type,
+        value: lsir::Operand,
+    ) -> lsir::Operand {
         if let Some(intrinsic) = float_intrinsic(opcode) {
             return self.emit(
                 elem.clone(),
                 "fn",
-                llvm_ir::InstOp::Intrinsic {
+                lsir::InstOp::Intrinsic {
                     intrinsic,
                     args: vec![value],
                 },
@@ -1596,7 +1692,7 @@ impl<'a> Lowerer<'a> {
             return self.emit(
                 elem.clone(),
                 "cast",
-                llvm_ir::InstOp::Cast {
+                lsir::InstOp::Cast {
                     op,
                     value,
                     to: elem.clone(),
@@ -1607,9 +1703,9 @@ impl<'a> Lowerer<'a> {
             return self.emit(
                 elem.clone(),
                 "neg",
-                llvm_ir::InstOp::Bin {
-                    op: llvm_ir::BinOp::Sub,
-                    lhs: llvm_ir::Operand::Const(llvm_ir::Constant::Int(0)),
+                lsir::InstOp::Bin {
+                    op: lsir::BinOp::Sub,
+                    lhs: lsir::Operand::Const(lsir::Constant::Int(0)),
                     rhs: value,
                 },
             );
@@ -1619,51 +1715,118 @@ impl<'a> Lowerer<'a> {
 
     fn tile_element(
         &mut self,
-        base: &llvm_ir::Operand,
-        elem: &llvm_ir::Type,
-        index: llvm_ir::Operand,
-    ) -> llvm_ir::Operand {
+        base: &lsir::Operand,
+        elem: &lsir::Type,
+        index: lsir::Operand,
+    ) -> lsir::Operand {
         let ptr = self.emit(
-            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, elem.clone()),
+            lsir::Type::ptr(lsir::AddressSpace::Private, elem.clone()),
             "gep",
-            llvm_ir::InstOp::Gep {
+            lsir::InstOp::Gep {
                 base: base.clone(),
                 indices: vec![index],
             },
         );
-        self.emit(elem.clone(), "ld", llvm_ir::InstOp::Load { ptr })
+        self.emit(elem.clone(), "ld", lsir::InstOp::Load { ptr })
     }
 
-    fn store_void(&mut self, ptr: llvm_ir::Operand, value: llvm_ir::Operand) {
-        self.blocks[self.current].insts.push(llvm_ir::Inst {
+    /// Record `meta` on the instruction that just produced `value`.
+    fn stamp(&mut self, value: &lsir::Operand, meta: lsir::Metadata) {
+        let lsir::Operand::Value(id) = value else {
+            return;
+        };
+        let Some(inst) = self.blocks[self.current]
+            .insts
+            .iter_mut()
+            .rev()
+            .find(|inst| inst.result == Some(*id))
+        else {
+            return;
+        };
+        inst.metadata.push(meta);
+    }
+
+    fn store_void(&mut self, ptr: lsir::Operand, value: lsir::Operand) {
+        self.blocks[self.current].insts.push(lsir::Inst {
             result: None,
             result_name: None,
-            ty: llvm_ir::Type::Void,
-            op: llvm_ir::InstOp::Store { ptr, value },
+            ty: lsir::Type::Void,
+            op: lsir::InstOp::Store { ptr, value },
             metadata: Vec::new(),
         });
     }
 
+    /// Emit a result-less intrinsic.
+    fn emit_void(&mut self, intrinsic: lsir::Intrinsic, args: Vec<lsir::Operand>) {
+        self.blocks[self.current].insts.push(lsir::Inst {
+            result: None,
+            result_name: None,
+            ty: lsir::Type::Void,
+            op: lsir::InstOp::Intrinsic { intrinsic, args },
+            metadata: Vec::new(),
+        });
+    }
+
+    /// Copy `len` f32 elements between two arrays, four lanes at a time.
+    ///
+    /// The copy is the whole loop, so it moves whole registers: the vector
+    /// load and store spell as one wide move per four lanes on the targets
+    /// that have them, where four scalar moves would keep the copies — and,
+    /// through them, every kernel that relays a tile — scalar.
+    fn copy_vec4(&mut self, src: &lsir::Operand, dst: &lsir::Operand, len: usize) {
+        let vec_ty = lsir::Type::vector(4, lsir::Type::F32);
+        self.counted_loop("vc", len / 4, |lowerer, group| {
+            let off = lowerer.mul_i64(group.clone(), lowerer.const_operand(4));
+            let v = lowerer.emit(
+                vec_ty.clone(),
+                "vl",
+                lsir::InstOp::Intrinsic {
+                    intrinsic: lsir::Intrinsic::VecLoad { len: 4 },
+                    args: vec![src.clone(), off.clone()],
+                },
+            );
+            lowerer.emit_void(
+                lsir::Intrinsic::VecStore { len: 4 },
+                vec![dst.clone(), off, v],
+            );
+        });
+    }
+
+    /// A relay copy of this length moves four lanes at a time.
+    fn vec4_copyable(elem: &lsir::Type, len: usize) -> bool {
+        *elem == lsir::Type::F32 && len >= 4 && len % 4 == 0
+    }
+
+    /// True when a view's tile occupies packed row-major storage: the flat
+    /// tile index is the element offset from the tile origin.
+    fn view_packed(view: &View) -> bool {
+        match view.tile.len() {
+            1 => view.strides[0] == 1,
+            2 => view.strides[1] == 1 && view.strides[0] == view.tile[1].max(1),
+            _ => false,
+        }
+    }
+
     fn store_element(
         &mut self,
-        base: &llvm_ir::Operand,
-        elem: &llvm_ir::Type,
-        index: llvm_ir::Operand,
-        value: llvm_ir::Operand,
+        base: &lsir::Operand,
+        elem: &lsir::Type,
+        index: lsir::Operand,
+        value: lsir::Operand,
     ) {
         let ptr = self.emit(
-            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, elem.clone()),
+            lsir::Type::ptr(lsir::AddressSpace::Private, elem.clone()),
             "gep",
-            llvm_ir::InstOp::Gep {
+            lsir::InstOp::Gep {
                 base: base.clone(),
                 indices: vec![index],
             },
         );
-        self.blocks[self.current].insts.push(llvm_ir::Inst {
+        self.blocks[self.current].insts.push(lsir::Inst {
             result: None,
             result_name: None,
-            ty: llvm_ir::Type::Void,
-            op: llvm_ir::InstOp::Store { ptr, value },
+            ty: lsir::Type::Void,
+            op: lsir::InstOp::Store { ptr, value },
             metadata: Vec::new(),
         });
     }
@@ -1677,7 +1840,7 @@ impl<'a> Lowerer<'a> {
     /// the backends' `for` detection reads the header load and the back-edge
     /// store — so every instruction here dominates its uses
     /// by construction.
-    fn counted_loop(&mut self, prefix: &str, len: usize, mut body: impl FnMut(&mut Self, llvm_ir::Operand)) {
+    fn counted_loop(&mut self, prefix: &str, len: usize, mut body: impl FnMut(&mut Self, lsir::Operand)) {
         // A recipe names values from the block that built it, so nothing lazy
         // may cross into the loop body. This runs before the entry branch is
         // set: a materialisation started here emits its own loop, and the two
@@ -1690,16 +1853,16 @@ impl<'a> Lowerer<'a> {
         let exit = self.new_block(&format!("{prefix}_exit"), Vec::new());
         self.current = before;
         let iv = self.emit(
-            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::I64),
+            lsir::Type::ptr(lsir::AddressSpace::Private, lsir::Type::I64),
             "iv",
-            llvm_ir::InstOp::Alloca {
-                alloc_ty: llvm_ir::Type::I64,
-                addr_space: llvm_ir::AddressSpace::Private,
+            lsir::InstOp::Alloca {
+                alloc_ty: lsir::Type::I64,
+                addr_space: lsir::AddressSpace::Private,
             },
         );
         self.store_void(iv.clone(), self.const_operand(0));
         if self.blocks[self.current].terminator.is_none() {
-            self.set_terminator(llvm_ir::Terminator::Br {
+            self.set_terminator(lsir::Terminator::Br {
                 target: header,
                 args: Vec::new(),
             });
@@ -1707,20 +1870,20 @@ impl<'a> Lowerer<'a> {
 
         self.switch_to(header);
         let header_index = self.emit(
-            llvm_ir::Type::I64,
+            lsir::Type::I64,
             "ld",
-            llvm_ir::InstOp::Load { ptr: iv.clone() },
+            lsir::InstOp::Load { ptr: iv.clone() },
         );
         let cond = self.emit(
-            llvm_ir::Type::I1,
+            lsir::Type::I1,
             "cmp",
-            llvm_ir::InstOp::Cmp {
-                pred: llvm_ir::CmpPred::Slt,
+            lsir::InstOp::Cmp {
+                pred: lsir::CmpPred::Slt,
                 lhs: header_index,
-                rhs: llvm_ir::Operand::Const(llvm_ir::Constant::Int(len as i64)),
+                rhs: lsir::Operand::Const(lsir::Constant::Int(len as i64)),
             },
         );
-        self.set_terminator(llvm_ir::Terminator::CondBr {
+        self.set_terminator(lsir::Terminator::CondBr {
             cond,
             true_target: body_block,
             true_args: Vec::new(),
@@ -1730,9 +1893,9 @@ impl<'a> Lowerer<'a> {
 
         self.switch_to(body_block);
         let index = self.emit(
-            llvm_ir::Type::I64,
+            lsir::Type::I64,
             "ld",
-            llvm_ir::InstOp::Load { ptr: iv.clone() },
+            lsir::InstOp::Load { ptr: iv.clone() },
         );
         body(self, index.clone());
         // Anything the body left lazy belongs to this iteration; write it out
@@ -1741,16 +1904,16 @@ impl<'a> Lowerer<'a> {
         // which is set next, on whatever block that is — closes over it.
         self.materialize_all();
         let next = self.emit(
-            llvm_ir::Type::I64,
+            lsir::Type::I64,
             "inc",
-            llvm_ir::InstOp::Bin {
-                op: llvm_ir::BinOp::Add,
+            lsir::InstOp::Bin {
+                op: lsir::BinOp::Add,
                 lhs: index,
-                rhs: llvm_ir::Operand::Const(llvm_ir::Constant::Int(1)),
+                rhs: lsir::Operand::Const(lsir::Constant::Int(1)),
             },
         );
         self.store_void(iv, next);
-        self.set_terminator(llvm_ir::Terminator::Br {
+        self.set_terminator(lsir::Terminator::Br {
             target: header,
             args: Vec::new(),
         });
@@ -1799,7 +1962,7 @@ impl<'a> Lowerer<'a> {
         if shape.is_empty() || (shape.iter().product::<i64>() <= 1 && !lhs_tile) {
             // A rank-zero result: one scalar operation.
             let a = lhs;
-            let b = rhs.unwrap_or_else(|| llvm_ir::Operand::Const(llvm_ir::Constant::Int(0)));
+            let b = rhs.unwrap_or_else(|| lsir::Operand::Const(lsir::Constant::Int(0)));
             let value = if ceil_div {
                 self.ceil_div(&elem_out, a, b)
             } else {
@@ -1825,12 +1988,11 @@ impl<'a> Lowerer<'a> {
                 .unwrap_or_default()
         };
         let lhs_shape = shape_of(self, lhs_value);
-        let rhs_shape = rhs_value.map(|v| shape_of(self, v)).unwrap_or_default();
 
         // Elementwise work stays lazy: the consumer folds it into its own loop,
         // so `a * x + y` is one pass over memory rather than four.
         let rhs_recipe = rhs_value.map(|value| self.recipe_of(value)).unwrap_or(
-            Recipe::Ready(llvm_ir::Operand::Const(llvm_ir::Constant::Int(0))),
+            Recipe::Ready(lsir::Operand::Const(lsir::Constant::Int(0))),
         );
         let lhs_recipe = self.recipe_of(lhs_value);
         let rhs_shape = rhs_value.map(|value| self.shape_of(value)).unwrap_or_default();
@@ -1860,22 +2022,22 @@ impl<'a> Lowerer<'a> {
     fn elementwise_value(
         &mut self,
         opcode: Opcode,
-        elem: &llvm_ir::Type,
-        lhs: llvm_ir::Operand,
-        rhs: llvm_ir::Operand,
-    ) -> llvm_ir::Operand {
+        elem: &lsir::Type,
+        lhs: lsir::Operand,
+        rhs: lsir::Operand,
+    ) -> lsir::Operand {
         if let Some((integer_pred, float_pred)) = extreme_pred(opcode) {
             // A float compare is ordered; an integer one is signed. Using the
             // integer predicate on floats compares their bit patterns.
-            let pred = if matches!(elem, llvm_ir::Type::F16 | llvm_ir::Type::F32 | llvm_ir::Type::F64) {
+            let pred = if matches!(elem, lsir::Type::F16 | lsir::Type::F32 | lsir::Type::F64) {
                 float_pred
             } else {
                 integer_pred
             };
             let cond = self.emit(
-                llvm_ir::Type::I1,
+                lsir::Type::I1,
                 "ext",
-                llvm_ir::InstOp::Cmp {
+                lsir::InstOp::Cmp {
                     pred,
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
@@ -1884,7 +2046,7 @@ impl<'a> Lowerer<'a> {
             return self.emit(
                 elem.clone(),
                 "ext",
-                llvm_ir::InstOp::Select {
+                lsir::InstOp::Select {
                     cond,
                     on_true: lhs,
                     on_false: rhs,
@@ -1895,33 +2057,33 @@ impl<'a> Lowerer<'a> {
         self.emit(
             elem.clone(),
             "bin",
-            llvm_ir::InstOp::Bin { op, lhs, rhs },
+            lsir::InstOp::Bin { op, lhs, rhs },
         )
     }
 
     /// `a / b` rounded up, for the signed integers a tile count uses.
     fn ceil_div(
         &mut self,
-        elem: &llvm_ir::Type,
-        a: llvm_ir::Operand,
-        b: llvm_ir::Operand,
-    ) -> llvm_ir::Operand {
+        elem: &lsir::Type,
+        a: lsir::Operand,
+        b: lsir::Operand,
+    ) -> lsir::Operand {
         // `(a + b - 1) / b`. Both operands are non-negative tile counts.
         let sum = self.emit(
             elem.clone(),
             "cd",
-            llvm_ir::InstOp::Bin {
-                op: llvm_ir::BinOp::Add,
+            lsir::InstOp::Bin {
+                op: lsir::BinOp::Add,
                 lhs: a,
                 rhs: b.clone(),
             },
         );
-        let one = llvm_ir::Operand::Const(llvm_ir::Constant::Int(1));
+        let one = lsir::Operand::Const(lsir::Constant::Int(1));
         let adjusted = self.emit(
             elem.clone(),
             "cd",
-            llvm_ir::InstOp::Bin {
-                op: llvm_ir::BinOp::Sub,
+            lsir::InstOp::Bin {
+                op: lsir::BinOp::Sub,
                 lhs: sum,
                 rhs: one,
             },
@@ -1929,8 +2091,8 @@ impl<'a> Lowerer<'a> {
         self.emit(
             elem.clone(),
             "cd",
-            llvm_ir::InstOp::Bin {
-                op: llvm_ir::BinOp::Div,
+            lsir::InstOp::Bin {
+                op: lsir::BinOp::Div,
                 lhs: adjusted,
                 rhs: b,
             },
@@ -1944,10 +2106,10 @@ impl<'a> Lowerer<'a> {
     /// repeats, so its coordinate drops out of the source position.
     fn aligned_index(
         &mut self,
-        index: llvm_ir::Operand,
+        index: lsir::Operand,
         out_shape: &[i64],
         source_shape: &[i64],
-    ) -> llvm_ir::Operand {
+    ) -> lsir::Operand {
         if out_shape == source_shape || source_shape.is_empty() {
             return index;
         }
@@ -1955,7 +2117,7 @@ impl<'a> Lowerer<'a> {
         // yields `4x1`, and the `4x4` operand is then read at column zero of
         // each row. Walk the *output's* axes and take the source coordinate
         // along each, dropping the axes the source has extent one on.
-        let mut position = llvm_ir::Operand::Const(llvm_ir::Constant::Int(0));
+        let mut position = lsir::Operand::Const(lsir::Constant::Int(0));
         let mut running: i64 = 1;
         for axis in (0..source_shape.len()).rev() {
             if axis >= out_shape.len() {
@@ -1989,17 +2151,6 @@ impl<'a> Lowerer<'a> {
         position
     }
 
-    /// Fold `lhs` and `rhs` with `opcode`, which a reduce carries.
-    fn combine(
-        &mut self,
-        opcode: Opcode,
-        elem: &llvm_ir::Type,
-        lhs: llvm_ir::Operand,
-        rhs: llvm_ir::Operand,
-    ) -> llvm_ir::Operand {
-        self.elementwise_value(opcode, elem, lhs, rhs)
-    }
-
     fn lower_elementwise_cmp(&mut self, op_id: OpId) -> Result<(), String> {
         let op = self.module.op(op_id).clone();
         let Some(result) = self.op_result(op_id, 0) else {
@@ -2017,11 +2168,11 @@ impl<'a> Lowerer<'a> {
         if shape.is_empty() {
             let lhs = self.operand_of(lhs_value);
             let rhs = rhs_value.map(|v| self.operand_of(v));
-            let b = rhs.unwrap_or_else(|| llvm_ir::Operand::Const(llvm_ir::Constant::Int(0)));
+            let b = rhs.unwrap_or_else(|| lsir::Operand::Const(lsir::Constant::Int(0)));
             let value = self.emit(
                 elem.clone(),
                 "cmp",
-                llvm_ir::InstOp::Cmp {
+                lsir::InstOp::Cmp {
                     pred,
                     lhs,
                     rhs: b,
@@ -2039,7 +2190,7 @@ impl<'a> Lowerer<'a> {
         let lhs_shape = self.shape_of(lhs_value);
         let rhs_shape = rhs_value.map(|v| self.shape_of(v)).unwrap_or_default();
         let no_operand = || {
-            Recipe::Ready(llvm_ir::Operand::Const(llvm_ir::Constant::Int(0)))
+            Recipe::Ready(lsir::Operand::Const(lsir::Constant::Int(0)))
         };
         self.register_recipe(
             result,
@@ -2081,12 +2232,12 @@ impl<'a> Lowerer<'a> {
         let is_neg = matches!(op.opcode, Opcode::NegF | Opcode::NegI);
         let out_elem = elem.clone();
 
-        let apply = |lowerer: &mut Self, value: llvm_ir::Operand| -> llvm_ir::Operand {
+        let apply = |lowerer: &mut Self, value: lsir::Operand| -> lsir::Operand {
             if let Some(intrinsic) = &intrinsic {
                 return lowerer.emit(
                     out_elem.clone(),
                     "fn",
-                    llvm_ir::InstOp::Intrinsic {
+                    lsir::InstOp::Intrinsic {
                         intrinsic: intrinsic.clone(),
                         args: vec![value],
                     },
@@ -2096,7 +2247,7 @@ impl<'a> Lowerer<'a> {
                 return lowerer.emit(
                     out_elem.clone(),
                     "cast",
-                    llvm_ir::InstOp::Cast {
+                    lsir::InstOp::Cast {
                         op: cast,
                         value,
                         to: out_elem.clone(),
@@ -2107,9 +2258,9 @@ impl<'a> Lowerer<'a> {
                 return lowerer.emit(
                     out_elem.clone(),
                     "neg",
-                    llvm_ir::InstOp::Bin {
-                        op: llvm_ir::BinOp::Sub,
-                        lhs: llvm_ir::Operand::Const(llvm_ir::Constant::Int(0)),
+                    lsir::InstOp::Bin {
+                        op: lsir::BinOp::Sub,
+                        lhs: lsir::Operand::Const(lsir::Constant::Int(0)),
                         rhs: value,
                     },
                 );
@@ -2260,7 +2411,7 @@ impl<'a> Lowerer<'a> {
             let value = self.tile_element(
                 &source,
                 &source_elem,
-                llvm_ir::Operand::Const(llvm_ir::Constant::Int(0)),
+                lsir::Operand::Const(lsir::Constant::Int(0)),
             );
             self.operands.insert(result, value);
             self.layouts.insert(result, Layout::Scalar);
@@ -2270,7 +2421,22 @@ impl<'a> Lowerer<'a> {
         }
 
         if !source_tile {
-            // A scalar reshaped to a one-element tile is the scalar.
+            // A scalar reshaped to a one-element tile is the scalar. The
+            // storage stays for consumers that read the tile; the recipe lets
+            // a broadcast chain over it stay lazy, so the fold reads the
+            // scalar itself instead of a tile of copies of it.
+            self.register_recipe(
+                result,
+                Recipe::Reindex {
+                    shape: shape.clone(),
+                    source: Box::new(Recipe::Ready(source.clone())),
+                    source_shape: Vec::new(),
+                    kind: Reindex::Reshape,
+                    permutation: Vec::new(),
+                },
+                &shape,
+                &elem,
+            );
             let dst = self.alloc_tile(result, &shape, &elem);
             let len = self.tile_len_of(result);
             self.counted_loop("rs", len, |lowerer, index| {
@@ -2369,7 +2535,7 @@ impl<'a> Lowerer<'a> {
 
         // The indices are the remaining operands, one per source axis. A
         // dynamic index is a value; a static one arrives as a constant tile.
-        let mut linear = llvm_ir::Operand::Const(llvm_ir::Constant::Int(0));
+        let mut linear = lsir::Operand::Const(lsir::Constant::Int(0));
         for (axis, index_value) in op.operands.iter().skip(1).enumerate() {
             let stride: i64 = shape.iter().skip(axis + 1).map(|d| (*d).max(1)).product();
             let component = self.scalar_of_value(*index_value);
@@ -2387,14 +2553,12 @@ impl<'a> Lowerer<'a> {
 
     /// A value as a scalar operand: a tile of one element is read, a scalar is
     /// already one.
-    fn scalar_of_value(&mut self, value: Value) -> llvm_ir::Operand {
+    fn scalar_of_value(&mut self, value: Value) -> lsir::Operand {
         if self.recipes.contains_key(&value) {
-            let shape = self.shape_of(value);
             return self.tile_value_at(
                 value,
-                llvm_ir::Operand::Const(llvm_ir::Constant::Int(0)),
+                lsir::Operand::Const(lsir::Constant::Int(0)),
                 None,
-                &shape,
             );
         }
         let operand = self.operand_of(value);
@@ -2403,7 +2567,7 @@ impl<'a> Lowerer<'a> {
             self.tile_element(
                 &operand,
                 &elem,
-                llvm_ir::Operand::Const(llvm_ir::Constant::Int(0)),
+                lsir::Operand::Const(lsir::Constant::Int(0)),
             )
         } else {
             operand
@@ -2420,14 +2584,14 @@ impl<'a> Lowerer<'a> {
         let dst = self.alloc_tile(result, &shape, &elem);
         let len = self.tile_len_of(result);
         self.counted_loop("iota", len, |lowerer, index| {
-            let value = if elem == llvm_ir::Type::F32 {
+            let value = if elem == lsir::Type::F32 {
                 lowerer.emit(
-                    llvm_ir::Type::F32,
+                    lsir::Type::F32,
                     "iota",
-                    llvm_ir::InstOp::Cast {
-                        op: llvm_ir::CastOp::Sitofp,
+                    lsir::InstOp::Cast {
+                        op: lsir::CastOp::Sitofp,
                         value: index.clone(),
-                        to: llvm_ir::Type::F32,
+                        to: lsir::Type::F32,
                     },
                 )
             } else {
@@ -2444,6 +2608,36 @@ impl<'a> Lowerer<'a> {
 // ---------------------------------------------------------------------------
 
 impl<'a> Lowerer<'a> {
+    /// A flat tile index split into its row and column coordinates.
+    ///
+    /// A tile with a single row or column needs no division: the flat index
+    /// is the other coordinate directly. The `%`/`/` pair the general shape
+    /// emits would otherwise sit in every inner loop of every kernel whose
+    /// tiles are one row tall, and it keeps the targets' vectorizers away.
+    fn split_row_col(
+        &mut self,
+        index: lsir::Operand,
+        shape: &[i64],
+    ) -> (lsir::Operand, lsir::Operand) {
+        let cols = shape.last().copied().unwrap_or(1).max(1);
+        let rows: i64 = shape
+            .iter()
+            .rev()
+            .skip(1)
+            .map(|d| (*d).max(1))
+            .product::<i64>()
+            .max(1);
+        if rows <= 1 {
+            return (lsir::Operand::Const(lsir::Constant::Int(0)), index);
+        }
+        if cols <= 1 {
+            return (index, lsir::Operand::Const(lsir::Constant::Int(0)));
+        }
+        let col = self.rem_i64(index.clone(), self.const_operand(cols));
+        let row = self.div_i64(index, self.const_operand(cols));
+        (row, col)
+    }
+
     /// The element pointer of tile position `(row, col)` of a view.
     ///
     /// `indices` are tile coordinates, not element coordinates: the tile at
@@ -2455,11 +2649,11 @@ impl<'a> Lowerer<'a> {
     fn view_element_ptr(
         &mut self,
         view: &View,
-        indices: &[llvm_ir::Operand],
-        row: llvm_ir::Operand,
-        col: llvm_ir::Operand,
-        elem: &llvm_ir::Type,
-    ) -> llvm_ir::Operand {
+        indices: &[lsir::Operand],
+        row: lsir::Operand,
+        col: lsir::Operand,
+        elem: &lsir::Type,
+    ) -> lsir::Operand {
         let rank = view.tile.len();
         let buffer = self.operand_of(view.buffer);
         // A tile covers the last two axes, so the row steps by the row axis's
@@ -2472,7 +2666,7 @@ impl<'a> Lowerer<'a> {
         let col_stride = view.strides.get(rank.saturating_sub(1)).copied().unwrap_or(1);
 
         // The tile's origin, in elements.
-        let mut index = llvm_ir::Operand::Const(llvm_ir::Constant::Int(0));
+        let mut index = lsir::Operand::Const(lsir::Constant::Int(0));
         for (axis, tile_coord) in indices.iter().enumerate() {
             let Some(tile_extent) = view.tile.get(axis).copied() else {
                 continue;
@@ -2484,9 +2678,9 @@ impl<'a> Lowerer<'a> {
         index = self.add_scaled(index, row, row_stride);
         index = self.add_scaled(index, col, col_stride);
         self.emit(
-            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Global, elem.clone()),
+            lsir::Type::ptr(lsir::AddressSpace::Global, elem.clone()),
             "ptr",
-            llvm_ir::InstOp::Gep {
+            lsir::InstOp::Gep {
                 base: buffer,
                 indices: vec![index],
             },
@@ -2495,10 +2689,10 @@ impl<'a> Lowerer<'a> {
 
     fn add_scaled(
         &mut self,
-        base: llvm_ir::Operand,
-        value: llvm_ir::Operand,
+        base: lsir::Operand,
+        value: lsir::Operand,
         scale: i64,
-    ) -> llvm_ir::Operand {
+    ) -> lsir::Operand {
         if scale == 0 {
             return base;
         }
@@ -2563,8 +2757,7 @@ impl<'a> Lowerer<'a> {
             .tiles
             .get(&value_operand)
             .cloned()
-            .unwrap_or((Vec::new(), llvm_ir::Type::F32));
-        let source = self.operand_of(value_operand);
+            .unwrap_or((Vec::new(), lsir::Type::F32));
         let index_operands = indices
             .iter()
             .map(|value| self.scalar_of_value(*value))
@@ -2577,10 +2770,10 @@ impl<'a> Lowerer<'a> {
             let mut indices = index_operands;
             if let Some(first) = indices.first_mut() {
                 *first = self.emit(
-                    llvm_ir::Type::I64,
+                    lsir::Type::I64,
                     "pid",
-                    llvm_ir::InstOp::Intrinsic {
-                        intrinsic: llvm_ir::Intrinsic::BlockId { dim: 0 },
+                    lsir::InstOp::Intrinsic {
+                        intrinsic: lsir::Intrinsic::BlockId { dim: 0 },
                         args: Vec::new(),
                     },
                 );
@@ -2590,25 +2783,102 @@ impl<'a> Lowerer<'a> {
             index_operands
         };
         let len = self.tile_len_of(value_operand);
-        let cols = shape.last().copied().unwrap_or(1).max(1);
-        let rows = if shape.len() >= 2 {
-            shape[shape.len() - 2].max(1)
-        } else {
-            1
-        };
+
+        // A stored value with no chain of its own is a relay copy. When the
+        // view is packed — the flat tile index is the element offset from the
+        // tile origin — the relay moves four lanes at a time.
+        if !self.recipes.contains_key(&value_operand)
+            && Self::vec4_copyable(&elem, len)
+            && Self::view_packed(&view)
+        {
+            let zero_row = self.const_operand(0);
+            let zero_col = self.const_operand(0);
+            let origin = self.view_element_ptr(&view, &index_operands, zero_row, zero_col, &elem);
+            let src = self.operand_of(value_operand);
+            self.copy_vec4(&src, &origin, len);
+            return Ok(());
+        }
 
         // The store is where a lazy chain finally meets memory: the whole
-        // elementwise graph is emitted inside this one loop.
+        // elementwise graph is emitted inside this one loop. A stored value
+        // that is still lazy folds right here — its parts were built on this
+        // block chain, so their definitions dominate the loop body — instead
+        // of materialising to scratch storage first and copying the scratch
+        // onto the view. A chain that reads the destination's own buffer keeps
+        // the general form: its reads would land between this loop's writes.
+        let fuse = match self.recipes.get(&value_operand) {
+            Some(recipe) => !Self::recipe_touches_buffer(recipe, view.buffer),
+            None => false,
+        };
+        if fuse {
+            self.fuse_keep = Some(value_operand);
+        }
         self.counted_loop("sv", len, |lowerer, index| {
-            let row = lowerer.div_i64(index.clone(), lowerer.const_operand(cols));
-            let col = lowerer.rem_i64(index.clone(), lowerer.const_operand(cols));
+            let (row, col) = lowerer.split_row_col(index.clone(), &shape);
+            let value = lowerer.tile_value_at(value_operand, index, None);
             // `view_element_ptr` adds the tile origin from the view's own tile extent.
-            let _ = (rows, cols);
-            let value = lowerer.tile_value_at(value_operand, index, None, &shape);
             let ptr = lowerer.view_element_ptr(&view, &index_operands, row, col, &elem);
             lowerer.store_void(ptr, value);
         });
+        if fuse {
+            self.fuse_keep = None;
+            // The store consumed the value. A later reader folds the chain in
+            // its own loop; keeping the recipe here would make the enclosing
+            // back edge materialise it every iteration.
+            self.recipes.remove(&value_operand);
+        }
         Ok(())
+    }
+
+    /// True when a recipe folds to the same value wherever it is folded: a
+    /// chain over plain values, reading no memory.
+    ///
+    /// Such a recipe needs no materialisation before a block boundary — every
+    /// fold lands on the same value, and folding is what its consumers do
+    /// anyway. The case that pays is a broadcast of one element: materialised,
+    /// it is a tile of copies of one scalar that the consuming loop reads back
+    /// element by element.
+    fn recipe_invariant(recipe: &Recipe) -> bool {
+        match recipe {
+            Recipe::Ready(_) => true,
+            Recipe::Broadcast {
+                source,
+                source_shape,
+                ..
+            }
+            | Recipe::Reindex {
+                kind: Reindex::Reshape,
+                source,
+                source_shape,
+                ..
+            } => {
+                let source_len: i64 = source_shape
+                    .iter()
+                    .map(|d| (*d).max(1))
+                    .product::<i64>()
+                    .max(1);
+                source_len == 1 && Self::recipe_invariant(source)
+            }
+            _ => false,
+        }
+    }
+
+    /// True when a recipe reads a view of `buffer`.
+    fn recipe_touches_buffer(recipe: &Recipe, buffer: Value) -> bool {
+        match recipe {
+            Recipe::Ready(_) | Recipe::Element { .. } => false,
+            Recipe::ViewElement { view, .. } => view.buffer == buffer,
+            Recipe::Bin { lhs, rhs, .. } | Recipe::Cmp { lhs, rhs, .. } => {
+                Self::recipe_touches_buffer(lhs, buffer)
+                    || Self::recipe_touches_buffer(rhs, buffer)
+            }
+            Recipe::Un { source, .. }
+            | Recipe::Reindex { source, .. }
+            | Recipe::Broadcast { source, .. } => Self::recipe_touches_buffer(source, buffer),
+            Recipe::Fma { parts, .. } | Recipe::Select { parts, .. } => parts
+                .iter()
+                .any(|part| Self::recipe_touches_buffer(part, buffer)),
+        }
     }
 }
 
@@ -2715,13 +2985,13 @@ impl<'a> Lowerer<'a> {
             .find(|(k, _)| k == "identities")
             .and_then(|(_, v)| match v {
                 Attribute::Array(items) => items.first().and_then(|item| match item {
-                    Attribute::Float(f, _) => Some(llvm_ir::Constant::Float(*f)),
-                    Attribute::Integer(i, _) => Some(llvm_ir::Constant::Int(*i)),
+                    Attribute::Float(f, _) => Some(lsir::Constant::Float(*f)),
+                    Attribute::Integer(i, _) => Some(lsir::Constant::Int(*i)),
                     _ => None,
                 }),
                 _ => None,
             })
-            .unwrap_or(llvm_ir::Constant::Float(0.0));
+            .unwrap_or(lsir::Constant::Float(0.0));
         let combiner = reduce_combiner(self.module, op_id);
 
         let dst = self.alloc_tile(result, &out_shape, &elem);
@@ -2739,22 +3009,22 @@ impl<'a> Lowerer<'a> {
         // whether the target fuses it into a reduction directive, is the
         // target's decision. The lowering only says what is folded.
         let reduce_op = match combiner {
-            Opcode::MulF | Opcode::MulI => llvm_ir::TileReduceOp::Product,
-            Opcode::MaxF | Opcode::MaxI => llvm_ir::TileReduceOp::Max,
-            Opcode::MinF | Opcode::MinI => llvm_ir::TileReduceOp::Min,
-            _ => llvm_ir::TileReduceOp::Sum,
+            Opcode::MulF | Opcode::MulI => lsir::TileReduceOp::Product,
+            Opcode::MaxF | Opcode::MaxI => lsir::TileReduceOp::Max,
+            Opcode::MinF | Opcode::MinI => lsir::TileReduceOp::Min,
+            _ => lsir::TileReduceOp::Sum,
         };
         let _ = (&identity, &source_elem);
         // The fold writes a tile of its own, so its result owns storage the
         // same way an `alloca` does: a pointer to `outer` elements.
         let reduced = self.emit(
-            llvm_ir::Type::ptr(
-                llvm_ir::AddressSpace::Private,
-                llvm_ir::Type::array(out_len.max(1), elem.clone()),
+            lsir::Type::ptr(
+                lsir::AddressSpace::Private,
+                lsir::Type::array(out_len.max(1), elem.clone()),
             ),
             "red",
-            llvm_ir::InstOp::Intrinsic {
-                intrinsic: llvm_ir::Intrinsic::TileReduce {
+            lsir::InstOp::Intrinsic {
+                intrinsic: lsir::Intrinsic::TileReduce {
                     reduce: reduce_op,
                     extent: reduce_extent.max(1) as u64,
                     inner: inner_extent.max(1) as u64,
@@ -2763,6 +3033,11 @@ impl<'a> Lowerer<'a> {
                 args: vec![source],
             },
         );
+        // The relay is a broadcast: every thread reads the same copied
+        // values, so the slot is not a partition the strip may split. The
+        // lowering knows it emitted the reduce, so it says so here instead of
+        // a later pass re-deriving it from the pointer chain.
+        self.stamp(&reduced, lsir::Metadata::ReduceRelay);
         self.counted_loop("rd", out_len, |lowerer, out_index| {
             let value = lowerer.tile_element(&reduced, &elem, out_index.clone());
             lowerer.store_element(&dst, &elem, out_index, value);
@@ -2798,8 +3073,8 @@ impl<'a> Lowerer<'a> {
         let acc = acc_value.map(|v| self.operand_of_tile(v));
         let lhs_elem = self.elem_of_value(lhs_value);
         let rhs_elem = self.elem_of_value(rhs_value);
-        let (lhs_shape, _) = self.tiles.get(&lhs_value).cloned().unwrap_or_else(|| (Vec::new(), llvm_ir::Type::F32));
-        let (rhs_shape, _) = self.tiles.get(&rhs_value).cloned().unwrap_or_else(|| (Vec::new(), llvm_ir::Type::F32));
+        let (lhs_shape, _) = self.tiles.get(&lhs_value).cloned().unwrap_or_else(|| (Vec::new(), lsir::Type::F32));
+        let (rhs_shape, _) = self.tiles.get(&rhs_value).cloned().unwrap_or_else(|| (Vec::new(), lsir::Type::F32));
 
         let m = out_shape.first().copied().unwrap_or(1).max(1);
         let n = out_shape.last().copied().unwrap_or(1).max(1);
@@ -2814,13 +3089,13 @@ impl<'a> Lowerer<'a> {
             args.push(accumulator);
         }
         let dst = self.emit(
-            llvm_ir::Type::ptr(
-                llvm_ir::AddressSpace::Private,
-                llvm_ir::Type::array((m * n) as usize, elem.clone()),
+            lsir::Type::ptr(
+                lsir::AddressSpace::Private,
+                lsir::Type::array((m * n) as usize, elem.clone()),
             ),
             "tile",
-            llvm_ir::InstOp::Intrinsic {
-                intrinsic: llvm_ir::Intrinsic::TileMma {
+            lsir::InstOp::Intrinsic {
+                intrinsic: lsir::Intrinsic::TileMma {
                     m: m as u64,
                     n: n as u64,
                     k: k as u64,
@@ -2863,7 +3138,7 @@ impl<'a> Lowerer<'a> {
             .skip(1)
             .zip(inits.iter())
             .map(|((value, ty), init)| {
-                let (shape, elem) = tile_shape(ty).unwrap_or_else(|| (Vec::new(), llvm_ir::Type::F32));
+                let (shape, elem) = tile_shape(ty).unwrap_or_else(|| (Vec::new(), lsir::Type::F32));
                 let is_tile = !shape.is_empty() && shape.iter().product::<i64>() > 1;
                 (*value, *init, shape, elem, is_tile)
             })
@@ -2886,16 +3161,16 @@ impl<'a> Lowerer<'a> {
         self.current = before;
 
         let iv = self.emit(
-            llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, llvm_ir::Type::I64),
+            lsir::Type::ptr(lsir::AddressSpace::Private, lsir::Type::I64),
             "iv",
-            llvm_ir::InstOp::Alloca {
-                alloc_ty: llvm_ir::Type::I64,
-                addr_space: llvm_ir::AddressSpace::Private,
+            lsir::InstOp::Alloca {
+                alloc_ty: lsir::Type::I64,
+                addr_space: lsir::AddressSpace::Private,
             },
         );
         self.store_void(
             iv.clone(),
-            lb.clone().unwrap_or_else(|| llvm_ir::Operand::Const(llvm_ir::Constant::Int(0))),
+            lb.clone().unwrap_or_else(|| lsir::Operand::Const(lsir::Constant::Int(0))),
         );
         let mut carry_allocas = Vec::with_capacity(carried.len());
         for (_, init, shape, elem, is_tile) in &carried {
@@ -2908,31 +3183,49 @@ impl<'a> Lowerer<'a> {
                 // The pointee is the array the tile occupies, not one element:
                 // a backend that reads the pointee to declare storage would
                 // otherwise bind a scalar and the carried tile would not index.
-                llvm_ir::Type::array(len, elem.clone())
+                lsir::Type::array(len, elem.clone())
             } else {
                 elem.clone()
             };
             let carry = self.emit(
-                llvm_ir::Type::ptr(llvm_ir::AddressSpace::Private, elem.clone()),
+                lsir::Type::ptr(lsir::AddressSpace::Private, elem.clone()),
                 "carry",
-                llvm_ir::InstOp::Alloca {
+                lsir::InstOp::Alloca {
                     alloc_ty,
-                    addr_space: llvm_ir::AddressSpace::Private,
+                    addr_space: lsir::AddressSpace::Private,
                 },
             );
             if *is_tile {
-                let src = self.operand_of_tile(*init);
-                self.counted_loop("cp", len, |lowerer, index| {
-                    let value = lowerer.tile_element(&src, elem, index.clone());
-                    lowerer.store_element(&carry, elem, index, value);
-                });
+                // A constant-tile init fills the carry itself: materialising
+                // the tile first would write the same constant to scratch
+                // storage and then copy every element of it here.
+                if let Some(value) = self.tile_constant_scalar(*init) {
+                    self.counted_loop("cp", len, |lowerer, index| {
+                        lowerer.store_element(
+                            &carry,
+                            elem,
+                            index,
+                            lsir::Operand::Const(value.clone()),
+                        );
+                    });
+                } else {
+                    let src = self.operand_of_tile(*init);
+                    if Self::vec4_copyable(elem, len) {
+                        self.copy_vec4(&src, &carry, len);
+                    } else {
+                        self.counted_loop("cp", len, |lowerer, index| {
+                            let value = lowerer.tile_element(&src, elem, index.clone());
+                            lowerer.store_element(&carry, elem, index, value);
+                        });
+                    }
+                }
             } else {
                 let src = self.scalar_of_value(*init);
                 self.store_void(carry.clone(), src);
             }
             carry_allocas.push(carry);
         }
-        self.set_terminator(llvm_ir::Terminator::Br {
+        self.set_terminator(lsir::Terminator::Br {
             target: header,
             args: Vec::new(),
         });
@@ -2940,20 +3233,20 @@ impl<'a> Lowerer<'a> {
         // The header's condition reads the induction variable from storage.
         self.switch_to(header);
         let iv_current = self.emit(
-            llvm_ir::Type::I64,
+            lsir::Type::I64,
             "ld",
-            llvm_ir::InstOp::Load { ptr: iv.clone() },
+            lsir::InstOp::Load { ptr: iv.clone() },
         );
         let cond = self.emit(
-            llvm_ir::Type::I1,
+            lsir::Type::I1,
             "forc",
-            llvm_ir::InstOp::Cmp {
-                pred: llvm_ir::CmpPred::Slt,
+            lsir::InstOp::Cmp {
+                pred: lsir::CmpPred::Slt,
                 lhs: iv_current.clone(),
-                rhs: ub.unwrap_or_else(|| llvm_ir::Operand::Const(llvm_ir::Constant::Int(0))),
+                rhs: ub.unwrap_or_else(|| lsir::Operand::Const(lsir::Constant::Int(0))),
             },
         );
-        self.set_terminator(llvm_ir::Terminator::CondBr {
+        self.set_terminator(lsir::Terminator::CondBr {
             cond,
             true_target: body,
             true_args: Vec::new(),
@@ -2969,7 +3262,7 @@ impl<'a> Lowerer<'a> {
         if let Some((iv_value, _)) = block_args.first() {
             self.operands.insert(*iv_value, iv_current.clone());
             self.layouts.insert(*iv_value, Layout::Scalar);
-            self.elem_types.insert(*iv_value, llvm_ir::Type::I64);
+            self.elem_types.insert(*iv_value, lsir::Type::I64);
         }
         for (slot, (value, _, shape, elem, is_tile)) in carried.iter().enumerate() {
             let carry = carry_allocas[slot].clone();
@@ -2985,7 +3278,7 @@ impl<'a> Lowerer<'a> {
                 let loaded = self.emit(
                     elem.clone(),
                     "ld",
-                    llvm_ir::InstOp::Load { ptr: carry },
+                    lsir::InstOp::Load { ptr: carry },
                 );
                 self.operands.insert(*value, loaded);
                 self.layouts.insert(*value, Layout::Scalar);
@@ -3002,9 +3295,10 @@ impl<'a> Lowerer<'a> {
             self.emit_op(inner)?;
         }
 
-        // This iteration's lazy values cannot outlive the body block.
-        self.materialize_all();
         // The `continue` op names the values the next iteration carries.
+        // Carrying a tile folds its chain onto the carry slot itself, which
+        // needs the chain's recipe, so the carries are settled before the
+        // sweep that writes out whatever else is still lazy.
         let continue_op = self
             .module
             .block(body_block)
@@ -3016,12 +3310,12 @@ impl<'a> Lowerer<'a> {
             .map(|op| self.module.op(op).operands.clone())
             .unwrap_or_default();
         let next_iv = self.emit(
-            llvm_ir::Type::I64,
+            lsir::Type::I64,
             "fori",
-            llvm_ir::InstOp::Bin {
-                op: llvm_ir::BinOp::Add,
+            lsir::InstOp::Bin {
+                op: lsir::BinOp::Add,
                 lhs: iv_current,
-                rhs: step.unwrap_or_else(|| llvm_ir::Operand::Const(llvm_ir::Constant::Int(1))),
+                rhs: step.unwrap_or_else(|| lsir::Operand::Const(lsir::Constant::Int(1))),
             },
         );
         self.store_void(iv, next_iv);
@@ -3044,15 +3338,36 @@ impl<'a> Lowerer<'a> {
             // reused every iteration. Copying the next value into it on the
             // back edge keeps the storage the body reads distinct from the
             // tile this iteration just produced.
-            let src = self.operand_of_tile(next_value);
-            self.counted_loop("cc", len, |lowerer, index| {
-                let value = lowerer.tile_element(&src, elem, index.clone());
-                lowerer.store_element(&carry_allocas[slot], elem, index, value);
-            });
+            // When the next value is still a foldable chain that reads the
+            // carry only at its own index, the fold writes the carry in
+            // place: one loop per iteration instead of a materialisation
+            // plus a copy loop. Chains that read the carry at a remapped
+            // index keep the two-loop form.
+            let carry = carry_allocas[slot].clone();
+            let in_place = match self.recipes.get(&next_value) {
+                Some(recipe) => Self::carry_safe(recipe, &carry, shape),
+                None => false,
+            };
+            if in_place {
+                self.materialize_into(&carry, next_value, elem);
+            } else {
+                let src = self.operand_of_tile(next_value);
+                if Self::vec4_copyable(elem, len) {
+                    self.copy_vec4(&src, &carry, len);
+                } else {
+                    self.counted_loop("cc", len, |lowerer, index| {
+                        let value = lowerer.tile_element(&src, elem, index.clone());
+                        lowerer.store_element(&carry, elem, index, value);
+                    });
+                }
+            }
         }
+        // Whatever else is still lazy cannot outlive the body block: the
+        // carries settled above consumed their own chains.
+        self.materialize_all();
         // Each copy loop leaves the current block at its exit and links itself
         // in, so the back edge belongs to the end of that chain.
-        self.set_terminator(llvm_ir::Terminator::Br {
+        self.set_terminator(lsir::Terminator::Br {
             target: header,
             args: Vec::new(),
         });
@@ -3071,7 +3386,7 @@ impl<'a> Lowerer<'a> {
                     .map(|_| self.module.value_type(value))
                     .unwrap_or(&Type::Token),
             )
-            .unwrap_or_else(|| (Vec::new(), llvm_ir::Type::F32));
+            .unwrap_or_else(|| (Vec::new(), lsir::Type::F32));
             let len = shape.iter().map(|d| (*d).max(1) as usize).product::<usize>().max(1);
             if len > 1 {
                 self.operands.insert(value, carry);
@@ -3079,7 +3394,7 @@ impl<'a> Lowerer<'a> {
                 let loaded = self.emit(
                     elem.clone(),
                     "ld",
-                    llvm_ir::InstOp::Load { ptr: carry },
+                    lsir::InstOp::Load { ptr: carry },
                 );
                 self.operands.insert(value, loaded);
             }
@@ -3105,7 +3420,7 @@ impl<'a> Lowerer<'a> {
             .operands
             .first()
             .map(|v| self.scalar_of_value(*v))
-            .unwrap_or_else(|| llvm_ir::Operand::Const(llvm_ir::Constant::Bool(false)));
+            .unwrap_or_else(|| lsir::Operand::Const(lsir::Constant::Bool(false)));
         let then_region = op.regions.first().copied();
         let else_region = op.regions.get(1).copied();
 
@@ -3116,7 +3431,7 @@ impl<'a> Lowerer<'a> {
             .collect::<Vec<_>>();
         let mut slots = Vec::new();
         for result in results.iter().flatten() {
-            let (shape, elem) = tile_shape(self.module.value_type(*result)).unwrap_or_else(|| (Vec::new(), llvm_ir::Type::F32));
+            let (shape, elem) = tile_shape(self.module.value_type(*result)).unwrap_or_else(|| (Vec::new(), lsir::Type::F32));
             let len = shape.iter().map(|d| (*d).max(1) as usize).product::<usize>().max(1);
             let operand = self.alloc_tile(*result, &shape, &elem);
             slots.push((*result, operand, shape, elem, len));
@@ -3137,7 +3452,7 @@ impl<'a> Lowerer<'a> {
         self.materialize_all();
         // Back at the branch point.
         self.switch_to(branch_at);
-        self.set_terminator(llvm_ir::Terminator::CondBr {
+        self.set_terminator(lsir::Terminator::CondBr {
             cond,
             true_target: then_block,
             true_args: Vec::new(),
@@ -3167,11 +3482,10 @@ impl<'a> Lowerer<'a> {
                     if let Some(source) = yielded.get(slot) {
                         let is_tile = matches!(self.layouts.get(source), Some(Layout::Tile { .. }));
                         let source_value = *source;
-                        let source_shape = self.shape_of(source_value);
                         if is_tile {
                             self.counted_loop("ys", *len, |lowerer, index| {
                                 let value =
-                                    lowerer.tile_value_at(source_value, index.clone(), None, &source_shape);
+                                    lowerer.tile_value_at(source_value, index.clone(), None);
                                 lowerer.store_element(dst, elem, index, value);
                             });
                         } else if *len <= 1 {
@@ -3180,14 +3494,14 @@ impl<'a> Lowerer<'a> {
                             self.store_element(
                                 dst,
                                 elem,
-                                llvm_ir::Operand::Const(llvm_ir::Constant::Int(0)),
+                                lsir::Operand::Const(lsir::Constant::Int(0)),
                                 operand,
                             );
                         }
                     }
                 }
             }
-            self.set_terminator(llvm_ir::Terminator::Br {
+            self.set_terminator(lsir::Terminator::Br {
                 target: join,
                 args: Vec::new(),
             });
@@ -3208,18 +3522,18 @@ impl<'a> Lowerer<'a> {
 // Opcode tables and index arithmetic
 // ---------------------------------------------------------------------------
 
-fn bin_op(opcode: Opcode) -> Option<llvm_ir::BinOp> {
+fn bin_op(opcode: Opcode) -> Option<lsir::BinOp> {
     Some(match opcode {
-        Opcode::AddF | Opcode::AddI => llvm_ir::BinOp::Add,
-        Opcode::SubF | Opcode::SubI => llvm_ir::BinOp::Sub,
-        Opcode::MulF | Opcode::MulI => llvm_ir::BinOp::Mul,
-        Opcode::DivF | Opcode::DivI => llvm_ir::BinOp::Div,
-        Opcode::RemF | Opcode::RemI => llvm_ir::BinOp::Rem,
-        Opcode::AndI => llvm_ir::BinOp::And,
-        Opcode::OrI => llvm_ir::BinOp::Or,
-        Opcode::XOrI => llvm_ir::BinOp::Xor,
-        Opcode::ShLI => llvm_ir::BinOp::Shl,
-        Opcode::ShRI => llvm_ir::BinOp::Shr,
+        Opcode::AddF | Opcode::AddI => lsir::BinOp::Add,
+        Opcode::SubF | Opcode::SubI => lsir::BinOp::Sub,
+        Opcode::MulF | Opcode::MulI => lsir::BinOp::Mul,
+        Opcode::DivF | Opcode::DivI => lsir::BinOp::Div,
+        Opcode::RemF | Opcode::RemI => lsir::BinOp::Rem,
+        Opcode::AndI => lsir::BinOp::And,
+        Opcode::OrI => lsir::BinOp::Or,
+        Opcode::XOrI => lsir::BinOp::Xor,
+        Opcode::ShLI => lsir::BinOp::Shl,
+        Opcode::ShRI => lsir::BinOp::Shr,
         _ => return None,
     })
 }
@@ -3230,52 +3544,52 @@ fn bin_op(opcode: Opcode) -> Option<llvm_ir::BinOp> {
 /// by element type.
 fn extreme_pred(
     opcode: Opcode,
-) -> Option<(llvm_ir::CmpPred, llvm_ir::CmpPred)> {
+) -> Option<(lsir::CmpPred, lsir::CmpPred)> {
     Some(match opcode {
-        Opcode::MaxF => (llvm_ir::CmpPred::Sge, llvm_ir::CmpPred::Oge),
-        Opcode::MinF => (llvm_ir::CmpPred::Sle, llvm_ir::CmpPred::Ole),
-        Opcode::MaxI => (llvm_ir::CmpPred::Sge, llvm_ir::CmpPred::Oge),
-        Opcode::MinI => (llvm_ir::CmpPred::Sle, llvm_ir::CmpPred::Ole),
+        Opcode::MaxF => (lsir::CmpPred::Sge, lsir::CmpPred::Oge),
+        Opcode::MinF => (lsir::CmpPred::Sle, lsir::CmpPred::Ole),
+        Opcode::MaxI => (lsir::CmpPred::Sge, lsir::CmpPred::Oge),
+        Opcode::MinI => (lsir::CmpPred::Sle, lsir::CmpPred::Ole),
         _ => return None,
     })
 }
 
-fn float_intrinsic(opcode: Opcode) -> Option<llvm_ir::Intrinsic> {
+fn float_intrinsic(opcode: Opcode) -> Option<lsir::Intrinsic> {
     Some(match opcode {
-        Opcode::Exp => llvm_ir::Intrinsic::Exp,
-        Opcode::Exp2 => llvm_ir::Intrinsic::Exp2,
-        Opcode::Log => llvm_ir::Intrinsic::Log,
-        Opcode::Log2 => llvm_ir::Intrinsic::Log2,
-        Opcode::Sqrt => llvm_ir::Intrinsic::Sqrt,
-        Opcode::Rsqrt => llvm_ir::Intrinsic::Sqrt,
-        Opcode::AbsF => llvm_ir::Intrinsic::Abs,
-        Opcode::Sin => llvm_ir::Intrinsic::Sin,
-        Opcode::Cos => llvm_ir::Intrinsic::Cos,
-        Opcode::Tan => llvm_ir::Intrinsic::Tan,
-        Opcode::SinH => llvm_ir::Intrinsic::Sinh,
-        Opcode::CosH => llvm_ir::Intrinsic::Cosh,
-        Opcode::TanH => llvm_ir::Intrinsic::Tanh,
-        Opcode::Ceil => llvm_ir::Intrinsic::Ceil,
-        Opcode::Floor => llvm_ir::Intrinsic::Floor,
-        Opcode::Pow => llvm_ir::Intrinsic::Pow,
-        Opcode::Atan2 => llvm_ir::Intrinsic::Atan2,
+        Opcode::Exp => lsir::Intrinsic::Exp,
+        Opcode::Exp2 => lsir::Intrinsic::Exp2,
+        Opcode::Log => lsir::Intrinsic::Log,
+        Opcode::Log2 => lsir::Intrinsic::Log2,
+        Opcode::Sqrt => lsir::Intrinsic::Sqrt,
+        Opcode::Rsqrt => lsir::Intrinsic::Sqrt,
+        Opcode::AbsF => lsir::Intrinsic::Abs,
+        Opcode::Sin => lsir::Intrinsic::Sin,
+        Opcode::Cos => lsir::Intrinsic::Cos,
+        Opcode::Tan => lsir::Intrinsic::Tan,
+        Opcode::SinH => lsir::Intrinsic::Sinh,
+        Opcode::CosH => lsir::Intrinsic::Cosh,
+        Opcode::TanH => lsir::Intrinsic::Tanh,
+        Opcode::Ceil => lsir::Intrinsic::Ceil,
+        Opcode::Floor => lsir::Intrinsic::Floor,
+        Opcode::Pow => lsir::Intrinsic::Pow,
+        Opcode::Atan2 => lsir::Intrinsic::Atan2,
         _ => return None,
     })
 }
 
-fn cast_op(opcode: Opcode) -> Option<llvm_ir::CastOp> {
+fn cast_op(opcode: Opcode) -> Option<lsir::CastOp> {
     Some(match opcode {
-        Opcode::FToF => llvm_ir::CastOp::Bitcast,
-        Opcode::FToI => llvm_ir::CastOp::Fptosi,
-        Opcode::IToF => llvm_ir::CastOp::Sitofp,
-        Opcode::ExtI => llvm_ir::CastOp::Sext,
-        Opcode::TruncI => llvm_ir::CastOp::Trunc,
-        Opcode::Bitcast => llvm_ir::CastOp::Bitcast,
+        Opcode::FToF => lsir::CastOp::Bitcast,
+        Opcode::FToI => lsir::CastOp::Fptosi,
+        Opcode::IToF => lsir::CastOp::Sitofp,
+        Opcode::ExtI => lsir::CastOp::Sext,
+        Opcode::TruncI => lsir::CastOp::Trunc,
+        Opcode::Bitcast => lsir::CastOp::Bitcast,
         _ => return None,
     })
 }
 
-fn comparison_pred(op: &sile_tile_ir::ir::Operation) -> llvm_ir::CmpPred {
+fn comparison_pred(op: &sile_tile_ir::ir::Operation) -> lsir::CmpPred {
     let predicate = op
         .attributes
         .iter()
@@ -3287,18 +3601,18 @@ fn comparison_pred(op: &sile_tile_ir::ir::Operation) -> llvm_ir::CmpPred {
         .unwrap_or(0);
     let is_float = op.opcode == Opcode::CmpF;
     match (predicate, is_float) {
-        (0, false) => llvm_ir::CmpPred::Eq,
-        (1, false) => llvm_ir::CmpPred::Ne,
-        (2, false) => llvm_ir::CmpPred::Slt,
-        (3, false) => llvm_ir::CmpPred::Sle,
-        (4, false) => llvm_ir::CmpPred::Sgt,
-        (5, false) => llvm_ir::CmpPred::Sge,
-        (0, true) => llvm_ir::CmpPred::Eq,
-        (1, true) => llvm_ir::CmpPred::Ne,
-        (2, true) => llvm_ir::CmpPred::Olt,
-        (3, true) => llvm_ir::CmpPred::Ole,
-        (4, true) => llvm_ir::CmpPred::Ogt,
-        _ => llvm_ir::CmpPred::Oge,
+        (0, false) => lsir::CmpPred::Eq,
+        (1, false) => lsir::CmpPred::Ne,
+        (2, false) => lsir::CmpPred::Slt,
+        (3, false) => lsir::CmpPred::Sle,
+        (4, false) => lsir::CmpPred::Sgt,
+        (5, false) => lsir::CmpPred::Sge,
+        (0, true) => lsir::CmpPred::Eq,
+        (1, true) => lsir::CmpPred::Ne,
+        (2, true) => lsir::CmpPred::Olt,
+        (3, true) => lsir::CmpPred::Ole,
+        (4, true) => lsir::CmpPred::Ogt,
+        _ => lsir::CmpPred::Oge,
     }
 }
 
@@ -3328,10 +3642,10 @@ fn reduce_combiner(module: &Module, op_id: OpId) -> Opcode {
 /// the output's rows names the operand's rows too, when the two agree on
 /// the row extent. Anything else falls back to the flat index.
 fn aligned_row<'r>(
-    row: Option<&'r llvm_ir::Operand>,
+    row: Option<&'r lsir::Operand>,
     out_shape: &[i64],
     source_shape: &[i64],
-) -> Option<&'r llvm_ir::Operand> {
+) -> Option<&'r lsir::Operand> {
     if row.is_some() && out_shape.first() == source_shape.first() {
         row
     } else {
@@ -3372,14 +3686,14 @@ fn broadcast_index(
     lowerer: &mut Lowerer<'_>,
     out_shape: &[i64],
     source_shape: &[i64],
-    index: llvm_ir::Operand,
+    index: lsir::Operand,
     source_len: usize,
-) -> llvm_ir::Operand {
+) -> lsir::Operand {
     // Align the shapes on their last axis; an axis the source has extent one
     // on repeats, so its coordinate drops out of the source position.
     let out_len = out_shape.len();
     let src_len_axes = source_shape.len();
-    let mut position = llvm_ir::Operand::Const(llvm_ir::Constant::Int(0));
+    let mut position = lsir::Operand::Const(lsir::Constant::Int(0));
     let mut running: i64 = 1;
     let out_cols = out_shape.last().copied().unwrap_or(1).max(1);
     let _ = out_cols;
@@ -3396,7 +3710,7 @@ fn broadcast_index(
         let within = lowerer.rem_i64(index.clone(), lowerer.const_operand(out_extent * stride));
         let coordinate = lowerer.div_i64(within, lowerer.const_operand(stride));
         let used = if src_extent == 1 {
-            llvm_ir::Operand::Const(llvm_ir::Constant::Int(0))
+            lsir::Operand::Const(lsir::Constant::Int(0))
         } else {
             coordinate
         };
@@ -3420,10 +3734,10 @@ fn permute_index(
     out_shape: &[i64],
     source_shape: &[i64],
     permutation: &[i32],
-    index: llvm_ir::Operand,
-) -> llvm_ir::Operand {
+    index: lsir::Operand,
+) -> lsir::Operand {
     // The output coordinate along each output axis.
-    let mut coords: Vec<llvm_ir::Operand> = Vec::with_capacity(out_shape.len());
+    let mut coords: Vec<lsir::Operand> = Vec::with_capacity(out_shape.len());
     for axis in 0..out_shape.len() {
         let stride: i64 = out_shape
             .iter()
@@ -3436,7 +3750,7 @@ fn permute_index(
     }
 
     // Each source axis reads the output coordinate that became it.
-    let mut position = llvm_ir::Operand::Const(llvm_ir::Constant::Int(0));
+    let mut position = lsir::Operand::Const(lsir::Constant::Int(0));
     for axis in 0..source_shape.len() {
         let out_axis = permutation
             .iter()
@@ -3460,22 +3774,22 @@ fn permute_index(
     position
 }
 
-fn scalar_from_bytes(data: &[u8], elem: &llvm_ir::Type) -> Option<llvm_ir::Constant> {
+fn scalar_from_bytes(data: &[u8], elem: &lsir::Type) -> Option<lsir::Constant> {
     match elem {
-        llvm_ir::Type::F32 => data
+        lsir::Type::F32 => data
             .get(..4)
-            .map(|b| llvm_ir::Constant::Float(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64)),
-        llvm_ir::Type::F64 => data.get(..8).map(|b| {
-            llvm_ir::Constant::Float(f64::from_le_bytes([
+            .map(|b| lsir::Constant::Float(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64)),
+        lsir::Type::F64 => data.get(..8).map(|b| {
+            lsir::Constant::Float(f64::from_le_bytes([
                 b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
             ]))
         }),
-        llvm_ir::Type::I1 => data.first().map(|b| llvm_ir::Constant::Bool(*b != 0)),
-        llvm_ir::Type::I32 => data
+        lsir::Type::I1 => data.first().map(|b| lsir::Constant::Bool(*b != 0)),
+        lsir::Type::I32 => data
             .get(..4)
-            .map(|b| llvm_ir::Constant::Int(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64)),
+            .map(|b| lsir::Constant::Int(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64)),
         _ => data.get(..8).map(|b| {
-            llvm_ir::Constant::Int(i64::from_le_bytes([
+            lsir::Constant::Int(i64::from_le_bytes([
                 b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
             ]))
         }),
@@ -3484,27 +3798,27 @@ fn scalar_from_bytes(data: &[u8], elem: &llvm_ir::Type) -> Option<llvm_ir::Const
 
 impl<'a> Lowerer<'a> {
     /// `lhs op rhs` as an `i64`.
-    fn bin_i64(&mut self, op: llvm_ir::BinOp, lhs: llvm_ir::Operand, rhs: llvm_ir::Operand) -> llvm_ir::Operand {
-        self.emit(llvm_ir::Type::I64, "i", llvm_ir::InstOp::Bin { op, lhs, rhs })
+    fn bin_i64(&mut self, op: lsir::BinOp, lhs: lsir::Operand, rhs: lsir::Operand) -> lsir::Operand {
+        self.emit(lsir::Type::I64, "i", lsir::InstOp::Bin { op, lhs, rhs })
     }
 
-    fn add_i64(&mut self, lhs: llvm_ir::Operand, rhs: llvm_ir::Operand) -> llvm_ir::Operand {
-        self.bin_i64(llvm_ir::BinOp::Add, lhs, rhs)
+    fn add_i64(&mut self, lhs: lsir::Operand, rhs: lsir::Operand) -> lsir::Operand {
+        self.bin_i64(lsir::BinOp::Add, lhs, rhs)
     }
 
-    fn mul_i64(&mut self, lhs: llvm_ir::Operand, rhs: llvm_ir::Operand) -> llvm_ir::Operand {
-        self.bin_i64(llvm_ir::BinOp::Mul, lhs, rhs)
+    fn mul_i64(&mut self, lhs: lsir::Operand, rhs: lsir::Operand) -> lsir::Operand {
+        self.bin_i64(lsir::BinOp::Mul, lhs, rhs)
     }
 
-    fn div_i64(&mut self, lhs: llvm_ir::Operand, rhs: llvm_ir::Operand) -> llvm_ir::Operand {
-        self.bin_i64(llvm_ir::BinOp::Div, lhs, rhs)
+    fn div_i64(&mut self, lhs: lsir::Operand, rhs: lsir::Operand) -> lsir::Operand {
+        self.bin_i64(lsir::BinOp::Div, lhs, rhs)
     }
 
-    fn rem_i64(&mut self, lhs: llvm_ir::Operand, rhs: llvm_ir::Operand) -> llvm_ir::Operand {
-        self.bin_i64(llvm_ir::BinOp::Rem, lhs, rhs)
+    fn rem_i64(&mut self, lhs: lsir::Operand, rhs: lsir::Operand) -> lsir::Operand {
+        self.bin_i64(lsir::BinOp::Rem, lhs, rhs)
     }
 
-    fn const_operand(&self, value: i64) -> llvm_ir::Operand {
-        llvm_ir::Operand::Const(llvm_ir::Constant::Int(value))
+    fn const_operand(&self, value: i64) -> lsir::Operand {
+        lsir::Operand::Const(lsir::Constant::Int(value))
     }
 }

@@ -2,23 +2,29 @@ use std::collections::{HashMap, HashSet};
 use std::cell::OnceCell;
 
 use sile_core::{Error, Result};
-use sile_llvm_ir as llvm_ir;
-use sile_llvm_ir::Function as LlvmIrFunction;
+use sile_lsir as lsir;
+use sile_lsir::Function as LsirFunction;
 
-use crate::cpu::codegen::generate as generate_llvm_ir_c_source;
-use crate::metal::codegen::generate as generate_llvm_ir_metal_source;
-use crate::ptx::codegen::generate as generate_llvm_ir_ptx_source;
-use crate::wgsl::codegen::generate as generate_llvm_ir_wgsl_source;
+use crate::cpu::codegen::generate as generate_lsir_c_source;
+use crate::metal::codegen::generate as generate_lsir_metal_source;
+use crate::ptx::codegen::generate as generate_lsir_ptx_source;
+use crate::wgsl::codegen::generate as generate_lsir_wgsl_source;
 use crate::{BackendArtifact, CodegenTarget};
 
-pub fn run(llvm_ir: &LlvmIrFunction, target: CodegenTarget) -> Result<BackendArtifact> {
+pub fn run(
+    lsir: &LsirFunction,
+    target: CodegenTarget,
+    policy: &sile_lsir::mapping::MappingPolicy,
+) -> Result<BackendArtifact> {
     let artifact = match target {
-        CodegenTarget::C => BackendArtifact::CSource(generate_llvm_ir_c_source(llvm_ir)?),
+        CodegenTarget::C => BackendArtifact::CSource(generate_lsir_c_source(lsir)?),
         CodegenTarget::Metal => {
-            BackendArtifact::MetalSource(generate_llvm_ir_metal_source(llvm_ir)?)
+            BackendArtifact::MetalSource(generate_lsir_metal_source(lsir)?)
         }
-        CodegenTarget::Wgsl => BackendArtifact::WgslSource(generate_llvm_ir_wgsl_source(llvm_ir)?),
-        CodegenTarget::Ptx => BackendArtifact::PtxSource(generate_llvm_ir_ptx_source(llvm_ir)?),
+        CodegenTarget::Wgsl => {
+            BackendArtifact::WgslSource(generate_lsir_wgsl_source(lsir, policy)?)
+        }
+        CodegenTarget::Ptx => BackendArtifact::PtxSource(generate_lsir_ptx_source(lsir)?),
     };
     Ok(artifact)
 }
@@ -46,7 +52,7 @@ fn sanitize_identifier(name: &str) -> String {
     out
 }
 
-pub fn build_value_names(func: &llvm_ir::Function) -> HashMap<llvm_ir::ValueId, String> {
+pub fn build_value_names(func: &lsir::Function) -> HashMap<lsir::ValueId, String> {
     let mut names = HashMap::new();
     for param in &func.params {
         names.insert(param.id, sanitize_identifier(&param.name));
@@ -64,7 +70,7 @@ pub fn build_value_names(func: &llvm_ir::Function) -> HashMap<llvm_ir::ValueId, 
     names
 }
 
-pub fn value_name(value_names: &HashMap<llvm_ir::ValueId, String>, id: llvm_ir::ValueId) -> String {
+pub fn value_name(value_names: &HashMap<lsir::ValueId, String>, id: lsir::ValueId) -> String {
     value_names
         .get(&id)
         .cloned()
@@ -72,15 +78,15 @@ pub fn value_name(value_names: &HashMap<llvm_ir::ValueId, String>, id: llvm_ir::
 }
 
 pub fn format_operand(
-    value_names: &HashMap<llvm_ir::ValueId, String>,
+    value_names: &HashMap<lsir::ValueId, String>,
     float_literal: fn(f64) -> String,
-    operand: &llvm_ir::Operand,
+    operand: &lsir::Operand,
 ) -> String {
     match operand {
-        llvm_ir::Operand::Value(id) => value_name(value_names, *id),
-        llvm_ir::Operand::Const(llvm_ir::Constant::Int(value)) => value.to_string(),
-        llvm_ir::Operand::Const(llvm_ir::Constant::Float(value)) => float_literal(*value),
-        llvm_ir::Operand::Const(llvm_ir::Constant::Bool(value)) => {
+        lsir::Operand::Value(id) => value_name(value_names, *id),
+        lsir::Operand::Const(lsir::Constant::Int(value)) => value.to_string(),
+        lsir::Operand::Const(lsir::Constant::Float(value)) => float_literal(*value),
+        lsir::Operand::Const(lsir::Constant::Bool(value)) => {
             if *value {
                 "true".into()
             } else {
@@ -90,39 +96,39 @@ pub fn format_operand(
     }
 }
 
-pub fn array_dims(ty: &llvm_ir::Type) -> Vec<usize> {
+pub fn array_dims(ty: &lsir::Type) -> Vec<usize> {
     let mut dims = Vec::new();
     let mut current = ty;
-    while let llvm_ir::Type::Array { len, elem } = current {
+    while let lsir::Type::Array { len, elem } = current {
         dims.push(*len);
         current = elem;
     }
     dims
 }
 
-pub fn bin_op_symbol(op: llvm_ir::BinOp) -> &'static str {
+pub fn bin_op_symbol(op: lsir::BinOp) -> &'static str {
     match op {
-        llvm_ir::BinOp::Add => "+",
-        llvm_ir::BinOp::Sub => "-",
-        llvm_ir::BinOp::Mul => "*",
-        llvm_ir::BinOp::Div => "/",
-        llvm_ir::BinOp::Rem => "%",
-        llvm_ir::BinOp::And => "&",
-        llvm_ir::BinOp::Or => "|",
-        llvm_ir::BinOp::Xor => "^",
-        llvm_ir::BinOp::Shl => "<<",
-        llvm_ir::BinOp::Shr => ">>",
+        lsir::BinOp::Add => "+",
+        lsir::BinOp::Sub => "-",
+        lsir::BinOp::Mul => "*",
+        lsir::BinOp::Div => "/",
+        lsir::BinOp::Rem => "%",
+        lsir::BinOp::And => "&",
+        lsir::BinOp::Or => "|",
+        lsir::BinOp::Xor => "^",
+        lsir::BinOp::Shl => "<<",
+        lsir::BinOp::Shr => ">>",
     }
 }
 
-pub fn cmp_pred_symbol(pred: llvm_ir::CmpPred) -> &'static str {
+pub fn cmp_pred_symbol(pred: lsir::CmpPred) -> &'static str {
     match pred {
-        llvm_ir::CmpPred::Eq => "==",
-        llvm_ir::CmpPred::Ne => "!=",
-        llvm_ir::CmpPred::Slt | llvm_ir::CmpPred::Olt => "<",
-        llvm_ir::CmpPred::Sle | llvm_ir::CmpPred::Ole => "<=",
-        llvm_ir::CmpPred::Sgt | llvm_ir::CmpPred::Ogt => ">",
-        llvm_ir::CmpPred::Sge | llvm_ir::CmpPred::Oge => ">=",
+        lsir::CmpPred::Eq => "==",
+        lsir::CmpPred::Ne => "!=",
+        lsir::CmpPred::Slt | lsir::CmpPred::Olt => "<",
+        lsir::CmpPred::Sle | lsir::CmpPred::Ole => "<=",
+        lsir::CmpPred::Sgt | lsir::CmpPred::Ogt => ">",
+        lsir::CmpPred::Sge | lsir::CmpPred::Oge => ">=",
     }
 }
 
@@ -151,29 +157,29 @@ pub fn float_literal(value: f64) -> String {
 }
 
 /// The synthetic shape parameter every backend reads.
-pub const SHAPES_PARAM_NAME: &str = llvm_ir::SHAPES_PARAM_NAME;
+pub const SHAPES_PARAM_NAME: &str = lsir::SHAPES_PARAM_NAME;
 
 /// The synthetic scalar parameter, bound after the shape descriptor.
 ///
 /// A scalar kernel argument travels as a load from here rather than as a
 /// function parameter, because WGSL cannot pass a value into an entry point.
-pub const SCALARS_PARAM_NAME: &str = llvm_ir::SCALARS_PARAM_NAME;
+pub const SCALARS_PARAM_NAME: &str = lsir::SCALARS_PARAM_NAME;
 
 /// True when the parameter is the shape descriptor, not a kernel buffer.
-pub fn is_shapes_param(param: &llvm_ir::Param) -> bool {
+pub fn is_shapes_param(param: &lsir::Param) -> bool {
     param.name == SHAPES_PARAM_NAME
 }
 
 /// True when the parameter is the float scalar descriptor, not a kernel buffer.
-pub fn is_scalars_param(param: &llvm_ir::Param) -> bool {
+pub fn is_scalars_param(param: &lsir::Param) -> bool {
     param.name == SCALARS_PARAM_NAME
 }
 
 /// The synthetic integer scalar parameter, bound after the float one.
-pub const SCALARS_I64_PARAM_NAME: &str = llvm_ir::SCALARS_I64_PARAM_NAME;
+pub const SCALARS_I64_PARAM_NAME: &str = lsir::SCALARS_I64_PARAM_NAME;
 
 /// True when the parameter is the integer scalar descriptor.
-pub fn is_scalars_i64_param(param: &llvm_ir::Param) -> bool {
+pub fn is_scalars_i64_param(param: &lsir::Param) -> bool {
     param.name == SCALARS_I64_PARAM_NAME
 }
 
@@ -181,7 +187,7 @@ pub fn is_scalars_i64_param(param: &llvm_ir::Param) -> bool {
 ///
 /// The descriptors are the synthetic trailing parameters, and every place that
 /// counts or picks kernel buffers has to skip all of them.
-pub fn is_descriptor_param(param: &llvm_ir::Param) -> bool {
+pub fn is_descriptor_param(param: &lsir::Param) -> bool {
     is_shapes_param(param) || is_scalars_param(param) || is_scalars_i64_param(param)
 }
 
@@ -191,7 +197,7 @@ pub fn is_descriptor_param(param: &llvm_ir::Param) -> bool {
 /// knew when it emitted `store_ptr_tko`, so no backend re-derives it by scanning
 /// the CFG for the last store.
 pub struct OutputBuffer<'a> {
-    pub param: &'a llvm_ir::Param,
+    pub param: &'a lsir::Param,
     pub rows: usize,
     pub cols: usize,
 }
@@ -203,7 +209,7 @@ pub struct OutputBuffer<'a> {
 /// or not it carries tile ABI metadata: a kernel that only atomic-adds one
 /// scalar per program has an output with no tile, and the launch grid still
 /// has to come from somewhere.
-pub fn find_output_param(func: &llvm_ir::Function) -> Option<&llvm_ir::Param> {
+pub fn find_output_param(func: &lsir::Function) -> Option<&lsir::Param> {
     func.params
         .iter()
         .rev()
@@ -211,7 +217,7 @@ pub fn find_output_param(func: &llvm_ir::Function) -> Option<&llvm_ir::Param> {
 }
 
 /// Last non-descriptor parameter carrying tile ABI metadata.
-pub fn find_output_buffer(func: &llvm_ir::Function) -> Option<OutputBuffer<'_>> {
+pub fn find_output_buffer(func: &lsir::Function) -> Option<OutputBuffer<'_>> {
     func.params
         .iter()
         .rev()
@@ -236,7 +242,7 @@ pub fn find_output_buffer(func: &llvm_ir::Function) -> Option<OutputBuffer<'_>> 
 /// The rule lives here because the codegen and the runtime must agree: if the
 /// emitter assumes a flattened grid, the runtime has to send one, and neither
 /// side may decide alone.
-pub fn flatten_grid(func: &llvm_ir::Function, launch: &sile_core::LaunchConfig) -> [u32; 3] {
+pub fn flatten_grid(func: &lsir::Function, launch: &sile_core::LaunchConfig) -> [u32; 3] {
     let output_rank = find_output_buffer(func)
         .and_then(|output| output.param.abi.as_ref().map(|abi| abi.rank))
         .unwrap_or(1);
@@ -280,7 +286,7 @@ pub fn flatten_grid(func: &llvm_ir::Function, launch: &sile_core::LaunchConfig) 
 /// the shape descriptor and the tile ABI, so the kernel needs no launch-time
 /// value to recover them.
 pub fn grid_axis_exprs(
-    abi: &llvm_ir::ParamAbi,
+    abi: &lsir::ParamAbi,
     rows: usize,
     cols: usize,
     shapes: &str,
@@ -395,8 +401,8 @@ fn select_expr(
 /// dimension carries one.
 #[derive(Clone, Debug)]
 pub struct GepLink {
-    pub base: llvm_ir::Operand,
-    pub indices: Vec<llvm_ir::Operand>,
+    pub base: lsir::Operand,
+    pub indices: Vec<lsir::Operand>,
     pub strides: Vec<usize>,
 }
 
@@ -404,7 +410,7 @@ pub struct GepLink {
 ///
 /// A Gep's stride comes from the pointee of the value it indexes, so the table
 /// has to cover parameters, block parameters and instruction results.
-fn value_types(func: &llvm_ir::Function) -> HashMap<llvm_ir::ValueId, llvm_ir::Type> {
+fn value_types(func: &lsir::Function) -> HashMap<lsir::ValueId, lsir::Type> {
     let mut types = HashMap::new();
     for param in &func.params {
         types.insert(param.id, param.ty.clone());
@@ -428,12 +434,12 @@ fn value_types(func: &llvm_ir::Function) -> HashMap<llvm_ir::ValueId, llvm_ir::T
 /// An `alloca`'s result is a pointer to the storage it owns; the instruction
 /// records the allocation type instead, so the pointer is rebuilt here. Every
 /// other instruction's result has the type it recorded.
-pub fn result_type(inst: &llvm_ir::Inst) -> llvm_ir::Type {
+pub fn result_type(inst: &lsir::Inst) -> lsir::Type {
     match &inst.op {
-        llvm_ir::InstOp::Alloca {
+        lsir::InstOp::Alloca {
             alloc_ty,
             addr_space,
-        } => llvm_ir::Type::ptr(addr_space.clone(), alloc_ty.clone()),
+        } => lsir::Type::ptr(addr_space.clone(), alloc_ty.clone()),
         _ => inst.ty.clone(),
     }
 }
@@ -442,7 +448,7 @@ pub fn result_type(inst: &llvm_ir::Inst) -> llvm_ir::Type {
 ///
 /// Index `i` steps over the dimensions after it, so a row index of `[2 x [8 x
 /// f32]]` advances eight elements and the column index advances one.
-fn index_strides(pointee: &llvm_ir::Type, count: usize) -> Vec<usize> {
+fn index_strides(pointee: &lsir::Type, count: usize) -> Vec<usize> {
     let dims = array_dims(pointee);
     (0..count)
         .map(|i| dims.get(i + 1..).map_or(1, |rest| rest.iter().product()))
@@ -456,10 +462,10 @@ fn index_strides(pointee: &llvm_ir::Type, count: usize) -> Vec<usize> {
 /// keeps the stride of the link it came from, because a chain can cross array
 /// dimensions of different widths.
 pub fn walk_gep_chain<'g>(
-    ptr: &llvm_ir::Operand,
-    gep_elements: &'g HashMap<llvm_ir::ValueId, GepLink>,
-) -> Option<(&'g llvm_ir::Operand, Vec<(llvm_ir::Operand, usize)>)> {
-    let llvm_ir::Operand::Value(id) = ptr else {
+    ptr: &lsir::Operand,
+    gep_elements: &'g HashMap<lsir::ValueId, GepLink>,
+) -> Option<(&'g lsir::Operand, Vec<(lsir::Operand, usize)>)> {
+    let lsir::Operand::Value(id) = ptr else {
         return None;
     };
     let link = gep_elements.get(id)?;
@@ -479,14 +485,14 @@ pub fn walk_gep_chain<'g>(
 /// One index of a flattened access, scaled by the width of the dimension it
 /// indexes into.
 pub fn scaled_index(
-    index: &llvm_ir::Operand,
+    index: &lsir::Operand,
     stride: usize,
-    format_operand: &dyn Fn(&llvm_ir::Operand) -> String,
+    format_operand: &dyn Fn(&lsir::Operand) -> String,
     index_cast: fn(String) -> String,
 ) -> String {
     // A constant index folds into the constant, so a tile access with literal
     // coordinates stays one literal in the emitted source.
-    if let llvm_ir::Operand::Const(llvm_ir::Constant::Int(value)) = index {
+    if let lsir::Operand::Const(lsir::Constant::Int(value)) = index {
         return format!("({})", value * stride as i64);
     }
     if stride == 1 {
@@ -500,10 +506,10 @@ pub fn scaled_index(
 /// A dialect reaching for the element behind an intrinsic argument gets the
 /// same rule the shared load and store use, instead of a second spelling of it.
 pub fn element_operand(
-    ptr: &llvm_ir::Operand,
-    gep_elements: &HashMap<llvm_ir::ValueId, GepLink>,
-    value_name: &dyn Fn(llvm_ir::ValueId) -> String,
-    format_operand: &dyn Fn(&llvm_ir::Operand) -> String,
+    ptr: &lsir::Operand,
+    gep_elements: &HashMap<lsir::ValueId, GepLink>,
+    value_name: &dyn Fn(lsir::ValueId) -> String,
+    format_operand: &dyn Fn(&lsir::Operand) -> String,
     index_cast: fn(String) -> String,
 ) -> String {
     match walk_gep_chain(ptr, gep_elements) {
@@ -519,7 +525,7 @@ pub fn element_operand(
             }
         }
         None => match ptr {
-            llvm_ir::Operand::Value(id) => format!("{}[0]", value_name(*id)),
+            lsir::Operand::Value(id) => format!("{}[0]", value_name(*id)),
             other => format_operand(other),
         },
     }
@@ -531,22 +537,22 @@ pub fn element_operand(
 /// a store addresses, and a dialect needs the same table for an intrinsic
 /// argument. Both read the whole function, so both take it from one place
 /// instead of one of them re-deriving it during emission.
-pub fn collect_gep_elements(func: &llvm_ir::Function) -> HashMap<llvm_ir::ValueId, GepLink> {
+pub fn collect_gep_elements(func: &lsir::Function) -> HashMap<lsir::ValueId, GepLink> {
     let types = value_types(func);
     let mut gep_elements = HashMap::new();
     for block in &func.blocks {
         for inst in &block.insts {
-            if let llvm_ir::InstOp::Gep { base, indices } = &inst.op
+            if let lsir::InstOp::Gep { base, indices } = &inst.op
                 && let Some(result) = inst.result
             {
                 let strides = match base {
-                    llvm_ir::Operand::Value(id) => match types.get(id) {
-                        Some(llvm_ir::Type::Ptr { pointee, .. }) => {
+                    lsir::Operand::Value(id) => match types.get(id) {
+                        Some(lsir::Type::Ptr { pointee, .. }) => {
                             index_strides(pointee, indices.len())
                         }
                         _ => vec![1; indices.len()],
                     },
-                    llvm_ir::Operand::Const(_) => vec![1; indices.len()],
+                    lsir::Operand::Const(_) => vec![1; indices.len()],
                 };
                 gep_elements.insert(
                     result,
@@ -568,24 +574,24 @@ pub fn collect_gep_elements(func: &llvm_ir::Function) -> HashMap<llvm_ir::ValueI
 /// without pointers needs in order to spell the element a load reads or a store
 /// writes. It is empty for a pointer language, which never consults it.
 pub fn lower_common_inst_line_with<FValue, FOperand>(
-    inst: &llvm_ir::Inst,
+    inst: &lsir::Inst,
     value_name: FValue,
     format_operand: FOperand,
     pointers: PointerSpelling,
     select: SelectSpelling,
     int_div: IntDivSpelling,
-    cast_expr: fn(llvm_ir::CastOp, &llvm_ir::Type, String) -> String,
-    gep_elements: &mut HashMap<llvm_ir::ValueId, GepLink>,
-    folded_geps: &HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)>,
+    cast_expr: fn(lsir::CastOp, &lsir::Type, String) -> String,
+    gep_elements: &mut HashMap<lsir::ValueId, GepLink>,
+    folded_geps: &HashMap<lsir::ValueId, (lsir::Operand, Vec<lsir::Operand>)>,
 ) -> Option<String>
 where
-    FValue: Fn(llvm_ir::ValueId) -> String,
-    FOperand: Fn(&llvm_ir::Operand) -> String,
+    FValue: Fn(lsir::ValueId) -> String,
+    FOperand: Fn(&lsir::Operand) -> String,
 {
     // The Gep table is collected once in `TargetEmitter::new` for a
     // pointer-free target, so a Gep is already there when its use arrives.
 
-    let element = |ptr: &llvm_ir::Operand| -> String {
+    let element = |ptr: &lsir::Operand| -> String {
         element_operand(
             ptr,
             gep_elements,
@@ -596,9 +602,9 @@ where
     };
     // A pointer target reads straight through the geps a single load or store
     // uses, so the access spells `base[i]` and the gep itself leaves no text.
-    let addressed = |ptr: &llvm_ir::Operand| -> Option<String> {
+    let addressed = |ptr: &lsir::Operand| -> Option<String> {
         match ptr {
-            llvm_ir::Operand::Value(id) => folded_geps.get(id).map(|(base, indices)| {
+            lsir::Operand::Value(id) => folded_geps.get(id).map(|(base, indices)| {
                 let suffix = indices
                     .iter()
                     .map(|idx| format!("[{}]", format_operand(idx)))
@@ -611,12 +617,12 @@ where
     };
 
     match &inst.op {
-        llvm_ir::InstOp::Bin { op, lhs, rhs } => inst.result.map(|id| {
+        lsir::InstOp::Bin { op, lhs, rhs } => inst.result.map(|id| {
             match (int_div, &inst.ty, op) {
                 (
                     IntDivSpelling::I32Widened,
-                    llvm_ir::Type::I64,
-                    llvm_ir::BinOp::Div | llvm_ir::BinOp::Rem,
+                    lsir::Type::I64,
+                    lsir::BinOp::Div | lsir::BinOp::Rem,
                 ) => format!(
                     "{} = i64((i32({}) {} i32({})));",
                     value_name(id),
@@ -633,7 +639,7 @@ where
                 ),
             }
         }),
-        llvm_ir::InstOp::Cmp { pred, lhs, rhs } => inst.result.map(|id| {
+        lsir::InstOp::Cmp { pred, lhs, rhs } => inst.result.map(|id| {
             format!(
                 "{} = {} {} {};",
                 value_name(id),
@@ -642,17 +648,17 @@ where
                 format_operand(rhs)
             )
         }),
-        llvm_ir::InstOp::Select {
+        lsir::InstOp::Select {
             cond,
             on_true,
             on_false,
         } => inst.result.map(|id| {
-            let arg = |op: &llvm_ir::Operand| -> String {
+            let arg = |op: &lsir::Operand| -> String {
                 match (select, &inst.ty, op) {
                     (
                         SelectSpelling::Function { int_const },
-                        llvm_ir::Type::I64,
-                        llvm_ir::Operand::Const(llvm_ir::Constant::Int(value)),
+                        lsir::Type::I64,
+                        lsir::Operand::Const(lsir::Constant::Int(value)),
                     ) => int_const(*value),
                     _ => format_operand(op),
                 }
@@ -663,7 +669,7 @@ where
                 select_expr(select, arg(cond), arg(on_true), arg(on_false))
             )
         }),
-        llvm_ir::InstOp::Load { ptr } => inst.result.map(|id| {
+        lsir::InstOp::Load { ptr } => inst.result.map(|id| {
             if let Some(address) = addressed(ptr) {
                 format!("{} = {};", value_name(id), address)
             } else if pointers.load_deref {
@@ -673,7 +679,7 @@ where
                 format!("{} = {};", value_name(id), element(ptr))
             }
         }),
-        llvm_ir::InstOp::Store { ptr, value } => {
+        lsir::InstOp::Store { ptr, value } => {
             if let Some(address) = addressed(ptr) {
                 Some(format!("{} = {};", address, format_operand(value)))
             } else if pointers.load_deref {
@@ -685,7 +691,7 @@ where
         // A conversion is a value the target may have to spell: one language
         // converts where the value is assigned, and another names the type it
         // converts to.
-        llvm_ir::InstOp::Cast { op, value, to } => inst.result.map(|id| {
+        lsir::InstOp::Cast { op, value, to } => inst.result.map(|id| {
             format!(
                 "{} = {};",
                 value_name(id),
@@ -695,7 +701,7 @@ where
         // A language with addresses materializes the pointer — unless its only
         // use folded into the access it serves — and one without already
         // recorded the element above and emits nothing.
-        llvm_ir::InstOp::Gep { base, indices } if pointers.has_address_of => {
+        lsir::InstOp::Gep { base, indices } if pointers.has_address_of => {
             let folded_away = inst
                 .result
                 .is_some_and(|id| folded_geps.contains_key(&id));
@@ -748,12 +754,12 @@ pub trait TargetDialect {
     ///
     /// `is_alloca` separates an `alloca`, which owns storage the target must
     /// materialize, from a `gep` of a driver buffer, which borrows storage and
-    /// must stay a plain pointer. The two have the same LLVM IR type, so the
+    /// must stay a plain pointer. The two have the same LSIR type, so the
     /// flag is what tells them apart.
-    fn var_decl(&self, ty: &llvm_ir::Type, name: &str, is_alloca: bool) -> Option<String>;
+    fn var_decl(&self, ty: &lsir::Type, name: &str, is_alloca: bool) -> Option<String>;
 
     /// Parameter text for one kernel parameter.
-    fn param_decl(&self, ty: &llvm_ir::Type, name: &str) -> String;
+    fn param_decl(&self, ty: &lsir::Type, name: &str) -> String;
 
     /// Text of the function head, up to and including the opening brace.
     ///
@@ -765,24 +771,24 @@ pub trait TargetDialect {
     /// Lines emitted before the kernel body, after the declarations. The
     /// function is what tells a helper apart from dead weight: a target spells
     /// runtime support only for the intrinsics the body names.
-    fn prelude_lines(&self, func: &llvm_ir::Function) -> Vec<String>;
+    fn prelude_lines(&self, func: &lsir::Function) -> Vec<String>;
 
     /// Assignment of an intrinsic result, or a statement when it has none.
     fn intrinsic_stmt(
         &self,
-        result: Option<llvm_ir::ValueId>,
-        value_name: impl Fn(llvm_ir::ValueId) -> String,
-        format_operand: impl Fn(&llvm_ir::Operand) -> String,
-        intrinsic: &llvm_ir::Intrinsic,
-        args: &[llvm_ir::Operand],
+        result: Option<lsir::ValueId>,
+        value_name: impl Fn(lsir::ValueId) -> String,
+        format_operand: impl Fn(&lsir::Operand) -> String,
+        intrinsic: &lsir::Intrinsic,
+        args: &[lsir::Operand],
     ) -> sile_core::Result<Vec<String>>;
 
     /// A statement per target for operations the shared traversal does not know.
     fn extra_inst_stmt(
         &mut self,
-        inst: &llvm_ir::Inst,
-        value_name: impl Fn(llvm_ir::ValueId) -> String,
-        format_operand: impl Fn(&llvm_ir::Operand) -> String,
+        inst: &lsir::Inst,
+        value_name: impl Fn(lsir::ValueId) -> String,
+        format_operand: impl Fn(&lsir::Operand) -> String,
     ) -> sile_core::Result<Vec<String>>;
 
     /// How this target spells address-taking and dereferencing.
@@ -806,7 +812,7 @@ pub trait TargetDialect {
     /// can call it without borrowing the dialect. A language that converts
     /// where the value is assigned writes the value alone; one that has no
     /// implicit conversion names the type it converts to.
-    fn cast_expr(_op: llvm_ir::CastOp, _to: &llvm_ir::Type, value: String) -> String
+    fn cast_expr(_op: lsir::CastOp, _to: &lsir::Type, value: String) -> String
     where
         Self: Sized,
     {
@@ -840,7 +846,7 @@ pub trait TargetDialect {
     ///
     /// A target whose tiles are addresses must copy the elements; see
     /// [`copy_assign`]. A target whose tiles are values assigns them.
-    fn param_assign(&self, _ty: &llvm_ir::Type, name: &str, arg: &str) -> String {
+    fn param_assign(&self, _ty: &lsir::Type, name: &str, arg: &str) -> String {
         format!("{name} = {arg};")
     }
 
@@ -873,8 +879,8 @@ pub trait TargetDialect {
     /// A target with no pointers also declares nothing for a `gep`: the `gep`
     /// result is the element it points at, spelled where it is consumed, so it
     /// has no value and no type of its own to declare.
-    fn declares_at_use(&self, inst: &llvm_ir::Inst) -> bool {
-        self.pointers().has_address_of == false && matches!(inst.op, llvm_ir::InstOp::Gep { .. })
+    fn declares_at_use(&self, inst: &lsir::Inst) -> bool {
+        self.pointers().has_address_of == false && matches!(inst.op, lsir::InstOp::Gep { .. })
             || self.declares_intrinsic_at_use(inst)
     }
 
@@ -883,7 +889,7 @@ pub trait TargetDialect {
     /// Separate from [`TargetDialect::declares_at_use`] because the `gep` half
     /// of that answer comes from the pointer language and the intrinsic half is
     /// a per-target choice, so mixing them makes the default wrong for C.
-    fn declares_intrinsic_at_use(&self, _inst: &llvm_ir::Inst) -> bool {
+    fn declares_intrinsic_at_use(&self, _inst: &lsir::Inst) -> bool {
         false
     }
 
@@ -897,43 +903,46 @@ pub trait TargetDialect {
 /// it directly and hand this struct a dialect instead, which is what keeps the
 /// next target from copying the traversal a third time.
 pub struct TargetEmitter<'a, D: TargetDialect> {
-    pub func: &'a llvm_ir::Function,
+    pub func: &'a lsir::Function,
     pub dialect: D,
     /// Values that own storage, so a target can tell real storage apart from a
     /// pointer into a driver buffer.
-    pub storage_values: HashSet<llvm_ir::ValueId>,
-    pub value_names: HashMap<llvm_ir::ValueId, String>,
-    pub declared_values: HashSet<llvm_ir::ValueId>,
+    pub storage_values: HashSet<lsir::ValueId>,
+    pub value_names: HashMap<lsir::ValueId, String>,
+    pub declared_values: HashSet<lsir::ValueId>,
     /// Gep results, which a pointer-free target spells as elements.
     ///
     /// Filled by [`lower_common_inst_line_with`], so the emitter must own it and
     /// pass it on every instruction.
-    pub gep_elements: HashMap<llvm_ir::ValueId, GepLink>,
+    pub gep_elements: HashMap<lsir::ValueId, GepLink>,
     /// Geps whose only use is the load or store reading through them, with the
     /// base and indices to spell at that use.
     ///
     /// A pointer target writes `base[i]` on the spot; materializing the pointer
     /// first is a declaration and a line for nothing. Filled for a target with
     /// addresses only, and empty for a pointer-free one.
-    pub folded_geps: HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)>,
+    pub folded_geps: HashMap<lsir::ValueId, (lsir::Operand, Vec<lsir::Operand>)>,
     /// Values the traversal actually wrote an assignment for.
     ///
     /// The declaration pass runs before the body, so it cannot see which values
     /// the structured lowering will fold away — a loop header's condition, a
     /// gep a load folded through. The body records them here and the held-back
     /// declarations are filtered by it.
-    assigned_values: HashSet<llvm_ir::ValueId>,
+    assigned_values: HashSet<lsir::ValueId>,
     /// The alloca-form counted loops keyed by header, from the emission
     /// pre-pass. Their index updates fold into the `for` header.
-    for_loops: HashMap<llvm_ir::BlockId, AllocaForLoop>,
+    for_loops: HashMap<lsir::BlockId, CountedForLoop>,
+    /// The mapping's vectorization judgment. The policy decides whether the
+    /// target wants a hint at all; the dialect still spells it.
+    vector: lsir::VectorPolicy,
     /// The index allocas of those loops. Their stores fold away, so emission
     /// skips them and their declaration demotes to the scalar itself.
-    demoted_ivs: HashSet<llvm_ir::ValueId>,
+    demoted_ivs: HashSet<lsir::ValueId>,
     /// The step instructions of those loops. Their result only feeds the
     /// skipped store, so they fold away wherever the body put them.
-    step_values: HashSet<llvm_ir::ValueId>,
+    step_values: HashSet<lsir::ValueId>,
     /// Declarations held back while the body emits, filtered, then written.
-    deferred_decls: Vec<(llvm_ir::ValueId, llvm_ir::Type)>,
+    deferred_decls: Vec<(lsir::ValueId, lsir::Type)>,
     defer_decls: bool,
     pub indent: usize,
     out: String,
@@ -941,14 +950,14 @@ pub struct TargetEmitter<'a, D: TargetDialect> {
 
 /// The two extents of the storage a tile pointer addresses, when it addresses
 /// a tile at all.
-pub fn tile_storage_dims(ty: &llvm_ir::Type) -> Option<(usize, usize)> {
-    let llvm_ir::Type::Ptr { pointee, .. } = ty else {
+pub fn tile_storage_dims(ty: &lsir::Type) -> Option<(usize, usize)> {
+    let lsir::Type::Ptr { pointee, .. } = ty else {
         return None;
     };
-    let llvm_ir::Type::Array { len: rows, elem } = pointee.as_ref() else {
+    let lsir::Type::Array { len: rows, elem } = pointee.as_ref() else {
         return None;
     };
-    let llvm_ir::Type::Array { len: cols, .. } = elem.as_ref() else {
+    let lsir::Type::Array { len: cols, .. } = elem.as_ref() else {
         return None;
     };
     Some((*rows, *cols))
@@ -961,7 +970,7 @@ pub fn tile_storage_dims(ty: &llvm_ir::Type) -> Option<(usize, usize)> {
 /// names alias, and the parameter would lose the value it carried, so the
 /// elements are copied. A target whose tiles are values assigns them directly
 /// and never calls this.
-pub fn copy_assign(ty: &llvm_ir::Type, name: &str, arg: &str) -> String {
+pub fn copy_assign(ty: &lsir::Type, name: &str, arg: &str) -> String {
     match tile_storage_dims(ty) {
         Some((rows, 1)) => {
             format!("for (int64_t i = 0; i < {rows}; i++) {name}[i][0] = {arg}[i][0];")
@@ -976,7 +985,7 @@ pub fn copy_assign(ty: &llvm_ir::Type, name: &str, arg: &str) -> String {
 
 /// Every value that owns storage: an `alloca`, and a tile block parameter,
 /// which is the slot the loop carries that tile in.
-pub fn collect_storage_values(func: &llvm_ir::Function) -> HashSet<llvm_ir::ValueId> {
+pub fn collect_storage_values(func: &lsir::Function) -> HashSet<lsir::ValueId> {
     let mut values = collect_alloca_results(func);
     for block in &func.blocks {
         for param in &block.params {
@@ -989,9 +998,9 @@ pub fn collect_storage_values(func: &llvm_ir::Function) -> HashSet<llvm_ir::Valu
         for inst in &block.insts {
             if matches!(
                 inst.op,
-                llvm_ir::InstOp::Intrinsic {
+                lsir::InstOp::Intrinsic {
                     intrinsic:
-                        llvm_ir::Intrinsic::TileReduce { .. } | llvm_ir::Intrinsic::TileMma { .. },
+                        lsir::Intrinsic::TileReduce { .. } | lsir::Intrinsic::TileMma { .. },
                     ..
                 }
             ) && let Some(id) = inst.result
@@ -1004,49 +1013,49 @@ pub fn collect_storage_values(func: &llvm_ir::Function) -> HashSet<llvm_ir::Valu
 }
 
 /// Every value an `alloca` defines, on any block.
-pub fn collect_alloca_results(func: &llvm_ir::Function) -> HashSet<llvm_ir::ValueId> {
+pub fn collect_alloca_results(func: &lsir::Function) -> HashSet<lsir::ValueId> {
     func.blocks
         .iter()
         .flat_map(|block| block.insts.iter())
         .filter_map(|inst| match inst.op {
-            llvm_ir::InstOp::Alloca { .. } => inst.result,
+            lsir::InstOp::Alloca { .. } => inst.result,
             _ => None,
         })
         .collect()
 }
 
 /// The values one instruction reads.
-pub fn inst_operands(inst: &llvm_ir::Inst) -> Vec<&llvm_ir::Operand> {
+pub fn inst_operands(inst: &lsir::Inst) -> Vec<&lsir::Operand> {
     match &inst.op {
-        llvm_ir::InstOp::Gep { base, indices } => {
+        lsir::InstOp::Gep { base, indices } => {
             let mut all = vec![base];
             all.extend(indices.iter());
             all
         }
-        llvm_ir::InstOp::Load { ptr } => vec![ptr],
-        llvm_ir::InstOp::Store { ptr, value } => vec![ptr, value],
-        llvm_ir::InstOp::AtomicAdd { ptr, value } => vec![ptr, value],
-        llvm_ir::InstOp::Memcpy { dst, src, size } => vec![dst, src, size],
-        llvm_ir::InstOp::Bin { lhs, rhs, .. } => vec![lhs, rhs],
-        llvm_ir::InstOp::Cmp { lhs, rhs, .. } => vec![lhs, rhs],
-        llvm_ir::InstOp::Cast { value, .. } => vec![value],
-        llvm_ir::InstOp::Select {
+        lsir::InstOp::Load { ptr } => vec![ptr],
+        lsir::InstOp::Store { ptr, value } => vec![ptr, value],
+        lsir::InstOp::AtomicAdd { ptr, value } => vec![ptr, value],
+        lsir::InstOp::Memcpy { dst, src, size } => vec![dst, src, size],
+        lsir::InstOp::Bin { lhs, rhs, .. } => vec![lhs, rhs],
+        lsir::InstOp::Cmp { lhs, rhs, .. } => vec![lhs, rhs],
+        lsir::InstOp::Cast { value, .. } => vec![value],
+        lsir::InstOp::Select {
             cond,
             on_true,
             on_false,
         } => vec![cond, on_true, on_false],
-        llvm_ir::InstOp::Call { args, .. } | llvm_ir::InstOp::Intrinsic { args, .. } => {
+        lsir::InstOp::Call { args, .. } | lsir::InstOp::Intrinsic { args, .. } => {
             args.iter().collect()
         }
-        llvm_ir::InstOp::Alloca { .. } => Vec::new(),
+        lsir::InstOp::Alloca { .. } => Vec::new(),
     }
 }
 
 /// The values a terminator reads.
-pub fn terminator_operands(term: &llvm_ir::Terminator) -> Vec<&llvm_ir::Operand> {
+pub fn terminator_operands(term: &lsir::Terminator) -> Vec<&lsir::Operand> {
     match term {
-        llvm_ir::Terminator::Br { args, .. } => args.iter().collect(),
-        llvm_ir::Terminator::CondBr {
+        lsir::Terminator::Br { args, .. } => args.iter().collect(),
+        lsir::Terminator::CondBr {
             cond,
             true_args,
             false_args,
@@ -1057,8 +1066,8 @@ pub fn terminator_operands(term: &llvm_ir::Terminator) -> Vec<&llvm_ir::Operand>
             all.extend(false_args.iter());
             all
         }
-        llvm_ir::Terminator::Switch { value, .. } => vec![value],
-        llvm_ir::Terminator::Ret { value } => value.iter().collect(),
+        lsir::Terminator::Switch { value, .. } => vec![value],
+        lsir::Terminator::Ret { value } => value.iter().collect(),
     }
 }
 
@@ -1068,14 +1077,14 @@ pub fn terminator_operands(term: &llvm_ir::Terminator) -> Vec<&llvm_ir::Operand>
 /// so the gep itself leaves no text. Anything else — a pointer that lives
 /// across statements, one gep feeding two accesses — stays a value.
 pub fn collect_folded_geps(
-    func: &llvm_ir::Function,
-) -> HashMap<llvm_ir::ValueId, (llvm_ir::Operand, Vec<llvm_ir::Operand>)> {
-    let mut uses: HashMap<llvm_ir::ValueId, usize> = HashMap::new();
-    let mut users: HashMap<llvm_ir::ValueId, &llvm_ir::Inst> = HashMap::new();
+    func: &lsir::Function,
+) -> HashMap<lsir::ValueId, (lsir::Operand, Vec<lsir::Operand>)> {
+    let mut uses: HashMap<lsir::ValueId, usize> = HashMap::new();
+    let mut users: HashMap<lsir::ValueId, &lsir::Inst> = HashMap::new();
     for block in &func.blocks {
         for inst in &block.insts {
-            let mut note = |used: &llvm_ir::Operand| {
-                if let llvm_ir::Operand::Value(id) = used {
+            let mut note = |used: &lsir::Operand| {
+                if let lsir::Operand::Value(id) = used {
                     *uses.entry(*id).or_insert(0) += 1;
                     users.insert(*id, inst);
                 }
@@ -1085,7 +1094,7 @@ pub fn collect_folded_geps(
             }
         }
         for used in terminator_operands(&block.terminator) {
-            if let llvm_ir::Operand::Value(id) = used {
+            if let lsir::Operand::Value(id) = used {
                 *uses.entry(*id).or_insert(0) += 1;
             }
         }
@@ -1093,7 +1102,7 @@ pub fn collect_folded_geps(
     let mut folded = HashMap::new();
     for block in &func.blocks {
         for inst in &block.insts {
-            let llvm_ir::InstOp::Gep { base, indices } = &inst.op else {
+            let lsir::InstOp::Gep { base, indices } = &inst.op else {
                 continue;
             };
             let Some(result) = inst.result else {
@@ -1104,7 +1113,7 @@ pub fn collect_folded_geps(
             }
             if matches!(
                 users.get(&result).map(|user| &user.op),
-                Some(llvm_ir::InstOp::Load { .. } | llvm_ir::InstOp::Store { .. })
+                Some(lsir::InstOp::Load { .. } | lsir::InstOp::Store { .. })
             ) {
                 folded.insert(result, (base.clone(), indices.clone()));
             }
@@ -1114,7 +1123,7 @@ pub fn collect_folded_geps(
 }
 
 impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
-    pub fn new(func: &'a llvm_ir::Function, dialect: D) -> Self {
+    pub fn new(func: &'a lsir::Function, dialect: D, vector: lsir::VectorPolicy) -> Self {
         // A target that has no pointers reads the Gep table from the first
         // instruction, so the whole function is collected once here rather
         // than filled as the Geps go by.
@@ -1150,10 +1159,18 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
         // the body's into the scalar they read — so none of their results
         // reach the text.
         let (for_loops, load_index) = find_alloca_for_loops(func);
-        let demoted_ivs: HashSet<llvm_ir::ValueId> =
+        let demoted_ivs: HashSet<lsir::ValueId> =
             for_loops.values().map(|loop_| loop_.iv).collect();
-        let step_values: HashSet<llvm_ir::ValueId> =
-            for_loops.values().map(|loop_| loop_.step_value).collect();
+        // The step instruction folds into the `for` header when nothing but
+        // the loop's own edge reads it: in the memory form that is the latch's
+        // store, in the promoted form the back edge's argument. When the body
+        // reads the same value — the lowering computes it before the body runs
+        // — it is an ordinary instruction and stays.
+        let step_values: HashSet<lsir::ValueId> = for_loops
+            .values()
+            .filter(|loop_| !value_read_in_body(func, loop_.step_value))
+            .map(|loop_| loop_.step_value)
+            .collect();
         for (load, iv) in &load_index {
             if let Some(name) = value_names.get(iv).cloned() {
                 value_names.insert(*load, name);
@@ -1169,6 +1186,7 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
             folded_geps,
             assigned_values: HashSet::new(),
             for_loops,
+            vector,
             demoted_ivs,
             step_values,
             deferred_decls: Vec::new(),
@@ -1178,7 +1196,7 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
         }
     }
 
-    fn param_names(&self) -> HashMap<llvm_ir::ValueId, String> {
+    fn param_names(&self) -> HashMap<lsir::ValueId, String> {
         self.func
             .params
             .iter()
@@ -1211,7 +1229,7 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
             return;
         }
         let mut lines = Vec::new();
-        let mut seen: Vec<llvm_ir::ValueId> = Vec::new();
+        let mut seen: Vec<lsir::ValueId> = Vec::new();
         for block in &self.func.blocks {
             for param in &block.params {
                 if declared.contains_key(&param.id) && !seen.contains(&param.id) {
@@ -1263,12 +1281,12 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
     }
 
     /// The declaration text for one value.
-    fn write_decl(&mut self, id: llvm_ir::ValueId, ty: &llvm_ir::Type) {
+    fn write_decl(&mut self, id: lsir::ValueId, ty: &lsir::Type) {
         let name = self.value_name(id);
         // A demoted `for` induction declares the scalar itself, not the
         // storage-plus-pointer pair: the `for` header updates the scalar.
         let ty = match ty {
-            llvm_ir::Type::Ptr { pointee, .. } if self.demoted_ivs.contains(&id) => {
+            lsir::Type::Ptr { pointee, .. } if self.demoted_ivs.contains(&id) => {
                 pointee.as_ref().clone()
             }
             _ => ty.clone(),
@@ -1281,11 +1299,11 @@ impl<'a, D: TargetDialect> TargetEmitter<'a, D> {
         }
     }
 
-    pub fn value_name(&self, id: llvm_ir::ValueId) -> String {
+    pub fn value_name(&self, id: lsir::ValueId) -> String {
         value_name(&self.value_names, id)
     }
 
-    pub fn format_operand(&self, operand: &llvm_ir::Operand) -> String {
+    pub fn format_operand(&self, operand: &lsir::Operand) -> String {
         format_operand(&self.value_names, D::float_literal, operand)
     }
 
@@ -1331,7 +1349,8 @@ impl<D: TargetDialect> TextCodegen for TargetEmitter<'_, D> {
         let body_start = self.out.len();
         self.out.push('\n');
         let post_dominators = OnceCell::new();
-        if self.emit_structured_from(self.func.entry, &[], &post_dominators)?.is_some() {
+        let dominators = sile_lsir::passes::cfg::dominators(self.func);
+        if self.emit_structured_from(self.func.entry, &[], &post_dominators, &dominators)?.is_some() {
             return Err(Error::Compile(
                 "structured codegen unexpectedly stopped at a non-terminal block".into(),
             ));
@@ -1350,14 +1369,14 @@ impl<D: TargetDialect> TextCodegen for TargetEmitter<'_, D> {
 }
 
 impl<D: TargetDialect> StructuredEmitter for TargetEmitter<'_, D> {
-    fn emit_block_insts(&mut self, block: &llvm_ir::BasicBlock) -> Result<()> {
+    fn emit_block_insts(&mut self, block: &lsir::BasicBlock) -> Result<()> {
         self.emit_block_insts_except(block, None)
     }
 
     fn emit_block_insts_except(
         &mut self,
-        block: &llvm_ir::BasicBlock,
-        skip_result: Option<llvm_ir::ValueId>,
+        block: &lsir::BasicBlock,
+        skip_result: Option<lsir::ValueId>,
     ) -> Result<()> {
         for inst in &block.insts {
             if let Some(skip_result) = skip_result
@@ -1375,11 +1394,11 @@ impl<D: TargetDialect> StructuredEmitter for TargetEmitter<'_, D> {
                 continue;
             }
             match &inst.op {
-                llvm_ir::InstOp::Load {
-                    ptr: llvm_ir::Operand::Value(base),
+                lsir::InstOp::Load {
+                    ptr: lsir::Operand::Value(base),
                 }
-                | llvm_ir::InstOp::Store {
-                    ptr: llvm_ir::Operand::Value(base),
+                | lsir::InstOp::Store {
+                    ptr: lsir::Operand::Value(base),
                     ..
                 } if self.demoted_ivs.contains(base) => continue,
                 _ => {}
@@ -1391,9 +1410,9 @@ impl<D: TargetDialect> StructuredEmitter for TargetEmitter<'_, D> {
 
     fn emit_block_param_assignments_skipping(
         &mut self,
-        target: llvm_ir::BlockId,
-        args: &[llvm_ir::Operand],
-        skip_params: &[llvm_ir::ValueId],
+        target: lsir::BlockId,
+        args: &[lsir::Operand],
+        skip_params: &[lsir::ValueId],
     ) {
         let Some(block) = self.func.blocks.iter().find(|block| block.id == target) else {
             return;
@@ -1409,7 +1428,7 @@ impl<D: TargetDialect> StructuredEmitter for TargetEmitter<'_, D> {
         }
     }
 
-    fn format_operand(&self, operand: &llvm_ir::Operand) -> String {
+    fn format_operand(&self, operand: &lsir::Operand) -> String {
         self.format_operand(operand)
     }
 
@@ -1426,10 +1445,18 @@ impl<D: TargetDialect> StructuredEmitter for TargetEmitter<'_, D> {
     }
 
     fn vectorize_hint(&mut self, is_simple_body: bool) -> Option<String> {
-        self.dialect.vectorize_hint(is_simple_body)
+        // The policy decides whether the target wants a hint at all; the
+        // dialect still spells it. A simple body is part of the spell.
+        match self.vector {
+            lsir::VectorPolicy::None => None,
+            lsir::VectorPolicy::OmpSimd if is_simple_body => {
+                self.dialect.vectorize_hint(is_simple_body)
+            }
+            lsir::VectorPolicy::OmpSimd => None,
+        }
     }
 
-    fn for_loop_induction(&self, header: llvm_ir::BlockId) -> Option<AllocaForLoop> {
+    fn for_loop_induction(&self, header: lsir::BlockId) -> Option<CountedForLoop> {
         self.for_loops.get(&header).copied()
     }
 }
@@ -1437,18 +1464,20 @@ impl<D: TargetDialect> StructuredEmitter for TargetEmitter<'_, D> {
 impl<D: TargetDialect> TargetEmitter<'_, D> {
     fn emit_structured_from(
         &mut self,
-        start: llvm_ir::BlockId,
-        stop_targets: &[llvm_ir::BlockId],
+        start: lsir::BlockId,
+        stop_targets: &[lsir::BlockId],
         post_dominators: &OnceCell<PostDominators>,
-    ) -> Result<Option<llvm_ir::BlockId>> {
+        dominators: &Dominators,
+    ) -> Result<Option<lsir::BlockId>> {
         emit_structured_from(
             self,
             self.func,
             start,
             stop_targets,
-            None,
+            &[],
             None,
             post_dominators,
+            dominators,
             self.dialect.messages(),
         )
     }
@@ -1458,8 +1487,8 @@ impl<D: TargetDialect> TargetEmitter<'_, D> {
     /// The shared line covers every operator both targets spell the same way,
     /// which is most of the instruction set. A dialect only handles what it
     /// spells differently, so the two emitters cannot drift apart in silence.
-    fn emit_inst(&mut self, inst: &llvm_ir::Inst) -> Result<()> {
-        if let llvm_ir::InstOp::Intrinsic { intrinsic, args } = &inst.op {
+    fn emit_inst(&mut self, inst: &lsir::Inst) -> Result<()> {
+        if let lsir::InstOp::Intrinsic { intrinsic, args } = &inst.op {
             // The dialect borrows `self` immutably, so the closures it needs
             // cannot borrow `self` at the same time. Copy the name table.
             let value_names = self.value_names.clone();
@@ -1525,26 +1554,26 @@ impl<D: TargetDialect> TargetEmitter<'_, D> {
 }
 
 pub trait StructuredEmitter {
-    fn emit_block_insts(&mut self, block: &llvm_ir::BasicBlock) -> Result<()>;
+    fn emit_block_insts(&mut self, block: &lsir::BasicBlock) -> Result<()>;
     fn emit_block_insts_except(
         &mut self,
-        block: &llvm_ir::BasicBlock,
-        skip_result: Option<llvm_ir::ValueId>,
+        block: &lsir::BasicBlock,
+        skip_result: Option<lsir::ValueId>,
     ) -> Result<()>;
     fn emit_block_param_assignments_skipping(
         &mut self,
-        target: llvm_ir::BlockId,
-        args: &[llvm_ir::Operand],
-        skip_params: &[llvm_ir::ValueId],
+        target: lsir::BlockId,
+        args: &[lsir::Operand],
+        skip_params: &[lsir::ValueId],
     );
     fn emit_block_param_assignments(
         &mut self,
-        target: llvm_ir::BlockId,
-        args: &[llvm_ir::Operand],
+        target: lsir::BlockId,
+        args: &[lsir::Operand],
     ) {
         self.emit_block_param_assignments_skipping(target, args, &[]);
     }
-    fn format_operand(&self, operand: &llvm_ir::Operand) -> String;
+    fn format_operand(&self, operand: &lsir::Operand) -> String;
 
     fn writeln(&mut self, line: &str);
     fn indent_inc(&mut self);
@@ -1555,7 +1584,7 @@ pub trait StructuredEmitter {
 
     /// The alloca-form counted loop whose header this is, if the emission
     /// pre-pass matched one.
-    fn for_loop_induction(&self, _header: llvm_ir::BlockId) -> Option<AllocaForLoop> {
+    fn for_loop_induction(&self, _header: lsir::BlockId) -> Option<CountedForLoop> {
         None
     }
 }
@@ -1570,23 +1599,49 @@ pub struct StructuredCfgMessages {
     pub unsupported_switch: &'static str,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn emit_structured_from<E: StructuredEmitter>(
     emitter: &mut E,
-    func: &llvm_ir::Function,
-    start: llvm_ir::BlockId,
-    stop_targets: &[llvm_ir::BlockId],
-    stop_skip_params: Option<(llvm_ir::BlockId, Vec<llvm_ir::ValueId>)>,
-    stop_skip_inst: Option<llvm_ir::ValueId>,
+    func: &lsir::Function,
+    start: lsir::BlockId,
+    stop_targets: &[lsir::BlockId],
+    stop_skips: &[(lsir::BlockId, Vec<lsir::ValueId>)],
+    stop_skip_inst: Option<lsir::ValueId>,
     post_dominators: &OnceCell<PostDominators>,
+    dominators: &Dominators,
     messages: StructuredCfgMessages,
-) -> Result<Option<llvm_ir::BlockId>> {
+) -> Result<Option<lsir::BlockId>> {
     let mut current = start;
+    // An arm whose first block is the join itself (an `if` with no `else`
+    // body) has nothing to spell: emitting from the join here would swallow
+    // everything the join reaches into one arm, and the caller spells the
+    // join right after the two arms anyway.
+    if stop_targets.contains(&start) {
+        return Ok(Some(start));
+    }
+    // One call owns one structured region: the walk threads a single chain of
+    // blocks (nested ifs and loops are handed to recursive calls), so a block
+    // seen twice here means the region does not close and the walk would spin
+    // forever. Fail instead of eating memory; the compile layer falls back.
+    let mut walked: std::collections::HashSet<lsir::BlockId> = std::collections::HashSet::new();
     loop {
+        if !walked.insert(current) {
+            let stop_names: Vec<String> = stop_targets
+                .iter()
+                .filter_map(|id| get_block(func, *id).map(|b| b.name.clone()))
+                .collect();
+            return Err(Error::Compile(format!(
+                "structured walk revisited block {} (stop targets: {}); \
+                 the region never reaches a stop target",
+                get_block(func, current).map(|b| b.name.as_str()).unwrap_or("?"),
+                stop_names.join(", ")
+            )));
+        }
         let block = get_block(func, current)
             .cloned()
-            .ok_or_else(|| Error::Compile(format!("missing LLVM IR block {:?}", current)))?;
+            .ok_or_else(|| Error::Compile(format!("missing LSIR block {:?}", current)))?;
 
-        if let llvm_ir::Terminator::Br { target, args } = &block.terminator
+        if let lsir::Terminator::Br { target, args } = &block.terminator
             && stop_targets.contains(target)
         {
             // The structured loop writes the induction step in its own `for`
@@ -1608,17 +1663,20 @@ pub fn emit_structured_from<E: StructuredEmitter>(
             emitter.emit_block_param_assignments_skipping(
                 *target,
                 args,
-                skip_param_ids_for_target(stop_skip_params.as_ref(), *target),
+                skip_param_ids_for_target(stop_skips, *target),
             );
             return Ok(Some(*target));
         }
 
-        if is_loop_preheader(func, &block) {
+        if is_loop_preheader(func, &block, dominators) {
             current = emit_structured_loop_preheader(
                 emitter,
                 func,
                 &block,
+                stop_targets,
+                stop_skips,
                 post_dominators,
+                dominators,
                 messages,
             )?;
             if stop_targets.contains(&current) {
@@ -1627,22 +1685,33 @@ pub fn emit_structured_from<E: StructuredEmitter>(
             continue;
         }
 
-        if is_loop_header(func, &block) {
-            current = emit_structured_loop_header(emitter, func, &block, post_dominators, messages)?;
+        if is_loop_header(func, &block, dominators) {
+            current = emit_structured_loop_header(
+                emitter,
+                func,
+                &block,
+                stop_targets,
+                stop_skips,
+                post_dominators,
+                dominators,
+                messages,
+            )?;
             if stop_targets.contains(&current) {
                 return Ok(Some(current));
             }
             continue;
         }
 
-        if matches!(block.terminator, llvm_ir::Terminator::CondBr { .. }) {
+        if matches!(block.terminator, lsir::Terminator::CondBr { .. }) {
             current =
                 emit_structured_if_else(
                     emitter,
                     func,
                     &block,
-                    stop_skip_params.clone(),
+                    stop_targets,
+                    stop_skips,
                     post_dominators,
+                    dominators,
                     messages,
                 )?;
             if stop_targets.contains(&current) {
@@ -1653,43 +1722,47 @@ pub fn emit_structured_from<E: StructuredEmitter>(
 
         emitter.emit_block_insts(&block)?;
         match &block.terminator {
-            llvm_ir::Terminator::Br { target, args } => {
+            lsir::Terminator::Br { target, args } => {
                 emitter.emit_block_param_assignments_skipping(
                     *target,
                     args,
-                    skip_param_ids_for_target(stop_skip_params.as_ref(), *target),
+                    skip_param_ids_for_target(stop_skips, *target),
                 );
                 if stop_targets.contains(target) {
                     return Ok(Some(*target));
                 }
                 current = *target;
             }
-            llvm_ir::Terminator::Ret { value: None } => {
+            lsir::Terminator::Ret { value: None } => {
                 emitter.writeln("return;");
                 return Ok(None);
             }
-            llvm_ir::Terminator::Ret { value: Some(value) } => {
+            lsir::Terminator::Ret { value: Some(value) } => {
                 emitter.writeln(&format!("return {};", emitter.format_operand(value)));
                 return Ok(None);
             }
-            llvm_ir::Terminator::CondBr { .. } => {
+            lsir::Terminator::CondBr { .. } => {
                 return Err(Error::Compile(messages.unsupported_cond_br.into()));
             }
-            llvm_ir::Terminator::Switch { .. } => {
+            lsir::Terminator::Switch { .. } => {
                 return Err(Error::Compile(messages.unsupported_switch.into()));
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_structured_loop_preheader<E: StructuredEmitter>(
     emitter: &mut E,
-    func: &llvm_ir::Function,
-    preheader: &llvm_ir::BasicBlock,
+    func: &lsir::Function,
+    preheader: &lsir::BasicBlock,
+    outer_stops: &[lsir::BlockId],
+    outer_skips: &[(lsir::BlockId, Vec<lsir::ValueId>)],
     post_dominators: &OnceCell<PostDominators>,
+    dominators: &Dominators,
     messages: StructuredCfgMessages,
-) -> Result<llvm_ir::BlockId> {
-    let llvm_ir::Terminator::Br {
+) -> Result<lsir::BlockId> {
+    let lsir::Terminator::Br {
         target: header_id,
         args: header_args,
     } = &preheader.terminator
@@ -1699,7 +1772,7 @@ fn emit_structured_loop_preheader<E: StructuredEmitter>(
     let header = get_block(func, *header_id)
         .cloned()
         .ok_or_else(|| Error::Compile(messages.missing_loop_header.into()))?;
-    let llvm_ir::Terminator::CondBr {
+    let lsir::Terminator::CondBr {
         cond,
         true_target,
         true_args,
@@ -1721,19 +1794,25 @@ fn emit_structured_loop_preheader<E: StructuredEmitter>(
         true_args,
         *false_target,
         false_args,
+        outer_stops,
+        outer_skips,
         post_dominators,
+        dominators,
         messages,
     )
 }
 
 fn emit_structured_loop_header<E: StructuredEmitter>(
     emitter: &mut E,
-    func: &llvm_ir::Function,
-    header: &llvm_ir::BasicBlock,
+    func: &lsir::Function,
+    header: &lsir::BasicBlock,
+    outer_stops: &[lsir::BlockId],
+    outer_skips: &[(lsir::BlockId, Vec<lsir::ValueId>)],
     post_dominators: &OnceCell<PostDominators>,
+    dominators: &Dominators,
     messages: StructuredCfgMessages,
-) -> Result<llvm_ir::BlockId> {
-    let llvm_ir::Terminator::CondBr {
+) -> Result<lsir::BlockId> {
+    let lsir::Terminator::CondBr {
         cond,
         true_target,
         true_args,
@@ -1753,20 +1832,25 @@ fn emit_structured_loop_header<E: StructuredEmitter>(
         true_args,
         *false_target,
         false_args,
+        outer_stops,
+        outer_skips,
         post_dominators,
+        dominators,
         messages,
     )
 }
 
 fn emit_structured_if_else<E: StructuredEmitter>(
     emitter: &mut E,
-    func: &llvm_ir::Function,
-    block: &llvm_ir::BasicBlock,
-    stop_skip_params: Option<(llvm_ir::BlockId, Vec<llvm_ir::ValueId>)>,
+    func: &lsir::Function,
+    block: &lsir::BasicBlock,
+    outer_stops: &[lsir::BlockId],
+    outer_skips: &[(lsir::BlockId, Vec<lsir::ValueId>)],
     post_dominators: &OnceCell<PostDominators>,
+    dominators: &Dominators,
     messages: StructuredCfgMessages,
-) -> Result<llvm_ir::BlockId> {
-    let llvm_ir::Terminator::CondBr {
+) -> Result<lsir::BlockId> {
+    let lsir::Terminator::CondBr {
         cond,
         true_target,
         true_args,
@@ -1779,7 +1863,7 @@ fn emit_structured_if_else<E: StructuredEmitter>(
     let join = branch_join(func, block.id, post_dominators)
         .ok_or_else(|| Error::Compile(messages.unsupported_cond_br.into()))?;
 
-    let format_cond = |op: &llvm_ir::Operand| emitter.format_operand(op);
+    let format_cond = |op: &lsir::Operand| emitter.format_operand(op);
     let (cond_expr, skip_result) =
         branch_condition_expr(&format_cond, block, func, cond, false);
     emitter.emit_block_insts_except(block, skip_result)?;
@@ -1791,14 +1875,18 @@ fn emit_structured_if_else<E: StructuredEmitter>(
     // the arm that reaches it. The skips pass through because an arm can
     // also end on the enclosing loop's header — a `continue` — and a `for`
     // writes its induction step itself, so the arm must not write it too.
+    let mut arm_stops = Vec::with_capacity(outer_stops.len() + 1);
+    arm_stops.push(join);
+    arm_stops.extend_from_slice(outer_stops);
     emit_structured_from(
         emitter,
         func,
         *true_target,
-        &[join],
-        stop_skip_params.clone(),
+        &arm_stops,
+        outer_skips,
         None,
         post_dominators,
+        dominators,
         messages,
     )?;
     emitter.indent_dec();
@@ -1809,10 +1897,11 @@ fn emit_structured_if_else<E: StructuredEmitter>(
         emitter,
         func,
         *false_target,
-        &[join],
-        stop_skip_params,
+        &arm_stops,
+        outer_skips,
         None,
         post_dominators,
+        dominators,
         messages,
     )?;
     emitter.indent_dec();
@@ -1824,17 +1913,28 @@ fn emit_structured_if_else<E: StructuredEmitter>(
 #[allow(clippy::too_many_arguments)]
 fn emit_structured_loop_header_impl<E: StructuredEmitter>(
     emitter: &mut E,
-    func: &llvm_ir::Function,
-    header: &llvm_ir::BasicBlock,
-    incoming_header_args: Option<&[llvm_ir::Operand]>,
-    cond: &llvm_ir::Operand,
-    true_target: llvm_ir::BlockId,
-    true_args: &[llvm_ir::Operand],
-    false_target: llvm_ir::BlockId,
-    false_args: &[llvm_ir::Operand],
+    func: &lsir::Function,
+    header: &lsir::BasicBlock,
+    incoming_header_args: Option<&[lsir::Operand]>,
+    cond: &lsir::Operand,
+    true_target: lsir::BlockId,
+    true_args: &[lsir::Operand],
+    false_target: lsir::BlockId,
+    false_args: &[lsir::Operand],
+    outer_stops: &[lsir::BlockId],
+    outer_skips: &[(lsir::BlockId, Vec<lsir::ValueId>)],
     post_dominators: &OnceCell<PostDominators>,
+    dominators: &Dominators,
     messages: StructuredCfgMessages,
-) -> Result<llvm_ir::BlockId> {
+) -> Result<lsir::BlockId> {
+    // The body walk stops at this header's latch — and at every stop target
+    // the enclosing walk carries. A nested loop whose exit block is the
+    // enclosing loop's latch branches straight to the enclosing header, which
+    // this walk would otherwise walk straight past, re-emitting the enclosing
+    // loop's body forever.
+    let mut stops = Vec::with_capacity(outer_stops.len() + 1);
+    stops.push(header.id);
+    stops.extend_from_slice(outer_stops);
     // The lowering's alloca-form counted loop: the index lives in an alloca
     // the entry initializes and the latch steps, and the header only loads and
     // compares. All three index updates fold into the `for` header; the name
@@ -1842,7 +1942,7 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
     if let Some(loop_) = emitter.for_loop_induction(header.id) {
         let cmp_id = operand_value_id(cond)
             .ok_or_else(|| Error::Compile(messages.header_must_cond_br.into()))?;
-        let llvm_ir::InstOp::Cmp { pred, lhs, rhs } =
+        let lsir::InstOp::Cmp { pred, lhs, rhs } =
             &get_inst_by_result(func, cmp_id)
                 .ok_or_else(|| Error::Compile(messages.header_must_cond_br.into()))?
                 .op
@@ -1856,7 +1956,10 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
             cmp_pred_symbol(*pred),
             emitter.format_operand(rhs)
         );
-        let init_expr = format!("{iv} = {}", loop_.init);
+        let init_expr = match loop_.init {
+            LoopInit::Const(value) => format!("{iv} = {value}"),
+            LoopInit::Value(id) => format!("{iv} = {}", emitter.format_operand(&lsir::Operand::Value(id))),
+        };
         let step_expr = induction_step_expr(&iv, loop_.step);
         // OpenMP needs the initialization in the header, which the alloca
         // form always provides.
@@ -1869,19 +1972,50 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
             "for ({init_expr}; {cond_expr}; {step_expr}) {{"
         ));
         emitter.indent_inc();
+        if loop_.iv_is_param {
+            // The `for` header owns the index, so the entry edge's init and the
+            // latch's step reach the text through it. Every other parameter the
+            // header carries still needs its assignment.
+            if let Some(args) = incoming_header_args {
+                emitter.emit_block_param_assignments_skipping(
+                    header.id,
+                    args,
+                    &[loop_.iv],
+                );
+            }
+        }
         emitter.emit_block_param_assignments(true_target, true_args);
+        let mut skips: Vec<(lsir::BlockId, Vec<lsir::ValueId>)> = outer_skips.to_vec();
+        if loop_.iv_is_param {
+            skips.push((header.id, vec![loop_.iv]));
+        }
         let backedge = emit_structured_from(
             emitter,
             func,
             true_target,
-            &[header.id],
+            &stops,
+            &skips,
+            // The step instruction is skipped by the `step_values` gate in
+            // `emit_block_insts_except`, which asks whether the body reads it:
+            // a step only the edge consumes folds into the `for` header, and
+            // one the body uses is emitted like any other instruction.
             None,
-            Some(loop_.step_value),
             post_dominators,
+            dominators,
             messages,
         )?;
-        if backedge != Some(header.id) {
-            return Err(Error::Compile(messages.loop_backedge_mismatch.into()));
+        match backedge {
+            Some(id) if id == header.id => {}
+            // The walk landed on an enclosing loop's header: this loop's text
+            // is complete, and the walk that owns the header closes the cycle.
+            // The exit block the jump came from was already spelled, so the
+            // `false_target` assignments here must not be.
+            Some(ancestor) => {
+                emitter.indent_dec();
+                emitter.writeln("}");
+                return Ok(ancestor);
+            }
+            None => return Err(Error::Compile(messages.loop_backedge_mismatch.into())),
         }
         emitter.indent_dec();
         emitter.writeln("}");
@@ -1889,7 +2023,7 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
         return Ok(false_target);
     }
 
-    let format_cond = |op: &llvm_ir::Operand| emitter.format_operand(op);
+    let format_cond = |op: &lsir::Operand| emitter.format_operand(op);
     let optimized_loop = branch_condition_expr(&format_cond, header, func, cond, true);
     match optimized_loop {
         (cond_expr, skip_result @ Some(_))
@@ -1905,14 +2039,21 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
                 emitter,
                 func,
                 true_target,
-                &[header.id],
-                None,
+                &stops,
+                outer_skips,
                 None,
                 post_dominators,
+                dominators,
                 messages,
             )?;
-            if backedge != Some(header.id) {
-                return Err(Error::Compile(messages.loop_backedge_mismatch.into()));
+            match backedge {
+                Some(id) if id == header.id => {}
+                Some(ancestor) => {
+                    emitter.indent_dec();
+                    emitter.writeln("}");
+                    return Ok(ancestor);
+                }
+                None => return Err(Error::Compile(messages.loop_backedge_mismatch.into())),
             }
             emitter.indent_dec();
             emitter.writeln("}");
@@ -1938,14 +2079,21 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
                 emitter,
                 func,
                 true_target,
-                &[header.id],
-                None,
+                &stops,
+                outer_skips,
                 None,
                 post_dominators,
+                dominators,
                 messages,
             )?;
-            if backedge != Some(header.id) {
-                return Err(Error::Compile(messages.loop_backedge_mismatch.into()));
+            match backedge {
+                Some(id) if id == header.id => {}
+                Some(ancestor) => {
+                    emitter.indent_dec();
+                    emitter.writeln("}");
+                    return Ok(ancestor);
+                }
+                None => return Err(Error::Compile(messages.loop_backedge_mismatch.into())),
             }
             emitter.indent_dec();
             emitter.writeln("}");
@@ -1955,7 +2103,7 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
     }
 }
 
-/// An alloca-form counted loop the emitter spells as a `for`.
+/// A counted loop the emitter spells as a `for`.
 ///
 /// The lowering emits every loop in memory form: the index lives in a scalar
 /// `alloca`, the entry stores the initial value, the header loads and compares
@@ -1963,17 +2111,34 @@ fn emit_structured_loop_header_impl<E: StructuredEmitter>(
 /// that shape exactly, so emission can fold all three index updates into the
 /// `for` header and demote the alloca to a plain scalar — the canonical form
 /// an OpenMP loop directive requires.
+///
+/// The scalar-promotion pass turns that same loop into the block-parameter
+/// form: the header takes the index as a parameter, the entry edge passes the
+/// initial value and the latch passes the step. Both shapes spell one `for`,
+/// and [`CountedForLoop::iv_is_param`] says which one the IR holds.
 #[derive(Clone, Copy)]
-pub(crate) struct AllocaForLoop {
-    /// The index `alloca`. Its declaration demotes to the scalar itself.
-    pub iv: llvm_ir::ValueId,
-    /// The entry's initial value.
-    pub init: i64,
+pub(crate) struct CountedForLoop {
+    /// The index: an `alloca`'s value id in the memory form, the header's
+    /// block parameter in the promoted form.
+    pub iv: lsir::ValueId,
+    /// The entry's initial value: a constant from the lowering, or a value
+    /// the mapping strips with (the thread id).
+    pub init: LoopInit,
     /// The signed step the latch adds.
     pub step: i64,
     /// The step instruction, which the latch must not emit: the `for` header
     /// writes it.
-    pub step_value: llvm_ir::ValueId,
+    pub step_value: lsir::ValueId,
+    /// Whether `iv` is a header block parameter rather than an allocation.
+    pub iv_is_param: bool,
+}
+
+/// A counted loop's initial index.
+#[derive(Clone, Copy)]
+pub(crate) enum LoopInit {
+    Const(i64),
+    /// A value defined where every loop entry can read it.
+    Value(lsir::ValueId),
 }
 
 /// The alloca-form counted loops of `func`, keyed by header block.
@@ -1993,30 +2158,30 @@ pub(crate) struct AllocaForLoop {
 /// Also returns every load of a recognized index, mapped to the index: the
 /// emitter spells all of them as the scalar.
 pub(crate) fn find_alloca_for_loops(
-    func: &llvm_ir::Function,
+    func: &lsir::Function,
 ) -> (
-    HashMap<llvm_ir::BlockId, AllocaForLoop>,
-    HashMap<llvm_ir::ValueId, llvm_ir::ValueId>,
+    HashMap<lsir::BlockId, CountedForLoop>,
+    HashMap<lsir::ValueId, lsir::ValueId>,
 ) {
-    let mut loads: HashMap<llvm_ir::ValueId, Vec<(llvm_ir::BlockId, llvm_ir::ValueId)>> =
+    let mut loads: HashMap<lsir::ValueId, Vec<(lsir::BlockId, lsir::ValueId)>> =
         HashMap::new();
-    let mut stores: HashMap<llvm_ir::ValueId, Vec<(llvm_ir::BlockId, &llvm_ir::Operand)>> =
+    let mut stores: HashMap<lsir::ValueId, Vec<(lsir::BlockId, &lsir::Operand)>> =
         HashMap::new();
-    let mut alloca_ty: HashMap<llvm_ir::ValueId, &llvm_ir::Type> = HashMap::new();
+    let mut alloca_ty: HashMap<lsir::ValueId, &lsir::Type> = HashMap::new();
 
     for block in &func.blocks {
         for inst in &block.insts {
             match &inst.op {
-                llvm_ir::InstOp::Alloca {
+                lsir::InstOp::Alloca {
                     alloc_ty,
-                    addr_space: llvm_ir::AddressSpace::Private,
+                    addr_space: lsir::AddressSpace::Private,
                 } => {
                     if let Some(result) = inst.result {
                         alloca_ty.insert(result, alloc_ty);
                     }
                 }
-                llvm_ir::InstOp::Load {
-                    ptr: llvm_ir::Operand::Value(base),
+                lsir::InstOp::Load {
+                    ptr: lsir::Operand::Value(base),
                 } => {
                     if let Some(result) = inst.result {
                         loads
@@ -2025,8 +2190,8 @@ pub(crate) fn find_alloca_for_loops(
                             .push((block.id, result));
                     }
                 }
-                llvm_ir::InstOp::Store {
-                    ptr: llvm_ir::Operand::Value(base),
+                lsir::InstOp::Store {
+                    ptr: lsir::Operand::Value(base),
                     value,
                 } => {
                     stores
@@ -2043,7 +2208,7 @@ pub(crate) fn find_alloca_for_loops(
     let mut load_index = HashMap::new();
     for (iv, alloc_ty) in &alloca_ty {
         // A counted index is a scalar integer; arrays are tile storage.
-        if !matches!(alloc_ty, llvm_ir::Type::I64) {
+        if !matches!(alloc_ty, lsir::Type::I64) {
             continue;
         }
         let Some(sites) = loads.get(iv) else {
@@ -2059,8 +2224,8 @@ pub(crate) fn find_alloca_for_loops(
             if first.result == Some(*site_load)
                 && matches!(
                     &first.op,
-                    llvm_ir::InstOp::Load {
-                        ptr: llvm_ir::Operand::Value(base),
+                    lsir::InstOp::Load {
+                        ptr: lsir::Operand::Value(base),
                     } if *base == *iv
                 )
             {
@@ -2088,9 +2253,9 @@ pub(crate) fn find_alloca_for_loops(
         if header.insts[0].result != Some(load) {
             continue;
         }
-        let llvm_ir::InstOp::Cmp {
+        let lsir::InstOp::Cmp {
             pred,
-            lhs: llvm_ir::Operand::Value(lhs),
+            lhs: lsir::Operand::Value(lhs),
             ..
         } = &header.insts[1].op
         else {
@@ -2102,8 +2267,8 @@ pub(crate) fn find_alloca_for_loops(
         let Some(cmp_id) = header.insts[1].result else {
             continue;
         };
-        let llvm_ir::Terminator::CondBr {
-            cond: llvm_ir::Operand::Value(cond_id),
+        let lsir::Terminator::CondBr {
+            cond: lsir::Operand::Value(cond_id),
             true_target,
             ..
         } = &header.terminator
@@ -2117,7 +2282,7 @@ pub(crate) fn find_alloca_for_loops(
         // loop cannot reach reads the index outside the `for`, where the
         // folded init has not run yet.
         if !sites.iter().all(|(block_id, _)| {
-            block_reaches(func, *true_target, *block_id, &mut HashSet::new())
+            block_reaches(func, *true_target, *block_id)
         }) {
             continue;
         }
@@ -2126,8 +2291,8 @@ pub(crate) fn find_alloca_for_loops(
         let mut preds = Vec::new();
         for block in &func.blocks {
             let targets = match &block.terminator {
-                llvm_ir::Terminator::Br { target, .. } => vec![*target],
-                llvm_ir::Terminator::CondBr {
+                lsir::Terminator::Br { target, .. } => vec![*target],
+                lsir::Terminator::CondBr {
                     true_target,
                     false_target,
                     ..
@@ -2144,7 +2309,7 @@ pub(crate) fn find_alloca_for_loops(
         let Some(latch) = preds
             .iter()
             .copied()
-            .find(|pred| block_reaches(func, header_id, *pred, &mut HashSet::new()))
+            .find(|pred| block_reaches(func, header_id, *pred))
         else {
             continue;
         };
@@ -2158,39 +2323,52 @@ pub(crate) fn find_alloca_for_loops(
         let mut step = None;
         for (site_block, value) in store_sites {
             match value {
-                llvm_ir::Operand::Const(llvm_ir::Constant::Int(value)) => {
+                lsir::Operand::Const(lsir::Constant::Int(value)) => {
                     // Entry side: on the way to the header through the entry
                     // edge, so the init runs once per loop entry.
                     if *site_block == entry_edge
-                        || block_reaches(func, *site_block, entry_edge, &mut HashSet::new())
+                        || block_reaches(func, *site_block, entry_edge)
                     {
-                        init = Some(*value);
+                        init = Some(LoopInit::Const(*value));
                     }
                 }
-                llvm_ir::Operand::Value(step_value) => {
-                    let Some(step_inst) = get_inst_by_result(func, *step_value) else {
+                lsir::Operand::Value(value) => {
+                    // A step adds a constant to the header's load.
+                    let step_shape = get_inst_by_result(func, *value).and_then(|step_inst| {
+                        match &step_inst.op {
+                            lsir::InstOp::Bin {
+                                op: lsir::BinOp::Add,
+                                lhs: lsir::Operand::Value(id),
+                                rhs: lsir::Operand::Const(lsir::Constant::Int(k)),
+                            } if *id == load => Some((lsir::BinOp::Add, *k)),
+                            lsir::InstOp::Bin {
+                                op: lsir::BinOp::Sub,
+                                lhs: lsir::Operand::Value(id),
+                                rhs: lsir::Operand::Const(lsir::Constant::Int(k)),
+                            } if *id == load => Some((lsir::BinOp::Sub, *k)),
+                            _ => None,
+                        }
+                    });
+                    if let Some((op, amount)) = step_shape {
+                        // Inside the true arm, inside the loop, and on the way
+                        // back to the header.
+                        if block_reaches(func, *true_target, *site_block)
+                            && block_reaches(func, header_id, *site_block)
+                            && block_reaches(func, *site_block, header_id)
+                        {
+                            step = Some((op, *site_block, amount, *value));
+                        }
                         continue;
-                    };
-                    let (op, amount) = match &step_inst.op {
-                        llvm_ir::InstOp::Bin {
-                            op: llvm_ir::BinOp::Add,
-                            lhs: llvm_ir::Operand::Value(id),
-                            rhs: llvm_ir::Operand::Const(llvm_ir::Constant::Int(k)),
-                        } if *id == load => (llvm_ir::BinOp::Add, *k),
-                        llvm_ir::InstOp::Bin {
-                            op: llvm_ir::BinOp::Sub,
-                            lhs: llvm_ir::Operand::Value(id),
-                            rhs: llvm_ir::Operand::Const(llvm_ir::Constant::Int(k)),
-                        } if *id == load => (llvm_ir::BinOp::Sub, *k),
-                        _ => continue,
-                    };
-                    // Inside the true arm, inside the loop, and on the way
-                    // back to the header.
-                    if block_reaches(func, *true_target, *site_block, &mut HashSet::new())
-                        && block_reaches(func, header_id, *site_block, &mut HashSet::new())
-                        && block_reaches(func, *site_block, header_id, &mut HashSet::new())
+                    }
+                    // Otherwise an entry-side value init, which the mapping's
+                    // strips spell: the thread id. It must be defined where
+                    // every loop entry can read it — a parameter or the entry
+                    // block, which dominates every loop the `for` reaches.
+                    if (*site_block == entry_edge
+                        || block_reaches(func, *site_block, entry_edge))
+                        && defined_in_entry(func, *value)
                     {
-                        step = Some((op, *site_block, amount, *step_value));
+                        init = Some(LoopInit::Value(*value));
                     }
                 }
                 _ => {}
@@ -2212,35 +2390,221 @@ pub(crate) fn find_alloca_for_loops(
         }
         // The back edge must be the loop's true arm: the `for` body is what
         // returns to the header.
-        if !block_reaches(func, *true_target, header_id, &mut HashSet::new()) {
+        if !block_reaches(func, *true_target, header_id) {
             continue;
         }
         let signed_step = match op {
-            llvm_ir::BinOp::Add => amount,
+            lsir::BinOp::Add => amount,
             _ => -amount,
         };
         let direction_ok = matches!(
             (signed_step > 0, pred),
-            (true, llvm_ir::CmpPred::Slt | llvm_ir::CmpPred::Sle)
-                | (false, llvm_ir::CmpPred::Sgt | llvm_ir::CmpPred::Sge)
+            (true, lsir::CmpPred::Slt | lsir::CmpPred::Sle)
+                | (false, lsir::CmpPred::Sgt | lsir::CmpPred::Sge)
         );
         if !direction_ok {
             continue;
         }
         loops.insert(
             header_id,
-            AllocaForLoop {
+            CountedForLoop {
                 iv: *iv,
                 init: init_value,
                 step: signed_step,
                 step_value,
+                iv_is_param: false,
             },
         );
         for (_, load_result) in sites {
             load_index.insert(*load_result, *iv);
         }
     }
+    // The promoted form: the scalar-promotion pass moved the index into the
+    // header's block parameters, so the same loop reads as a parameter, an
+    // edge-carried init and an edge-carried step.
+    for (header_id, loop_) in find_promoted_for_loops(func) {
+        loops.entry(header_id).or_insert(loop_);
+    }
     (loops, load_index)
+}
+
+/// Counted loops whose index is a header block parameter.
+///
+/// The promoted shape is the memory shape after renaming: the header takes the
+/// index as its last parameter, the entry edge passes a constant, the latch
+/// passes `iv + step`, and the header compares its own index. Which parameter
+/// carries the index is decided by the compare, not by position, so a loop
+/// that carries other values promotes as well.
+fn find_promoted_for_loops(
+    func: &lsir::Function,
+) -> HashMap<lsir::BlockId, CountedForLoop> {
+    let mut loops = HashMap::new();
+    for block in &func.blocks {
+        if block.params.is_empty() {
+            continue;
+        }
+        let lsir::Terminator::CondBr {
+            cond: lsir::Operand::Value(cond_id),
+            true_target,
+            ..
+        } = &block.terminator
+        else {
+            continue;
+        };
+        // The header's compare must read one of its own parameters: that is
+        // the index this loop counts.
+        let Some(cmp_inst) = block.insts.iter().find(|inst| inst.result == Some(*cond_id))
+        else {
+            continue;
+        };
+        let lsir::InstOp::Cmp { pred, lhs, .. } = &cmp_inst.op else {
+            continue;
+        };
+        let Some(lhs_id) = operand_value_id(lhs) else {
+            continue;
+        };
+        let Some(index_in_params) = block
+            .params
+            .iter()
+            .position(|param| param.id == lhs_id)
+        else {
+            continue;
+        };
+        // The limit itself is not needed here: emission spells whatever the
+        // compare reads, constant or not. A dynamic limit is a counted loop
+        // all the same.
+        if !matches!(cmp_inst.ty, lsir::Type::I1) {
+            continue;
+        }
+        // Two predecessors: the entry edge carrying the init and the latch
+        // carrying the step.
+        let mut edges: Vec<(lsir::BlockId, &Vec<lsir::Operand>)> = Vec::new();
+        for candidate in &func.blocks {
+            match &candidate.terminator {
+                lsir::Terminator::Br { target, args } if *target == block.id => {
+                    edges.push((candidate.id, args));
+                }
+                lsir::Terminator::CondBr {
+                    true_target,
+                    true_args,
+                    false_target,
+                    false_args,
+                    ..
+                } => {
+                    if *true_target == block.id {
+                        edges.push((candidate.id, true_args));
+                    }
+                    if *false_target == block.id {
+                        edges.push((candidate.id, false_args));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if edges.len() != 2 {
+            continue;
+        }
+        let mut init = None;
+        let mut step = None;
+        for (edge_block, args) in &edges {
+            let Some(arg) = args.get(index_in_params) else {
+                continue;
+            };
+            match arg {
+                lsir::Operand::Const(lsir::Constant::Int(value)) => {
+                    init = Some(LoopInit::Const(*value))
+                }
+                lsir::Operand::Value(value) => {
+                    // A step adds a constant to the header's index parameter.
+                    let step_shape = get_inst_by_result(func, *value).and_then(|step_inst| {
+                        match &step_inst.op {
+                            lsir::InstOp::Bin {
+                                op: lsir::BinOp::Add,
+                                lhs: lsir::Operand::Value(id),
+                                rhs: lsir::Operand::Const(lsir::Constant::Int(k)),
+                            } if *id == lhs_id => Some((lsir::BinOp::Add, *k)),
+                            lsir::InstOp::Bin {
+                                op: lsir::BinOp::Sub,
+                                lhs: lsir::Operand::Value(id),
+                                rhs: lsir::Operand::Const(lsir::Constant::Int(k)),
+                            } if *id == lhs_id => Some((lsir::BinOp::Sub, *k)),
+                            _ => None,
+                        }
+                    });
+                    if let Some((op, amount)) = step_shape {
+                        // The step must run inside the loop: on the way from
+                        // the true arm back to the header.
+                        if !block_reaches(func, *true_target, *edge_block) {
+                            continue;
+                        }
+                        step = Some((op, *edge_block, amount, *value));
+                        continue;
+                    }
+                    // Otherwise an entry-edge value init, which the mapping's
+                    // strips spell: the thread id. It must be defined where
+                    // every loop entry can read it, and run outside the loop.
+                    if !block_reaches(func, *true_target, *edge_block)
+                        && defined_in_entry(func, *value)
+                    {
+                        init = Some(LoopInit::Value(*value));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (Some(init_value), Some((op, _latch, amount, step_value))) = (init, step) else {
+            continue;
+        };
+        let signed_step = match op {
+            lsir::BinOp::Add => amount,
+            _ => -amount,
+        };
+        let direction_ok = matches!(
+            (signed_step > 0, pred),
+            (true, lsir::CmpPred::Slt | lsir::CmpPred::Sle)
+                | (false, lsir::CmpPred::Sgt | lsir::CmpPred::Sge)
+        );
+        if !direction_ok {
+            continue;
+        }
+        loops.insert(
+            block.id,
+            CountedForLoop {
+                iv: lhs_id,
+                init: init_value,
+                step: signed_step,
+                step_value,
+                iv_is_param: true,
+            },
+        );
+    }
+    loops
+}
+
+/// Is `value` defined where every loop entry can read it: a parameter, or a
+/// definition in the entry block, which dominates every loop the `for` text
+/// reaches? The thread id the mapping plants in the entry is the one case.
+fn defined_in_entry(func: &lsir::Function, value: lsir::ValueId) -> bool {
+    func.params.iter().any(|param| param.id == value)
+        || get_block(func, func.entry).is_some_and(|entry| {
+            entry.insts.iter().any(|inst| inst.result == Some(value))
+        })
+}
+
+/// Whether any instruction reads `value` as an ordinary operand.
+///
+/// A counted loop's step is read by the loop's own edge — the latch's store in
+/// the memory form, the back edge's argument in the promoted form. Both fold
+/// into the `for` header's increment. A read from anywhere else means the body
+/// uses the stepped value, and then the instruction has to run.
+fn value_read_in_body(func: &lsir::Function, value: lsir::ValueId) -> bool {
+    func.blocks.iter().any(|block| {
+        block.insts.iter().any(|inst| {
+            inst_operands(inst)
+                .iter()
+                .any(|operand| matches!(operand, lsir::Operand::Value(id) if *id == value))
+        })
+    })
 }
 
 /// Loop step text, as an assignment every target accepts.
@@ -2254,9 +2618,9 @@ fn induction_step_expr(name: &str, step: i64) -> String {
 }
 
 fn is_simple_loop_body(
-    func: &llvm_ir::Function,
-    body_start: llvm_ir::BlockId,
-    header_id: llvm_ir::BlockId,
+    func: &lsir::Function,
+    body_start: lsir::BlockId,
+    header_id: lsir::BlockId,
 ) -> bool {
     let mut current = body_start;
     let mut visited = HashSet::new();
@@ -2275,57 +2639,59 @@ fn is_simple_loop_body(
         // is — the walk below only accepts a straight chain back to the
         // header.
         match &block.terminator {
-            llvm_ir::Terminator::Br { target, .. } if *target == header_id => return true,
-            llvm_ir::Terminator::Br { target, .. } => current = *target,
+            lsir::Terminator::Br { target, .. } if *target == header_id => return true,
+            lsir::Terminator::Br { target, .. } => current = *target,
             _ => return false,
         }
     }
 }
 
 fn skip_param_ids_for_target<'a>(
-    skip: Option<&'a (llvm_ir::BlockId, Vec<llvm_ir::ValueId>)>,
-    target: llvm_ir::BlockId,
-) -> &'a [llvm_ir::ValueId] {
-    if let Some((skip_target, ids)) = skip
-        && *skip_target == target
-    {
-        return ids;
-    }
-    &[]
+    skips: &'a [(lsir::BlockId, Vec<lsir::ValueId>)],
+    target: lsir::BlockId,
+) -> &'a [lsir::ValueId] {
+    skips
+        .iter()
+        .find(|(skip_target, _)| *skip_target == target)
+        .map(|(_, ids)| ids.as_slice())
+        .unwrap_or(&[])
 }
 
-fn get_block(func: &llvm_ir::Function, id: llvm_ir::BlockId) -> Option<&llvm_ir::BasicBlock> {
+fn get_block(func: &lsir::Function, id: lsir::BlockId) -> Option<&lsir::BasicBlock> {
     func.blocks.iter().find(|block| block.id == id)
 }
 
-fn get_inst_by_result(func: &llvm_ir::Function, id: llvm_ir::ValueId) -> Option<&llvm_ir::Inst> {
+fn get_inst_by_result(func: &lsir::Function, id: lsir::ValueId) -> Option<&lsir::Inst> {
     func.blocks
         .iter()
         .flat_map(|block| block.insts.iter())
         .find(|inst| inst.result == Some(id))
 }
 
-fn is_loop_preheader(func: &llvm_ir::Function, block: &llvm_ir::BasicBlock) -> bool {
-    let llvm_ir::Terminator::Br { target: header, .. } = block.terminator else {
+fn is_loop_preheader(func: &lsir::Function, block: &lsir::BasicBlock, dominators: &Dominators) -> bool {
+    let lsir::Terminator::Br { target: header, .. } = block.terminator else {
         return false;
     };
     get_block(func, header)
-        .map(|header| is_loop_header(func, header))
+        .map(|header| is_loop_header(func, header, dominators))
         .unwrap_or(false)
 }
 
-pub(crate) fn is_loop_header(func: &llvm_ir::Function, block: &llvm_ir::BasicBlock) -> bool {
-    let llvm_ir::Terminator::CondBr {
-        true_target,
-        false_target,
-        ..
-    } = block.terminator
-    else {
+pub(crate) fn is_loop_header(func: &lsir::Function, block: &lsir::BasicBlock, dominators: &Dominators) -> bool {
+    let lsir::Terminator::CondBr { .. } = block.terminator else {
         return false;
     };
-    predecessor_count(func, block.id) > 1
-        && (block_reaches(func, true_target, block.id, &mut HashSet::new())
-            || block_reaches(func, false_target, block.id, &mut HashSet::new()))
+    // A backedge is an edge whose source the header dominates. Reachability
+    // alone cannot tell it: one arm of an `if` joins on the branch itself, and
+    // in a mapped kernel that arm can wrap around an enclosing loop before it
+    // lands, which looks like a cycle to a reachability walk and spelled the
+    // join as a `while` loop that swallowed everything after it.
+    func.blocks
+        .iter()
+        .filter(|source| {
+            sile_lsir::passes::cfg::successors(&source.terminator).contains(&block.id)
+        })
+        .any(|source| dominators[&source.id].contains(&block.id))
 }
 
 /// The block the two arms of a branch continue at: the join.
@@ -2337,10 +2703,10 @@ pub(crate) fn is_loop_header(func: &llvm_ir::Function, block: &llvm_ir::BasicBlo
 /// block both arms reach would name a block inside an arm instead, because the
 /// loop that encloses the branch reaches the arm's blocks too.
 fn branch_join(
-    func: &llvm_ir::Function,
-    block_id: llvm_ir::BlockId,
+    func: &lsir::Function,
+    block_id: lsir::BlockId,
     post_dominators: &OnceCell<PostDominators>,
-) -> Option<llvm_ir::BlockId> {
+) -> Option<lsir::BlockId> {
     if let Some(join) = branch_join_post_dominator(func, block_id, post_dominators) {
         return Some(join);
     }
@@ -2350,7 +2716,7 @@ fn branch_join(
     // arms — an arm that continues names it, and an arm that returns names
     // nothing, so the continuing arm's target is the join. Two continuing
     // arms must name the same one, or the CFG is not structured.
-    let llvm_ir::Terminator::CondBr {
+    let lsir::Terminator::CondBr {
         true_target,
         false_target,
         ..
@@ -2358,9 +2724,9 @@ fn branch_join(
     else {
         return None;
     };
-    let arm_target = |id: &llvm_ir::BlockId| {
+    let arm_target = |id: &lsir::BlockId| {
         get_block(func, *id).and_then(|arm| match &arm.terminator {
-            llvm_ir::Terminator::Br { target, .. } => Some(*target),
+            lsir::Terminator::Br { target, .. } => Some(*target),
             _ => None,
         })
     };
@@ -2372,14 +2738,14 @@ fn branch_join(
 }
 
 fn branch_join_post_dominator(
-    func: &llvm_ir::Function,
-    block_id: llvm_ir::BlockId,
+    func: &lsir::Function,
+    block_id: lsir::BlockId,
     post_dominators: &OnceCell<PostDominators>,
-) -> Option<llvm_ir::BlockId> {
+) -> Option<lsir::BlockId> {
     let post_dominators = post_dominators.get_or_init(|| compute_post_dominators(func));
     // A block closer to the branch post-dominates a farther one, so it has the
     // larger set: the join is the closest, which is the largest.
-    let mut best: Option<(llvm_ir::BlockId, usize)> = None;
+    let mut best: Option<(lsir::BlockId, usize)> = None;
     for candidate in post_dominators.get(&block_id)? {
         if *candidate == block_id {
             continue;
@@ -2401,25 +2767,26 @@ fn branch_join_post_dominator(
 
 /// The post-dominator table of one function, computed at most once and only
 /// when a branch actually asks for it.
-type PostDominators = HashMap<llvm_ir::BlockId, HashSet<llvm_ir::BlockId>>;
+type PostDominators = HashMap<lsir::BlockId, HashSet<lsir::BlockId>>;
+
+/// The dominator table of one function, each set including the block itself.
+///
+/// The structured walk asks for it at every block it visits — a loop header
+/// is a block a backedge returns to — and the dataflow rebuilds the whole
+/// table per call, so one table serves the walk instead.
+type Dominators = HashMap<lsir::BlockId, HashSet<lsir::BlockId>>;
 
 fn compute_post_dominators(
-    func: &llvm_ir::Function,
-) -> HashMap<llvm_ir::BlockId, HashSet<llvm_ir::BlockId>> {
-    let __t = std::time::Instant::now();
-    let __blocks = func.blocks.len();
-    let __r = compute_post_dominators_inner(func);
-    if std::env::var_os("SILE_PD_PROFILE").is_some() {
-        eprintln!("[pd] blocks={__blocks} compute={}ms", __t.elapsed().as_millis());
-    }
-    return __r;
+    func: &lsir::Function,
+) -> HashMap<lsir::BlockId, HashSet<lsir::BlockId>> {
+    compute_post_dominators_inner(func)
 }
 
 fn compute_post_dominators_inner(
-    func: &llvm_ir::Function,
-) -> HashMap<llvm_ir::BlockId, HashSet<llvm_ir::BlockId>> {
+    func: &lsir::Function,
+) -> HashMap<lsir::BlockId, HashSet<lsir::BlockId>> {
     let returns =
-        |block: &llvm_ir::BasicBlock| matches!(block.terminator, llvm_ir::Terminator::Ret { .. });
+        |block: &lsir::BasicBlock| matches!(block.terminator, lsir::Terminator::Ret { .. });
     if !func.blocks.iter().any(returns) {
         // Nothing returns, so no path ends and no block post-dominates another.
         return func
@@ -2429,8 +2796,8 @@ fn compute_post_dominators_inner(
             .collect();
     }
 
-    let all: HashSet<llvm_ir::BlockId> = func.blocks.iter().map(|block| block.id).collect();
-    let mut post_dominators: HashMap<llvm_ir::BlockId, HashSet<llvm_ir::BlockId>> = func
+    let all: HashSet<lsir::BlockId> = func.blocks.iter().map(|block| block.id).collect();
+    let mut post_dominators: HashMap<lsir::BlockId, HashSet<lsir::BlockId>> = func
         .blocks
         .iter()
         .map(|block| {
@@ -2449,7 +2816,7 @@ fn compute_post_dominators_inner(
             if returns(block) {
                 continue;
             }
-            let mut new_set: Option<HashSet<llvm_ir::BlockId>> = None;
+            let mut new_set: Option<HashSet<lsir::BlockId>> = None;
             for successor in terminator_successors(&block.terminator) {
                 let successor_set = post_dominators.get(&successor).cloned().unwrap_or_default();
                 new_set = Some(match new_set {
@@ -2471,50 +2838,73 @@ fn compute_post_dominators_inner(
     post_dominators
 }
 
-fn terminator_successors(terminator: &llvm_ir::Terminator) -> Vec<llvm_ir::BlockId> {
+fn terminator_successors(terminator: &lsir::Terminator) -> Vec<lsir::BlockId> {
     match terminator {
-        llvm_ir::Terminator::Br { target, .. } => vec![*target],
-        llvm_ir::Terminator::CondBr {
+        lsir::Terminator::Br { target, .. } => vec![*target],
+        lsir::Terminator::CondBr {
             true_target,
             false_target,
             ..
         } => vec![*true_target, *false_target],
-        llvm_ir::Terminator::Switch { default, cases, .. } => {
+        lsir::Terminator::Switch { default, cases, .. } => {
             let mut targets = vec![*default];
             targets.extend(cases.iter().map(|(_, target)| *target));
             targets
         }
-        llvm_ir::Terminator::Ret { .. } => Vec::new(),
+        lsir::Terminator::Ret { .. } => Vec::new(),
     }
 }
 
+/// Does `start` reach `goal` along branches?
+///
+/// The walk memoizes: a block whose answer is known short-circuits, and a
+/// block on the active path reports `false` for the cycle it closes (the
+/// answer for the path through it is the caller's to make). The mapped
+/// kernels spell CFGs thousands of blocks deep, where a backtracking walk —
+/// one that un-marks blocks on its way out — re-explores the same subgraph
+/// once per path and blows the stack.
 fn block_reaches(
-    func: &llvm_ir::Function,
-    start: llvm_ir::BlockId,
-    goal: llvm_ir::BlockId,
-    visiting: &mut HashSet<llvm_ir::BlockId>,
+    func: &lsir::Function,
+    start: lsir::BlockId,
+    goal: lsir::BlockId,
+) -> bool {
+    let mut done: HashMap<lsir::BlockId, bool> = HashMap::new();
+    let mut active: HashSet<lsir::BlockId> = HashSet::new();
+    block_reaches_walk(func, start, goal, &mut done, &mut active)
+}
+
+fn block_reaches_walk(
+    func: &lsir::Function,
+    start: lsir::BlockId,
+    goal: lsir::BlockId,
+    done: &mut HashMap<lsir::BlockId, bool>,
+    active: &mut HashSet<lsir::BlockId>,
 ) -> bool {
     if start == goal {
         return true;
     }
-    if !visiting.insert(start) {
+    if let Some(&known) = done.get(&start) {
+        return known;
+    }
+    if !active.insert(start) {
         return false;
     }
     let reaches = match get_block(func, start).map(|block| &block.terminator) {
-        Some(llvm_ir::Terminator::Br { target, .. }) => {
-            block_reaches(func, *target, goal, visiting)
+        Some(lsir::Terminator::Br { target, .. }) => {
+            block_reaches_walk(func, *target, goal, done, active)
         }
-        Some(llvm_ir::Terminator::CondBr {
+        Some(lsir::Terminator::CondBr {
             true_target,
             false_target,
             ..
         }) => {
-            block_reaches(func, *true_target, goal, visiting)
-                || block_reaches(func, *false_target, goal, visiting)
+            block_reaches_walk(func, *true_target, goal, done, active)
+                || block_reaches_walk(func, *false_target, goal, done, active)
         }
         _ => false,
     };
-    visiting.remove(&start);
+    active.remove(&start);
+    done.insert(start, reaches);
     reaches
 }
 
@@ -2523,26 +2913,26 @@ fn block_reaches(
 /// Operands go through the emitter's formatter so skipped definitions (an
 /// induction variable's body reload, say) still name the value that survives.
 fn branch_condition_expr(
-    format_operand: &impl Fn(&llvm_ir::Operand) -> String,
-    block: &llvm_ir::BasicBlock,
-    func: &llvm_ir::Function,
-    cond: &llvm_ir::Operand,
+    format_operand: &impl Fn(&lsir::Operand) -> String,
+    block: &lsir::BasicBlock,
+    func: &lsir::Function,
+    cond: &lsir::Operand,
     require_header_only: bool,
-) -> (String, Option<llvm_ir::ValueId>) {
+) -> (String, Option<lsir::ValueId>) {
     let Some(cond_id) = operand_value_id(cond) else {
         return (format_operand(cond), None);
     };
     let Some(inst) = get_inst_by_result(func, cond_id) else {
         return (format_operand(cond), None);
     };
-    if !matches!(inst.op, llvm_ir::InstOp::Cmp { .. }) {
+    if !matches!(inst.op, lsir::InstOp::Cmp { .. }) {
         return (format_operand(cond), None);
     }
     if require_header_only && !header_only_contains_skipped_cmp(block, Some(cond_id)) {
         return (format_operand(cond), None);
     }
     match &inst.op {
-        llvm_ir::InstOp::Cmp { pred, lhs, rhs } => (
+        lsir::InstOp::Cmp { pred, lhs, rhs } => (
             format!(
                 "{} {} {}",
                 format_operand(lhs),
@@ -2556,8 +2946,8 @@ fn branch_condition_expr(
 }
 
 fn header_only_contains_skipped_cmp(
-    block: &llvm_ir::BasicBlock,
-    skip_result: Option<llvm_ir::ValueId>,
+    block: &lsir::BasicBlock,
+    skip_result: Option<lsir::ValueId>,
 ) -> bool {
     let Some(skip_result) = skip_result else {
         return false;
@@ -2568,25 +2958,9 @@ fn header_only_contains_skipped_cmp(
         .all(|inst| inst.result == Some(skip_result))
 }
 
-fn operand_value_id(operand: &llvm_ir::Operand) -> Option<llvm_ir::ValueId> {
+fn operand_value_id(operand: &lsir::Operand) -> Option<lsir::ValueId> {
     match operand {
-        llvm_ir::Operand::Value(id) => Some(*id),
-        llvm_ir::Operand::Const(_) => None,
+        lsir::Operand::Value(id) => Some(*id),
+        lsir::Operand::Const(_) => None,
     }
-}
-
-
-fn predecessor_count(func: &llvm_ir::Function, target: llvm_ir::BlockId) -> usize {
-    func.blocks
-        .iter()
-        .map(|block| match &block.terminator {
-            llvm_ir::Terminator::Br { target: succ, .. } => usize::from(*succ == target),
-            llvm_ir::Terminator::CondBr {
-                true_target,
-                false_target,
-                ..
-            } => usize::from(*true_target == target) + usize::from(*false_target == target),
-            llvm_ir::Terminator::Ret { .. } | llvm_ir::Terminator::Switch { .. } => 0,
-        })
-        .sum()
 }

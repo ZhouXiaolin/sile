@@ -436,7 +436,7 @@ fn expand_kernel_fn(
     // `OnceLock` then hands the first `TILE` to every later one, and a kernel
     // compiled at `TILE = 4` silently runs the code built for `TILE = 2`. The
     // HIR is a compile-time value here, so it is built inline. The expensive
-    // part of a launch is the Tile IR -> LLVM IR -> backend pipeline, and that
+    // part of a launch is the Tile IR -> LSIR -> backend pipeline, and that
     // is cached by the launcher, keyed on the HIR it actually received.
     // The host body is a stub: loops run once, a return hands back nothing.
     // The warnings that stub would raise are noise the device program does

@@ -10,10 +10,10 @@ use std::{
 };
 
 use libloading::Library;
-use sile_llvm_ir::Function as LlvmIrFunction;
+use sile_lsir::Function as LsirFunction;
 use tempfile::tempdir;
 
-use self::codegen::generate as generate_llvm_ir_kernel;
+use self::codegen::generate as generate_lsir_kernel;
 use sile_core::{KernelArg, LaunchConfig, Result, Stream};
 
 type KernelFn = unsafe extern "C" fn(
@@ -27,13 +27,17 @@ type KernelFn = unsafe extern "C" fn(
     *const i64,
 );
 
-/// Compiled kernels, keyed by the source they were built from.
+/// Compiled kernels, keyed by the address of their source text.
 ///
 /// `cc -O2` costs tens of milliseconds, which dwarfs a short kernel's own
-/// runtime: a 16M-element saxpy runs in 2.7 ms. Keeping the loaded library
-/// means the second launch of a kernel measures the kernel, not the compiler.
-fn loaded_libraries() -> &'static Mutex<HashMap<String, &'static Library>> {
-    static LIBRARIES: OnceLock<Mutex<HashMap<String, &'static Library>>> = OnceLock::new();
+/// runtime: a 16M-element saxpy runs in 2.7 ms. Keeping the loaded library and
+/// its entry point means the second launch of a kernel measures the kernel,
+/// not the compiler — and not a dlsym or a hash over kilobytes of C either.
+/// The key is the address of the cached `Arc<String>`: a compiled kernel's
+/// source is leaked into the process-wide caches, so the address is stable.
+fn loaded_libraries() -> &'static Mutex<HashMap<usize, (&'static Library, KernelFn)>> {
+    static LIBRARIES: OnceLock<Mutex<HashMap<usize, (&'static Library, KernelFn)>>> =
+        OnceLock::new();
     LIBRARIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -42,8 +46,8 @@ fn loaded_libraries() -> &'static Mutex<HashMap<String, &'static Library>> {
 /// The address is a plain `usize` so the map can live in a `static`: the
 /// function outlives the cache entry, which is only read back for that same
 /// function.
-fn generated_sources() -> &'static Mutex<HashMap<usize, String>> {
-    static SOURCES: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
+fn generated_sources() -> &'static Mutex<HashMap<usize, std::sync::Arc<String>>> {
+    static SOURCES: OnceLock<Mutex<HashMap<usize, std::sync::Arc<String>>>> = OnceLock::new();
     SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -84,27 +88,25 @@ impl CpuBackend {
         ))
     }
 
-    fn compile_llvm_ir_kernel(func: &LlvmIrFunction) -> Result<String> {
-        generate_llvm_ir_kernel(func)
+    fn compile_lsir_kernel(func: &LsirFunction) -> Result<String> {
+        generate_lsir_kernel(func)
     }
 
     fn execute_compiled_source(
         &self,
         kernel_name: &str,
-        c_code: &str,
+        c_code: &std::sync::Arc<String>,
         args: &[KernelArg<'_>],
         scalars: &[f32],
         scalars_i64: &[i64],
         launch: &LaunchConfig,
-        llvm_ir_mode: bool,
+        lsir_mode: bool,
     ) -> Result<()> {
         // A cached library serves every launch of the same source.
-        let library = {
-            let libraries = loaded_libraries().lock().unwrap();
-            libraries.get(c_code).copied()
-        };
-        if let Some(library) = library {
-            return Self::launch(library, kernel_name, args, scalars, scalars_i64, launch, llvm_ir_mode);
+        let key = std::sync::Arc::as_ptr(c_code) as *const c_void as usize;
+        let entry = loaded_libraries().lock().unwrap().get(&key).copied();
+        if let Some((_library, func)) = entry {
+            return Self::launch(func, args, scalars, scalars_i64, launch, lsir_mode);
         }
 
         let dir = tempdir()?;
@@ -118,7 +120,7 @@ impl CpuBackend {
         };
         let so_path = dir.path().join(format!("lib{}.{}", kernel_name, ext));
 
-        fs::write(&c_path, c_code)?;
+        fs::write(&c_path, c_code.as_str())?;
 
         let compiler = Self::compiler()?;
         let mut cmd = Command::new(compiler);
@@ -160,18 +162,15 @@ impl CpuBackend {
             // `nodelete` keeps the library mapped after `dlclose`. libgomp's
             // worker threads are parked inside this library and the runtime
             // tears them down lazily, so unloading it under them segfaults.
-            cmd.args([
-                "-shared",
-                "-fPIC",
-                "-O2",
-                "-fopenmp",
-                "-Wl,-z,nodelete",
-                "-lm",
-                "-o",
-            ]);
+            cmd.args(["-shared", "-fPIC", "-O2", "-fopenmp", "-Wl,-z,nodelete", "-o"]);
         }
 
-        let output = cmd.arg(&so_path).arg(&c_path).output()?;
+        // `-lm` must follow the source file: a library named before any
+        // object is dropped by the driver, and the `.so` would keep `expf`
+        // undefined, which fails `dlopen` in hosts that have not loaded libm.
+        // MSVC has no libm to name; its math lives in the CRT.
+        let libs: &[&str] = if cfg!(target_os = "windows") { &[] } else { &["-lm"] };
+        let output = cmd.arg(&so_path).arg(&c_path).args(libs).output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -188,53 +187,47 @@ impl CpuBackend {
             unsafe { Library::new(&so_path) }.map_err(|e| sile_core::Error::Compile(e.to_string()))?,
         ));
         kept_directories().lock().unwrap().push(kept);
-        loaded_libraries()
-            .lock()
-            .unwrap()
-            .insert(c_code.to_string(), library);
-        Self::launch(library, kernel_name, args, scalars, scalars_i64, launch, llvm_ir_mode)
+        let symbol_name = format!("sile_kernel_{}", kernel_name);
+        let symbol: libloading::Symbol<KernelFn> = unsafe { library.get(symbol_name.as_bytes()) }
+            .map_err(|e| sile_core::Error::Compile(e.to_string()))?;
+        loaded_libraries().lock().unwrap().insert(key, (library, *symbol));
+        Self::launch(*symbol, args, scalars, scalars_i64, launch, lsir_mode)
     }
 
     /// Call one entry point in an already-loaded kernel library.
     fn launch(
-        library: &'static Library,
-        kernel_name: &str,
+        func: KernelFn,
         args: &[KernelArg<'_>],
         scalars: &[f32],
         scalars_i64: &[i64],
         launch: &LaunchConfig,
-        llvm_ir_mode: bool,
+        lsir_mode: bool,
     ) -> Result<()> {
+        let buffers: Vec<*const c_void> =
+            args.iter().map(|a| a.mut_ptr as *const c_void).collect();
+
+        let shapes: Vec<i64> = args.iter().flat_map(|a| a.shape.iter().copied()).collect();
+
+        let num_threadgroups = if lsir_mode {
+            launch.grid.iter().map(|dim| *dim as i64).product::<i64>()
+        } else {
+            launch.grid[0] as i64
+        };
+        let threads_per_group = if lsir_mode {
+            1
+        } else if args.is_empty() || args[0].shape.is_empty() {
+            256
+        } else {
+            args[0].shape[0] / num_threadgroups
+        };
+
+        let grid: [i64; 3] = [
+            launch.grid[0] as i64,
+            launch.grid[1] as i64,
+            launch.grid[2] as i64,
+        ];
+
         unsafe {
-            let symbol_name = format!("sile_kernel_{}", kernel_name);
-            let func: libloading::Symbol<KernelFn> = library
-                .get(symbol_name.as_bytes())
-                .map_err(|e| sile_core::Error::Compile(e.to_string()))?;
-
-            let buffers: Vec<*const c_void> =
-                args.iter().map(|a| a.mut_ptr as *const c_void).collect();
-
-            let shapes: Vec<i64> = args.iter().flat_map(|a| a.shape.iter().copied()).collect();
-
-            let num_threadgroups = if llvm_ir_mode {
-                launch.grid.iter().map(|dim| *dim as i64).product::<i64>()
-            } else {
-                launch.grid[0] as i64
-            };
-            let threads_per_group = if llvm_ir_mode {
-                1
-            } else if args.is_empty() || args[0].shape.is_empty() {
-                256
-            } else {
-                args[0].shape[0] / num_threadgroups
-            };
-
-            let grid: [i64; 3] = [
-                launch.grid[0] as i64,
-                launch.grid[1] as i64,
-                launch.grid[2] as i64,
-            ];
-
             func(
                 buffers.as_ptr(),
                 num_threadgroups,
@@ -252,7 +245,7 @@ impl CpuBackend {
 
     pub fn execute_llir(
         &self,
-        func: &LlvmIrFunction,
+        func: &LsirFunction,
         args: &[KernelArg<'_>],
         scalars: &[f32],
         scalars_i64: &[i64],
@@ -264,11 +257,11 @@ impl CpuBackend {
         // for a compiled kernel, so its address identifies the source.
         let c_code = {
             let mut sources = generated_sources().lock().unwrap();
-            match sources.get(&(func as *const LlvmIrFunction as usize)) {
+            match sources.get(&(func as *const LsirFunction as usize)) {
                 Some(cached) => cached.clone(),
                 None => {
-                    let generated = Self::compile_llvm_ir_kernel(func)?;
-                    sources.insert(func as *const LlvmIrFunction as usize, generated.clone());
+                    let generated = std::sync::Arc::new(Self::compile_lsir_kernel(func)?);
+                    sources.insert(func as *const LsirFunction as usize, generated.clone());
                     generated
                 }
             }

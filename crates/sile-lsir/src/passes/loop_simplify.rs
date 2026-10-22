@@ -79,6 +79,8 @@ fn dedup_function_metadata(metadata: &mut Vec<Metadata>) {
 enum MetadataKey {
     Parallel,
     Reduction,
+    OwnerOrdered,
+    ReduceRelay,
     VectorizeWidth(u32),
     Unroll(u32),
     Alignment(u32),
@@ -92,6 +94,8 @@ impl From<&Metadata> for MetadataKey {
         match value {
             Metadata::Parallel => Self::Parallel,
             Metadata::Reduction => Self::Reduction,
+            Metadata::OwnerOrdered => Self::OwnerOrdered,
+            Metadata::ReduceRelay => Self::ReduceRelay,
             Metadata::VectorizeWidth(width) => Self::VectorizeWidth(*width),
             Metadata::Unroll(width) => Self::Unroll(*width),
             Metadata::Alignment(align) => Self::Alignment(*align),

@@ -5,10 +5,10 @@ use metal::{CommandQueue, ComputePipelineState, Device, Library};
 #[cfg(target_os = "macos")]
 use sile_core::{KernelArg, LaunchConfig, Result, Stream};
 #[cfg(target_os = "macos")]
-use sile_llvm_ir::Function as LlvmIrFunction;
+use sile_lsir::Function as LsirFunction;
 
 #[cfg(target_os = "macos")]
-use self::codegen::generate as generate_llvm_ir_metal;
+use self::codegen::generate as generate_lsir_metal;
 
 #[cfg(target_os = "macos")]
 pub struct MetalBackend {
@@ -67,7 +67,7 @@ impl MetalBackend {
 
     pub fn execute_llir(
         &self,
-        func: &LlvmIrFunction,
+        func: &LsirFunction,
         outputs: &[bool],
         args: &[KernelArg<'_>],
         scalars: &[f32],
@@ -75,8 +75,8 @@ impl MetalBackend {
         launch: &LaunchConfig,
         _stream: &Stream,
     ) -> Result<()> {
-        let source = generate_llvm_ir_metal(func)?;
-        let launch = self.normalize_llvm_ir_launch(func, launch);
+        let source = generate_lsir_metal(func)?;
+        let launch = self.normalize_lsir_launch(func, launch);
         self.execute_source(
             &func.name,
             &source,
@@ -88,9 +88,9 @@ impl MetalBackend {
         )
     }
 
-    fn normalize_llvm_ir_launch(
+    fn normalize_lsir_launch(
         &self,
-        func: &LlvmIrFunction,
+        func: &LsirFunction,
         launch: &LaunchConfig,
     ) -> LaunchConfig {
         LaunchConfig {
@@ -143,7 +143,7 @@ impl MetalBackend {
         encoder.set_buffer(args.len() as u64, Some(&shapes_buf), 0);
 
         // The scalar descriptor binds after the shape descriptor, matching the
-        // order the LLVM IR signature declares them. A kernel with no scalar
+        // order the LSIR signature declares them. A kernel with no scalar
         // argument still carries the parameter, so the slot is bound to an
         // empty buffer rather than skipped.
         let scalars_buf = self.device.new_buffer(

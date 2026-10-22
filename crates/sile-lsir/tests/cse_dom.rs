@@ -1,7 +1,7 @@
 //! The dominator case of cross-block CSE: a two-block chain where the second
 //! block repeats an expression its predecessor already computed.
 
-use sile_llvm_ir::{AddressSpace, BasicBlock, BlockId, Function, Inst, InstOp, Operand, Terminator, Type, ValueId};
+use sile_lsir::{AddressSpace, BasicBlock, BlockId, Function, Inst, InstOp, Operand, Terminator, Type, ValueId};
 
 fn add(result: u32, lhs: u32) -> Inst {
     Inst {
@@ -9,9 +9,9 @@ fn add(result: u32, lhs: u32) -> Inst {
         result_name: None,
         ty: Type::I64,
         op: InstOp::Bin {
-            op: sile_llvm_ir::BinOp::Add,
+            op: sile_lsir::BinOp::Add,
             lhs: Operand::Value(ValueId(lhs)),
-            rhs: Operand::Const(sile_llvm_ir::Constant::Int(1)),
+            rhs: Operand::Const(sile_lsir::Constant::Int(1)),
         },
         metadata: Vec::new(),
     }
@@ -34,7 +34,7 @@ fn cse_merges_across_straight_chain() {
                     result_name: None,
                     ty: Type::I64,
                     op: InstOp::Intrinsic {
-                        intrinsic: sile_llvm_ir::Intrinsic::BlockId { dim: 0 },
+                        intrinsic: sile_lsir::Intrinsic::BlockId { dim: 0 },
                         args: Vec::new(),
                     },
                     metadata: Vec::new(),
@@ -64,7 +64,7 @@ fn cse_merges_across_straight_chain() {
         ],
     };
 
-    let out = sile_llvm_ir::run_llvm_ir_pipeline(func, &[sile_llvm_ir::LlvmIrPassKind::Cse])
+    let out = sile_lsir::run_lsir_pipeline(func, &[sile_lsir::LsirPassKind::Cse])
         .expect("cse");
     let b2 = out.blocks.iter().find(|b| b.id == BlockId(2)).unwrap();
     assert!(
@@ -99,7 +99,7 @@ fn cse_merges_when_predecessor_is_last_in_list() {
                     result_name: None,
                     ty: Type::I64,
                     op: InstOp::Intrinsic {
-                        intrinsic: sile_llvm_ir::Intrinsic::BlockId { dim: 0 },
+                        intrinsic: sile_lsir::Intrinsic::BlockId { dim: 0 },
                         args: Vec::new(),
                     },
                     metadata: Vec::new(),
@@ -152,7 +152,7 @@ fn cse_merges_when_predecessor_is_last_in_list() {
         ],
     };
 
-    let out = sile_llvm_ir::run_llvm_ir_pipeline(func, &[sile_llvm_ir::LlvmIrPassKind::Cse])
+    let out = sile_lsir::run_lsir_pipeline(func, &[sile_lsir::LsirPassKind::Cse])
         .expect("cse");
     let b2 = out.blocks.iter().find(|b| b.id == BlockId(2)).unwrap();
     assert!(

@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use crate::{BlockId, Function, Terminator};
 
 /// The blocks a terminator can transfer control to.
-pub(crate) fn successors(terminator: &Terminator) -> Vec<BlockId> {
+pub fn successors(terminator: &Terminator) -> Vec<BlockId> {
     match terminator {
         Terminator::Br { target, .. } => vec![*target],
         Terminator::CondBr {
@@ -81,7 +81,7 @@ pub(crate) fn reverse_postorder(func: &Function) -> Vec<BlockId> {
 /// reverse postorder, which is what keeps this analysis linear on the long
 /// straight-line chains an unroller leaves behind: walking the block list in
 /// source order would need one pass per block of the chain.
-pub(crate) fn dominators(func: &Function) -> HashMap<BlockId, HashSet<BlockId>> {
+pub fn dominators(func: &Function) -> HashMap<BlockId, HashSet<BlockId>> {
     let order = reverse_postorder(func);
     let reachable: HashSet<BlockId> = order.iter().copied().collect();
     let all: HashSet<BlockId> = reachable.clone();

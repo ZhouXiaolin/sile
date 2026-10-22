@@ -22,7 +22,7 @@ COLUMNS = [
     "e2e_ms",
     "hir_us",
     "tileir_us",
-    "llvmir_us",
+    "lsir_us",
     "source_us",
     "ir_lines",
     "ir_blocks",

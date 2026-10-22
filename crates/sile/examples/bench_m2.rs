@@ -1,15 +1,21 @@
-//! The M2 benchmark: the same three kernels at the same sizes as the
+//! The M2 benchmark: the same four kernels at the same sizes as the
 //! handwritten references in `handwritten/`.
 //!
 //! `docs/BACKEND_PLAN.md` M2 asks for saxpy, softmax and rms_norm at 80% of
 //! hand-written C. That comparison only means something when both sides run the
 //! same problem, so this example uses the reference's own sizes — 16M elements
-//! for saxpy, 4096x1024 for the other two — and reports the median of 100
-//! launches, which is how `handwritten/common.h` times its side. The count is
-//! high because the first ~20 omp regions of any process on this box run under
-//! a flat cold-start transient; the median has to outvote them.
+//! for saxpy, 4096x1024 for softmax and rms_norm, 1024x1024x1024 for gemm —
+//! and reports the median of 100 launches, which is how `handwritten/common.h`
+//! times its side. The count is high because the first ~20 omp regions of any
+//! process on this box run under a flat cold-start transient; the median has
+//! to outvote them.
 //!
-//! Usage: `cargo run --release --example bench_m2 -- [saxpy|softmax|rms_norm]`
+//! The gemm arm takes `SILE_GEMM_M`/`SILE_GEMM_N`/`SILE_GEMM_K` (default
+//! 1024) and `SILE_GEMM_ONES` for an all-ones fill. The accumulator seeds
+//! from a zero tile, not from z: a benchmark relaunches the kernel, and a
+//! z-seeded accumulator would stack every launch's product.
+//!
+//! Usage: `cargo run --release --example bench_m2 -- [saxpy|softmax|rms_norm|gemm]`
 
 use std::time::Instant;
 
@@ -47,6 +53,28 @@ mod kernels {
         let denom = reduce_sum(num.clone(), 1i64);
         let denom = denom.reshape(shape![BM, 1]).broadcast(y.shape());
         y.store(num / denom);
+    }
+
+    #[sile::entry]
+    pub fn gemm<const BM: i64, const BN: i64, const BK: i64, const K: i64>(
+        z: &mut Tensor<f32, { [BM, BN] }>,
+        x: &Tensor<f32, { [-1, K] }>,
+        y: &Tensor<f32, { [-1, -1] }>,
+    ) {
+        let part_x = x.partition(shape![BM, BK]);
+        let part_y = y.partition(shape![BK, BN]);
+        let pid: (i64, i64, i64) = get_tile_block_id();
+        // The seed is a zero tile, not z's current content: a benchmark
+        // relaunches the kernel many times, and a z-seeded accumulator would
+        // add every launch's product onto the last.
+        let zero: f32 = convert_scalar(0i64);
+        let mut tile_z = broadcast_scalar(zero, shape![BM, BN]);
+        for i in 0i64..(K / BK) {
+            let tile_x = part_x.load([pid.0, i]);
+            let tile_y = part_y.load([i, pid.1]);
+            tile_z = sile::mma(tile_x, tile_y, tile_z);
+        }
+        z.store(tile_z);
     }
 
     #[sile::entry]
@@ -139,7 +167,11 @@ fn run_saxpy(device: &Device) -> sile::Result<()> {
 fn run_softmax(device: &Device) -> sile::Result<()> {
     let stream = device.create_stream()?;
     let (rows, cols) = (4096i64, 1024i64);
-    const BM: i64 = 4;
+    // One row per tile, the reference's own decomposition: a wider tile puts
+    // two 16 KB workgroup tiles beside the reduce scratch, and a workgroup
+    // that big pins the occupancy at one workgroup per compute unit — the
+    // kernel then runs at a fraction of the hardware, not a fraction of 80%.
+    const BM: i64 = 1;
     let x = Tensor::from_vec(vec![0.5f32; (rows * cols) as usize], [rows, cols], device)?;
     let mut y = Tensor::zeros([rows, cols], device)?;
     let mut y_part = y.partition_mut([BM, cols]);
@@ -148,8 +180,11 @@ fn run_softmax(device: &Device) -> sile::Result<()> {
             .apply(&stream)
             .expect("softmax launch")
     });
-    // One read and one write.
-    report("softmax", ms, (rows * cols * 2 * 4) as f64, "GB/s");
+    // The byte count must match the handwritten reference's own convention,
+    // or the GB/s ratio compares two different denominators: softmax is
+    // counted as a read of x, a read of y, a write of y, and the final read
+    // for the checksum, 4 flows of 4 bytes.
+    report("softmax", ms, (rows * cols * 4 * 4) as f64, "GB/s");
     Ok(())
 }
 
@@ -170,6 +205,74 @@ fn run_rms_norm(device: &Device) -> sile::Result<()> {
     Ok(())
 }
 
+fn run_gemm(device: &Device) -> sile::Result<()> {
+    let stream = device.create_stream()?;
+    let env_num = |name: &str, default: i64| {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    };
+    let (m, n, k) = (
+        env_num("SILE_GEMM_M", 1024),
+        env_num("SILE_GEMM_N", 1024),
+        env_num("SILE_GEMM_K", 1024),
+    );
+    // The reference's decomposition: a 32x16 output tile per workgroup, the
+    // contraction walked in 16-deep panel steps.
+    const BM: i64 = 32;
+    const BN: i64 = 16;
+    const BK: i64 = 16;
+
+    // The same deterministic fill the reference harness uses, so the oracle
+    // checks the product of the same inputs on both sides.
+    let mut seed = 1u64;
+    let mut fill = |len: usize| -> Vec<f32> {
+        (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((seed >> 33) % 2000) as f32 / 1000.0 - 1.0
+            })
+            .collect()
+    };
+    let ones_mode = std::env::var_os("SILE_GEMM_ONES").is_some();
+    let (xf, yf) = if ones_mode {
+        (vec![1.0f32; (m * k) as usize], vec![1.0f32; (k * n) as usize])
+    } else {
+        (fill((m * k) as usize), fill((k * n) as usize))
+    };
+    let x = Tensor::from_vec(xf, [m, k], device)?;
+    let y = Tensor::from_vec(yf, [k, n], device)?;
+    let mut z = Tensor::zeros([m, n], device)?;
+    let mut z_part = z.partition_mut([BM, BN]);
+    let ms = best_of(100, || {
+                if k == 64 {
+            kernels::gemm::<BM, BN, BK, 64>(&mut z_part, &x, &y)
+        } else if k == 256 {
+            kernels::gemm::<BM, BN, BK, 256>(&mut z_part, &x, &y)
+        } else {
+            kernels::gemm::<BM, BN, BK, 1024>(&mut z_part, &x, &y)
+        }
+            .apply(&stream)
+            .expect("gemm launch")
+    });
+    // The oracle on a corner of the output: the full product in f64 at 1024^3
+    // is a minute of work for a check, and the reference checks the corner.
+    let x_host = x.to_vec(&stream)?;
+    let y_host = y.to_vec(&stream)?;
+    let z_host = z.to_vec(&stream)?;
+    let mut worst = 0.0f32;
+    for i in 0..8usize {
+        for j in 0..8usize {
+            let mut sum = 0.0f64;
+            for p in 0..k as usize {
+                sum += x_host[i * k as usize + p] as f64 * y_host[p * n as usize + j] as f64;
+            }
+            worst = worst.max((z_host[i * n as usize + j] - sum as f32).abs());
+        }
+    }
+    assert!(worst < 1e-2, "gemm corner error {worst}");
+    report("gemm", ms, 2.0 * (m * n * k) as f64, "GFLOP/s");
+    Ok(())
+}
+
 fn main() -> sile::Result<()> {
     let device = Device::default()?;
     let only: Vec<String> = std::env::args().skip(1).collect();
@@ -183,6 +286,9 @@ fn main() -> sile::Result<()> {
     }
     if wanted("rms_norm") {
         run_rms_norm(&device)?;
+    }
+    if wanted("gemm") {
+        run_gemm(&device)?;
     }
     Ok(())
 }

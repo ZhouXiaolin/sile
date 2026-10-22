@@ -1,6 +1,6 @@
 use sile_core::{Error, Result};
 use sile_hir::{Kernel, typeck::TypedKernel};
-use sile_llvm_ir::Function as LlvmIrFunction;
+use sile_lsir::Function as LsirFunction;
 
 pub use sile_backend::{BackendArtifact, CodegenTarget, compile as compile_backend};
 
@@ -11,9 +11,9 @@ pub use sile_hir::{
     verify_typed_kernel as verify_hir_typed_kernel,
 };
 
-pub use sile_llvm_ir::{
-    ACTIVE_LLVM_IR_PIPELINE, LlvmIrPassKind, RECOMMENDED_LLVM_IR_PIPELINE, run_llvm_ir_passes,
-    run_llvm_ir_pipeline,
+pub use sile_lsir::{
+    ACTIVE_LSIR_PIPELINE, LsirPassKind, RECOMMENDED_LSIR_PIPELINE, run_lsir_passes,
+    run_lsir_pipeline,
 };
 
 /// The only path from a kernel to a backend's input.
@@ -24,36 +24,41 @@ pub use sile_llvm_ir::{
 /// moved out of the kernel.
 pub fn compile_kernel_to_module(
     kernel: &Kernel,
-) -> Result<(TypedKernel, sile_tile_ir::ir::Module, LlvmIrFunction)> {
+) -> Result<(
+    TypedKernel,
+    sile_tile_ir::ir::Module,
+    LsirFunction,
+    Vec<sile_hir::passes::predicate::LaunchCheck>,
+)> {
     let typed = run_hir_analysis_pipeline(kernel, ACTIVE_HIR_TYPECK_PIPELINE)
         .map_err(|e| Error::Shape(e.to_string()))?;
     verify_typed_kernel(&typed, "HIR output")?;
-    let (module, _checks) = sile_tile_ir::cutile::emit::emit(&typed).map_err(Error::Shape)?;
+    let (module, checks) = sile_tile_ir::cutile::emit::emit(&typed).map_err(Error::Shape)?;
     module
         .verify_dominance()
         .map_err(|e| Error::Compile(format!("Tile IR dominance: {e}")))?;
-    let llvm_ir = sile_llvm_ir::lower_module_to_llvm_ir(&module).map_err(Error::Compile)?;
-    if std::env::var_os("SILE_PRINT_LLVMIR").is_some() {
-        eprintln!("{}", sile_llvm_ir::format_llvm_ir(&llvm_ir));
+    let lsir = sile_lsir::lower_module_to_lsir(&module).map_err(Error::Compile)?;
+    if std::env::var_os("SILE_PRINT_LSIR").is_some() {
+        eprintln!("{}", sile_lsir::format_lsir(&lsir));
     }
-    let llvm_ir = finalize_llvm_ir_for_backend(llvm_ir)?;
-    Ok((typed, module, llvm_ir))
+    let lsir = finalize_lsir_for_backend(lsir)?;
+    Ok((typed, module, lsir, checks))
 }
 
 /// The same compilation, also returning the backend's source text.
 pub fn compile_kernel_to_backend_source(
     kernel: &Kernel,
     target: CodegenTarget,
-) -> Result<(TypedKernel, sile_tile_ir::ir::Module, LlvmIrFunction, BackendArtifact)> {
-    let (typed, module, llvm_ir) = compile_kernel_to_module(kernel)?;
-    let artifact = compile_backend(&llvm_ir, target)?;
-    Ok((typed, module, llvm_ir, artifact))
+) -> Result<(TypedKernel, sile_tile_ir::ir::Module, LsirFunction, BackendArtifact)> {
+    let (typed, module, lsir, _) = compile_kernel_to_module(kernel)?;
+    let artifact = compile_backend(&lsir, target)?;
+    Ok((typed, module, lsir, artifact))
 }
 
 fn verify_typed_kernel(typed: &TypedKernel, stage: &str) -> Result<()> {
     verify_hir_typed_kernel(typed).map_err(|err| Error::Compile(format!("{stage}: {err}")))
 }
 
-fn finalize_llvm_ir_for_backend(llvm_ir: LlvmIrFunction) -> Result<LlvmIrFunction> {
-    run_llvm_ir_pipeline(llvm_ir, ACTIVE_LLVM_IR_PIPELINE).map_err(Error::Shape)
+fn finalize_lsir_for_backend(lsir: LsirFunction) -> Result<LsirFunction> {
+    run_lsir_pipeline(lsir, ACTIVE_LSIR_PIPELINE).map_err(Error::Shape)
 }

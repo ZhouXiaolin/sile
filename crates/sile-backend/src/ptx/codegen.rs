@@ -3,7 +3,7 @@
 //!
 //! The shared text emitter produces C-like structured control flow, which PTX
 //! cannot spell: a PTX kernel is a flat sequence of instructions with labels
-//! and explicit branches. So this module walks the LLVM IR itself and emits one
+//! and explicit branches. So this module walks the LSIR itself and emits one
 //! label per basic block, copying block parameters on the edge that carries
 //! them. A tile parameter owns storage and receives the elements of its
 //! argument, the same way the C backend does: aliasing the argument's storage
@@ -24,8 +24,8 @@
 use std::collections::HashMap;
 
 use sile_core::{Error, Result};
-use sile_llvm_ir as llvm_ir;
-use sile_llvm_ir::{
+use sile_lsir as lsir;
+use sile_lsir::{
     BasicBlock, BinOp, BlockId, CastOp, CmpPred, Constant, Function, Inst, InstOp, Intrinsic,
     Metadata, Operand, Type, ValueId,
 };
@@ -296,7 +296,7 @@ impl<'a> Emitter<'a> {
 
     fn block(&self, id: BlockId) -> Result<&BasicBlock> {
         self.func.blocks.iter().find(|block| block.id == id).ok_or_else(|| {
-            Error::Compile(format!("PTX codegen: missing LLVM IR block {:?}", id))
+            Error::Compile(format!("PTX codegen: missing LSIR block {:?}", id))
         })
     }
 
@@ -663,13 +663,13 @@ impl<'a> Emitter<'a> {
         self.emit_terminator(&block.terminator)
     }
 
-    fn emit_terminator(&mut self, terminator: &llvm_ir::Terminator) -> Result<()> {
+    fn emit_terminator(&mut self, terminator: &lsir::Terminator) -> Result<()> {
         match terminator {
-            llvm_ir::Terminator::Br { target, args } => {
+            lsir::Terminator::Br { target, args } => {
                 self.emit_edge_args(*target, args)?;
                 self.line(format!("bra {};", block_label(*target)));
             }
-            llvm_ir::Terminator::CondBr {
+            lsir::Terminator::CondBr {
                 cond,
                 true_target,
                 true_args,
@@ -698,12 +698,12 @@ impl<'a> Emitter<'a> {
                 self.emit_edge_args(*true_target, true_args)?;
                 self.line(format!("bra {};", block_label(*true_target)));
             }
-            llvm_ir::Terminator::Switch { .. } => {
+            lsir::Terminator::Switch { .. } => {
                 return Err(Error::Compile(
                     "PTX codegen does not support switch terminators".into(),
                 ));
             }
-            llvm_ir::Terminator::Ret { .. } => {
+            lsir::Terminator::Ret { .. } => {
                 self.line("ret;");
             }
         }
@@ -936,7 +936,7 @@ impl<'a> Emitter<'a> {
                 on_false,
             } => self.emit_select(inst, cond, on_true, on_false),
             InstOp::Call { func, .. } => Err(Error::Compile(format!(
-                "PTX codegen does not support LLVM IR call instructions, got `{func}`"
+                "PTX codegen does not support LSIR call instructions, got `{func}`"
             ))),
             InstOp::Intrinsic { intrinsic, args } => self.emit_intrinsic(inst, intrinsic, args),
         }

@@ -23,7 +23,7 @@ use std::sync::OnceLock;
 
 use libloading::Library;
 use sile_core::{Error, KernelArg, LaunchConfig, Result, Stream};
-use sile_llvm_ir::Function as LlvmIrFunction;
+use sile_lsir::Function as LsirFunction;
 
 use crate::emit::{flatten_grid, is_scalars_i64_param, is_scalars_param, is_shapes_param};
 
@@ -340,7 +340,7 @@ impl PtxBackend {
 
     pub fn execute_llir(
         &self,
-        func: &LlvmIrFunction,
+        func: &LsirFunction,
         args: &[KernelArg<'_>],
         scalars: &[f32],
         scalars_i64: &[i64],
@@ -421,7 +421,7 @@ fn load_module(driver: &'static Driver, ptx: &str, source: &CString) -> Result<C
 /// Allocate, upload, launch and read back one kernel.
 fn run_launch(
     driver: &'static Driver,
-    func: &LlvmIrFunction,
+    func: &LsirFunction,
     args: &[KernelArg<'_>],
     scalars: &[f32],
     scalars_i64: &[i64],

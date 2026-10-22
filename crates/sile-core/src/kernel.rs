@@ -21,6 +21,10 @@ pub struct KernelArg<'a> {
     pub elem_size: usize,
     pub shape: &'a [i64],
     pub device: &'a Device,
+    /// The kernel writes this buffer, so the launch reads it back. A
+    /// read-only argument skips the read-back: copying it home would make the
+    /// launch's cost the copy, not the kernel.
+    pub written: bool,
 }
 
 impl KernelArg<'_> {

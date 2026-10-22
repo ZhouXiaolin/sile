@@ -13,7 +13,7 @@ pub const SHAPES_PARAM_NAME: &str = "__sile_shapes";
 ///
 /// The same channel for scalar arguments: one `ptr<constant f32>` holding each
 /// scalar the launch passed, in parameter order. A scalar is a load from here
-/// rather than a function parameter, which is what keeps one LLVM IR signature
+/// rather than a function parameter, which is what keeps one LSIR signature
 /// across targets: WGSL cannot pass a value into an entry point.
 pub const SCALARS_PARAM_NAME: &str = "__sile_scalars";
 
@@ -100,6 +100,16 @@ pub enum Operand {
 pub enum Metadata {
     Parallel,
     Reduction,
+    /// The addressed slot is the accessing thread's own by construction: the
+    /// builder checked the extent divides across the threads before spelling
+    /// `tid + k * threads`. The mapping's placement check honors the word
+    /// instead of re-deriving the arithmetic.
+    OwnerOrdered,
+    /// The addressed slot reads a `TileReduce`'s relay: the reduce stage hands
+    /// every thread the same copied values, so the slot is a broadcast, not a
+    /// partition the strip may split. The lowering says so where it emits the
+    /// access, instead of a later pass re-deriving it from the pointer chain.
+    ReduceRelay,
     VectorizeWidth(u32),
     Unroll(u32),
     Alignment(u32),

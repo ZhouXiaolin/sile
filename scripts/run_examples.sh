@@ -35,9 +35,12 @@ for example in $EXAMPLES; do
     printf '%-24s ' "$example"
     log=$(mktemp)
     # `ulimit -v` is a virtual-memory ceiling: it stops an unbounded allocator
-    # with a bad_alloc instead of letting the machine swap.
+    # with a bad_alloc instead of letting the machine swap. 0 disables it — a
+    # Vulkan driver reserves virtual address space far past any RSS budget, so
+    # a cgroup-style ceiling (systemd-run MemoryMax) is the gate to use here,
+    # not this one.
     (
-        ulimit -v $((MEM_MB * 1024)) 2>/dev/null || true
+        [ "$MEM_MB" -gt 0 ] && ulimit -v $((MEM_MB * 1024)) 2>/dev/null || true
         SILE_DEVICE="$DEVICE" exec timeout --kill-after=5 "$TIMEOUT" "$BIN/$example"
     ) >"$log" 2>&1
     code=$?

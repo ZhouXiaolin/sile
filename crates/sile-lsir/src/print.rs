@@ -3,7 +3,7 @@ use std::fmt::Write;
 
 use crate::ir::*;
 
-pub fn format_llvm_ir(func: &Function) -> String {
+pub fn format_lsir(func: &Function) -> String {
     let mut out = String::new();
     let names = build_value_names(func);
     let block_names = build_block_names(func);
@@ -63,7 +63,7 @@ pub fn format_llvm_ir(func: &Function) -> String {
 }
 
 pub fn format_function(func: &Function) -> String {
-    format_llvm_ir(func)
+    format_lsir(func)
 }
 
 fn build_value_names(func: &Function) -> HashMap<ValueId, String> {
@@ -888,6 +888,8 @@ fn metadata_name(metadata: &Metadata) -> &'static str {
     match metadata {
         Metadata::Parallel => "sile.parallel",
         Metadata::Reduction => "sile.reduction",
+        Metadata::OwnerOrdered => "sile.owner_ordered",
+        Metadata::ReduceRelay => "sile.reduce_relay",
         Metadata::VectorizeWidth(_) => "sile.vectorize_width",
         Metadata::Unroll(_) => "sile.unroll",
         Metadata::Alignment(_) => "sile.align",

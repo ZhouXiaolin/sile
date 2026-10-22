@@ -6,43 +6,42 @@ use sile_backend::{BackendArtifact, cpu::CpuBackend, ptx::PtxBackend, wgsl::runt
 use sile_backend::metal::MetalBackend;
 use sile_core::{Device, KernelArg, LaunchConfig, Result, Stream};
 use sile_hir::Kernel;
-use sile_llvm_ir::format_llvm_ir;
+use sile_lsir::format_lsir;
 
 use crate::compiler::{CodegenTarget, compile_backend, compile_kernel_to_module};
 
 const PRINT_TILE_IR_ENV: &str = "SILE_PRINT_TILEIR";
-const PRINT_LLVM_IR_ENV: &str = "SILE_PRINT_LLVMIR";
+const PRINT_LSIR_ENV: &str = "SILE_PRINT_LSIR";
 const PRINT_SOURCE_ENV: &str = "SILE_PRINT_SOURCE";
 
 /// One compiled kernel, shared by every launch of the same source.
 ///
 /// Compilation is a pure function of the HIR: the device only chooses which
-/// backend consumes the LLVM IR, never what the IR is. So the result is cached
+/// backend consumes the LSIR, never what the IR is. So the result is cached
 /// once per distinct kernel and every target reuses it. Without this, a launch
 /// inside a loop re-runs the whole front end and both lowering stages on every
 /// iteration.
 type CompiledParts = (
     sile_hir::typeck::TypedKernel,
     sile_tile_ir::ir::Module,
-    sile_llvm_ir::Function,
+    sile_lsir::Function,
+    Vec<sile_hir::passes::predicate::LaunchCheck>,
 );
 
-fn compile_cache() -> &'static Mutex<HashMap<String, Arc<CompiledParts>>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Arc<CompiledParts>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// The cache key. The HIR is the compilation unit, so its full debug form is
-/// the identity: two kernels with the same body and constants compile to the
-/// same IR, whatever they are named.
-fn cache_key(kernel: &Kernel) -> String {
-    format!("{kernel:?}")
+fn compile_cache() -> &'static Mutex<Vec<(Kernel, Arc<CompiledParts>)>> {
+    static CACHE: OnceLock<Mutex<Vec<(Kernel, Arc<CompiledParts>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn compiled_parts(kernel: &Kernel) -> Result<Arc<CompiledParts>> {
-    let key = cache_key(kernel);
-    if let Some(hit) = compile_cache().lock().unwrap().get(&key) {
-        return Ok(Arc::clone(hit));
+    // The kernel itself is the cache key: a process holds a handful of
+    // kernels, so a `PartialEq` walk over that many entries beats formatting
+    // a multimegabyte debug form and hashing it on every launch.
+    {
+        let cache = compile_cache().lock().unwrap();
+        if let Some((_, hit)) = cache.iter().find(|(known, _)| known == kernel) {
+            return Ok(Arc::clone(hit));
+        }
     }
 
     // A dump request is served before the cache is consulted for a value, but
@@ -51,7 +50,9 @@ fn compiled_parts(kernel: &Kernel) -> Result<Arc<CompiledParts>> {
     // costs one compile's worth of file writes per distinct kernel.
     if let Some(root) = crate::dump::dump_dir_from_env() {
         let mut reported = dumped_kernels().lock().unwrap();
-        if reported.insert(key.clone()) {
+        // The full debug form: two instantiations of one kernel (the causal
+        // and unmasked `fmha`) share a name but dump different IR.
+        if reported.insert(format!("{kernel:?}")) {
             drop(reported);
             crate::dump::dump_kernel(kernel, &root)?;
         }
@@ -61,7 +62,7 @@ fn compiled_parts(kernel: &Kernel) -> Result<Arc<CompiledParts>> {
     compile_cache()
         .lock()
         .unwrap()
-        .insert(key, Arc::clone(&parts));
+        .push((kernel.clone(), Arc::clone(&parts)));
     Ok(parts)
 }
 
@@ -216,21 +217,17 @@ impl<'a> KernelLauncher<'a> {
         };
 
         let parts = compiled_parts(&self.kernel)?;
-        let (typed, tile_ir_module, llvm_ir_func) = parts.as_ref();
+        let (_typed, tile_ir_module, lsir_func, checks) = parts.as_ref();
 
-        // The access checks the compiler moved out of the kernel run here,
-        // before anything is launched. A check that cannot be resolved is an
-        // error rather than a skip: a check the host cannot evaluate is one
-        // nothing would ever enforce.
-        let checks = crate::tileir_text::launch_checks(typed)
-            .map_err(sile_core::Error::Shape)?;
-        validate_launch_checks(&checks, &self.args)?;
+        // The checks came out of the same Tile IR emission the cache holds;
+        // validating them per launch only reads the args.
+        validate_launch_checks(checks, &self.args)?;
 
         if should_print(PRINT_TILE_IR_ENV) {
             eprintln!("{}", tile_ir_module.to_mlir_text());
         }
-        if should_print(PRINT_LLVM_IR_ENV) {
-            eprintln!("{}", format_llvm_ir(llvm_ir_func));
+        if should_print(PRINT_LSIR_ENV) {
+            eprintln!("{}", format_lsir(lsir_func));
         }
 
         // A dump that stops at the Tile IR has nothing to run: the launch would
@@ -242,10 +239,9 @@ impl<'a> KernelLauncher<'a> {
 
         match stream.device() {
             Device::Cpu(_) => {
-                maybe_print_backend_source(llvm_ir_func, CodegenTarget::C)?;
-                let backend = CpuBackend::new();
-                backend.execute_llir(
-                    llvm_ir_func,
+                maybe_print_backend_source(&self.kernel, lsir_func, CodegenTarget::C)?;
+                CpuBackend::new().execute_llir(
+                    lsir_func,
                     &self.args,
                     &self.scalars,
                     &self.scalars_i64,
@@ -256,7 +252,7 @@ impl<'a> KernelLauncher<'a> {
             #[cfg(target_os = "macos")]
             Device::Metal(_) => {
                 let typed = _typed;
-                maybe_print_backend_source(llvm_ir_func, CodegenTarget::Metal)?;
+                maybe_print_backend_source(&self.kernel, lsir_func, CodegenTarget::Metal)?;
                 let backend = MetalBackend::new()?;
                 // `args` holds the buffers only, so the output flags have to
                 // line up with it: a scalar parameter is not in `args` and
@@ -269,7 +265,7 @@ impl<'a> KernelLauncher<'a> {
                     .map(|param| param.kind == sile_hir::ParamKind::Output)
                     .collect();
                 backend.execute_llir(
-                    llvm_ir_func,
+                    lsir_func,
                     &outputs,
                     &self.args,
                     &self.scalars,
@@ -283,10 +279,15 @@ impl<'a> KernelLauncher<'a> {
                 "the Metal backend is only available on macOS; use C or WGPU",
             )),
             Device::Wgpu(_) => {
-                maybe_print_backend_source(llvm_ir_func, CodegenTarget::Wgsl)?;
-                let backend = WgpuBackend::new()?;
-                backend.execute_llir(
-                    llvm_ir_func,
+                maybe_print_backend_source(&self.kernel, lsir_func, CodegenTarget::Wgsl)?;
+                let backend = WgpuBackend::shared()?;
+                let source = compiled_artifact(&self.kernel, lsir_func, CodegenTarget::Wgsl)?;
+                let BackendArtifact::WgslSource(source) = source.as_ref() else {
+                    unreachable!("the WGSL target spells WGSL source");
+                };
+                backend.execute_source(
+                    source,
+                    lsir_func,
                     &self.args,
                     &self.scalars,
                     &self.scalars_i64,
@@ -295,10 +296,10 @@ impl<'a> KernelLauncher<'a> {
                 )
             }
             Device::Cuda(_) => {
-                maybe_print_backend_source(llvm_ir_func, CodegenTarget::Ptx)?;
+                maybe_print_backend_source(&self.kernel, lsir_func, CodegenTarget::Ptx)?;
                 let backend = PtxBackend::new()?;
                 backend.execute_llir(
-                    llvm_ir_func,
+                    lsir_func,
                     &self.args,
                     &self.scalars,
                     &self.scalars_i64,
@@ -341,15 +342,16 @@ fn constant_dims(shape: &sile_hir::ShapeExpr, constants: &HashMap<&str, i64>) ->
 }
 
 fn maybe_print_backend_source(
-    llvm_ir_func: &sile_llvm_ir::Function,
+    kernel: &Kernel,
+    lsir_func: &sile_lsir::Function,
     target: CodegenTarget,
 ) -> Result<()> {
     if !should_print(PRINT_SOURCE_ENV) {
         return Ok(());
     }
 
-    let artifact = compile_backend(llvm_ir_func, target)?;
-    match artifact {
+    let artifact = compiled_artifact(kernel, lsir_func, target)?;
+    match artifact.as_ref() {
         BackendArtifact::CSource(source)
         | BackendArtifact::MetalSource(source)
         | BackendArtifact::WgslSource(source)
@@ -358,6 +360,42 @@ fn maybe_print_backend_source(
         }
     }
     Ok(())
+}
+
+/// The backend artifact of one kernel on one target, compiled once.
+///
+/// The source is a pure function of the LSIR the kernel lowers to, and that
+/// lowers from the same kernel every launch, so the mapping, the emitter and
+/// the WGSL validation run once per distinct kernel and target. Without this,
+/// a launch inside a loop re-runs all three on every iteration — tens of
+/// milliseconds against a kernel that runs in one.
+type SourceCache = Vec<(Kernel, CodegenTarget, std::sync::Arc<BackendArtifact>)>;
+
+fn source_cache() -> &'static Mutex<SourceCache> {
+    static CACHE: OnceLock<Mutex<SourceCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn compiled_artifact(
+    kernel: &Kernel,
+    lsir_func: &sile_lsir::Function,
+    target: CodegenTarget,
+) -> Result<std::sync::Arc<BackendArtifact>> {
+    {
+        let cache = source_cache().lock().unwrap();
+        if let Some((_, _, hit)) = cache
+            .iter()
+            .find(|(known, known_target, _)| known == kernel && known_target == &target)
+        {
+            return Ok(std::sync::Arc::clone(hit));
+        }
+    }
+    let artifact = std::sync::Arc::new(compile_backend(lsir_func, target)?);
+    source_cache()
+        .lock()
+        .unwrap()
+        .push((kernel.clone(), target, std::sync::Arc::clone(&artifact)));
+    Ok(artifact)
 }
 
 /// Evaluate the access checks the compiler moved out of the kernel.

@@ -35,11 +35,23 @@ struct Gpu {
 impl Gpu {
     fn new() -> Self {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            ..Default::default()
-        }))
-        .expect("no WGPU adapter");
+        // The WGPU backend names its card with `SILE_WGPU_ADAPTER`; the
+        // reference side honors the same variable, so a ratio compares one
+        // card, not two. Unset, the choice stays HighPerformance.
+        let adapter = match std::env::var("SILE_WGPU_ADAPTER") {
+            Ok(want) => instance
+                .enumerate_adapters(wgpu::Backends::all())
+                .into_iter()
+                .find(|a| a.get_info().name.to_lowercase().contains(&want.to_lowercase()))
+                .expect("no WGPU adapter matches SILE_WGPU_ADAPTER"),
+            Err(_) => pollster::block_on(
+                instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    ..Default::default()
+                }),
+            )
+            .expect("no WGPU adapter"),
+        };
         eprintln!("adapter: {:?}", adapter.get_info());
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("handwritten"),
@@ -243,19 +255,69 @@ fn check(name: &str, got: &[f32], want: &[f32], tol: f32) {
     println!("PASS {name:<24} worst={w:.3e} (tol {tol:.0e})");
 }
 
-fn bench(name: &str, gpu: &Gpu, kernel: &Kernel, grid: [u32; 3], reps: usize) -> f64 {
-    // One warm-up dispatch, then the fastest of `reps` wall-clock runs.
+/// Time a reference the way a launch runs: the inputs travel from the host,
+/// the kernel dispatches, the output travels home. The same host-to-host
+/// round trip is what the WGPU backend's launch costs, so the ratio this
+/// feeds compares one launch with another, not a launch with a bare dispatch.
+/// The statistic is the median of `reps` runs, the one `common.h` and
+/// `bench_m2` report, which outvotes both the cold-start transient and stray
+/// clock readings.
+fn bench(
+    name: &str,
+    gpu: &Gpu,
+    kernel: &Kernel,
+    grid: [u32; 3],
+    inputs: &[(usize, &[f32])],
+    output: (usize, usize),
+    reps: usize,
+) -> f64 {
     gpu.dispatch(kernel, grid);
     let _ = gpu.device.poll(wgpu::PollType::Wait);
-    let mut best = f64::MAX;
+    let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bench staging"),
+        size: (output.1 * 4) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut samples = Vec::with_capacity(reps);
+    let mut home = vec![0.0f32; output.1];
     for _ in 0..reps {
         let started = Instant::now();
+        for &(index, data) in inputs {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+            };
+            gpu.queue.write_buffer(&kernel.buffers[index], 0, bytes);
+        }
         gpu.dispatch(kernel, grid);
+        let mut copy = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        copy.copy_buffer_to_buffer(
+            &kernel.buffers[output.0],
+            0,
+            &staging,
+            0,
+            (output.1 * 4) as u64,
+        );
+        gpu.queue.submit(Some(copy.finish()));
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = gpu.device.poll(wgpu::PollType::Wait);
-        best = best.min(started.elapsed().as_secs_f64() * 1e3);
+        let mapped = slice.get_mapped_range();
+        let words = mapped.chunks_exact(4);
+        for (chunk, slot) in words.zip(home.iter_mut()) {
+            *slot = f32::from_le_bytes(chunk.try_into().unwrap());
+        }
+        drop(mapped);
+        staging.unmap();
+        samples.push(started.elapsed().as_secs_f64() * 1e3);
     }
-    println!("BENCH {name:<12} {best:10.3} ms");
-    best
+    let _ = home;
+    samples.sort_by(|a, b| a.partial_cmp(b).expect("finite durations"));
+    let median = samples[reps / 2];
+    println!("BENCH {name:<12} {median:10.3} ms");
+    median
 }
 
 fn main() {
@@ -264,7 +326,7 @@ fn main() {
 
     match which.as_str() {
         "saxpy" => {
-            let n = 1usize << 22;
+            let n = 1usize << 24;
             let mut rng = Rng(1);
             let x = rng.fill(n);
             let y = rng.fill(n);
@@ -273,15 +335,17 @@ fn main() {
             let kernel = gpu.build(
                 "saxpy",
                 &source("saxpy"),
-                &params([n as u32, 0, 0, 0], [a, 0.0, 0.0, 0.0]),
+                &params([n as u32, 256 * 4096, 0, 0], [a, 0.0, 0.0, 0.0]),
                 &[&x, &y, &out],
             );
-            let grid = [n.div_ceil(256) as u32, 1, 1];
+            // One grid axis caps at 65535 workgroups, so the launch is rows:
+            // 4096 workgroups per row, 256 elements per workgroup.
+            let grid = [4096u32, n.div_ceil(256 * 4096) as u32, 1];
             gpu.dispatch(&kernel, grid);
             let got = gpu.read(&kernel, 3, n);
             let want: Vec<f32> = (0..n).map(|i| a * x[i] + y[i]).collect();
             check("saxpy 4M", &got, &want, 1e-5);
-            let ms = bench("saxpy", &gpu, &kernel, grid, 7);
+            let ms = bench("saxpy", &gpu, &kernel, grid, &[(1, &x), (2, &y)], (3, n), 100);
             println!(
                 "       {:.2} GB/s",
                 (n as f64 * 3.0 * 4.0) / (ms * 1e-3) / 1e9
@@ -314,7 +378,7 @@ fn main() {
                 }
             }
             check("softmax 4096x1024", &got, &want, 1e-5);
-            let ms = bench("softmax", &gpu, &kernel, grid, 7);
+            let ms = bench("softmax", &gpu, &kernel, grid, &[(1, &x)], (3, rows * cols), 100);
             println!(
                 "       {:.2} GB/s",
                 (rows * cols * 4 * 4) as f64 / (ms * 1e-3) / 1e9
@@ -346,7 +410,7 @@ fn main() {
                 }
             }
             check("rms_norm 4096x1024", &got, &want, 1e-5);
-            let ms = bench("rms_norm", &gpu, &kernel, grid, 7);
+            let ms = bench("rms_norm", &gpu, &kernel, grid, &[(1, &x), (2, &w)], (3, rows * cols), 100);
             println!(
                 "       {:.2} GB/s",
                 (rows * cols * 3 * 4) as f64 / (ms * 1e-3) / 1e9
@@ -381,7 +445,7 @@ fn main() {
                 }
             }
             check("gemm 1024^3", &got, &want, 1e-2);
-            let ms = bench("gemm", &gpu, &kernel, grid, 5);
+            let ms = bench("gemm", &gpu, &kernel, grid, &[(1, &x), (2, &y)], (3, m * n), 100);
             println!(
                 "       {:.2} GFLOP/s",
                 (2.0 * (m * n * k) as f64) / (ms * 1e-3) / 1e9

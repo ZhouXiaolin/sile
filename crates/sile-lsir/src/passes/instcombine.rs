@@ -1,7 +1,7 @@
 //! Constant folding and instruction combining.
 //!
 //! The lowering emits literal index arithmetic and constant comparisons that a
-//! later stage can evaluate, and the other LLVM IR passes leave them in place.
+//! later stage can evaluate, and the other LSIR passes leave them in place.
 //! This pass folds an instruction whose operands are all constants, and it
 //! applies the algebraic identities that are exact for the target semantics.
 //! A folded instruction becomes an operand, every use is rewritten, and the

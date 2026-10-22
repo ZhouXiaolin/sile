@@ -373,7 +373,7 @@ fn terminator_mentions(terminator: &crate::Terminator, value: ValueId) -> bool {
         .any(|operand| matches!(operand, Operand::Value(used) if *used == value))
 }
 
-fn collect_op_operands(op: &InstOp, operands: &mut Vec<Operand>) {
+pub(crate) fn collect_op_operands(op: &InstOp, operands: &mut Vec<Operand>) {
     match op {
         InstOp::Alloca { .. } => {}
         InstOp::Gep { base, indices } => {
@@ -414,7 +414,7 @@ fn collect_op_operands(op: &InstOp, operands: &mut Vec<Operand>) {
     }
 }
 
-fn collect_terminator_operands(terminator: &crate::Terminator, operands: &mut Vec<Operand>) {
+pub(crate) fn collect_terminator_operands(terminator: &crate::Terminator, operands: &mut Vec<Operand>) {
     match terminator {
         crate::Terminator::Br { args, .. } => operands.extend(args.iter().cloned()),
         crate::Terminator::CondBr {
