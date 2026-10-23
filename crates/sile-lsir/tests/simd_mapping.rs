@@ -39,7 +39,6 @@ fn tile_alloca(result: ValueId, name: &str, len: usize) -> Inst {
 fn tile_reduce_func(reduce: TileReduceOp, extent: u64) -> Function {
     let tile = ValueId(1);
     let red = ValueId(2);
-    let out = ValueId(3);
     let red_slot = ValueId(4);
     let loaded = ValueId(5);
     Function {

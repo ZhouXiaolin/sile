@@ -3466,6 +3466,480 @@ fn build_mma_strip(ctx: &mut Ctx, site: MmaSite, threads: i64, order: usize) -> 
     let tid = thread_id_of(&ctx.func).expect("the policy stage ran");
     let tag = format!("mm{order}");
 
+    // Column blocking: when the workgroup width is a whole multiple of the
+    // tile's row length, every element a thread owns — e = tid + j*W over a
+    // row-major tile — sits in one column (e % n == tid % n), so one rhs
+    // load per contraction step can feed the thread's whole strip, and the
+    // strip's partials fit a private slot array small enough for registers.
+    // The strip is spelled straight out, so the cap keeps the unrolled body
+    // bounded; past it the per-lane shape carries the site.
+    if threads % n == 0 && (m * n) % threads == 0 && (m * n) / threads <= 16 {
+        let direct = match acc {
+            Some(carry) => acc_copy_loop(&ctx.func, result, carry),
+            None => None,
+        };
+        build_mma_strip_blocked(
+            ctx, at, cont, tid, &tag, result, m, n, k, rhs_cols, lhs, rhs, acc, threads, direct,
+        );
+    } else {
+        build_mma_strip_lanes(
+            ctx, at, cont, tid, &tag, result, m, n, k, rhs_cols, lhs, rhs, acc, threads,
+        );
+    }
+    Ok(())
+}
+
+/// Whether any operand of this operation reads `id`.
+fn op_uses(op: &InstOp, id: ValueId) -> bool {
+    fn has(operand: &Operand, id: ValueId) -> bool {
+        matches!(operand, Operand::Value(v) if *v == id)
+    }
+    match op {
+        InstOp::Alloca { .. } => false,
+        InstOp::Gep { base, indices } => has(base, id) || indices.iter().any(|x| has(x, id)),
+        InstOp::Load { ptr } => has(ptr, id),
+        InstOp::Store { ptr, value } | InstOp::AtomicAdd { ptr, value } => {
+            has(ptr, id) || has(value, id)
+        }
+        InstOp::Memcpy { dst, src, size } => [dst, src, size].iter().any(|x| has(x, id)),
+        InstOp::Bin { lhs, rhs, .. } | InstOp::Cmp { lhs, rhs, .. } => {
+            has(lhs, id) || has(rhs, id)
+        }
+        InstOp::Cast { value, .. } => has(value, id),
+        InstOp::Select {
+            cond,
+            on_true,
+            on_false,
+        } => has(cond, id) || has(on_true, id) || has(on_false, id),
+        InstOp::Call { args, .. } | InstOp::Intrinsic { args, .. } => {
+            args.iter().any(|x| has(x, id))
+        }
+    }
+}
+
+/// The one consumer shape the accumulator chain gives an mma's result tile:
+/// the strip copy `acc[e] = result[e]` the lowering lowers the assignment
+/// into — the result's single use, one load into one store, inside a counted
+/// loop that carries nothing else. Writing through it lets the copy-out
+/// address the accumulator directly and the copy loop disappear, which
+/// takes the result tile's shared round-trip and its ordering barrier with
+/// it. Returns the loop's (header, body, exit) and the exit's target.
+fn acc_copy_loop(
+    func: &Function,
+    result: ValueId,
+    acc: ValueId,
+) -> Option<(BlockId, BlockId, BlockId, BlockId, Vec<Operand>)> {
+    // The result's only use: one element gep.
+    let mut from = None;
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if op_uses(&inst.op, result) {
+                if from.is_some() {
+                    return None;
+                }
+                let InstOp::Gep {
+                    base: Operand::Value(base),
+                    indices,
+                } = &inst.op
+                else {
+                    return None;
+                };
+                if *base != result || indices.len() != 1 {
+                    return None;
+                }
+                from = Some((block.id, inst.result.expect("a gep has a result")));
+            }
+        }
+    }
+    let (body, from_gep) = from?;
+    let block = func.blocks.iter().find(|b| b.id == body)?;
+    let Terminator::Br {
+        target: header, ..
+    } = &block.terminator
+    else {
+        return None;
+    };
+    let header_block = func.blocks.iter().find(|b| b.id == *header)?;
+    let Terminator::CondBr {
+        true_target,
+        false_target,
+        ..
+    } = &header_block.terminator
+    else {
+        return None;
+    };
+    if *true_target != body {
+        return None;
+    }
+    let exit = *false_target;
+    let exit_block = func.blocks.iter().find(|b| b.id == exit)?;
+    let Terminator::Br { target, args } = &exit_block.terminator else {
+        return None;
+    };
+    // The lowering's counted loops carry the index in block params (the
+    // header holds one compare); the mapping's own spell it through an index
+    // alloca (a load, then the compare, and the latch steps the alloca).
+    // Either shape says counted loop.
+    let index = match header_block.insts.as_slice() {
+        [Inst {
+            op: InstOp::Load { ptr },
+            ..
+        }, Inst {
+            op: InstOp::Cmp { .. },
+            ..
+        }] => match ptr {
+            Operand::Value(v) => Some(*v),
+            Operand::Const(_) => None,
+        },
+        [Inst {
+            op: InstOp::Cmp { .. },
+            ..
+        }] => None,
+        _ => return None,
+    };
+    // from[e] into acc[e]: one load, one store, the latch step, nothing else.
+    let mut value = None;
+    let mut to = None;
+    for inst in &block.insts {
+        match &inst.op {
+            InstOp::Load { ptr } if has_operand(ptr, from_gep) => {
+                if value.is_some() {
+                    return None;
+                }
+                value = Some(inst.result.expect("a load has a result"));
+            }
+            InstOp::Gep {
+                base: Operand::Value(base),
+                indices,
+            } if *base == acc && indices.len() == 1 => {
+                if to.is_some() {
+                    return None;
+                }
+                to = Some(inst.result.expect("a gep has a result"));
+            }
+            _ => {}
+        }
+    }
+    let (Some(value), Some(to)) = (value, to) else {
+        return None;
+    };
+    let mut stored = false;
+    for inst in &block.insts {
+        let known = op_uses(&inst.op, result)
+            || matches!(&inst.op, InstOp::Load { ptr } if has_operand(ptr, from_gep))
+            || matches!(&inst.op, InstOp::Gep { base, .. } if has_operand(base, acc))
+            || index
+                .map(|iv| {
+                    matches!(&inst.op, InstOp::Store { ptr, .. } if has_operand(ptr, iv))
+                })
+                .unwrap_or(false);
+        if matches!(
+            &inst.op,
+            InstOp::Store { ptr, value: v } if has_operand(ptr, to) && has_operand(v, value)
+        ) {
+            if stored {
+                return None;
+            }
+            stored = true;
+        } else if !known && !matches!(&inst.op, InstOp::Bin { .. }) {
+            return None;
+        }
+    }
+    if stored {
+        Some((*header, body, exit, *target, args.clone()))
+    } else {
+        None
+    }
+}
+
+fn has_operand(operand: &Operand, id: ValueId) -> bool {
+    matches!(operand, Operand::Value(v) if *v == id)
+}
+
+/// Stage one `TileMma` with the contraction step outermost and the thread's
+/// same-column strip innermost — Goto & Geijn's register blocking along the
+/// column axis. One rhs load per step feeds the whole strip; the strip's
+/// partials live in a private slot array whose slots the unroll turns into
+/// registers. The accumulator the site carries is read once into the slots
+/// and written back once from them, both through the owner's own shared
+/// slots, so no ordering barrier is needed for either direction; the
+/// lowering's result copy (`acc[e] = result[e]`, the result tile's only
+/// consumer) is written through directly when [`acc_copy_loop`] recognized
+/// it, which removes the result round-trip. Two barriers remain, and both
+/// order the panel buffers: the panels are written again by the next
+/// iteration of the loop the site lives in.
+#[allow(clippy::too_many_arguments)]
+fn build_mma_strip_blocked(
+    ctx: &mut Ctx,
+    at: BlockId,
+    cont: BlockId,
+    tid: ValueId,
+    tag: &str,
+    result: ValueId,
+    m: i64,
+    n: i64,
+    k: i64,
+    rhs_cols: i64,
+    lhs: ValueId,
+    rhs: ValueId,
+    acc: Option<ValueId>,
+    threads: i64,
+    direct: Option<(BlockId, BlockId, BlockId, BlockId, Vec<Operand>)>,
+) {
+    let trips = (m * n) / threads;
+    let slots_inst = ctx.alloca(
+        &format!("{tag}_acc"),
+        Type::array(trips as usize, Type::F32),
+        AddressSpace::Private,
+    );
+    let slots = slots_inst.result.expect("an alloca has a result");
+    ctx.push(at, slots_inst);
+    // The strip is spelled straight out: `trips` is a compile-time constant,
+    // and a rolled strip would index the slot array with a loop variable,
+    // which no downstream pass can turn back into registers. Constant slot
+    // indices let sroa split the array and scalar promotion carry the
+    // scalars across the contraction loop as block arguments.
+    //
+    // The seed: slot[e/W] comes from the accumulator's own slot — the
+    // previous iteration's copy-out wrote it, and the trailing barrier
+    // ordered that write against this read.
+    for j in 0..trips {
+        let walked = ctx.int_bin(
+            at,
+            &format!("{tag}_walk"),
+            BinOp::Mul,
+            Operand::Const(Constant::Int(threads)),
+            Operand::Const(Constant::Int(j)),
+        );
+        let e = ctx.int_bin(
+            at,
+            &format!("{tag}_e"),
+            BinOp::Add,
+            Operand::Value(walked),
+            Operand::Value(tid),
+        );
+        let slot = ctx.gep(
+            at,
+            &format!("{tag}_slot"),
+            slots,
+            Operand::Const(Constant::Int(j)),
+            Type::F32,
+        );
+        match acc {
+            Some(carry) => {
+                let from = ctx.gep(
+                    at,
+                    &format!("{tag}_from"),
+                    carry,
+                    Operand::Value(e),
+                    Type::F32,
+                );
+                let v = ctx.load(at, &format!("{tag}_a0"), Operand::Value(from), Type::F32);
+                ctx.store(at, Operand::Value(slot), Operand::Value(v));
+            }
+            None => {
+                ctx.store(at, Operand::Value(slot), Operand::Const(Constant::Float(0.0)))
+            }
+        }
+    }
+
+    // The panels are shared now: a barrier separates the writes every thread
+    // made from the reads every thread is about to make.
+    ctx.barrier(at);
+    let col = ctx.int_bin(
+        at,
+        &format!("{tag}_col"),
+        BinOp::Rem,
+        Operand::Value(tid),
+        Operand::Const(Constant::Int(n)),
+    );
+    let steps = ctx.open_loop(
+        &format!("{tag}k"),
+        at,
+        Operand::Const(Constant::Int(0)),
+        k,
+        1,
+    );
+    let y_base = ctx.int_bin(
+        steps.body,
+        &format!("{tag}_yb"),
+        BinOp::Mul,
+        Operand::Value(steps.index),
+        Operand::Const(Constant::Int(rhs_cols)),
+    );
+    let y_addr = ctx.int_bin(
+        steps.body,
+        &format!("{tag}_ya"),
+        BinOp::Add,
+        Operand::Value(y_base),
+        Operand::Value(col),
+    );
+    let y_ptr = ctx.gep(
+        steps.body,
+        &format!("{tag}_y"),
+        rhs,
+        Operand::Value(y_addr),
+        Type::F32,
+    );
+    let y = ctx.load(steps.body, &format!("{tag}_yv"), Operand::Value(y_ptr), Type::F32);
+    for j in 0..trips {
+        let walked = ctx.int_bin(
+            steps.body,
+            &format!("{tag}_walk"),
+            BinOp::Mul,
+            Operand::Const(Constant::Int(threads)),
+            Operand::Const(Constant::Int(j)),
+        );
+        let e = ctx.int_bin(
+            steps.body,
+            &format!("{tag}_e"),
+            BinOp::Add,
+            Operand::Value(walked),
+            Operand::Value(tid),
+        );
+        let row = ctx.int_bin(
+            steps.body,
+            &format!("{tag}_row"),
+            BinOp::Div,
+            Operand::Value(e),
+            Operand::Const(Constant::Int(n)),
+        );
+        let x_base = ctx.int_bin(
+            steps.body,
+            &format!("{tag}_xb"),
+            BinOp::Mul,
+            Operand::Value(row),
+            Operand::Const(Constant::Int(k)),
+        );
+        let x_addr = ctx.int_bin(
+            steps.body,
+            &format!("{tag}_xa"),
+            BinOp::Add,
+            Operand::Value(x_base),
+            Operand::Value(steps.index),
+        );
+        let x_ptr = ctx.gep(
+            steps.body,
+            &format!("{tag}_x"),
+            lhs,
+            Operand::Value(x_addr),
+            Type::F32,
+        );
+        let x = ctx.load(steps.body, &format!("{tag}_xv"), Operand::Value(x_ptr), Type::F32);
+        let slot = ctx.gep(
+            steps.body,
+            &format!("{tag}_slot"),
+            slots,
+            Operand::Const(Constant::Int(j)),
+            Type::F32,
+        );
+        let a = ctx.load(steps.body, &format!("{tag}_a"), Operand::Value(slot), Type::F32);
+        let product = ctx.float_bin(steps.body, &format!("{tag}_mul"), BinOp::Mul, x, y);
+        let sum = ctx.float_bin(steps.body, &format!("{tag}_add"), BinOp::Add, a, product);
+        ctx.store(steps.body, Operand::Value(slot), Operand::Value(sum));
+    }
+    ctx.close_loop(&steps, 1, steps.body);
+
+    // The slots go back where the site's consumers read them: the
+    // accumulator's own slots when the lowering's copy was recognized, the
+    // result tile otherwise.
+    let dst_base = match (direct.as_ref(), acc) {
+        (Some(_), Some(carry)) => carry,
+        _ => result,
+    };
+    for j in 0..trips {
+        let walked = ctx.int_bin(
+            steps.exit,
+            &format!("{tag}_walk"),
+            BinOp::Mul,
+            Operand::Const(Constant::Int(threads)),
+            Operand::Const(Constant::Int(j)),
+        );
+        let e = ctx.int_bin(
+            steps.exit,
+            &format!("{tag}_e"),
+            BinOp::Add,
+            Operand::Value(walked),
+            Operand::Value(tid),
+        );
+        let slot = ctx.gep(
+            steps.exit,
+            &format!("{tag}_slot"),
+            slots,
+            Operand::Const(Constant::Int(j)),
+            Type::F32,
+        );
+        let total = ctx.load(steps.exit, &format!("{tag}_tot"), Operand::Value(slot), Type::F32);
+        let to = ctx.gep(
+            steps.exit,
+            &format!("{tag}_out"),
+            dst_base,
+            Operand::Value(e),
+            Type::F32,
+        );
+        ctx.store(steps.exit, Operand::Value(to), Operand::Value(total));
+    }
+    // The reads are done: the next iteration's panel writes may proceed.
+    // The reads are done: the next iteration's panel writes may proceed.
+    ctx.barrier(steps.exit);
+    ctx.set_terminator(
+        steps.exit,
+        Terminator::Br {
+            target: cont,
+            args: Vec::new(),
+        },
+    );
+    // The lowering's copy loop is redundant now: the copy-out wrote its
+    // target already. Its preheader branches here instead, and the loop's
+    // blocks go away.
+    if let Some((header, body, exit, target, exit_args)) = direct {
+        // The exit's branch args feed the target's block params; the
+        // preheader takes them over verbatim.
+        let preheader = ctx
+            .func
+            .blocks
+            .iter()
+            .find(|b| {
+                b.id != body
+                    && matches!(&b.terminator, Terminator::Br { target: at, .. } if *at == header)
+            })
+            .map(|b| b.id);
+        if let Some(preheader) = preheader {
+            ctx.set_terminator(
+                preheader,
+                Terminator::Br {
+                    target,
+                    args: exit_args,
+                },
+            );
+        }
+        ctx.func
+            .blocks
+            .retain(|b| b.id != header && b.id != body && b.id != exit);
+    }
+}
+
+/// Stage one `TileMma` the per-lane way: each thread walks its cyclic strip
+/// of the accumulator with the contraction innermost. The shape any tile
+/// spells when the workgroup width is not a whole multiple of the row
+/// length — no column to fix, so every load feeds one multiply.
+#[allow(clippy::too_many_arguments)]
+fn build_mma_strip_lanes(
+    ctx: &mut Ctx,
+    at: BlockId,
+    cont: BlockId,
+    tid: ValueId,
+    tag: &str,
+    result: ValueId,
+    m: i64,
+    n: i64,
+    k: i64,
+    rhs_cols: i64,
+    lhs: ValueId,
+    rhs: ValueId,
+    acc: Option<ValueId>,
+    threads: i64,
+) {
     // The panels are shared now: a barrier separates the writes every thread
     // made from the reads every thread is about to make.
     ctx.barrier(at);
@@ -3600,7 +4074,6 @@ fn build_mma_strip(ctx: &mut Ctx, site: MmaSite, threads: i64, order: usize) -> 
             args: Vec::new(),
         },
     );
-    Ok(())
 }
 
 /// Stage one `TileMma` for the simd-group fragments and leave the multiply
