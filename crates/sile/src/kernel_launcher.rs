@@ -264,14 +264,19 @@ impl<'a> KernelLauncher<'a> {
                     .filter(|param| !matches!(param.ty, sile_hir::Type::Scalar(_)))
                     .map(|param| param.kind == sile_hir::ParamKind::Output)
                     .collect();
-                backend.execute_llir(
+                let artifact = compiled_artifact(&self.kernel, lsir_func, CodegenTarget::Metal)?;
+                let BackendArtifact::MetalSource { source, threads } = artifact.as_ref() else {
+                    unreachable!("the Metal target spells MSL source");
+                };
+                backend.execute_source(
                     lsir_func,
+                    source,
                     &outputs,
                     &self.args,
                     &self.scalars,
                     &self.scalars_i64,
                     &launch,
-                    stream,
+                    *threads,
                 )
             }
             #[cfg(not(target_os = "macos"))]
@@ -353,7 +358,7 @@ fn maybe_print_backend_source(
     let artifact = compiled_artifact(kernel, lsir_func, target)?;
     match artifact.as_ref() {
         BackendArtifact::CSource(source)
-        | BackendArtifact::MetalSource(source)
+        | BackendArtifact::MetalSource { source, .. }
         | BackendArtifact::WgslSource(source)
         | BackendArtifact::PtxSource(source) => {
             eprintln!("{}", source);

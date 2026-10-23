@@ -295,6 +295,36 @@ pub enum Intrinsic {
         k: u64,
         rhs_cols: u64,
     },
+    /// The hardware fold across one SIMD-group: every active lane receives
+    /// the combined value of the lanes' arguments. Args: [value]. Result F32.
+    /// Metal spells `simd_sum` and kin; no other target in the tree carries
+    /// the primitive, so the contracts hold it to Metal only.
+    SimdReduce {
+        reduce: TileReduceOp,
+    },
+    /// The calling lane's index inside its SIMD-group. Metal's
+    /// `thread_index_in_simdgroup`: the map from thread index to lane is the
+    /// hardware's to choose, so the spelled builtin is the only sanctioned
+    /// source.
+    SimdLaneId,
+    /// The calling SIMD-group's index inside the threadgroup. Metal's
+    /// `simdgroup_index_in_threadgroup`.
+    SimdGroupId,
+    /// The SIMD-group tile multiply, `lhs @ rhs + acc` left whole for the
+    /// Metal dialect to spell as `simdgroup_matrix` fragments. Args:
+    /// [lhs, rhs, acc, out] — the panels and both `m * n` staging buffers in
+    /// workgroup storage, `acc` absent when the multiply has no accumulator.
+    /// `row_groups` x `col_groups` names the SIMD-groups the tile's 8x8
+    /// fragments split across; a group with no block idles. Result-less: the
+    /// fragment stores land the tile in `out`.
+    SimdGroupMma {
+        m: u64,
+        n: u64,
+        k: u64,
+        rhs_cols: u64,
+        row_groups: u32,
+        col_groups: u32,
+    },
 }
 
 impl Intrinsic {

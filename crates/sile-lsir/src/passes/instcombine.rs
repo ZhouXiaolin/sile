@@ -74,7 +74,9 @@ pub fn run(mut func: Function) -> Function {
         if replacements.is_empty() {
             // The recombination exposes folds and the folds expose the next
             // recombination, so the two share the fixed point.
-            if !recombine_remainders(&mut func) {
+            let mut changed = recombine_remainders(&mut func);
+            changed |= recombine_masked_adds(&mut func);
+            if !changed {
                 break;
             }
             continue;
@@ -84,6 +86,107 @@ pub fn run(mut func: Function) -> Function {
 
     eliminate_dead_insts(&mut func);
     func
+}
+
+/// `x + select(mask, +0.0, -inf)` becomes `select(mask, x, -inf)`.
+///
+/// The masked-softmax lowering spells the score mask as an add of a select
+/// whose false arm is a constant -infinity. Every GPU compiler behind this
+/// pipeline runs a fast-math mode by default, and fast-math folds
+/// `x + (-INFINITY)` into `x` — probed on AIR, the fold swallowed the whole
+/// mask and every output matched the unmasked kernel. Moving the select to
+/// the result of the add removes the add-with-infinity pattern entirely: the
+/// select now *produces* the infinity instead of feeding it to an add, and a
+/// select whose value is decided at run time cannot be constant-folded. The
+/// identity is exact IEEE arithmetic — `x + 0.0` is `x` (the single sign-of-
+/// zero divergence is immaterial under the max/exp2 consumers), and
+/// `x + (-inf)` is `-inf`. Either select arm order and either add operand
+/// order matches; a select feeding two adds is left alone.
+fn recombine_masked_adds(func: &mut Function) -> bool {
+    // The select definitions this rewrite looks for: the -inf arm's side and
+    // its operand, next to the select condition.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Arm {
+        True,
+        False,
+    }
+    let mut selects: HashMap<ValueId, (Operand, Arm)> = HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let (Some(result), InstOp::Select { cond, on_true, on_false }) =
+                (inst.result, &inst.op)
+            else {
+                continue;
+            };
+            let is_zero =
+                |o: &Operand| matches!(o, Operand::Const(Constant::Float(v)) if *v == 0.0);
+            let is_neginf = |o: &Operand| {
+                matches!(o, Operand::Const(Constant::Float(v)) if *v == f64::NEG_INFINITY)
+            };
+            if is_zero(on_true) && is_neginf(on_false) {
+                selects.insert(result, (cond.clone(), Arm::False));
+            } else if is_neginf(on_true) && is_zero(on_false) {
+                selects.insert(result, (cond.clone(), Arm::True));
+            }
+        }
+    }
+    if selects.is_empty() {
+        return false;
+    }
+
+    // The add sites: the select result takes over the add's users, and the
+    // select's zero arm takes the add's other operand.
+    let mut replacements: HashMap<ValueId, Operand> = HashMap::new();
+    let mut rewrites: HashMap<ValueId, Operand> = HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let Some(result) = inst.result else { continue };
+            let InstOp::Bin {
+                op: BinOp::Add,
+                lhs,
+                rhs,
+            } = &inst.op
+            else {
+                continue;
+            };
+            for (x, sel_op) in [(lhs, rhs), (rhs, lhs)] {
+                let Operand::Value(sel) = sel_op else { continue };
+                let Some((_, _)) = selects.get(sel) else { continue };
+                if rewrites.contains_key(sel) {
+                    // Two adds share one mask select; spelling both would
+                    // need two selects. Leave the pattern alone.
+                    rewrites.remove(sel);
+                    replacements.retain(|_, target| *target != Operand::Value(*sel));
+                    continue;
+                }
+                rewrites.insert(*sel, x.clone());
+                replacements.insert(result, Operand::Value(*sel));
+            }
+        }
+    }
+    if rewrites.is_empty() {
+        return false;
+    }
+
+    for block in &mut func.blocks {
+        for inst in &mut block.insts {
+            let Some(result) = inst.result else { continue };
+            let Some(x) = rewrites.get(&result) else { continue };
+            let x = x.clone();
+            if let InstOp::Select {
+                on_true, on_false, ..
+            } = &mut inst.op
+            {
+                if matches!(on_true, Operand::Const(Constant::Float(v)) if *v == 0.0) {
+                    *on_true = x;
+                } else {
+                    *on_false = x;
+                }
+            }
+        }
+    }
+    apply_replacements(func, &replacements);
+    true
 }
 
 /// `(iv / W) * W + iv % W` is `iv`.

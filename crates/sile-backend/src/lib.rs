@@ -22,7 +22,12 @@ pub enum CodegenTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BackendArtifact {
     CSource(String),
-    MetalSource(String),
+    /// The MSL source plus the threadgroup width the mapping decided. One
+    /// threadgroup owns one tile, so the dispatch owes the kernel exactly
+    /// this count — the strips and barriers assume it — and the number is
+    /// final here, after any serial fallback, not a re-derivation the
+    /// runtime could get wrong.
+    MetalSource { source: String, threads: u32 },
     WgslSource(String),
     PtxSource(String),
 }
@@ -57,12 +62,26 @@ fn compile_inner(lsir: &LsirFunction, target: CodegenTarget) -> Result<BackendAr
     // pre-mapping pipeline did.
     let (mapped, policy) = if policy.is_parallel() {
         let fallback = mapping::policy_with_vector(policy.vector);
+        let trace = std::env::var_os("SILE_TRACE").is_some();
         match sile_lsir::mapping::run(lsir.clone(), &policy) {
-            Ok(mapped) => match verify::parallel_contract(&mapped, "Backend mapped kernel") {
+            Ok(mapped) => match verify::parallel_contract(&mapped, target, "Backend mapped kernel") {
                 Ok(()) => (Some(mapped), policy),
-                Err(_) => (None, fallback),
+                Err(reason) => {
+                    // A fallback nobody sees looks identical to a parallel
+                    // kernel that works, which is how a broken mapping hides
+                    // behind a passing benchmark.
+                    if trace {
+                        eprintln!("[sile] parallel mapping declined: {reason}");
+                    }
+                    (None, fallback)
+                }
             },
-            Err(_) => (None, fallback),
+            Err(reason) => {
+                if trace {
+                    eprintln!("[sile] parallel mapping declined: {reason}");
+                }
+                (None, fallback)
+            }
         }
     } else {
         (None, policy)

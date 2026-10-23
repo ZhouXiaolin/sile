@@ -978,29 +978,22 @@ impl<'a> Lowerer<'a> {
             return Ok(());
         }
 
-        let alloc = self.emit(
-            lsir::Type::ptr(lsir::AddressSpace::Private, elem.clone()),
-            "tile",
-            lsir::InstOp::Alloca {
-                alloc_ty: lsir::Type::array(len, elem.clone()),
-                addr_space: lsir::AddressSpace::Private,
+        // The splat stays lazy: it is a broadcast of one scalar, so every
+        // consumer folds the constant into its own element and nothing is
+        // stored. Writing `len` elements here costs `len` instructions per
+        // constant — a 32x32 tile of them is 1024 stores that a GPU driver
+        // then has to compile, and the causal fmha's two constants alone
+        // pushed Metal past two minutes of pipeline compilation.
+        self.register_recipe(
+            result,
+            Recipe::Broadcast {
+                shape: shape.clone(),
+                source: Box::new(Recipe::Ready(lsir::Operand::Const(value))),
+                source_shape: Vec::new(),
             },
+            &shape,
+            &elem,
         );
-        for index in 0..len {
-            let ptr = self.emit(
-                lsir::Type::ptr(lsir::AddressSpace::Private, elem.clone()),
-                "gep",
-                lsir::InstOp::Gep {
-                    base: alloc.clone(),
-                    indices: vec![lsir::Operand::Const(lsir::Constant::Int(index as i64))],
-                },
-            );
-            self.store_void(ptr, lsir::Operand::Const(value.clone()));
-        }
-        self.operands.insert(result, alloc);
-        self.layouts.insert(result, Layout::Tile { len });
-        self.elem_types.insert(result, elem.clone());
-        self.tiles.insert(result, (shape, elem));
         Ok(())
     }
 
@@ -1587,7 +1580,7 @@ impl<'a> Lowerer<'a> {
     /// block — a loop body, a branch arm — would leave those definitions behind,
     /// so everything is written out before the crossing.
     fn materialize_all(&mut self) {
-        let pending: Vec<Value> = self
+        let mut pending: Vec<Value> = self
             .recipes
             .keys()
             .copied()
@@ -1600,6 +1593,9 @@ impl<'a> Lowerer<'a> {
                         .is_some_and(|recipe| Self::recipe_invariant(recipe))
             })
             .collect();
+        // HashMap order differs per process; the spelled kernel — and with it
+        // the Metal driver's pipeline-cache hit — must not.
+        pending.sort_by_key(|value| value.index());
         for value in pending {
             // A sibling earlier in the snapshot can already have materialised
             // this value from a nested prologue, which removed its recipe and

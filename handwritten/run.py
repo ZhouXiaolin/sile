@@ -39,13 +39,24 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
 
 
+# The C backend's own flags: Apple's clang has no `-fopenmp`, so macOS names
+# libomp explicitly. A reference built with different flags would compare
+# lowering against a compiler setting.
+CFLAGS = ["-O2"]
+if sys.platform == "darwin":
+    CFLAGS += ["-Xpreprocessor", "-fopenmp", "-I/usr/local/opt/libomp/include",
+               "-L/usr/local/opt/libomp/lib", "-lomp"]
+else:
+    CFLAGS += ["-fopenmp"]
+
+
 def build_c(kernels):
     BUILD.mkdir(exist_ok=True)
     for name in kernels:
         exe = BUILD / name
         if exe.exists() and exe.stat().st_mtime > (HERE / f"{name}.c").stat().st_mtime:
             continue
-        done = run(["cc", "-O2", "-fopenmp", "-o", str(exe), str(HERE / f"{name}.c"), "-lm"])
+        done = run(["cc", *CFLAGS, "-o", str(exe), str(HERE / f"{name}.c"), "-lm"])
         if done.returncode != 0:
             print(f"cc failed for {name}:\n{done.stderr}", file=sys.stderr)
             sys.exit(1)

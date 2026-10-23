@@ -19,3 +19,10 @@ naga = { version = "26", features = ["wgsl-in", "wgsl-out"] }
 wgpu = "26"
 pollster = "0.4"
 thiserror = "2"
+
+# wgpu-hal compiles every WGSL kernel through AIR with fast-math on, and
+# fast-math miscompiles the tile language's non-finite constants (see
+# vendor/wgpu-hal/README.md for the fold, and sile-lsir instcombine's
+# recombine_masked_adds for the IR-level defense that makes it rare).
+[patch.crates-io]
+wgpu-hal = { path = "vendor/wgpu-hal" }

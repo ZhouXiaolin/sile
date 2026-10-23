@@ -7,22 +7,19 @@ use sile_core::Result;
 
 /// The bytes one WGSL source needs in workgroup storage.
 ///
-/// Two arrays make up that storage: a module-scope `var<workgroup>` holds the
-/// shared scratch the mapping's folds and multiply panels live in, and a
-/// function-scope `var` array is one workgroup item's own state. Both count
-/// against the adapter's `max_compute_workgroup_storage_size`, which is the
-/// limit the driver refuses a pipeline over.
+/// Only a module-scope `var<workgroup>` costs workgroup storage. A
+/// function-scope `var` array is one invocation's own state — private memory,
+/// not shared — so it counts against nothing here: naga and the driver keep it
+/// out of `max_compute_workgroup_storage_size`, and counting it refused legal
+/// kernels on adapters with a small shared budget.
 pub fn local_array_bytes(source: &str) -> u32 {
     let mut total: u32 = 0;
     for line in source.lines() {
-        // `var name: array<f32, N>;` or `var<workgroup> name: array<f32, N>;`
-        // — the f32 arrays are the whole cost; an `i64` or an aggregate would
-        // need a wider rule, and none exists here.
+        // `var<workgroup> name: array<f32, N>;` — the f32 arrays are the whole
+        // cost; an `i64` or an aggregate would need a wider rule, and none
+        // exists here.
         let trimmed = line.trim();
-        let rest = trimmed
-            .strip_prefix("var<workgroup> ")
-            .or_else(|| trimmed.strip_prefix("var "));
-        let Some(rest) = rest else {
+        let Some(rest) = trimmed.strip_prefix("var<workgroup> ") else {
             continue;
         };
         let Some((_, spec)) = rest.split_once("array<f32, ") else {
@@ -59,12 +56,13 @@ pub fn validate(source: &str) -> Result<()> {
                 .unwrap_or(0);
             sile_core::Error::Compile(format!("generated WGSL does not parse at line {line}: {e}"))
         })?;
-    // The lowering makes every index an i64, which WGSL allows only when the
-    // target enables the capability, so validation permits it rather than
-    // rejecting a shader the device would accept.
+    // Kernels spell 32-bit integers only, which needs no capability, so
+    // validation keeps the default set: an i64 that sneaks back into the
+    // spelling is a local compile error naming SHADER_INT64, not a device
+    // that refuses the kernel at pipeline-creation time.
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::all(),
+        naga::valid::Capabilities::default(),
     )
     .validate(&module)
     .map_err(|e| {

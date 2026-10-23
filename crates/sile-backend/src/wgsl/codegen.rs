@@ -31,9 +31,9 @@ const SCALARS_I64_NAME: &str = "sile_scalars_i64";
 
 /// WGSL spelling of one array subscript.
 ///
-/// WGSL subscripts take `i32` or `u32`, and the lowering makes every index
-/// `i64`, so a computed index narrows here. Every other value keeps the width
-/// the IR gave it; this is the one place the two disagree.
+/// Every integer value spells 32-bit (see `wgsl_type`), so a computed index is
+/// already an `i32`; the cast stays as the guard for the `u32` builtins and
+/// bare literals a subscript can still meet.
 fn wgsl_index(index: String) -> String {
     format!("i32({index})")
 }
@@ -214,6 +214,23 @@ impl<'a> WgslDialect<'a> {
     }
 
     fn new(func: &'a lsir::Function, threads: u32) -> Result<Self> {
+        // The spelling demotes every integer to `i32`, which is sound only
+        // for the descriptors the host packs 32-bit. An `i64` element buffer
+        // would bind `array<i32>` over 8-byte host elements — refused here
+        // rather than misspelled.
+        for param in &func.params {
+            if emit::is_descriptor_param(param) {
+                continue;
+            }
+            if let lsir::Type::Ptr { pointee, .. } = &param.ty
+                && **pointee == lsir::Type::I64
+            {
+                return Err(sile_core::Error::Compile(format!(
+                    "WGSL spells 32-bit integers, so the i64 buffer `{}` has no spelling",
+                    param.name
+                )));
+            }
+        }
         // Shared storage prints in the prelude under the same names the body
         // spells, so the table is the one the emitter builds.
         let names = emit::build_value_names(func);
@@ -310,7 +327,7 @@ impl<'a> WgslDialect<'a> {
     /// the launcher divided the buffer extents by) lives on the host alone.
     fn block_id_expr(&self, dim: u8) -> String {
         let axis = ["x", "y", "z"][dim as usize];
-        format!("i64({LAUNCH_INDEX}.{axis})")
+        format!("i32({LAUNCH_INDEX}.{axis})")
     }
 }
 
@@ -321,7 +338,11 @@ fn wgsl_type(ty: &lsir::Type) -> String {
         lsir::Type::F16 => "f16".to_string(),
         lsir::Type::I1 => "bool".to_string(),
         lsir::Type::I32 => "i32".to_string(),
-        lsir::Type::I64 => "i64".to_string(),
+        // The WGSL spelling demotes the lowering's 64-bit integers to `i32`
+        // (MAPPING_DESIGN §5): no kernel value needs the width, and i64 is an
+        // optional capability that naga lowers into wrapped multi-instruction
+        // arithmetic.
+        lsir::Type::I64 => "i32".to_string(),
         lsir::Type::F32 => "f32".to_string(),
         lsir::Type::F64 => "f64".to_string(),
         lsir::Type::Ptr { pointee, .. } => wgsl_type(pointee.as_ref()),
@@ -482,10 +503,6 @@ impl TargetDialect for WgslDialect<'_> {
         }
     }
 
-    fn int_div(&self) -> emit::IntDivSpelling {
-        emit::IntDivSpelling::I32Widened
-    }
-
     fn declares_intrinsic_at_use(&self, inst: &lsir::Inst) -> bool {
         // A WGSL intrinsic is a `let` binding, so it must not also be declared.
         matches!(inst.op, lsir::InstOp::Intrinsic { .. })
@@ -493,10 +510,10 @@ impl TargetDialect for WgslDialect<'_> {
 
     fn select(&self) -> emit::SelectSpelling {
         // WGSL has no conditional expression; a choice is a call. A bare
-        // integer argument resolves to `i32` before the context is seen, so
-        // the constants of an `i64` choice carry their type.
+        // integer argument resolves to `i32`, which is what every choice
+        // spells now that the i64 IR type demotes (see `wgsl_type`).
         emit::SelectSpelling::Function {
-            int_const: |value| format!("i64({value})"),
+            int_const: |value| value.to_string(),
         }
     }
 
@@ -535,7 +552,7 @@ impl TargetDialect for WgslDialect<'_> {
                 // The mapping's flat thread index: this workgroup's x slot.
                 // Only dimension 0 exists under the workgroup mapping.
                 debug_assert!(*dim == 0, "the workgroup mapping only uses thread axis 0");
-                format!("let {} = i64({LOCAL_INDEX}.x);", name())
+                format!("let {} = i32({LOCAL_INDEX}.x);", name())
             }
             lsir::Intrinsic::GridDim { .. } => {
                 // The launch grid lives on the host: the launcher derives it
@@ -627,7 +644,7 @@ impl TargetDialect for WgslDialect<'_> {
                     self.buffer_element(ptr, &|id| value_name(id), &|op| format_operand(op));
                 let offset = format_operand(offset);
                 let lanes = (0..*len)
-                    .map(|lane| format!("{element}[{offset} + i64({lane})]"))
+                    .map(|lane| format!("{element}[{offset} + {lane}]"))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("let {} = vec{len}<f32>({lanes});", name())
@@ -645,7 +662,7 @@ impl TargetDialect for WgslDialect<'_> {
                 let offset = format_operand(offset);
                 let value = format_operand(value);
                 (0..*len)
-                    .map(|lane| format!("{element}[{offset} + i64({lane})] = {value}[{lane}];"))
+                    .map(|lane| format!("{element}[{offset} + {lane}] = {value}[{lane}];"))
                     .collect::<Vec<_>>()
                     .join(" ")
             }
@@ -696,8 +713,8 @@ impl TargetDialect for WgslDialect<'_> {
                         |acc: String, v: String| format!("select({v}, {acc}, {acc} < {v})")
                     }
                 };
-                // WGSL indexes an array with an `i32`, so the fold's counters
-                // are `i32` rather than the `i64` the rest of the lowering uses.
+                // The fold's counters are `i32` — the width every value
+                // spells (see `wgsl_type`) — and array subscripts require it.
                 let mut lines = vec![format!("var {dst}: array<f32, {}>;", outer)];
                 lines.push(format!(
                     "for (var ro: i32 = 0; ro < {outer}; ro = ro + 1) {{"
@@ -768,6 +785,18 @@ impl TargetDialect for WgslDialect<'_> {
                 lines.push("}".to_string());
                 return Ok(lines);
             }
+            // The SIMD-group intrinsics are the Metal mapping's plants. The
+            // parallel contract rejects them before emit; this arm keeps the
+            // rejection loud if the pipeline changes under it.
+            lsir::Intrinsic::SimdReduce { .. }
+            | lsir::Intrinsic::SimdLaneId
+            | lsir::Intrinsic::SimdGroupId
+            | lsir::Intrinsic::SimdGroupMma { .. } => {
+                return Err(sile_core::Error::Compile(
+                    "WGSL cannot spell the SIMD-group intrinsics: the WGSL mapping never plants them"
+                        .into(),
+                ));
+            }
         };
         Ok(vec![line])
     }
@@ -787,7 +816,7 @@ impl TargetDialect for WgslDialect<'_> {
             // WGSL has no `memcpy`; a byte copy becomes an element loop.
             lsir::InstOp::Memcpy { dst, src, size } => Ok(vec![
                 format!(
-                    "for (var copy_i: i64 = 0; copy_i < {}; copy_i++) {{",
+                    "for (var copy_i: i32 = 0; copy_i < {}; copy_i++) {{",
                     format_operand(size)
                 ),
                 format!("{}[copy_i] = {}[copy_i];", element(dst), element(src)),

@@ -55,7 +55,8 @@ impl Gpu {
         eprintln!("adapter: {:?}", adapter.get_info());
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("handwritten"),
-            required_features: wgpu::Features::empty(),
+            required_features: wgpu::Features::SHADER_INT64
+                .intersection(adapter.features()),
             required_limits: adapter.limits(),
             ..Default::default()
         }))
@@ -170,6 +171,80 @@ impl Gpu {
         }
     }
 
+    /// Compile `source` and bind `storage` buffers from binding 0.
+    fn build_storage(&self, name: &str, source: &str, storage: &[&[f32]]) -> Kernel {
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(name),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+        let mut buffers = Vec::new();
+        for data in storage {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(*data))
+            };
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("storage"),
+                size: bytes.len() as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&buffer, 0, bytes);
+            buffers.push(buffer);
+        }
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("layout"),
+                entries: &buffers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| wgpu::BindGroupLayoutEntry {
+                        binding: index as u32,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: index >= 2 },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    })
+                    .collect::<Vec<_>>(),
+            });
+        let entries = buffers
+            .iter()
+            .enumerate()
+            .map(|(index, buffer)| wgpu::BindGroupEntry {
+                binding: index as u32,
+                resource: buffer.as_entire_binding(),
+            })
+            .collect::<Vec<_>>();
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bind group"),
+            layout: &layout,
+            entries: &entries,
+        });
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pipeline layout"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(name),
+                layout: Some(&pipeline_layout),
+                module: &module,
+                entry_point: Some("sile_kernel_saxpy"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        Kernel { pipeline, bind_group, buffers }
+    }
+
     fn dispatch(&self, kernel: &Kernel, grid: [u32; 3]) {
         let mut encoder = self
             .device
@@ -212,6 +287,11 @@ impl Gpu {
         staging.unmap();
         out
     }
+}
+
+fn as_f32(v: &[f32]) -> &[f32] { v }
+fn as_i64(v: &[i64]) -> &[f32] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const f32, v.len() * 2) }
 }
 
 /// dims and scalars, the uniform every reference shares.
@@ -280,16 +360,23 @@ fn bench(
         mapped_at_creation: false,
     });
     let mut samples = Vec::with_capacity(reps);
+    // The kernel alone, with the round trip around it excluded: a host copy
+    // and a map/unmap can dominate a small kernel, and the number that says
+    // whether the code is fast is the dispatch.
+    let mut kernel_samples = Vec::with_capacity(reps);
     let mut home = vec![0.0f32; output.1];
+    // Uploaded once, the way the backend caches an upload: re-sending 200 MB
+    // every rep times the host's copy bandwidth, not the kernel.
+    for &(index, data) in inputs {
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        gpu.queue.write_buffer(&kernel.buffers[index], 0, bytes);
+    }
     for _ in 0..reps {
         let started = Instant::now();
-        for &(index, data) in inputs {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-            };
-            gpu.queue.write_buffer(&kernel.buffers[index], 0, bytes);
-        }
         gpu.dispatch(kernel, grid);
+        let _ = gpu.device.poll(wgpu::PollType::Wait);
+        kernel_samples.push(started.elapsed().as_secs_f64() * 1e3);
         let mut copy = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -315,8 +402,10 @@ fn bench(
     }
     let _ = home;
     samples.sort_by(|a, b| a.partial_cmp(b).expect("finite durations"));
+    kernel_samples.sort_by(|a, b| a.partial_cmp(b).expect("finite durations"));
     let median = samples[reps / 2];
     println!("BENCH {name:<12} {median:10.3} ms");
+    println!("  kernel      {:10.3} ms", kernel_samples[reps / 2]);
     median
 }
 
@@ -325,7 +414,28 @@ fn main() {
     let gpu = Gpu::new();
 
     match which.as_str() {
-        "saxpy" => {
+        "probe_sile" => {
+            // Run the WGSL the SILE backend generated, in this harness. The
+            // source declares four storage buffers and no uniform, so it gets
+            // its own build path.
+            let n = 1usize << 24;
+            let mut rng = Rng(1);
+            let y = rng.fill(n);
+            let out = vec![0.0f32; n];
+            let shapes: Vec<i64> = vec![16384, 1024];
+            let scalars: Vec<f32> = vec![2.0, 0.0, 0.0, 0.0];
+            let src = std::fs::read_to_string("/tmp/d2/saxpy/source-wgsl.txt").expect("read sile wgsl");
+            let kernel = gpu.build_storage("probe_sile", &src, &[
+                as_f32(&out), as_f32(&y), as_i64(&shapes), as_f32(&scalars),
+            ]);
+            let grid = [1024u32, 1, 1];
+            gpu.dispatch(&kernel, grid);
+            let _ = gpu.read(&kernel, 0, n);
+            let ms = bench("probe_sile", &gpu, &kernel, grid, &[], (0, n), 100);
+            println!("       {:.2} GB/s", (n as f64 * 3.0 * 4.0) / (ms * 1e-3) / 1e9);
+        }
+        "saxpy" | "probe_i64" | "probe_strip" | "probe_strip64" | "probe_unroll" => {
+            let probe = which.strip_prefix("probe_");
             let n = 1usize << 24;
             let mut rng = Rng(1);
             let x = rng.fill(n);
@@ -333,14 +443,19 @@ fn main() {
             let out = vec![0.0f32; n];
             let a = 2.0f32;
             let kernel = gpu.build(
-                "saxpy",
-                &source("saxpy"),
+                if probe.is_some() { which.as_str() } else { "saxpy" },
+                &source(&probe.map(|p| format!("_probe_{p}")).unwrap_or_else(|| "saxpy".into())),
                 &params([n as u32, 256 * 4096, 0, 0], [a, 0.0, 0.0, 0.0]),
                 &[&x, &y, &out],
             );
             // One grid axis caps at 65535 workgroups, so the launch is rows:
             // 4096 workgroups per row, 256 elements per workgroup.
-            let grid = [4096u32, n.div_ceil(256 * 4096) as u32, 1];
+            // The strip probe covers 16384 elements per workgroup of 256 threads.
+            let grid = if matches!(probe.as_deref(), Some("strip") | Some("strip64") | Some("unroll")) {
+                [(n / 16384) as u32, 1, 1]
+            } else {
+                [4096u32, n.div_ceil(256 * 4096) as u32, 1]
+            };
             gpu.dispatch(&kernel, grid);
             let got = gpu.read(&kernel, 3, n);
             let want: Vec<f32> = (0..n).map(|i| a * x[i] + y[i]).collect();

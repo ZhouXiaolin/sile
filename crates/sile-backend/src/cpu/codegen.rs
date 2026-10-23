@@ -650,5 +650,13 @@ fn intrinsic_name(intrinsic: &lsir::Intrinsic) -> String {
         lsir::Intrinsic::TileReduce { .. } | lsir::Intrinsic::TileMma { .. } => {
             unreachable!("a tile-level intrinsic is expanded, not called")
         }
+        // The SIMD-group intrinsics are the Metal mapping's plants: the C
+        // policy never asks for them and the input contract rejects them.
+        lsir::Intrinsic::SimdReduce { .. }
+        | lsir::Intrinsic::SimdLaneId
+        | lsir::Intrinsic::SimdGroupId
+        | lsir::Intrinsic::SimdGroupMma { .. } => {
+            unreachable!("a SIMD-group intrinsic is the Metal mapping's plant, never spelled here")
+        }
     }
 }

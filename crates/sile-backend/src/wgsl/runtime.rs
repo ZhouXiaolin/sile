@@ -47,7 +47,7 @@ pub struct WgpuBackend {
     buffers: std::sync::Mutex<std::collections::HashMap<(usize, usize), (wgpu::Buffer, bool)>>,
     /// MAP_READ staging keyed by the host range, for the same reason.
     staging: std::sync::Mutex<std::collections::HashMap<(usize, usize), wgpu::Buffer>>,
-    descriptors: std::sync::Mutex<std::collections::HashMap<u64, wgpu::Buffer>>,
+    descriptors: std::sync::Mutex<std::collections::HashMap<(String, u64), wgpu::Buffer>>,
 }
 
 /// True when the type is, contains, or points at an `f16`.
@@ -142,23 +142,14 @@ impl WgpuBackend {
     pub fn new() -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = pick_adapter(&instance)?;
-        // The lowering makes every index an i64, so a device without 64-bit
-        // shader integers cannot run any kernel. Asking for the intersection of
-        // optional features would silently drop this one, and the shader would
-        // fail validation later as if the kernel were at fault.
+        // Kernels spell 32-bit integers only — the WGSL spelling demotes the
+        // lowering's i64 (MAPPING_DESIGN §5) — so no integer feature is a
+        // precondition any more. A half buffer stays an optional ask: take
+        // what the adapter offers; `execute_llir` rejects an f16 kernel when
+        // this one is missing.
         let (device, queue) = {
             let available = adapter.features();
-            if !available.contains(wgpu::Features::SHADER_INT64) {
-                return Err(sile_core::Error::UnsupportedBackend(
-                    "the WGPU adapter has no SHADER_INT64 feature, which every kernel needs for its i64 indices",
-                ));
-            }
-            // The lowering makes every index an i64, which is an optional
-            // WGSL capability rather than a default, and a half buffer
-            // is the same kind of ask. Take what the adapter offers here;
-            // `execute_llir` rejects an f16 kernel when this one is missing.
-            let required_features =
-                available.intersection(wgpu::Features::SHADER_INT64 | wgpu::Features::SHADER_F16);
+            let required_features = available.intersection(wgpu::Features::SHADER_F16);
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("sile wgpu device"),
                 required_features,
@@ -253,7 +244,12 @@ impl WgpuBackend {
             .descriptors
             .lock()
             .expect("the descriptor buffer cache lock is poisoned");
-        if let Some(buffer) = cache.get(&size) {
+        // The key carries the label: two descriptors of one byte size — the
+        // float scalars and the demoted integer scalars are both 4 bytes —
+        // must stay separate buffers, or one launch's write clobbers the
+        // other's binding.
+        let key = (label.to_string(), size);
+        if let Some(buffer) = cache.get(&key) {
             return buffer.clone();
         }
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -264,7 +260,7 @@ impl WgpuBackend {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        cache.insert(size, buffer.clone());
+        cache.insert(key, buffer.clone());
         buffer
     }
 
@@ -336,20 +332,23 @@ impl WgpuBackend {
         // the driver-side compile all read the source alone, so the cache
         // turns a repeated launch into the dispatch it is. A first launch
         // runs the whole gate once; the same source again takes the pipeline.
+        // The cache keys on the owned source, so the launch owns one copy of
+        // the text it validates, compiles and dispatches.
+        let source: String = source.to_string();
         let (layout, pipeline) = {
             let mut cache = self
                 .pipelines
                 .lock()
                 .expect("the pipeline cache lock is poisoned");
-            match cache.get(source) {
+            match cache.get(&source) {
                 Some((layout, pipeline)) => (layout.clone(), pipeline.clone()),
                 None => {
-                    super::validate(source)?;
+                    super::validate(&source)?;
 
                     // The entry point declares its workgroup size from the mapping
                     // policy, and an adapter caps it along every axis. The driver would
                     // refuse the pipeline without naming the cause, so name it here.
-                    if let Some(threads) = declared_workgroup_size(source)
+                    if let Some(threads) = declared_workgroup_size(&source)
                         && threads > self.limits.max_compute_workgroup_size_x
                     {
                         return Err(sile_core::Error::UnsupportedBackend(Box::leak(
@@ -366,7 +365,7 @@ impl WgpuBackend {
                     // and the driver refuses a pipeline over the adapter's limit without
                     // saying so — the dispatch fails later as `Encoder is invalid`. Name
                     // the real cause here, the way the f16 check above does.
-                    let local_bytes = super::local_array_bytes(source);
+                    let local_bytes = super::local_array_bytes(&source);
                     let limit = self.limits.max_compute_workgroup_storage_size;
                     if local_bytes > limit {
                         return Err(sile_core::Error::UnsupportedBackend(Box::leak(
@@ -455,6 +454,7 @@ impl WgpuBackend {
         // allocation zero-initialized — would put allocation, not the kernel,
         // in the timing loop. `write_buffer` still runs per launch: the host
         // bytes may have changed since.
+        let t_setup = std::time::Instant::now();
         let mut buffers = Vec::with_capacity(args.len());
         for arg in args {
             let bytes = unsafe { std::slice::from_raw_parts(arg.ptr, arg.len_in_bytes()) };
@@ -462,7 +462,7 @@ impl WgpuBackend {
             // A written argument's mirror was filled once and every launch
             // since has read it back, so the mirror holds the host bytes; an
             // untouched mirror, like a read-only argument's, needs the upload.
-            if !uploaded || !arg.written {
+            if !uploaded {
                 self.queue.write_buffer(&buffer, 0, bytes);
                 self.mark_buffer_uploaded(arg.ptr as usize, bytes.len());
             }
@@ -472,9 +472,23 @@ impl WgpuBackend {
         // A kernel declares the integer scalar descriptor only when it takes
         // an integer scalar, so the host asks the shader rather than assuming.
 
-        let shapes: Vec<i64> = args.iter().flat_map(|a| a.shape.iter().copied()).collect();
+        // The descriptors load as `i32` on the device (the spelling demotes
+        // every integer), so the host packs 32-bit and enforces the value
+        // contract that makes the demotion sound: an extent past `i32::MAX`
+        // would wrap on the device, so it refuses the launch instead.
+        let shapes: Vec<i32> = args
+            .iter()
+            .flat_map(|a| a.shape.iter().copied())
+            .map(|v| {
+                i32::try_from(v).map_err(|_| {
+                    sile_core::Error::Compile(format!(
+                        "shape extent {v} exceeds the WGSL 32-bit index contract"
+                    ))
+                })
+            })
+            .collect::<Result<_>>()?;
         let shapes_buffer = self.descriptor_buffer(
-            (shapes.len().max(1) * std::mem::size_of::<i64>()) as u64,
+            (shapes.len().max(1) * std::mem::size_of::<i32>()) as u64,
             "sile shapes",
         );
         self.queue
@@ -497,12 +511,25 @@ impl WgpuBackend {
         // kernel that declares one gets a binding: a bind group entry without
         // a binding in the shader is an error, not an unused slot.
         let scalars_i64_buffer = if has_scalars_i64 {
+            // Same 32-bit packing as the shapes: the device descriptor loads
+            // `i32`, and a scalar past the contract has no meaning as one.
+            let packed: Vec<i32> = scalars_i64
+                .iter()
+                .copied()
+                .map(|v| {
+                    i32::try_from(v).map_err(|_| {
+                        sile_core::Error::Compile(format!(
+                            "integer scalar {v} exceeds the WGSL 32-bit index contract"
+                        ))
+                    })
+                })
+                .collect::<Result<_>>()?;
             let buffer = self.descriptor_buffer(
-                (scalars_i64.len().max(1) * std::mem::size_of::<i64>()) as u64,
+                (packed.len().max(1) * std::mem::size_of::<i32>()) as u64,
                 "sile scalars i64",
             );
-            if !scalars_i64.is_empty() {
-                self.queue.write_buffer(&buffer, 0, as_bytes(scalars_i64));
+            if !packed.is_empty() {
+                self.queue.write_buffer(&buffer, 0, as_bytes(&packed));
             }
             Some(buffer)
         } else {
@@ -543,6 +570,8 @@ impl WgpuBackend {
             entries: &entries,
         });
 
+        let t_submit = std::time::Instant::now();
+        let _trace = std::env::var_os("SILE_TRACE").is_some();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -579,8 +608,12 @@ impl WgpuBackend {
             let staging = self.staging_buffer(arg_ptr(args, *index), *byte_len);
             encoder.copy_buffer_to_buffer(&buffers[*index], 0, &staging, 0, *byte_len as u64);
         }
+        let t_enc = t_submit.elapsed();
         self.queue.submit(Some(encoder.finish()));
+        let t_sub = t_submit.elapsed();
         let _ = self.device.poll(wgpu::PollType::Wait);
+        let t_poll = t_submit.elapsed();
+        if _trace { eprintln!("TRACE setup {:?} enc {:?} submit {:?} poll {:?}", t_setup.elapsed(), t_enc, t_sub - t_enc, t_poll - t_sub); }
 
         // A kernel writes its output in place, so the host reads the buffer
         // back. The read-back is a byte copy: the device holds the same

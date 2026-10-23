@@ -205,7 +205,7 @@ pub fn dump_kernel(kernel: &sile_hir::Kernel, root: &Path) -> Result<()> {
             Ok(artifact) => {
                 let (name, source) = match artifact {
                     sile_backend::BackendArtifact::CSource(source) => ("c", source),
-                    sile_backend::BackendArtifact::MetalSource(source) => ("metal", source),
+                    sile_backend::BackendArtifact::MetalSource { source, .. } => ("metal", source),
                     sile_backend::BackendArtifact::WgslSource(source) => ("wgsl", source),
                     sile_backend::BackendArtifact::PtxSource(source) => ("ptx", source),
                 };

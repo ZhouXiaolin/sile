@@ -3,12 +3,9 @@ pub mod codegen;
 #[cfg(target_os = "macos")]
 use metal::{CommandQueue, ComputePipelineState, Device, Library};
 #[cfg(target_os = "macos")]
-use sile_core::{KernelArg, LaunchConfig, Result, Stream};
+use sile_core::{KernelArg, LaunchConfig, Result};
 #[cfg(target_os = "macos")]
 use sile_lsir::Function as LsirFunction;
-
-#[cfg(target_os = "macos")]
-use self::codegen::generate as generate_lsir_metal;
 
 #[cfg(target_os = "macos")]
 pub struct MetalBackend {
@@ -27,6 +24,12 @@ impl MetalBackend {
     }
 
     fn compile_shader(&self, source: &str) -> Result<Library> {
+        // Note on fast-math: AIR's default fast-math folds `x + (-INFINITY)`
+        // into `x`, which once swallowed the causal mask whole (see
+        // examples/probe_metal.rs). The defense lives in the IR — instcombine
+        // rewrites `x + select(mask, 0, -inf)` into `select(mask, x, -inf)`,
+        // a shape fast-math leaves alone — so the compiler options stay at
+        // their fast defaults.
         let options = metal::CompileOptions::new();
         self.device
             .new_library_with_source(source, &options)
@@ -65,40 +68,43 @@ impl MetalBackend {
         }
     }
 
-    pub fn execute_llir(
+    /// Dispatch one compiled kernel.
+    ///
+    /// The source is the artifact [`crate::compile`] produced — the mapping
+    /// has already run, and `threads` is the threadgroup width its policy
+    /// decided, serial fallback included. One threadgroup owns one tile, so
+    /// the dispatch owes the kernel exactly that count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_source(
         &self,
         func: &LsirFunction,
+        source: &str,
         outputs: &[bool],
         args: &[KernelArg<'_>],
         scalars: &[f32],
         scalars_i64: &[i64],
         launch: &LaunchConfig,
-        _stream: &Stream,
+        threads: u32,
     ) -> Result<()> {
-        let source = generate_lsir_metal(func)?;
-        let launch = self.normalize_lsir_launch(func, launch);
-        self.execute_source(
+        let launch = LaunchConfig {
+            // The kernel reads the grid per axis (`threadgroup_position_in_grid`),
+            // so the dispatch keeps the shape the launcher resolved.
+            grid: launch.grid,
+        };
+        self.dispatch(
             &func.name,
-            &source,
+            source,
             outputs,
             args,
             scalars,
             scalars_i64,
             &launch,
+            threads,
         )
     }
 
-    fn normalize_lsir_launch(
-        &self,
-        func: &LsirFunction,
-        launch: &LaunchConfig,
-    ) -> LaunchConfig {
-        LaunchConfig {
-            grid: crate::emit::flatten_grid(func, launch),
-        }
-    }
-
-    fn execute_source(
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch(
         &self,
         kernel_name: &str,
         source: &str,
@@ -107,11 +113,22 @@ impl MetalBackend {
         scalars: &[f32],
         scalars_i64: &[i64],
         launch: &LaunchConfig,
+        threads: u32,
     ) -> Result<()> {
         let library = self.compile_shader(source)?;
         let fn_name = format!("sile_kernel_{}", kernel_name);
         let function = self.get_function(&library, &fn_name)?;
         let pipeline = self.create_pipeline(&function)?;
+        // Fail closed on an adapter that cannot fit the mapped threadgroup:
+        // dispatching fewer threads than the kernel's strips assume would
+        // silently drop the elements those threads own.
+        let max_threads = pipeline.max_total_threads_per_threadgroup();
+        if u64::from(threads) > max_threads {
+            return Err(sile_core::Error::Compile(format!(
+                "the mapping wants {threads} threads per threadgroup but this \
+                 adapter allows at most {max_threads}"
+            )));
+        }
 
         let mut mtl_buffers: Vec<metal::Buffer> = Vec::new();
         for arg in args {
@@ -176,7 +193,9 @@ impl MetalBackend {
         let grid_x = launch.grid[0] as u64;
         let grid_y = launch.grid[1] as u64;
         let grid_z = launch.grid[2] as u64;
-        let threads_per_threadgroup = metal::MTLSize::new(1, 1, 1);
+        // One threadgroup owns one tile; the flat spread runs along x, the
+        // axis the mapping's strips and barriers are written against.
+        let threads_per_threadgroup = metal::MTLSize::new(u64::from(threads), 1, 1);
 
         encoder.dispatch_thread_groups(
             metal::MTLSize::new(grid_x, grid_y, grid_z),

@@ -95,6 +95,12 @@ pub enum ReducePolicy {
     /// Per-thread partials in shared scratch and a tree reduction over them,
     /// one barrier per tree step.
     WorkgroupTree,
+    /// Per-thread partials folded by one hardware SIMD-group instruction, the
+    /// group partials in shared scratch and the tree run over them — Harris's
+    /// two-phase shape with the first shared round trip replaced by the
+    /// hardware fold. A workgroup no wider than one SIMD-group needs neither
+    /// scratch nor barrier: every lane leaves the fold holding the result.
+    SimdGroupTree,
 }
 
 /// How a `TileMma` materializes.
@@ -105,6 +111,11 @@ pub enum MmaPolicy {
     /// Operands in shared storage, one barrier per side, and each thread
     /// computes the accumulator strip it owns.
     ThreadStrips,
+    /// Operands and two staging buffers in shared storage, and the multiply
+    /// left whole as a `SimdGroupMma` for the target to spell as
+    /// `simdgroup_matrix` fragments — Goto & Geijn's register blocking, one
+    /// register block per SIMD-group.
+    SimdGroupTiles,
 }
 
 /// Whether the target wants a loop vectorization hint.
@@ -175,16 +186,26 @@ pub fn run_stage(func: Function, policy: &MappingPolicy, stage: usize) -> Result
         2 => match policy.reduce {
             ReducePolicy::Serial => Ok(func),
             ReducePolicy::WorkgroupTree => materialize_reduces(func, policy),
+            ReducePolicy::SimdGroupTree => materialize_reduces(func, policy),
         },
         3 => match policy.mma {
             MmaPolicy::Serial => Ok(func),
             MmaPolicy::ThreadStrips => materialize_mmas(func, policy),
+            MmaPolicy::SimdGroupTiles => materialize_mmas(func, policy),
         },
         4 => {
             let mut func = crate::passes::loop_unroll::run(func);
             expand_owner_strips(&mut func, policy)?;
             privatize_owner_tiles(&mut func, policy)?;
             share_owner_tiles(&mut func, policy)?;
+            retype_shared_geps(&mut func);
+            // After the strips are unrolled and the tiles are privatized, a
+            // thread's fragment is only reached through constant indices, so
+            // the array holds nothing the SSA values do not. Promoting it here
+            // is what keeps the fragment in registers: the emitter has no
+            // optimizer behind it, so a surviving array is per-thread memory
+            // on WGSL and Metal (the C target only hides this behind clang).
+            func = crate::passes::sroa::run(func);
             crate::passes::storage::run(&mut func);
             crate::passes::canonicalize::eliminate_dead_insts(&mut func);
             Ok(func)
@@ -574,8 +595,8 @@ fn expand_owner_strips(func: &mut Function, policy: &MappingPolicy) -> Result<()
         if barrier_in_body
             || plan.extent % plan.step != 0
             || trip < 1
-            || trip > 16
-            || body_block.insts.len() * trip as usize > 400
+            || trip > 64
+            || body_block.insts.len() * trip as usize > 1600
             || plan.exit_args.iter().any(|operand| {
                 matches!(operand, Operand::Value(v) if *v == plan.induction)
             })
@@ -877,7 +898,7 @@ fn privatize_owner_tiles(func: &mut Function, policy: &MappingPolicy) -> Result<
                 &inst.op,
                 InstOp::Alloca { alloc_ty: Type::Array { elem, len }, addr_space: AddressSpace::Private }
                     if **elem == Type::F32
-                        && (*len * 4) as i64 <= policy.shared_cap
+                        && (*len as i64 / threads * 4) <= policy.shared_cap
                         && *len as i64 % threads == 0
             )
         })
@@ -1216,6 +1237,60 @@ fn share_owner_tiles(func: &mut Function, policy: &MappingPolicy) -> Result<(), 
         );
     }
     Ok(())
+}
+
+/// The address space a pointer names, told truthfully.
+///
+/// The flip stages move a tile's alloca into shared storage; the geps that
+/// address it were typed against the old space, and nothing retyped them.
+/// WGSL and C spell no address spaces, so the lie was invisible — MSL's
+/// qualified pointers refuse the assignment instead. A gep into shared
+/// storage is a shared pointer, transitively through gep chains, so one
+/// fixpoint makes the types say so.
+fn retype_shared_geps(func: &mut Function) {
+    loop {
+        let tys: std::collections::HashMap<ValueId, Type> = func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .filter_map(|inst| inst.result.map(|id| (id, inst.ty.clone())))
+            .collect();
+        let mut changed = false;
+        for block in &mut func.blocks {
+            for inst in &mut block.insts {
+                let InstOp::Gep {
+                    base: Operand::Value(base),
+                    indices,
+                    ..
+                } = &inst.op
+                else {
+                    continue;
+                };
+                let Some(Type::Ptr {
+                    addr_space: AddressSpace::Shared,
+                    pointee,
+                }) = tys.get(base)
+                else {
+                    continue;
+                };
+                let mut elem = (**pointee).clone();
+                for _ in indices {
+                    let Type::Array { elem: next, .. } = elem else {
+                        break;
+                    };
+                    elem = (*next).clone();
+                }
+                let shared = Type::ptr(AddressSpace::Shared, elem);
+                if inst.ty != shared {
+                    inst.ty = shared;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return;
+        }
+    }
 }
 
 /// The value a load of this pointer's alloca produces, when the pointer is
@@ -2081,15 +2156,19 @@ fn materialize_reduces(func: Function, policy: &MappingPolicy) -> Result<Functio
         return Ok(func);
     }
     let threads = policy.launch.count();
-    // The tree reads the tile's columns across the strip: thread `tid` reads
+    // Both trees read the tile's columns across the strip: thread `tid` reads
     // slot `base + tid`, so the column count has to be a whole number of
-    // strips or the last ones read past the tile. Fail closed; the caller
-    // falls back to the serial mapping.
+    // strips or the last ones read past the tile — and the strip loop's trip
+    // count, which the hardware fold's uniformity rides on, would vary by
+    // lane. Fail closed; the caller falls back to the serial mapping.
     if let Some(site) = sites.iter().find(|site| site.extent % threads as u64 != 0) {
         return Err(format!(
             "a tile reduce over {} columns does not divide across {} threads",
             site.extent, threads
         ));
+    }
+    if policy.reduce == ReducePolicy::SimdGroupTree {
+        return materialize_simd_reduces(func, policy, sites);
     }
     let scratch_len = sites
         .iter()
@@ -2107,6 +2186,50 @@ fn materialize_reduces(func: Function, policy: &MappingPolicy) -> Result<Functio
     ctx.append_to_entry(scratch);
     for (order, site) in sites.into_iter().enumerate() {
         build_tree_reduce(&mut ctx, scratch_id, site, threads, order)?;
+    }
+    Ok(ctx.finish())
+}
+
+/// Replace every `TileReduce` with the simd-group tree.
+///
+/// The scratch holds one slot per SIMD-group per output row; a workgroup no
+/// wider than one SIMD-group writes no scratch, so none is allocated and the
+/// fold's uniform result is the result.
+fn materialize_simd_reduces(
+    func: Function,
+    policy: &MappingPolicy,
+    sites: Vec<ReduceSite>,
+) -> Result<Function, String> {
+    let threads = policy.launch.count();
+    let simd_groups = (threads as i64 / 32).max(1);
+    let mut ctx = Ctx::new(func);
+    let scratch = if simd_groups > 1 {
+        let scratch_len = sites
+            .iter()
+            .map(|site| site.outer as usize)
+            .max()
+            .expect("checked non-empty")
+            * simd_groups as usize;
+        let alloca = ctx.alloca(
+            "sile_reduce_scratch",
+            Type::array(scratch_len, Type::F32),
+            AddressSpace::Shared,
+        );
+        let scratch_id = alloca.result.expect("an alloca has a result");
+        ctx.append_to_entry(alloca);
+        Some(scratch_id)
+    } else {
+        None
+    };
+    for (order, site) in sites.into_iter().enumerate() {
+        build_simd_tree_reduce(
+            &mut ctx,
+            scratch,
+            site,
+            threads,
+            simd_groups,
+            order,
+        )?;
     }
     Ok(ctx.finish())
 }
@@ -2511,29 +2634,30 @@ impl Ctx {
     }
 }
 
-/// The tree reduction one site becomes.
-///
-/// The site's call is replaced by the result alloca it promised, and the
-/// blocks between compute it: per-thread partials per output row, a barrier,
-/// `log2(W)` straight-line tree steps, the result copy, and a barrier that
-/// lets the scratch serve the next fold.
-fn build_tree_reduce(
+/// One fold's per-thread strip partial, the part both tree reductions share:
+/// swap the call for the result alloca it promised, split the block so the
+/// tree lands between the site and its consumers, and spell the rows loop
+/// whose cols strip loop leaves the thread's partial in a private
+/// accumulator.
+struct StripPartial {
+    rows: CountedLoop,
+    cols: CountedLoop,
+    acc_slot: ValueId,
+    /// The continuation the site's consumers live on.
+    cont: BlockId,
+}
+
+fn build_strip_partial(
     ctx: &mut Ctx,
-    scratch_id: ValueId,
-    site: ReduceSite,
+    site: &ReduceSite,
     threads: u32,
     order: usize,
-) -> Result<(), String> {
+) -> Result<StripPartial, String> {
     let span = (site.extent * site.inner) as i64;
     let outer = site.outer as i64;
     let w = threads as i64;
-    let ReduceSite {
-        result,
-        reduce,
-        source,
-        ..
-    } = site;
-    // The fold reads tile storage, and this policy only spells f32 folds.
+    // The fold reads tile storage, and both tree policies only spell f32
+    // folds — the hardware fold's primitives are f32 too.
     let defs: Defs<'_> = ctx
         .func
         .blocks
@@ -2541,23 +2665,23 @@ fn build_tree_reduce(
         .flat_map(|block| &block.insts)
         .filter_map(|inst| inst.result.map(|id| (id, inst)))
         .collect();
-    let elem = tile_element_of(&ctx.func, &defs, source)
+    let elem = tile_element_of(&ctx.func, &defs, site.source)
         .map(|(_, elem)| elem)
         .ok_or_else(|| "a reduce source is not tile storage".to_string())?;
     if elem != Type::F32 {
-        return Err("the workgroup-tree reduce policy only spells f32 folds".into());
+        return Err("the tree reduce policies only spell f32 folds".into());
     }
     // Swap the call for the result alloca it promised, and split the block
     // so the tree lands between the site and its consumers.
-    let at = find_block_with_inst(&ctx.func, result)
+    let at = find_block_with_inst(&ctx.func, site.result)
         .ok_or_else(|| "a reduce site vanished before materialization".to_string())?;
     let index = ctx.block_ref(at)
         .insts
         .iter()
-        .position(|inst| inst.result == Some(result))
+        .position(|inst| inst.result == Some(site.result))
         .expect("the block holds the call");
     let dst = Inst {
-        result: Some(result),
+        result: Some(site.result),
         result_name: Some(ctx.name("red")),
         ty: Type::ptr(AddressSpace::Private, Type::array(outer as usize, Type::F32)),
         op: InstOp::Alloca {
@@ -2591,7 +2715,7 @@ fn build_tree_reduce(
     ctx.store(
         rows.body,
         Operand::Value(acc_slot),
-        Operand::Const(Constant::Float(identity(reduce))),
+        Operand::Const(Constant::Float(identity(site.reduce))),
     );
     let cols = ctx.open_loop(
         &format!("{tag}j"),
@@ -2619,7 +2743,7 @@ fn build_tree_reduce(
     let src_ptr = ctx.gep(
         cols.body,
         &format!("{tag}_src"),
-        source,
+        site.source,
         Operand::Value(addr),
         Type::F32,
     );
@@ -2637,9 +2761,38 @@ fn build_tree_reduce(
         Type::F32,
     );
     let p = ctx.load(cols.body, &format!("{tag}_p"), Operand::Value(p_slot), Type::F32);
-    let combined = ctx.fold(cols.body, &format!("{tag}_fold"), reduce, p, v);
+    let combined = ctx.fold(cols.body, &format!("{tag}_fold"), site.reduce, p, v);
     ctx.store(cols.body, Operand::Value(p_slot), Operand::Value(combined));
     ctx.close_loop(&cols, w, cols.body);
+    Ok(StripPartial {
+        rows,
+        cols,
+        acc_slot,
+        cont,
+    })
+}
+
+/// The tree reduction one site becomes.
+///
+/// The site's call is replaced by the result alloca it promised, and the
+/// blocks between compute it: per-thread partials per output row, a barrier,
+/// `log2(W)` straight-line tree steps, the result copy, and a barrier that
+/// lets the scratch serve the next fold.
+fn build_tree_reduce(
+    ctx: &mut Ctx,
+    scratch_id: ValueId,
+    site: ReduceSite,
+    threads: u32,
+    order: usize,
+) -> Result<(), String> {
+    let StripPartial { rows, cols, acc_slot, cont } =
+        build_strip_partial(ctx, &site, threads, order)?;
+    let outer = site.outer as i64;
+    let w = threads as i64;
+    let result = site.result;
+    let reduce = site.reduce;
+    let tid = thread_id_of(&ctx.func).expect("the policy stage ran");
+    let tag = format!("mr{order}");
     // scratch[r * W + tid] = partial; the continuation of the rows body
     // lives on the cols loop's exit, which carries the rows back edge.
     let row_after = ctx.load(cols.exit, &format!("{tag}_row"), Operand::Value(rows.iv), Type::I64);
@@ -2797,6 +2950,272 @@ fn build_tree_reduce(
     Ok(())
 }
 
+/// The simd-group tree one site becomes.
+///
+/// The strip partial folds in hardware: one `SimdReduce` the whole
+/// SIMD-group meets under uniform control flow — the rows loop runs `outer`
+/// trips and the cols loop `span / threads` trips for every lane, both
+/// counts lane-independent — and every active lane leaves with the group's
+/// value, a partial SIMD-group folding its active lanes. With one group that
+/// is the result already: the copy is a private store, and the site costs no
+/// scratch and no barrier. With several, one lane writes each group's
+/// partial to scratch — the lane test and the slot come from the spelled
+/// builtins, because the hardware owns the map from thread index to
+/// SIMD-group — and the same straight-line tree steps run over the group
+/// slots, `log2(simd_groups)` of them.
+fn build_simd_tree_reduce(
+    ctx: &mut Ctx,
+    scratch: Option<ValueId>,
+    site: ReduceSite,
+    threads: u32,
+    simd_groups: i64,
+    order: usize,
+) -> Result<(), String> {
+    let StripPartial { rows, cols, acc_slot, cont } =
+        build_strip_partial(ctx, &site, threads, order)?;
+    let outer = site.outer as i64;
+    let result = site.result;
+    let reduce = site.reduce;
+    let tid = thread_id_of(&ctx.func).expect("the policy stage ran");
+    let tag = format!("mr{order}");
+
+    // The hardware fold over the strip partial.
+    let partial = ctx.load(cols.exit, &format!("{tag}_partial"), Operand::Value(acc_slot), Type::F32);
+    let simd = ctx.named_inst(
+        &format!("{tag}_simd"),
+        Type::F32,
+        InstOp::Intrinsic {
+            intrinsic: Intrinsic::SimdReduce { reduce },
+            args: vec![Operand::Value(partial)],
+        },
+    );
+    let simd_id = simd.result.expect("a simd fold has a result");
+    ctx.push(cols.exit, simd);
+
+    let Some(scratch_id) = scratch else {
+        // One SIMD-group: the uniform value is the result, in every lane's
+        // register at once.
+        let row_after = ctx.load(cols.exit, &format!("{tag}_row"), Operand::Value(rows.iv), Type::I64);
+        let to = ctx.gep(
+            cols.exit,
+            &format!("{tag}_out"),
+            result,
+            Operand::Value(row_after),
+            Type::F32,
+        );
+        ctx.store(cols.exit, Operand::Value(to), Operand::Value(simd_id));
+        ctx.close_loop(&rows, 1, cols.exit);
+        ctx.set_terminator(
+            rows.exit,
+            Terminator::Br {
+                target: cont,
+                args: Vec::new(),
+            },
+        );
+        return Ok(());
+    };
+
+    // One lane per SIMD-group writes the group's partial.
+    let row_after = ctx.load(cols.exit, &format!("{tag}_row"), Operand::Value(rows.iv), Type::I64);
+    let lane_at = ctx.named_inst(
+        &format!("{tag}_lane_at"),
+        Type::I64,
+        InstOp::Intrinsic {
+            intrinsic: Intrinsic::SimdLaneId,
+            args: Vec::new(),
+        },
+    );
+    let lane_id = lane_at.result.expect("a lane index has a result");
+    ctx.push(cols.exit, lane_at);
+    let lane0 = ctx.icmp(
+        cols.exit,
+        &format!("{tag}_lane0"),
+        CmpPred::Eq,
+        Operand::Value(lane_id),
+        Operand::Const(Constant::Int(0)),
+    );
+    let write_body = ctx.block(&format!("{tag}_lane_body"));
+    let write_join = ctx.block(&format!("{tag}_lane_join"));
+    ctx.set_terminator(
+        cols.exit,
+        Terminator::CondBr {
+            cond: Operand::Value(lane0),
+            true_target: write_body,
+            true_args: Vec::new(),
+            false_target: write_join,
+            false_args: Vec::new(),
+        },
+    );
+    let gid = ctx.named_inst(
+        &format!("{tag}_gid"),
+        Type::I64,
+        InstOp::Intrinsic {
+            intrinsic: Intrinsic::SimdGroupId,
+            args: Vec::new(),
+        },
+    );
+    let gid_id = gid.result.expect("a group index has a result");
+    ctx.push(write_body, gid);
+    let lane = ctx.int_bin(
+        write_body,
+        &format!("{tag}_lane"),
+        BinOp::Mul,
+        Operand::Value(row_after),
+        Operand::Const(Constant::Int(simd_groups)),
+    );
+    let slot = ctx.int_bin(
+        write_body,
+        &format!("{tag}_slot"),
+        BinOp::Add,
+        Operand::Value(lane),
+        Operand::Value(gid_id),
+    );
+    let out = ctx.gep(
+        write_body,
+        &format!("{tag}_out"),
+        scratch_id,
+        Operand::Value(slot),
+        Type::F32,
+    );
+    ctx.store(write_body, Operand::Value(out), Operand::Value(simd_id));
+    ctx.set_terminator(
+        write_body,
+        Terminator::Br {
+            target: write_join,
+            args: Vec::new(),
+        },
+    );
+    ctx.close_loop(&rows, 1, write_join);
+
+    // The tree, over the group slots: the same straight-line steps the
+    // workgroup tree spells, one barrier each, fewer of them.
+    let mut guard = rows.exit;
+    ctx.barrier(guard);
+    let mut stride = simd_groups / 2;
+    while stride > 0 {
+        let picks = ctx.icmp(
+            guard,
+            &format!("{tag}_step{stride}"),
+            CmpPred::Slt,
+            Operand::Value(tid),
+            Operand::Const(Constant::Int(stride)),
+        );
+        let step_body = ctx.block(&format!("{tag}_step{stride}_body"));
+        let step_join = ctx.block(&format!("{tag}_step{stride}_join"));
+        ctx.set_terminator(
+            guard,
+            Terminator::CondBr {
+                cond: Operand::Value(picks),
+                true_target: step_body,
+                true_args: Vec::new(),
+                false_target: step_join,
+                false_args: Vec::new(),
+            },
+        );
+        let walks = ctx.open_loop(
+            &format!("{tag}t{stride}"),
+            step_body,
+            Operand::Const(Constant::Int(0)),
+            outer,
+            1,
+        );
+        let walk_row = ctx.load(walks.body, &format!("{tag}_tr"), Operand::Value(walks.iv), Type::I64);
+        let walk_base = ctx.int_bin(
+            walks.body,
+            &format!("{tag}_tb"),
+            BinOp::Mul,
+            Operand::Value(walk_row),
+            Operand::Const(Constant::Int(simd_groups)),
+        );
+        let low_index = ctx.int_bin(
+            walks.body,
+            &format!("{tag}_tl"),
+            BinOp::Add,
+            Operand::Value(walk_base),
+            Operand::Value(tid),
+        );
+        let high_index = ctx.int_bin(
+            walks.body,
+            &format!("{tag}_th"),
+            BinOp::Add,
+            Operand::Value(low_index),
+            Operand::Const(Constant::Int(stride)),
+        );
+        let low = ctx.gep(
+            walks.body,
+            &format!("{tag}_low"),
+            scratch_id,
+            Operand::Value(low_index),
+            Type::F32,
+        );
+        let high = ctx.gep(
+            walks.body,
+            &format!("{tag}_high"),
+            scratch_id,
+            Operand::Value(high_index),
+            Type::F32,
+        );
+        let a = ctx.load(walks.body, &format!("{tag}_ta"), Operand::Value(low), Type::F32);
+        let b = ctx.load(walks.body, &format!("{tag}_tbv"), Operand::Value(high), Type::F32);
+        let merged = ctx.fold(walks.body, &format!("{tag}_tm"), reduce, a, b);
+        ctx.store(walks.body, Operand::Value(low), Operand::Value(merged));
+        ctx.close_loop(&walks, 1, walks.body);
+        ctx.set_terminator(
+            walks.exit,
+            Terminator::Br {
+                target: step_join,
+                args: Vec::new(),
+            },
+        );
+        ctx.barrier(step_join);
+        guard = step_join;
+        stride /= 2;
+    }
+
+    // Every thread copies the results out, then one more barrier lets the
+    // scratch serve the next fold.
+    let copy = ctx.open_loop(
+        &format!("{tag}c"),
+        guard,
+        Operand::Const(Constant::Int(0)),
+        outer,
+        1,
+    );
+    let copy_base = ctx.int_bin(
+        copy.body,
+        &format!("{tag}_cb"),
+        BinOp::Mul,
+        Operand::Value(copy.index),
+        Operand::Const(Constant::Int(simd_groups)),
+    );
+    let from = ctx.gep(
+        copy.body,
+        &format!("{tag}_cf"),
+        scratch_id,
+        Operand::Value(copy_base),
+        Type::F32,
+    );
+    let value = ctx.load(copy.body, &format!("{tag}_cv"), Operand::Value(from), Type::F32);
+    let to = ctx.gep(
+        copy.body,
+        &format!("{tag}_ct"),
+        result,
+        Operand::Value(copy.index),
+        Type::F32,
+    );
+    ctx.store(copy.body, Operand::Value(to), Operand::Value(value));
+    ctx.close_loop(&copy, 1, copy.body);
+    ctx.barrier(copy.exit);
+    ctx.set_terminator(
+        copy.exit,
+        Terminator::Br {
+            target: cont,
+            args: Vec::new(),
+        },
+    );
+    Ok(())
+}
+
 fn identity(reduce: TileReduceOp) -> f64 {
     // The same unit the TileIR fold carries: Max/Min seed ±inf so a fold
     // over data containing infinities still folds correctly. The C, MSL and
@@ -2875,9 +3294,79 @@ fn materialize_mmas(func: Function, policy: &MappingPolicy) -> Result<Function, 
     let threads = policy.launch.count() as i64;
     let mut ctx = Ctx::new(func);
     for (order, site) in sites.into_iter().enumerate() {
-        build_mma_strip(&mut ctx, site, threads, order)?;
+        if policy.mma == MmaPolicy::SimdGroupTiles {
+            build_mma_simd_tiles(&mut ctx, site, threads, order, policy.shared_cap)?;
+        } else {
+            build_mma_strip(&mut ctx, site, threads, order)?;
+        }
     }
     Ok(ctx.finish())
+}
+
+/// Split the tile's 8x8 fragment grid across the workgroup's SIMD-groups: a
+/// power-of-two block of fragment rows times one of fragment columns, every
+/// group at least one fragment and every block a whole number of fragments.
+/// The grid is fixed, so every feasible split leaves the same fragments per
+/// group; what the search maximizes is how many of the workgroup's groups
+/// hold one. `None` when the grid cannot cover the groups at all.
+fn split_fragment_blocks(simds: i64, frag_m: i64, frag_n: i64) -> Option<(u32, u32)> {
+    let mut best: Option<(i64, i64)> = None;
+    let mut sm = 1i64;
+    while sm <= simds && sm <= frag_m {
+        if frag_m % sm == 0 {
+            let mut sn = 1i64;
+            while sn * 2 * sm <= simds && sn * 2 <= frag_n && frag_n % (sn * 2) == 0 {
+                sn *= 2;
+            }
+            let better = match best {
+                Some((bm, bn)) => sm * sn > bm * bn,
+                None => true,
+            };
+            if better {
+                best = Some((sm, sn));
+            }
+        }
+        sm *= 2;
+    }
+    best.map(|(sm, sn)| (sm as u32, sn as u32))
+}
+
+/// Whether every `TileMma` site tiles for the simd-group fragment policy:
+/// whole SIMD-groups in the workgroup, extents that are multiples of eight,
+/// a fragment partition, and staging inside the workgroup-storage budget,
+/// all f32. The policy consults this before promising the tier; the stage
+/// re-checks per site, and this one implementation keeps the two ends of the
+/// promise from disagreeing.
+pub fn simd_tiles_feasible(func: &Function, threads: i64, shared_cap: i64) -> bool {
+    find_mma_sites(func).into_iter().all(|site| {
+        if site.m % 8 != 0 || site.n % 8 != 0 || site.k % 8 != 0 || threads % 32 != 0 {
+            return false;
+        }
+        if split_fragment_blocks(threads / 32, site.m / 8, site.n / 8).is_none() {
+            return false;
+        }
+        let staged = site.m * site.k
+            + site.k * site.rhs_cols
+            + site.m * site.n
+                * if site.acc.is_some() { 2 } else { 1 };
+        if staged * 4 > shared_cap {
+            return false;
+        }
+        let defs: Defs<'_> = func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .filter_map(|inst| inst.result.map(|id| (id, inst)))
+            .collect();
+        [&site.lhs, &site.rhs]
+            .into_iter()
+            .chain(site.acc.iter())
+            .all(|tile| {
+                tile_element_of(func, &defs, *tile)
+                    .map(|(_, elem)| elem == Type::F32)
+                    .unwrap_or(false)
+            })
+    })
 }
 
 /// Flip one tile's storage to shared.
@@ -3103,6 +3592,197 @@ fn build_mma_strip(ctx: &mut Ctx, site: MmaSite, threads: i64, order: usize) -> 
     ctx.store(steps.exit, Operand::Value(to), Operand::Value(total));
     ctx.close_loop(&lane, threads, steps.exit);
     // The reads are done: the next iteration's panel writes may proceed.
+    ctx.barrier(lane.exit);
+    ctx.set_terminator(
+        lane.exit,
+        Terminator::Br {
+            target: cont,
+            args: Vec::new(),
+        },
+    );
+    Ok(())
+}
+
+/// Stage one `TileMma` for the simd-group fragments and leave the multiply
+/// whole as a `SimdGroupMma` for the Metal dialect to spell — Goto & Geijn's
+/// register blocking with one register block per SIMD-group, the blocking
+/// the dialect picks because the MSL fragment program lives there.
+///
+/// The panels move to shared storage as the strip policy moves them; the
+/// accumulator is staged in by a strip copy, one barrier orders the writes
+/// against the fragment reads, a second orders the fragment stores against
+/// the strip copy that moves the result into the private tile the site's
+/// consumers read, and a third lets the next iteration's writes proceed. The
+/// checks here re-state what [`simd_tiles_feasible`] promised the policy.
+fn build_mma_simd_tiles(
+    ctx: &mut Ctx,
+    site: MmaSite,
+    threads: i64,
+    order: usize,
+    shared_cap: i64,
+) -> Result<(), String> {
+    let MmaSite {
+        result,
+        m,
+        n,
+        k,
+        rhs_cols,
+        lhs,
+        rhs,
+        acc,
+    } = site;
+    // The fragments are 8x8, and MSL defines the fragment program for whole
+    // SIMD-groups only — a partial group has no collective spelling.
+    if m % 8 != 0 || n % 8 != 0 || k % 8 != 0 || threads % 32 != 0 {
+        return Err(
+            "the simd-group tile policy needs m, n, k multiples of eight and whole simd-groups"
+                .into(),
+        );
+    }
+    let (row_groups, col_groups) = split_fragment_blocks(threads / 32, m / 8, n / 8)
+        .ok_or_else(|| "the simd-group tile policy found no fragment partition".to_string())?;
+    let staged = m * k + k * rhs_cols + m * n * if acc.is_some() { 2 } else { 1 };
+    if staged * 4 > shared_cap {
+        return Err(
+            "the simd-group tile policy's staging exceeds the workgroup-storage budget".into(),
+        );
+    }
+    let defs: Defs<'_> = ctx
+        .func
+        .blocks
+        .iter()
+        .flat_map(|block| &block.insts)
+        .filter_map(|inst| inst.result.map(|id| (id, inst)))
+        .collect();
+    for tile in [&lhs, &rhs].into_iter().chain(acc.iter()) {
+        let elem = tile_element_of(&ctx.func, &defs, *tile)
+            .map(|(_, elem)| elem)
+            .ok_or_else(|| "an mma operand is not tile storage".to_string())?;
+        if elem != Type::F32 {
+            return Err("the simd-group tile policy only spells f32 panels".into());
+        }
+    }
+    drop(defs);
+    flip_to_shared(ctx, lhs)?;
+    flip_to_shared(ctx, rhs)?;
+
+    let tag = format!("mm{order}");
+    let carry_shared = match acc {
+        Some(_) => {
+            let alloca = ctx.alloca(
+                &format!("{tag}_carry"),
+                Type::array((m * n) as usize, Type::F32),
+                AddressSpace::Shared,
+            );
+            let id = alloca.result.expect("an alloca has a result");
+            ctx.append_to_entry(alloca);
+            Some(id)
+        }
+        None => None,
+    };
+    let out = ctx.alloca(
+        &format!("{tag}_stage"),
+        Type::array((m * n) as usize, Type::F32),
+        AddressSpace::Shared,
+    );
+    let out_id = out.result.expect("an alloca has a result");
+    ctx.append_to_entry(out);
+
+    // The site's consumers keep reading a private tile: the call is replaced
+    // by the alloca it promised, and the staged multiply lands between.
+    let at = find_block_with_inst(&ctx.func, result)
+        .ok_or_else(|| "an mma site vanished before materialization".to_string())?;
+    let index = ctx.block_ref(at)
+        .insts
+        .iter()
+        .position(|inst| inst.result == Some(result))
+        .expect("the block holds the call");
+    let dst = Inst {
+        result: Some(result),
+        result_name: Some(ctx.name("tile")),
+        ty: Type::ptr(
+            AddressSpace::Private,
+            Type::array((m * n) as usize, Type::F32),
+        ),
+        op: InstOp::Alloca {
+            alloc_ty: Type::array((m * n) as usize, Type::F32),
+            addr_space: AddressSpace::Private,
+        },
+        metadata: Vec::new(),
+    };
+    ctx.block_mut(at).insts[index] = dst;
+    let cont = ctx.split_before(at, index + 1);
+
+    let tid = thread_id_of(&ctx.func).expect("the policy stage ran");
+
+    // The carry, one owner strip at a time, into shared staging.
+    let mut handoff = at;
+    if let (Some(carry), Some(carry_id)) = (acc, carry_shared) {
+        let stage = ctx.open_loop(&format!("{tag}s"), at, Operand::Value(tid), m * n, threads);
+        let from = ctx.gep(
+            stage.body,
+            &format!("{tag}_seed"),
+            carry,
+            Operand::Value(stage.index),
+            Type::F32,
+        );
+        let seed = ctx.load(stage.body, &format!("{tag}_sv"), Operand::Value(from), Type::F32);
+        let to = ctx.gep(
+            stage.body,
+            &format!("{tag}_st"),
+            carry_id,
+            Operand::Value(stage.index),
+            Type::F32,
+        );
+        ctx.store(stage.body, Operand::Value(to), Operand::Value(seed));
+        ctx.close_loop(&stage, threads, stage.body);
+        handoff = stage.exit;
+    }
+    // The first barrier orders the panel and staging writes against the
+    // fragment reads; the one after orders the fragment stores against the
+    // copy-out.
+    ctx.barrier(handoff);
+    let mma = ctx.void_inst(InstOp::Intrinsic {
+        intrinsic: Intrinsic::SimdGroupMma {
+            m: m as u64,
+            n: n as u64,
+            k: k as u64,
+            rhs_cols: rhs_cols as u64,
+            row_groups,
+            col_groups,
+        },
+        args: {
+            let mut args = vec![Operand::Value(lhs), Operand::Value(rhs)];
+            args.extend(carry_shared.map(Operand::Value));
+            args.push(Operand::Value(out_id));
+            args
+        },
+    });
+    ctx.push(handoff, mma);
+    ctx.barrier(handoff);
+
+    // The result, one owner strip at a time, out of the staging buffer.
+    let lane = ctx.open_loop(&format!("{tag}o"), handoff, Operand::Value(tid), m * n, threads);
+    let from = ctx.gep(
+        lane.body,
+        &format!("{tag}_of"),
+        out_id,
+        Operand::Value(lane.index),
+        Type::F32,
+    );
+    let value = ctx.load(lane.body, &format!("{tag}_ov"), Operand::Value(from), Type::F32);
+    let to = ctx.gep(
+        lane.body,
+        &format!("{tag}_ot"),
+        result,
+        Operand::Value(lane.index),
+        Type::F32,
+    );
+    ctx.stamp(to, Metadata::OwnerOrdered);
+    ctx.store(lane.body, Operand::Value(to), Operand::Value(value));
+    ctx.close_loop(&lane, threads, lane.body);
+    // The reads are done: the next iteration's panel and staging writes may
+    // proceed.
     ctx.barrier(lane.exit);
     ctx.set_terminator(
         lane.exit,

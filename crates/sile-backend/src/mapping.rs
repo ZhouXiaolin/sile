@@ -12,7 +12,7 @@ use sile_lsir::mapping::{MappingPolicy, MmaPolicy, ReducePolicy, VectorPolicy};
 
 use crate::CodegenTarget;
 
-/// The largest workgroup a WGSL kernel asks for.
+/// The largest workgroup a GPU kernel asks for.
 ///
 /// Every adapter allows at least this along the x axis, and the kernels map
 /// one tile to one workgroup, so a larger count only idles threads: the tile
@@ -21,17 +21,18 @@ const MAX_WORKGROUP: i64 = 256;
 
 /// The mapping policy `target` runs `func` under.
 ///
-/// C, Metal and PTX keep the serial policy — the mapping is identity for
-/// them, which is what keeps their output byte-identical to the pre-mapping
-/// pipeline. C's `omp simd` hint is a mapping judgment that survives a serial
-/// mapping: the pragma belongs to the spelling, and the policy only says
-/// whether the target wants it.
+/// C and PTX keep the serial policy — the mapping is identity for them. Metal
+/// and WGSL map one tile to one workgroup and share the flat spread: the
+/// threads cooperate on the tile's element runs, its folds and its multiply.
 pub fn policy_for(target: CodegenTarget, func: &lsir::Function) -> MappingPolicy {
-    // Debug switch: `SILE_SERIAL=1` forces the serial mapping so a numeric
-    // mismatch can be pinned on the parallel mapping or the spelling alone.
-    if target == CodegenTarget::Wgsl && std::env::var_os("SILE_SERIAL").is_some() {
+    // Debug switch: `SILE_SERIAL=1` forces the serial mapping on the parallel
+    // targets so a numeric mismatch can be pinned on the parallel mapping or
+    // the spelling alone.
+    if matches!(target, CodegenTarget::Metal | CodegenTarget::Wgsl)
+        && std::env::var_os("SILE_SERIAL").is_some()
+    {
         let mut serial = MappingPolicy::serial();
-        serial.vector = wgsl_policy(func).vector;
+        serial.vector = flat_tile_policy(func).vector;
         return serial;
     }
     match target {
@@ -42,9 +43,56 @@ pub fn policy_for(target: CodegenTarget, func: &lsir::Function) -> MappingPolicy
             vector: VectorPolicy::OmpSimd,
             shared_cap: 0,
         },
-        CodegenTarget::Metal | CodegenTarget::Ptx => MappingPolicy::serial(),
-        CodegenTarget::Wgsl => wgsl_policy(func),
+        CodegenTarget::Metal => metal_tile_policy(func),
+        CodegenTarget::Wgsl => flat_tile_policy(func),
+        CodegenTarget::Ptx => MappingPolicy::serial(),
     }
+}
+
+/// The Metal flat spread: the shared tile-to-workgroup decision with the two
+/// SIMD-group tiers on top. The fold runs on the hardware `simd_*`
+/// primitives — feasible wherever the shared tree is, since a partial
+/// SIMD-group folds its active lanes — and the multiply on
+/// `simdgroup_matrix` fragments when the device and every site can. Where
+/// either says no, the ladder's next rung is the shared tree and strips, the
+/// decision `flat_tile_policy` already made.
+fn metal_tile_policy(func: &lsir::Function) -> MappingPolicy {
+    let mut policy = flat_tile_policy(func);
+    if !policy.is_parallel() {
+        return policy;
+    }
+    policy.reduce = ReducePolicy::SimdGroupTree;
+    let threads = policy.launch.count() as i64;
+    if simdgroup_matrix_supported()
+        && lsir::mapping::simd_tiles_feasible(func, threads, policy.shared_cap)
+    {
+        policy.mma = MmaPolicy::SimdGroupTiles;
+    }
+    policy
+}
+
+/// Whether this machine's GPU lowers the `simdgroup_matrix` fragment
+/// program. The fragment ops are an Apple7-family feature: elsewhere the
+/// front end accepts them and the pipeline compile fails with `SC
+/// compilation failure: there is a call to an undefined label` — an AMD
+/// Radeon Pro 5500M (Mac2) reproduces exactly that, while the `simd_*`
+/// reduction primitives lower fine on the same device. The capability is a
+/// per-process constant, so one probe feeds every policy decision; on a
+/// device without it the mapping keeps the ThreadStrips rung, which is the
+/// degrade-when-absent rule the ladder spells.
+#[cfg(target_os = "macos")]
+fn simdgroup_matrix_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        metal::Device::system_default()
+            .map(|device| device.supports_family(metal::MTLGPUFamily::Apple7))
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn simdgroup_matrix_supported() -> bool {
+    false
 }
 
 /// The serial policy that keeps `vector`, for a kernel the parallel mapping
@@ -59,9 +107,11 @@ pub fn policy_with_vector(vector: lsir::VectorPolicy) -> MappingPolicy {
     }
 }
 
-/// WGSL maps one tile to one workgroup: the threads cooperate on the tile's
-/// element runs, its folds and its multiply.
-fn wgsl_policy(func: &lsir::Function) -> MappingPolicy {
+/// One tile to one workgroup: the threads cooperate on the tile's
+/// element runs, its folds and its multiply. The GPU targets whose flat
+/// spread is identical share this decision, so a kernel maps the same way
+/// wherever it runs.
+fn flat_tile_policy(func: &lsir::Function) -> MappingPolicy {
     // The output tile is the extent the threads share. A kernel without one
     // has no work to divide, and a one-element tile has no parallelism worth
     // two barriers; both stay serial.
@@ -89,9 +139,10 @@ fn wgsl_policy(func: &lsir::Function) -> MappingPolicy {
         reduce: ReducePolicy::WorkgroupTree,
         mma: MmaPolicy::ThreadStrips,
         vector: VectorPolicy::None,
-        // The WGSL spec's smallest guaranteed workgroup storage. A tile at or
-        // under it moves to `var<workgroup>`; a larger one — the saxpy bench's
-        // 64 KB strip — stays private, correct but spilled.
+        // The smallest workgroup storage either dialect guarantees (WGSL's
+        // spec floor; MSL guarantees 32 KB, so the WGSL number covers both).
+        // A tile at or under it moves to workgroup storage; a larger one —
+        // the saxpy bench's 64 KB strip — stays private, correct but spilled.
         shared_cap: 16384,
     }
 }

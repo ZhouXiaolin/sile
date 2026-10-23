@@ -771,6 +771,37 @@ fn format_intrinsic(
             &[operand(0), operand(1), operand(2)],
             footer,
         ),
+        Intrinsic::SimdReduce { reduce } => format_runtime_call(
+            &format!("sile.simd.reduce.{}", reduce.name()),
+            result_ty,
+            &[operand(0)],
+            footer,
+        ),
+        Intrinsic::SimdLaneId => format_runtime_call(
+            "sile.simd.lane.id",
+            result_ty,
+            &[],
+            footer,
+        ),
+        Intrinsic::SimdGroupId => format_runtime_call(
+            "sile.simd.group.id",
+            result_ty,
+            &[],
+            footer,
+        ),
+        Intrinsic::SimdGroupMma {
+            m,
+            n,
+            k,
+            rhs_cols,
+            row_groups,
+            col_groups,
+        } => format_runtime_call(
+            &format!("sile.simd.mma.{m}.{n}.{k}.{rhs_cols}.{row_groups}.{col_groups}"),
+            result_ty,
+            &[operand(0), operand(1), operand(2), operand(3)],
+            footer,
+        ),
     }
 }
 

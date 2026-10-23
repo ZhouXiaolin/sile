@@ -1,16 +1,11 @@
-use crate::emit::{
-    self, OutputBuffer, StructuredCfgMessages, TargetDialect, array_dims, find_output_buffer,
-    find_output_param,
-};
+use crate::emit::{self, StructuredCfgMessages, TargetDialect, array_dims};
 use sile_lsir as lsir;
-
-const SHAPES_PARAM_NAME: &str = "__sile_shapes";
+use std::collections::HashMap;
 
 pub fn generate(func: &lsir::Function) -> sile_core::Result<String> {
-    let dialect = MetalDialect::new(func)?;
     emit::generate_text(emit::TargetEmitter::new(
         func,
-        dialect,
+        MetalDialect::new(func),
         lsir::VectorPolicy::None,
     ))
 }
@@ -18,120 +13,45 @@ pub fn generate(func: &lsir::Function) -> sile_core::Result<String> {
 /// The MSL dialect: one spelling table, plus the tile arithmetic that MSL reads
 /// from buffer shapes.
 ///
-/// `grid_dim` and `block_id` divide the flat thread index into tiles, which is
-/// what the tile ABI promises the target can reconstruct.
+/// The launch indices arrive as per-axis builtins — one threadgroup owns one
+/// tile, so the threadgroup's position in the grid is the tile index, and the
+/// dispatch shape itself answers a `grid_dim` query. No ABI reconstruction.
 struct MetalDialect<'a> {
     func: &'a lsir::Function,
-    output: Option<OutputBuffer<'a>>,
-    /// The output even when it stores no tile, so the launch index still has a
-    /// place to come from.
-    output_param: Option<&'a lsir::Param>,
+    /// Address space of every pointer-typed instruction result, so a vector
+    /// load spells the cast its pointer actually names: a relay over private
+    /// tile storage must not cast through a `device` pointer.
+    ptr_spaces: HashMap<lsir::ValueId, lsir::AddressSpace>,
 }
 
 impl<'a> MetalDialect<'a> {
-    fn new(func: &'a lsir::Function) -> sile_core::Result<Self> {
-        Ok(Self {
-            func,
-            output: find_output_buffer(func),
-            output_param: find_output_param(func),
-        })
-    }
-
-    fn shapes_param_name(&self) -> sile_core::Result<&str> {
-        self.func
-            .params
+    fn new(func: &'a lsir::Function) -> Self {
+        let ptr_spaces = func
+            .blocks
             .iter()
-            .find(|param| param.name == SHAPES_PARAM_NAME)
-            .map(|param| param.name.as_str())
-            .ok_or_else(|| {
-                sile_core::Error::Compile(
-                    "Metal backend requires explicit __sile_shapes parameter in LSIR".into(),
-                )
-            })
-    }
-
-    /// Extent of logical grid axis `dim`.
-    ///
-    /// Metal dispatches one thread per tile, so the axes are the tile counts
-    /// along the output's axes. The count comes from the shape descriptor and
-    /// the tile ABI, so no launch-time value is needed.
-    fn grid_dim_expr(&self, dim: u8) -> sile_core::Result<String> {
-        let Some(output) = self.output.as_ref() else {
-            // The output has no tile, so one program owns one grid slot and
-            // the grid is the flat launch size.
-            return Ok(match dim {
-                0 => "(int64_t)gid.x".to_string(),
-                _ => "1".to_string(),
-            });
-        };
-        let Some(abi) = output.param.abi.as_ref() else {
-            return Err(sile_core::Error::Compile(
-                "missing output ABI for Metal grid_dim".into(),
-            ));
-        };
-        let shapes = self.shapes_param_name()?;
-        let axes = emit::grid_axis_exprs(abi, output.rows, output.cols, &shapes);
-        Ok(axes
-            .get(dim as usize)
-            .cloned()
-            .unwrap_or_else(|| "1".to_string()))
-    }
-
-    /// Program index along logical grid axis `dim`.
-    ///
-    /// One thread owns one tile, so the thread's flat position in the grid
-    /// counts tiles with the last axis varying fastest. Dividing by the strides
-    /// after `dim` and taking the remainder recovers the index along `dim`,
-    /// whether the output has one axis, two or three.
-    fn logical_block_id_expr(&self, dim: u8) -> sile_core::Result<String> {
-        let index = |dim: u8| -> String {
-            match dim {
-                0 => "(int64_t)gid.x".into(),
-                1 => "(int64_t)gid.y".into(),
-                2 => "(int64_t)gid.z".into(),
-                _ => unreachable!("guarded by the caller"),
-            }
-        };
-        // A kernel whose output has no tile (an atomic accumulation, for
-        // example) dispatches one program per grid slot, so the launch index is
-        // the program id. Splitting it by the output's extent would put every
-        // program on the same row.
-        if self.output_param.is_none() {
-            return Ok(index(dim));
-        }
-        let Some(output) = self.output.as_ref() else {
-            // The output stores no tile: it is written one element at a time,
-            // so one program owns one grid slot.
-            return Ok(match dim {
-                0 => index(0),
-                1 | 2 => "0".into(),
-                _ => index(dim),
-            });
-        };
-        // The axes and the rank come from the buffer that stores the tile, not
-        // from the last parameter: a kernel whose last parameter is an input
-        // has that input's shape where the output's belongs.
-        let Some(abi) = output.param.abi.as_ref() else {
-            return Ok(index(dim));
-        };
-        if abi.rank <= 1 {
-            return Ok(match dim {
-                0 => index(0),
-                1 | 2 => "0".into(),
-                _ => {
-                    return Err(sile_core::Error::Compile(format!(
-                        "unsupported block_id dimension in Metal codegen: {dim}"
-                    )));
+            .flat_map(|block| &block.insts)
+            .filter_map(|inst| {
+                let id = inst.result?;
+                match &inst.ty {
+                    lsir::Type::Ptr { addr_space, .. } => Some((id, addr_space.clone())),
+                    _ => None,
                 }
-            });
+            })
+            .collect();
+        Self { func, ptr_spaces }
+    }
+
+    /// Address-space qualifier of a vector access's pointer, `device` for a
+    /// kernel buffer argument, which no instruction defines.
+    fn vec_qualifier(&self, ptr: &lsir::Operand) -> &'static str {
+        match ptr {
+            lsir::Operand::Value(id) => self
+                .ptr_spaces
+                .get(id)
+                .map(metal_addr_qual)
+                .unwrap_or("device "),
+            lsir::Operand::Const(_) => "device ",
         }
-        let shapes = self.shapes_param_name()?;
-        let axes = emit::grid_axis_exprs(abi, output.rows, output.cols, &shapes);
-        let Some(extent) = axes.get(dim as usize) else {
-            return Ok("0".to_string());
-        };
-        let stride = emit::grid_axis_stride(&axes, dim as usize);
-        Ok(format!("((int64_t)gid.x / ({stride}) % ({extent}))"))
     }
 }
 
@@ -143,19 +63,23 @@ impl TargetDialect for MetalDialect<'_> {
     }
 
     fn var_decl(&self, ty: &lsir::Type, name: &str, _is_alloca: bool) -> Option<String> {
-        // MSL has no function-local pointer storage, so a private pointer binds
-        // to a `thread` local array. Unlike C, every private pointer behaves the
-        // same way here, whether it came from an `alloca` or a `gep`.
+        // MSL has no function-local pointer storage, so a private or
+        // threadgroup pointer binds to a local array in its own address
+        // space. Unlike C, every storage pointer behaves the same way here,
+        // whether it came from an `alloca` or a `gep`.
         match ty {
-            lsir::Type::Ptr {
-                addr_space: lsir::AddressSpace::Private,
-                pointee,
-            } => {
+            lsir::Type::Ptr { addr_space, pointee }
+                if matches!(
+                    addr_space,
+                    lsir::AddressSpace::Private | lsir::AddressSpace::Shared
+                ) =>
+            {
+                let qualifier = metal_addr_qual(addr_space);
                 let storage_name = format!("{name}_storage");
                 Some(format!(
                     "{}; {};",
-                    metal_storage_decl(pointee, &storage_name),
-                    metal_private_ptr_bind_decl(pointee, name, &storage_name)
+                    metal_storage_decl(qualifier, pointee, &storage_name),
+                    metal_ptr_bind_decl(qualifier, pointee, name, &storage_name)
                 ))
             }
             _ => Some(format!("{};", metal_var_decl(ty, name))),
@@ -167,11 +91,23 @@ impl TargetDialect for MetalDialect<'_> {
     }
 
     fn signature(&self, name: &str, params: &[(String, String)]) -> String {
+        // One threadgroup owns one tile, so the launch indices arrive as
+        // separate builtins, one per axis: the threadgroup's position in the
+        // grid is the tile index, the thread's slot inside the threadgroup is
+        // what the mapping's strips index with, and the dispatch shape itself
+        // answers a grid_dim query. Under a serial dispatch the threadgroup
+        // holds one thread and the builtins still read the launch as written.
         let mut out = format!("kernel void sile_kernel_{name}(\n");
         for (idx, (ty, param_name)) in params.iter().enumerate() {
             out.push_str(&format!("    {ty} {param_name} [[buffer({idx})]],\n"));
         }
-        out.push_str("    uint3 gid [[thread_position_in_grid]]) {\n");
+        out.push_str(
+            "    uint3 tgid [[threadgroup_position_in_grid]],\n    \
+             uint3 tid [[thread_position_in_threadgroup]],\n    \
+             uint simd_lid [[thread_index_in_simdgroup]],\n    \
+             uint simd_gid [[simdgroup_index_in_threadgroup]],\n    \
+             uint3 tgpog [[threadgroups_per_grid]]) {\n",
+        );
         out
     }
 
@@ -196,10 +132,14 @@ impl TargetDialect for MetalDialect<'_> {
         intrinsic: &lsir::Intrinsic,
         args: &[lsir::Operand],
     ) -> sile_core::Result<Vec<String>> {
-        // A vector store is a plain assignment and takes no result; every
-        // other intrinsic names one.
+        // A vector store is a plain assignment and takes no result; a barrier
+        // orders the tile's threads and takes none either; the staged
+        // SIMD-group multiply lands its tile in the out buffer, so it names
+        // nothing; every other intrinsic names one.
         let named = match intrinsic {
-            lsir::Intrinsic::VecStore { .. } => None,
+            lsir::Intrinsic::VecStore { .. }
+            | lsir::Intrinsic::Barrier { .. }
+            | lsir::Intrinsic::SimdGroupMma { .. } => None,
             _ => Some(result.ok_or_else(|| {
                 sile_core::Error::Compile(format!(
                     "{intrinsic:?} in LSIR Metal codegen must produce a result"
@@ -209,24 +149,45 @@ impl TargetDialect for MetalDialect<'_> {
         let name = || value_name(named.expect("every other intrinsic names its result"));
         let line = match intrinsic {
             lsir::Intrinsic::BlockId { dim } => {
-                format!("{} = {};", name(), self.logical_block_id_expr(*dim)?)
+                format!("{} = (int64_t)tgid.{};", name(), metal_launch_axis(*dim)?)
             }
-            lsir::Intrinsic::ThreadId { dim } => format!(
-                "{} = (int64_t)gid.{};",
-                name(),
-                match dim {
-                    0 => "x",
-                    1 => "y",
-                    _ => "z",
-                }
-            ),
+            lsir::Intrinsic::ThreadId { dim } => {
+                format!("{} = (int64_t)tid.{};", name(), metal_launch_axis(*dim)?)
+            }
             lsir::Intrinsic::GridDim { dim } => {
-                format!("{} = {};", name(), self.grid_dim_expr(*dim)?)
+                format!("{} = (int64_t)tgpog.{};", name(), metal_launch_axis(*dim)?)
             }
+            // The hardware fold across one SIMD-group. The mapped tree plants
+            // it where every lane of the group arrives together, and a
+            // partially filled group folds its active lanes.
+            lsir::Intrinsic::SimdReduce { reduce } => {
+                let [value] = args else {
+                    return Err(sile_core::Error::Compile(
+                        "simd_reduce intrinsic expects one argument".into(),
+                    ));
+                };
+                let function = match reduce {
+                    lsir::TileReduceOp::Sum => "simd_sum",
+                    lsir::TileReduceOp::Product => "simd_product",
+                    lsir::TileReduceOp::Max => "simd_max",
+                    lsir::TileReduceOp::Min => "simd_min",
+                };
+                format!("{} = {}({});", name(), function, format_operand(value))
+            }
+            // The SIMD-group coordinates come from the spelled builtins, never
+            // `tid % 32`: the hardware owns the map from thread index to
+            // SIMD-group.
+            lsir::Intrinsic::SimdLaneId => {
+                format!("{} = (int64_t)simd_lid;", name())
+            }
+            lsir::Intrinsic::SimdGroupId => {
+                format!("{} = (int64_t)simd_gid;", name())
+            }
+            // The mapping plants one barrier per tree step and shared-panel
+            // handoff, all inside one tile's threadgroup: the scope MSL's
+            // threadgroup barrier names.
             lsir::Intrinsic::Barrier { .. } => {
-                return Err(sile_core::Error::Compile(
-                    "barrier intrinsic is not yet supported in LSIR Metal codegen".into(),
-                ));
+                "threadgroup_barrier(mem_flags::mem_threadgroup);".to_string()
             }
             lsir::Intrinsic::Exp
             | lsir::Intrinsic::Exp2
@@ -293,13 +254,21 @@ impl TargetDialect for MetalDialect<'_> {
                         "vec_load intrinsic expects [ptr, offset] arguments".into(),
                     ));
                 };
-                format!(
-                    "{} = *((device float{}*)({} + {}));",
-                    name(),
-                    len,
-                    format_operand(ptr),
-                    format_operand(offset)
-                )
+                let ptr_text = format!("({} + {})", format_operand(ptr), format_operand(offset));
+                if self.vec_qualifier(ptr) == "device " {
+                    // A kernel buffer's base is aligned and its offset is a
+                    // whole vector, so the packed cast is safe.
+                    format!("{} = *((device float{}*){ptr_text});", name(), len)
+                } else {
+                    // Private and threadgroup storage carry no alignment
+                    // promise, so the elements gather one by one — the same
+                    // spelling WGSL uses.
+                    let items = (0..*len)
+                        .map(|k| format!("{ptr_text}[{k}]"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{} = float{}({items});", name(), len)
+                }
             }
             lsir::Intrinsic::VecStore { len } => {
                 let [ptr, offset, value] = args else {
@@ -307,13 +276,17 @@ impl TargetDialect for MetalDialect<'_> {
                         "vec_store intrinsic expects [ptr, offset, value] arguments".into(),
                     ));
                 };
-                format!(
-                    "*((device float{}*)({} + {})) = {};",
-                    len,
-                    format_operand(ptr),
-                    format_operand(offset),
-                    format_operand(value)
-                )
+                let value_text = format_operand(value);
+                let ptr_text = format!("({} + {})", format_operand(ptr), format_operand(offset));
+                if self.vec_qualifier(ptr) == "device " {
+                    format!("*((device float{}*){ptr_text}) = {value_text};", len)
+                } else {
+                    let mut lines = Vec::new();
+                    for k in 0..*len {
+                        lines.push(format!("{ptr_text}[{k}] = {value_text}[{k}];"));
+                    }
+                    return Ok(lines);
+                }
             }
             lsir::Intrinsic::VecReduceAdd => {
                 let [vector] = args else {
@@ -347,9 +320,9 @@ impl TargetDialect for MetalDialect<'_> {
                     lsir::TileReduceOp::Min => "min(racc, rv)",
                 };
                 return Ok(vec![
-                    format!("for (int64_t ro = 0; ro < {outer}; ++ro) {{"),
+                    format!("for (int ro = 0; ro < {outer}; ++ro) {{"),
                     format!("  float racc = {src}[ro * {span}];"),
-                    format!("  for (int64_t ri = 1; ri < {span}; ++ri) {{"),
+                    format!("  for (int ri = 1; ri < {span}; ++ri) {{"),
                     format!("    float rv = {src}[ro * {span} + ri];"),
                     format!("    racc = {combine};"),
                     "  }".to_string(),
@@ -357,10 +330,151 @@ impl TargetDialect for MetalDialect<'_> {
                     "}".to_string(),
                 ]);
             }
-            lsir::Intrinsic::TileMma { .. } => {
-                return Err(sile_core::Error::Compile(
-                    "MSL has no tile-level matrix multiply yet".into(),
+            // The serial rung of the mma ladder: plain FMA loops over the
+            // panels. The strip policy reaches here only after the parallel
+            // mapping declined, and a correct slow kernel is what a fallback
+            // owes.
+            lsir::Intrinsic::TileMma {
+                m,
+                n,
+                k,
+                rhs_cols,
+            } => {
+                let [lhs, rhs, ..] = args else {
+                    return Err(sile_core::Error::Compile(
+                        "tile_mma intrinsic expects at least two arguments".into(),
+                    ));
+                };
+                let lhs = format_operand(lhs);
+                let rhs = format_operand(rhs);
+                let acc = args.get(2).map(format_operand);
+                let dst = name();
+                let (m, n, k, rhs_cols) = (*m, *n, *k, *rhs_cols);
+                let seed = match &acc {
+                    Some(_acc) => format!("{dst}[mo * {n} + no]"),
+                    None => "0.0f".to_string(),
+                };
+                // The loop variables spell as `int`, never `int64_t`: AIR
+                // miscompiles the read-modify-write tile update when the
+                // subscripts are 64-bit (probe: the accumulator collapses to
+                // one element). WGSL already spells these loops as i32, so
+                // both targets agree.
+                let mut lines = Vec::new();
+                if let Some(acc) = &acc {
+                    lines.push(format!(
+                        "for (int mi = 0; mi < {}; ++mi) {{ {dst}[mi] = {acc}[mi]; }}",
+                        m * n
+                    ));
+                }
+                lines.push(format!("for (int mo = 0; mo < {m}; ++mo) {{"));
+                lines.push(format!("  for (int no = 0; no < {n}; ++no) {{"));
+                lines.push(format!("    float racc = {seed};"));
+                lines.push(format!("    for (int ko = 0; ko < {k}; ++ko) {{"));
+                lines.push(format!(
+                    "      racc += {lhs}[mo * {k} + ko] * {rhs}[ko * {rhs_cols} + no];"
                 ));
+                lines.push("    }".to_string());
+                lines.push(format!("    {dst}[mo * {n} + no] = racc;"));
+                lines.push("  }".to_string());
+                lines.push("}".to_string());
+                return Ok(lines);
+            }
+            // The SIMD-group rung of the mma ladder: the staged multiply the
+            // mapping left whole, spelled as 8x8 `simdgroup_matrix` fragments
+            // partitioned across the workgroup's SIMD-groups. A group's
+            // fragment block seeds from the staged accumulator (or zero),
+            // multiplies the k fragments in — the B fragment transposed out
+            // of the row-major panel by the load — and stores the block back
+            // to the staging buffer the copy-out strip reads. All of it sits
+            // behind one guard so a group with no block idles instead of
+            // addressing past the tile.
+            lsir::Intrinsic::SimdGroupMma {
+                m,
+                n,
+                k,
+                rhs_cols,
+                row_groups,
+                col_groups,
+            } => {
+                let [lhs, rhs, rest @ ..] = args else {
+                    return Err(sile_core::Error::Compile(
+                        "simd_group_mma intrinsic expects at least three arguments".into(),
+                    ));
+                };
+                let (acc, out) = match rest {
+                    [acc, out] => (Some(acc), out),
+                    [out] => (None, out),
+                    _ => {
+                        return Err(sile_core::Error::Compile(
+                            "simd_group_mma intrinsic expects [lhs, rhs, out] or [lhs, rhs, acc, out]"
+                                .into(),
+                        ));
+                    }
+                };
+                let lhs = format_operand(lhs);
+                let rhs = format_operand(rhs);
+                let acc = acc.map(|operand| format_operand(operand));
+                let out = format_operand(out);
+                let (m, n, k, rhs_cols) = (*m as u32, *n as u32, *k as u32, *rhs_cols as u32);
+                let frag_m = m / 8 / row_groups;
+                let frag_n = n / 8 / col_groups;
+                let frags = frag_m * frag_n;
+                let k_frags = k / 8;
+                // The array's name rides on the out buffer's: one staging
+                // buffer per site, so one fragment set per site, with no
+                // counter to keep deterministic.
+                let acc_arr = format!("{out}_acc");
+                let mut lines = Vec::new();
+                lines.push(format!("if (simd_gid < {}ul) {{", row_groups * col_groups));
+                lines.push(format!(
+                    "  const int br = (int)(simd_gid / {col_groups}ul) * {frag_m} * 8;"
+                ));
+                lines.push(format!(
+                    "  const int bc = (int)(simd_gid % {col_groups}ul) * {frag_n} * 8;"
+                ));
+                lines.push(format!("  simdgroup_float8x8 {acc_arr}[{frags}];"));
+                match &acc {
+                    Some(acc) => lines.push(format!(
+                        "  for (int fi = 0; fi < {frags}; ++fi) {{ simdgroup_load({acc_arr}[fi], {acc}, (ulong){n}, ulong2(bc + (fi % {frag_n}) * 8, br + (fi / {frag_n}) * 8), false); }}"
+                    )),
+                    None => lines.push(format!(
+                        "  for (int fi = 0; fi < {frags}; ++fi) {{ {acc_arr}[fi] = simdgroup_float8x8(0.0f); }}"
+                    )),
+                };
+                lines.push("  simdgroup_float8x8 fa;".to_string());
+                lines.push("  simdgroup_float8x8 fb;".to_string());
+                lines.push(format!("  for (int kf = 0; kf < {k_frags}; ++kf) {{"));
+                lines.push(format!("    for (int fi = 0; fi < {frags}; ++fi) {{"));
+                lines.push(format!(
+                    "      const int row0 = br + (fi / {frag_n}) * 8;"
+                ));
+                lines.push(format!(
+                    "      const int col0 = bc + (fi % {frag_n}) * 8;"
+                ));
+                lines.push(format!(
+                    "      simdgroup_load(fa, {lhs}, (ulong){k}, ulong2(kf * 8, row0), false);"
+                ));
+                lines.push(format!(
+                    "      simdgroup_load(fb, {rhs}, (ulong){rhs_cols}, ulong2(col0, kf * 8), true);"
+                ));
+                lines.push(format!(
+                    "      simdgroup_multiply_accumulate({acc_arr}[fi], fa, fb, {acc_arr}[fi]);"
+                ));
+                lines.push("    }".to_string());
+                lines.push("  }".to_string());
+                lines.push(format!("  for (int fi = 0; fi < {frags}; ++fi) {{"));
+                lines.push(format!(
+                    "    const int row0 = br + (fi / {frag_n}) * 8;"
+                ));
+                lines.push(format!(
+                    "    const int col0 = bc + (fi % {frag_n}) * 8;"
+                ));
+                lines.push(format!(
+                    "    simdgroup_store({acc_arr}[fi], {out}, (ulong){n}, ulong2(col0, row0), false);"
+                ));
+                lines.push("  }".to_string());
+                lines.push("}".to_string());
+                return Ok(lines);
             }
         };
         Ok(vec![line])
@@ -377,7 +491,7 @@ impl TargetDialect for MetalDialect<'_> {
         match &inst.op {
             lsir::InstOp::Memcpy { dst, src, size } => Ok(vec![
                 format!(
-                    "for (int64_t copy_i = 0; copy_i < {}; ++copy_i) {{",
+                    "for (int copy_i = 0; copy_i < {}; ++copy_i) {{",
                     format_operand(size)
                 ),
                 format!(
@@ -430,6 +544,18 @@ impl TargetDialect for MetalDialect<'_> {
     }
 }
 
+/// The MSL component of launch-axis `dim`.
+fn metal_launch_axis(dim: u8) -> sile_core::Result<&'static str> {
+    match dim {
+        0 => Ok("x"),
+        1 => Ok("y"),
+        2 => Ok("z"),
+        other => Err(sile_core::Error::Compile(format!(
+            "Metal codegen only supports launch axes 0..=2, got {other}"
+        ))),
+    }
+}
+
 fn metal_var_decl(ty: &lsir::Type, name: &str) -> String {
     match ty {
         lsir::Type::I1 => format!("bool {} = false", name),
@@ -448,37 +574,40 @@ fn metal_var_decl(ty: &lsir::Type, name: &str) -> String {
     }
 }
 
-fn metal_storage_decl(ty: &lsir::Type, name: &str) -> String {
+fn metal_storage_decl(qualifier: &str, ty: &lsir::Type, name: &str) -> String {
     match ty {
         lsir::Type::Array { .. } => {
             let dims = array_dims(ty);
             let base = array_base_type(ty);
             format!(
-                "{} {}{}",
-                base,
-                name,
+                "{qualifier}{base} {name}{}",
                 dims.iter()
-                    .map(|dim| format!("[{}]", dim))
+                    .map(|dim| format!("[{dim}]"))
                     .collect::<Vec<_>>()
                     .join("")
             )
         }
-        other => format!("{} {}", metal_type(other), name),
+        other => format!("{qualifier}{} {name}", metal_type(other)),
     }
 }
 
-fn metal_private_ptr_bind_decl(pointee: &lsir::Type, name: &str, storage_name: &str) -> String {
+fn metal_ptr_bind_decl(
+    qualifier: &str,
+    pointee: &lsir::Type,
+    name: &str,
+    storage_name: &str,
+) -> String {
     let dims = array_dims(pointee);
     let base = array_base_type(pointee);
     if dims.is_empty() {
-        format!("thread {base}* {name} = &{storage_name};")
+        format!("{qualifier}{base}* {name} = &{storage_name};")
     } else {
         let suffix = dims[1..]
             .iter()
             .map(|dim| format!("[{}]", dim))
             .collect::<Vec<_>>()
             .join("");
-        format!("thread {base} (*{name}){suffix} = {storage_name};")
+        format!("{qualifier}{base} (*{name}){suffix} = {storage_name};")
     }
 }
 

@@ -18,9 +18,12 @@ pub fn run(
 ) -> Result<BackendArtifact> {
     let artifact = match target {
         CodegenTarget::C => BackendArtifact::CSource(generate_lsir_c_source(lsir)?),
-        CodegenTarget::Metal => {
-            BackendArtifact::MetalSource(generate_lsir_metal_source(lsir)?)
-        }
+        CodegenTarget::Metal => BackendArtifact::MetalSource {
+            source: generate_lsir_metal_source(lsir)?,
+            // The final policy's thread count, so the runtime dispatches the
+            // threadgroup the kernel was spelled against.
+            threads: policy.launch.count().max(1),
+        },
         CodegenTarget::Wgsl => {
             BackendArtifact::WgslSource(generate_lsir_wgsl_source(lsir, policy)?)
         }
@@ -202,20 +205,6 @@ pub struct OutputBuffer<'a> {
     pub cols: usize,
 }
 
-/// Last output parameter, as the backend signature declares it.
-///
-/// The output is the last buffer the kernel writes, and the lowering numbers
-/// parameters in declaration order. The result is the same parameter whether
-/// or not it carries tile ABI metadata: a kernel that only atomic-adds one
-/// scalar per program has an output with no tile, and the launch grid still
-/// has to come from somewhere.
-pub fn find_output_param(func: &lsir::Function) -> Option<&lsir::Param> {
-    func.params
-        .iter()
-        .rev()
-        .find(|param| !is_descriptor_param(param))
-}
-
 /// Last non-descriptor parameter carrying tile ABI metadata.
 pub fn find_output_buffer(func: &lsir::Function) -> Option<OutputBuffer<'_>> {
     func.params
@@ -272,47 +261,6 @@ pub fn flatten_grid(func: &lsir::Function, launch: &sile_core::LaunchConfig) -> 
     }
 }
 
-/// The extent of each logical grid axis, as source expressions.
-///
-/// The logical axes are the output buffer's axes that the tile does not cover,
-/// in declaration order. A rank-2 output addresses one tile with `(row, col)`,
-/// so its axes are a row count and a column count. A rank-3 output addresses a
-/// plane of tiles with `(plane, row, col)`, so a plane count comes first. A
-/// rank-1 output has one axis.
-///
-/// The tile covers the last two axes, so an axis the tile does cover is the
-/// buffer's extent divided by the tile's; an axis before those holds one tile
-/// per element, and its extent is the buffer's extent unchanged. Both come from
-/// the shape descriptor and the tile ABI, so the kernel needs no launch-time
-/// value to recover them.
-pub fn grid_axis_exprs(
-    abi: &lsir::ParamAbi,
-    rows: usize,
-    cols: usize,
-    shapes: &str,
-) -> Vec<String> {
-    let rank = abi.rank.max(1);
-    let offset = abi.shape_offset;
-    let mut axes: Vec<String> = (0..rank.saturating_sub(2))
-        .map(|axis| format!("{shapes}[{}]", offset + axis))
-        .collect();
-    if rank >= 2 {
-        axes.push(format!("{shapes}[{}] / {}", offset + rank - 2, rows.max(1)));
-    }
-    axes.push(format!("{shapes}[{}] / {}", offset + rank - 1, cols.max(1)));
-    axes
-}
-
-/// The stride of logical grid axis `dim` in a flat launch index.
-///
-/// A flat launch index counts tiles with the last axis varying fastest, so the
-/// stride of an axis is the product of the extents after it.
-pub fn grid_axis_stride(axes: &[String], dim: usize) -> String {
-    axes.iter()
-        .skip(dim + 1)
-        .fold("1".to_string(), |acc, extent| format!("{acc} * {extent}"))
-}
-
 /// How a target spells address-taking and dereferencing.
 ///
 /// C and MSL have pointers, so a load is `*p` and a store is `*p = v`. WGSL has
@@ -362,22 +310,12 @@ pub enum SelectSpelling {
     },
 }
 
-/// How a target spells an integer division or remainder.
-#[derive(Clone, Copy, Debug)]
-pub enum IntDivSpelling {
-    /// The operator as the language defines it, for any width. C and MSL
-    /// compile a 64-bit `/` and `%` natively.
-    Operator,
-    /// The division runs in `i32` and the result widens back to `i64`.
-    ///
-    /// naga wraps a 64-bit `/` or `%` in a helper whose `metal::select` passes
-    /// an untyped literal next to a `long long`, which Metal rejects as an
-    /// ambiguous call, so a 64-bit division cannot reach the Metal compiler.
-    /// Index arithmetic — launch ids, tile coordinates, buffer offsets over
-    /// the descriptor — stays far below 2^31, and the operands truncate to
-    /// `i32` before the operator rather than after.
-    I32Widened,
-}
+// Integer division and remainder spell as the plain operator on every
+// target. WGSL once needed a widened spelling — naga wraps a 64-bit `/` or
+// `%` in a helper whose `metal::select` passes an untyped literal next to a
+// `long long`, which Metal rejects as an ambiguous call — but the WGSL
+// spelling demotes every integer to 32-bit (MAPPING_DESIGN §5), so a 64-bit
+// division can no longer be spelled at all.
 
 fn select_expr(
     spelling: SelectSpelling,
@@ -579,7 +517,6 @@ pub fn lower_common_inst_line_with<FValue, FOperand>(
     format_operand: FOperand,
     pointers: PointerSpelling,
     select: SelectSpelling,
-    int_div: IntDivSpelling,
     cast_expr: fn(lsir::CastOp, &lsir::Type, String) -> String,
     gep_elements: &mut HashMap<lsir::ValueId, GepLink>,
     folded_geps: &HashMap<lsir::ValueId, (lsir::Operand, Vec<lsir::Operand>)>,
@@ -618,26 +555,13 @@ where
 
     match &inst.op {
         lsir::InstOp::Bin { op, lhs, rhs } => inst.result.map(|id| {
-            match (int_div, &inst.ty, op) {
-                (
-                    IntDivSpelling::I32Widened,
-                    lsir::Type::I64,
-                    lsir::BinOp::Div | lsir::BinOp::Rem,
-                ) => format!(
-                    "{} = i64((i32({}) {} i32({})));",
-                    value_name(id),
-                    format_operand(lhs),
-                    bin_op_symbol(*op),
-                    format_operand(rhs)
-                ),
-                _ => format!(
-                    "{} = {} {} {};",
-                    value_name(id),
-                    format_operand(lhs),
-                    bin_op_symbol(*op),
-                    format_operand(rhs)
-                ),
-            }
+            format!(
+                "{} = {} {} {};",
+                value_name(id),
+                format_operand(lhs),
+                bin_op_symbol(*op),
+                format_operand(rhs)
+            )
         }),
         lsir::InstOp::Cmp { pred, lhs, rhs } => inst.result.map(|id| {
             format!(
@@ -799,11 +723,6 @@ pub trait TargetDialect {
     /// How this target spells a three-way choice.
     fn select(&self) -> SelectSpelling {
         SelectSpelling::Ternary
-    }
-
-    /// How this target spells an integer division or remainder.
-    fn int_div(&self) -> IntDivSpelling {
-        IntDivSpelling::Operator
     }
 
     /// How this target spells a conversion from one scalar type to another.
@@ -1519,7 +1438,6 @@ impl<D: TargetDialect> TargetEmitter<'_, D> {
                 |op| format_operand(&value_names, D::float_literal, op),
                 self.dialect.pointers(),
                 self.dialect.select(),
-                self.dialect.int_div(),
                 D::cast_expr,
                 &mut self.gep_elements,
                 &self.folded_geps,

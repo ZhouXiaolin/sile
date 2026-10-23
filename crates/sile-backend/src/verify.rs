@@ -35,6 +35,24 @@ fn verify_shared_contract(lsir: &LsirFunction, stage: &str) -> Result<()> {
                     block.name
                 )));
             }
+            // The SIMD-group intrinsics are the Metal mapping's plants: the
+            // lowering never produces them, so one in the input means the
+            // pipeline changed under the mapping. Checked before the target
+            // split so even the CPU target's input says no.
+            if let sile_lsir::InstOp::Intrinsic { intrinsic, .. } = &inst.op
+                && matches!(
+                    intrinsic,
+                    sile_lsir::Intrinsic::SimdReduce { .. }
+                        | sile_lsir::Intrinsic::SimdLaneId
+                        | sile_lsir::Intrinsic::SimdGroupId
+                        | sile_lsir::Intrinsic::SimdGroupMma { .. }
+                )
+            {
+                return Err(Error::Compile(format!(
+                    "{stage}: the lowering never produces the SIMD-group intrinsics — only the mapping plants them (block `{}`)",
+                    block.name
+                )));
+            }
         }
     }
     verify_structured_shapes(lsir, stage)
@@ -125,7 +143,16 @@ fn verify_gpu_contract(lsir: &LsirFunction, stage: &str) -> Result<()> {
 /// under a workgroup — a race, not a slowdown. Shared storage and barriers
 /// must pair: a shared write without a barrier between the write and the
 /// read across threads is exactly the race the mapping exists to order.
-pub(crate) fn parallel_contract(lsir: &LsirFunction, stage: &str) -> Result<()> {
+///
+/// The SIMD-group intrinsics are the one mapped surface that varies by
+/// target: only the Metal mapping plants them, so their appearance on any
+/// other target's kernel is the same pipeline-changed shape a surviving tile
+/// intrinsic is.
+pub(crate) fn parallel_contract(
+    lsir: &LsirFunction,
+    target: CodegenTarget,
+    stage: &str,
+) -> Result<()> {
     let mut has_shared = false;
     let mut has_barrier = false;
     for block in &lsir.blocks {
@@ -140,6 +167,17 @@ pub(crate) fn parallel_contract(lsir: &LsirFunction, stage: &str) -> Result<()> 
                     sile_lsir::Intrinsic::TileReduce { .. } | sile_lsir::Intrinsic::TileMma { .. } => {
                         return Err(Error::Compile(format!(
                             "{stage}: a mapped parallel kernel must have its tile intrinsic materialized, got `{intrinsic:?}` (block `{}`)",
+                            block.name
+                        )));
+                    }
+                    sile_lsir::Intrinsic::SimdReduce { .. }
+                    | sile_lsir::Intrinsic::SimdLaneId
+                    | sile_lsir::Intrinsic::SimdGroupId
+                    | sile_lsir::Intrinsic::SimdGroupMma { .. }
+                        if target != CodegenTarget::Metal =>
+                    {
+                        return Err(Error::Compile(format!(
+                            "{stage}: only the Metal mapping plants the SIMD-group intrinsics, got `{intrinsic:?}` (block `{}`)",
                             block.name
                         )));
                     }

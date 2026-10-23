@@ -138,4 +138,5 @@ sile_lsir::Function 保留为 lowering 的目标语言（backend 的输入契约
 4. softmax / rms_norm（TileReduce 并行归约）→ gemm（Mma）依次接入。
 5. 标量提升 pass（M2.5）已落地：`sile-lsir/src/passes/scalar_promote.rs`，链序 `Sroa → ScalarPromote → Dce`。
 6. M3 已落地：映射 pass 族在 `crates/sile-lsir/src/mapping.rs`（五阶段 `policy/threads/reduce/mma/cleanup`，`MappingPolicy` 参数化），`launch.rs` 已接线；WGSL 侧解除 `verify_gpu_contract` 对 Barrier 的无条件拒绝，改为有 Shared/Barrier 时校验配套。阶段间的两个词 `Metadata::OwnerOrdered` / `Metadata::ReduceRelay` 由 builder 显式打戳，模块头写明了它们的存活规则。
-7. 下一步 M4：PTX/cuda（shared 布局、`mma.sync`、barrier）。
+7. Metal simd 两档已落地（2026-10-23，详见 MAPPING_DESIGN.md §2/§3.3/§3.4/§6.3）：`ReducePolicy::SimdGroupTree` 与 `MmaPolicy::SimdGroupTiles`，四个 Metal 独有 intrinsic（`SimdReduce`/`SimdLaneId`/`SimdGroupId`/`SimdGroupMma`），`simdgroup_matrix_supported()` 以 Apple7 探测进 policy——实证 simdgroup_matrix 在非 Apple7 设备（AMD Radeon Pro 5500M）上前端编译通过但 pipeline 编译失败，capability 必须在映射前决策。本机 AMD 上 SimdGroupTree 数值验证通过，SimdGroupTiles 正确降级 ThreadStrips（gemm 数值正确）；Apple7+ 上的数值验证待机器。
+8. 下一步 M4：PTX/cuda（shared 布局、`mma.sync`、barrier）。
