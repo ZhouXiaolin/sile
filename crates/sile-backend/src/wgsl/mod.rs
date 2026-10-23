@@ -56,13 +56,15 @@ pub fn validate(source: &str) -> Result<()> {
                 .unwrap_or(0);
             sile_core::Error::Compile(format!("generated WGSL does not parse at line {line}: {e}"))
         })?;
-    // Kernels spell 32-bit integers only, which needs no capability, so
-    // validation keeps the default set: an i64 that sneaks back into the
-    // spelling is a local compile error naming SHADER_INT64, not a device
-    // that refuses the kernel at pipeline-creation time.
+    // Kernels spell 32-bit integers only, so SHADER_INT64 stays out of the
+    // capability set: an i64 that sneaks back into the spelling is a local
+    // compile error naming SHADER_INT64, not a device that refuses the kernel
+    // at pipeline-creation time. FLOAT16 stays in — half is a legitimate
+    // storage type the emitter spells with `enable f16` (the async_gemm
+    // family), and dropping it rejected legal kernels at validation.
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::default(),
+        naga::valid::Capabilities::default() | naga::valid::Capabilities::SHADER_FLOAT16,
     )
     .validate(&module)
     .map_err(|e| {
